@@ -1,0 +1,20 @@
+[package]
+name = "nightfall-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Filesystem chain + wallet storage"
+
+[dependencies]
+nightfall-types = { workspace = true }
+nightfall-consensus = { workspace = true }
+nightfall-ledger = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+dirs = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+nightfall-crypto = { workspace = true }

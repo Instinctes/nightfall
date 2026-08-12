@@ -1,0 +1,30 @@
+[package]
+name = "nightfall-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "nightfalld — NIGHTFALLCOIN full node"
+
+[lib]
+name = "nightfall_node"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nightfalld"
+path = "src/main.rs"
+
+[dependencies]
+nightfall-types = { workspace = true }
+nightfall-crypto = { workspace = true }
+nightfall-consensus = { workspace = true }
+nightfall-ledger = { workspace = true }
+nightfall-storage = { workspace = true }
+nightfall-p2p = { workspace = true }
+clap = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rand.workspace = true

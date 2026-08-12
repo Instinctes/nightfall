@@ -1,0 +1,20 @@
+/target
+**/*.rs.bk
+.DS_Store
+.env
+*.swp
+.idea/
+.vscode/
+
+# Never commit key material or chain data
+*.seed
+*.addr.json
+*.outputs.json
+blocks.jsonl
+chain-meta.json
+
+# Release artifacts — rebuild with scripts/build-macos-dmgs.sh
+/wallets/*.dmg
+/wallets/windows-x64/*.exe
+/website/public/downloads/*
+website/.wrangler/

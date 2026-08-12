@@ -1,0 +1,23 @@
+[package]
+name = "nightfall-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cryptography for NIGHTFALLCOIN"
+
+[dependencies]
+nightfall-types = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+rand = { workspace = true }
+ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
+chacha20poly1305 = { workspace = true }
+curve25519-dalek = { workspace = true }
+argon2 = { workspace = true }
+bulletproofs = { workspace = true }
+merlin = { workspace = true }
+serde = { workspace = true }
+subtle = { workspace = true }

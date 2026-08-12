@@ -1,0 +1,28 @@
+[package]
+name = "nightfall-wallet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NIGHTFALLCOIN CLI wallet"
+
+[lib]
+name = "nightfall_wallet"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nightfall-wallet"
+path = "src/main.rs"
+
+[dependencies]
+nightfall-types = { workspace = true }
+nightfall-crypto = { workspace = true }
+nightfall-ledger = { workspace = true }
+nightfall-consensus = { workspace = true }
+nightfall-storage = { workspace = true }
+curve25519-dalek = { workspace = true }
+clap = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }

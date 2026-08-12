@@ -1,0 +1,15 @@
+[package]
+name = "nightfall-consensus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Consensus, emission, blocks, mining"
+
+[dependencies]
+nightfall-types = { workspace = true }
+nightfall-crypto = { workspace = true }
+nightfall-ledger = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }

@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nightfall-types",
+    "crates/nightfall-crypto",
+    "crates/nightfall-ledger",
+    "crates/nightfall-consensus",
+    "crates/nightfall-storage",
+    "crates/nightfall-p2p",
+    "crates/nightfall-node",
+    "crates/nightfall-wallet",
+    "crates/nightfall-core",
+]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/instinctes/nightfall"
+authors = ["Nightfall contributors"]
+description = "NIGHTFALLCOIN — privacy-by-default sovereign L1"
+
+[workspace.dependencies]
+nightfall-types = { path = "crates/nightfall-types" }
+nightfall-crypto = { path = "crates/nightfall-crypto" }
+nightfall-ledger = { path = "crates/nightfall-ledger" }
+nightfall-consensus = { path = "crates/nightfall-consensus" }
+nightfall-storage = { path = "crates/nightfall-storage" }
+nightfall-p2p = { path = "crates/nightfall-p2p" }
+nightfall-node = { path = "crates/nightfall-node" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+zeroize = { version = "1", features = ["derive"] }
+blake3 = "1"
+rand = "0.8"
+ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "serde"] }
+chacha20poly1305 = "0.10"
+curve25519-dalek = { version = "4", features = ["rand_core", "digest"] }
+argon2 = { version = "0.5", features = ["std"] }
+bulletproofs = "5"
+merlin = "3"
+sha3 = "0.10"
+subtle = "2"
+anyhow = "1"
+dirs = "5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
