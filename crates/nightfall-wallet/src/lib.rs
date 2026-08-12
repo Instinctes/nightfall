@@ -624,7 +624,7 @@ mod tests {
             body,
         };
 
-        assert_eq!(w.scan_blocks(&[block.clone()]).unwrap(), 1);
+        assert_eq!(w.scan_blocks(std::slice::from_ref(&block)).unwrap(), 1);
         assert_eq!(w.balance().darks(), reward);
 
         // Rescanning must not double-count.

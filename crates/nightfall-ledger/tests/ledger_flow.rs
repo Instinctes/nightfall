@@ -11,7 +11,7 @@ fn mine_to(ledger: &mut LedgerState, miner: &WalletKeys, reward: u64, height: u6
     let cb = build_coinbase(&miner.address(), reward, height, CTX).unwrap();
     ledger
         .apply_block(
-            &BlockBody::aggregate(&[cb.clone()]),
+            &BlockBody::aggregate(std::slice::from_ref(&cb)),
             Height(height),
             reward,
             CTX,
