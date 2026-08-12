@@ -159,16 +159,17 @@ path is testable in seconds.
 
 ## Joining the network
 
-There is no public seed node yet, so the first connection is made by hand:
-**Network → Add a peer** in the wallet, or
+Builds from `main` dial `seed.nightfallcoin.org:17891` on startup and need no
+configuration. From there it is automatic: each node advertises its listening
+port in the handshake and peers exchange the addresses they know, so one
+working connection finds the rest of the network.
+
+**The v0.3.0 binaries predate this** and have no seed compiled in. With those,
+make the first connection by hand — **Network → Add a peer** in the wallet, or:
 
 ```bash
-SEED_NODE=1.2.3.4:17891 ./nightfall-core --network mainnet
+SEED_NODE=seed.nightfallcoin.org:17891 ./nightfall-core --network mainnet
 ```
-
-From there it is automatic. Each node advertises its listening port in the
-handshake and peers exchange the addresses they know, so one working connection
-finds the rest of the network.
 
 > **Connect before you mine.** Two miners who never meet build two separate
 > chains from the same genesis. Both look valid locally. When they finally
@@ -176,9 +177,11 @@ finds the rest of the network.
 > The wallet warns you when you are mining with zero peers. Reorgs deeper than
 > 500 blocks are refused outright.
 
-To publish a permanent seed node, add it to `NetworkId::seed_nodes()` in
-[`crates/nightfall-types/src/lib.rs`](crates/nightfall-types/src/lib.rs) and
-ship a build. A DNS name survives an address change; a bare IP does not.
+Running a seed node yourself is [documented in
+`docs/MAINNET.md` §3](docs/MAINNET.md) — `scripts/install-seed-node.sh` does the
+setup on macOS. A second seed on unrelated hardware genuinely helps: no seed can
+forge or hide a block, since every node validates independently, but if the only
+one is down then new installs find nobody.
 
 ---
 

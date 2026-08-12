@@ -144,19 +144,24 @@ impl NetworkId {
     ///
     /// **To publish a seed node**, put its `host:port` here and ship a new
     /// build. A DNS name is preferable to a bare IP — it survives the address
-    /// changing, which a home connection eventually will:
+    /// changing, which a home connection eventually will. Hostnames are
+    /// resolved at dial time, so dynamic DNS works.
     ///
-    /// ```ignore
-    /// Self::Mainnet => &["seed.nightfall.cash:17891"],
-    /// ```
+    /// A name that does not resolve is harmless: the dial fails, it is logged,
+    /// and the node carries on with manually added peers. That is why the entry
+    /// below can ship before the machine behind it is reachable.
     ///
-    /// Hostnames are resolved at dial time, so dynamic DNS works.
+    /// One seed is a single point of failure for *discovery only* — no seed can
+    /// forge a block, hide one, or change the rules, because every node
+    /// validates independently. But if it is down, a fresh install finds
+    /// nobody. A second operator on unrelated hardware is worth more here than
+    /// any amount of hardening on the first.
     pub fn seed_nodes(self) -> &'static [&'static str] {
         match self {
-            // No public seed node yet. Until one is listed here, every node has
-            // to be pointed at a peer manually — see docs/MAINNET.md.
-            Self::Mainnet => &[],
+            Self::Mainnet => &["seed.nightfallcoin.org:17891"],
+            // No public testnet seed yet — pass --connect by hand.
             Self::Testnet => &[],
+            // Devnet is local by definition.
             Self::Devnet => &[],
         }
     }
@@ -379,5 +384,46 @@ mod tests {
     fn fair_genesis() {
         let g = GenesisConfig::fair_launch(NetworkId::Devnet);
         assert!(g.assert_fair().is_ok());
+    }
+
+    /// Mainnet must ship a seed. Without one a fresh install finds nobody,
+    /// mines a private fork, and loses the work when it eventually connects —
+    /// which is a worse failure than not starting at all, because it looks
+    /// like it is working.
+    #[test]
+    fn mainnet_ships_a_seed_node() {
+        assert!(
+            !NetworkId::Mainnet.seed_nodes().is_empty(),
+            "mainnet has no seed node; new nodes cannot discover the network"
+        );
+    }
+
+    /// Each seed is `host:port` with the port this network actually listens on.
+    /// A typo here is silent: the dial fails, it is logged once, and nobody
+    /// notices until someone reports that syncing does not work.
+    #[test]
+    fn seed_nodes_are_well_formed() {
+        for network in [NetworkId::Mainnet, NetworkId::Testnet, NetworkId::Devnet] {
+            for seed in network.seed_nodes() {
+                let (host, port) = seed
+                    .rsplit_once(':')
+                    .unwrap_or_else(|| panic!("seed {seed:?} is missing a port"));
+
+                assert!(!host.is_empty(), "seed {seed:?} has an empty host");
+                assert!(
+                    !host.contains('/') && !host.contains(' '),
+                    "seed {seed:?} host looks like a URL, not host:port"
+                );
+
+                let port: u16 = port
+                    .parse()
+                    .unwrap_or_else(|_| panic!("seed {seed:?} has a non-numeric port"));
+                assert_eq!(
+                    port,
+                    network.default_p2p_port(),
+                    "seed {seed:?} does not use the {network:?} P2P port"
+                );
+            }
+        }
     }
 }
