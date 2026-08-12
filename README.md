@@ -12,7 +12,7 @@ chain, and the total money supply is something anyone can prove.
 [![Tests](https://img.shields.io/badge/tests-116%20passing-4ae0a8)](#testing)
 [![Status](https://img.shields.io/badge/status-pre--launch-ffc85c)](#honest-status)
 
-[Website](https://nightfallcoin.husref-huremovic.workers.dev) ·
+[Website](https://nightfallcoin.org) ·
 [Protocol spec](docs/SPEC.md) ·
 [Security audit](docs/AUDIT-2026-08-12.md) ·
 [Run a node](docs/MAINNET.md)
