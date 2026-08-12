@@ -18,3 +18,8 @@ chain-meta.json
 /wallets/windows-x64/*.exe
 /website/public/downloads/*
 website/.wrangler/
+
+# Editor and scratch leftovers
+*.bak
+*.orig
+*.rej
