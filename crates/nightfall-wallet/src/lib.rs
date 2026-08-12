@@ -425,7 +425,8 @@ impl Wallet {
                 maturity == 0 || !o.is_coinbase || tip_height >= o.height.saturating_add(maturity)
             })
             .collect();
-        available.sort_by(|a, b| b.value.cmp(&a.value));
+        // Largest first, so a payment consumes as few outputs as it can.
+        available.sort_by_key(|o| std::cmp::Reverse(o.value));
 
         let mut chosen = Vec::new();
         let mut total = 0u64;
