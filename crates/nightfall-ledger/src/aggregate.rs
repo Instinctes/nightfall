@@ -76,9 +76,9 @@ impl BlockBody {
     /// transaction an object came from) and a consensus one (every node
     /// computes the same body hash).
     pub fn canonicalise(&mut self) {
-        self.inputs.sort_by(|a, b| a.commit.0.cmp(&b.commit.0));
-        self.outputs.sort_by(|a, b| a.commit.0.cmp(&b.commit.0));
-        self.kernels.sort_by(|a, b| a.id().0.cmp(&b.id().0));
+        self.inputs.sort_by_key(|i| i.commit.0);
+        self.outputs.sort_by_key(|o| o.commit.0);
+        self.kernels.sort_by_key(|k| k.id().0);
     }
 
     pub fn is_canonical(&self) -> bool {
