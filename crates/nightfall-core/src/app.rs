@@ -337,12 +337,14 @@ impl App {
             .resizable(false)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("NIGHTFALL").size(18.0).color(TEXT).strong());
-                });
-                ui.horizontal(|ui| {
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("CORE WALLET").size(10.0).color(ACCENT_HI));
+                    ui.add_space(2.0);
+                    logo(ui, 36.0);
+                    ui.add_space(9.0);
+                    ui.vertical(|ui| {
+                        ui.add_space(2.0);
+                        ui.label(RichText::new("NIGHTFALL").size(17.0).color(TEXT).strong());
+                        ui.label(RichText::new("CORE WALLET").size(9.5).color(ACCENT_HI));
+                    });
                 });
 
                 ui.add_space(22.0);
@@ -473,7 +475,7 @@ impl App {
                         )
                         .fill(if mining { SURFACE_HI } else { ACCENT })
                         .stroke(if mining {
-                            Stroke::new(1.0, BORDER_HI)
+                            Stroke::new(1.0_f32, BORDER_HI)
                         } else {
                             Stroke::NONE
                         })
@@ -548,7 +550,7 @@ impl eframe::App for App {
                 if let Some(err) = self.status_error.clone() {
                     egui::Frame::none()
                         .fill(DANGER.gamma_multiply(0.12))
-                        .stroke(Stroke::new(1.0, DANGER.gamma_multiply(0.5)))
+                        .stroke(Stroke::new(1.0_f32, DANGER.gamma_multiply(0.5)))
                         .rounding(Rounding::same(ROUND_SM))
                         .inner_margin(egui::Margin::same(12.0))
                         .show(ui, |ui| {

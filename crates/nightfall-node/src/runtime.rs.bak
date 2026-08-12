@@ -1,0 +1,570 @@
+//! Shared node state, P2P server, mining loop.
+
+use crate::rpc;
+use nightfall_consensus::{Chain, Mempool};
+use nightfall_crypto::WalletKeys;
+use nightfall_ledger::Transaction;
+use nightfall_p2p::{
+    broadcast_block, broadcast_tx, connect_peer, handshake, network_magic, read_msg, request_blocks,
+    write_msg, PeerMsg,
+};
+use nightfall_storage::{now_unix, ChainStore};
+use nightfall_types::{Hash256, NetworkId};
+use std::collections::HashSet;
+use std::io::BufReader;
+use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+pub type SharedState = Arc<Mutex<NodeInner>>;
+
+pub struct NodeConfig {
+    pub network: NetworkId,
+    pub datadir: PathBuf,
+    pub p2p_listen: String,
+    pub rpc_listen: String,
+    pub connect: Vec<String>,
+    pub mine: bool,
+    pub miner: Option<WalletKeys>,
+}
+
+pub struct NodeInner {
+    pub chain: Chain,
+    pub mempool: Mempool,
+    pub store: ChainStore,
+    pub network: NetworkId,
+    pub peer_addrs: HashSet<String>,
+    pub miner: Option<WalletKeys>,
+    /// Outbound peer addresses for broadcast (best-effort reconnect each time)
+    pub bootstrap: Vec<String>,
+}
+
+impl NodeInner {
+    pub fn persist(&self) -> anyhow::Result<()> {
+        self.store.save(&self.chain)
+    }
+
+    pub fn submit_tx(&mut self, tx: Transaction) -> Result<String, String> {
+        self.chain.precheck_tx(&tx).map_err(|e| e.to_string())?;
+        let id = tx.txid().to_hex();
+        if !self.mempool.insert(tx.clone()) {
+            return Ok(id);
+        }
+        self.relay_tx(&tx);
+        Ok(id)
+    }
+
+    fn relay_tx(&self, tx: &Transaction) {
+        for addr in self.bootstrap.iter().chain(self.peer_addrs.iter()) {
+            if let Ok(mut s) = connect_peer(addr, 3000) {
+                let _ = handshake(
+                    &mut s,
+                    self.network,
+                    self.chain.genesis_hash,
+                    self.chain.block_count().saturating_sub(1).min(
+                        self.chain
+                            .tip_height()
+                            .map(|h| h.0)
+                            .unwrap_or(0),
+                    ),
+                    self.chain.tip_hash(),
+                );
+                // height field in hello is tip height semantics — use block count style
+                let _ = broadcast_tx(&mut s, tx);
+            }
+        }
+        // Also peer_addrs only
+        for addr in &self.peer_addrs {
+            if self.bootstrap.contains(addr) {
+                continue;
+            }
+            if let Ok(mut s) = connect_peer(addr, 2000) {
+                let _ = broadcast_tx(&mut s, tx);
+            }
+        }
+    }
+
+    pub fn broadcast_block(&self, block: nightfall_consensus::Block) {
+        let mut tried = HashSet::new();
+        for addr in self.bootstrap.iter().chain(self.peer_addrs.iter()) {
+            if !tried.insert(addr.clone()) {
+                continue;
+            }
+            if let Ok(mut s) = connect_peer(addr, 5000) {
+                let h = self.chain.tip_height().map(|x| x.0).unwrap_or(0);
+                if handshake(
+                    &mut s,
+                    self.network,
+                    self.chain.genesis_hash,
+                    h,
+                    self.chain.tip_hash(),
+                )
+                .is_ok()
+                {
+                    let _ = broadcast_block(&mut s, &block);
+                }
+            }
+        }
+    }
+}
+
+pub struct StatusSnap {
+    pub blocks: u64,
+    pub tip: String,
+    pub peers: usize,
+    pub mempool: usize,
+}
+
+pub struct NodeHandle {
+    state: SharedState,
+}
+
+impl NodeHandle {
+    pub fn start(cfg: NodeConfig) -> anyhow::Result<Self> {
+        let store = ChainStore::new(&cfg.datadir);
+        let chain = store.load_or_new(cfg.network)?;
+        store.save(&chain)?;
+
+        let inner = NodeInner {
+            chain,
+            mempool: Mempool::default(),
+            store,
+            network: cfg.network,
+            peer_addrs: HashSet::new(),
+            miner: cfg.miner.clone(),
+            bootstrap: cfg.connect.clone(),
+        };
+        let state: SharedState = Arc::new(Mutex::new(inner));
+
+        // P2P listener
+        {
+            let st = Arc::clone(&state);
+            let listen = cfg.p2p_listen.clone();
+            thread::spawn(move || p2p_listen_loop(listen, st));
+        }
+
+        // RPC
+        rpc::spawn_rpc(cfg.rpc_listen.clone(), Arc::clone(&state));
+
+        // Bootstrap connects + sync
+        {
+            let st = Arc::clone(&state);
+            let peers = cfg.connect.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(200));
+                for addr in peers {
+                    if let Err(e) = sync_from_peer(&st, &addr) {
+                        tracing::warn!("bootstrap {addr}: {e}");
+                    } else {
+                        tracing::info!("synced from {addr}");
+                    }
+                }
+                // periodic re-sync
+                loop {
+                    thread::sleep(Duration::from_secs(20));
+                    let peers: Vec<String> = {
+                        let g = st.lock().unwrap();
+                        g.bootstrap
+                            .iter()
+                            .chain(g.peer_addrs.iter())
+                            .cloned()
+                            .collect::<HashSet<_>>()
+                            .into_iter()
+                            .collect()
+                    };
+                    for addr in peers {
+                        let _ = sync_from_peer(&st, &addr);
+                    }
+                }
+            });
+        }
+
+        // Mining loop
+        if cfg.mine {
+            let st = Arc::clone(&state);
+            thread::spawn(move || mining_loop(st));
+        }
+
+        // Persist loop
+        {
+            let st = Arc::clone(&state);
+            thread::spawn(move || loop {
+                thread::sleep(Duration::from_secs(10));
+                if let Ok(g) = st.lock() {
+                    let _ = g.persist();
+                }
+            });
+        }
+
+        let _ = network_magic(cfg.network);
+        Ok(Self { state })
+    }
+
+    pub fn genesis_hex(&self) -> String {
+        self.state.lock().unwrap().chain.genesis_hash.to_hex()
+    }
+
+    pub fn status_snapshot(&self) -> anyhow::Result<StatusSnap> {
+        let g = self.state.lock().unwrap();
+        Ok(StatusSnap {
+            blocks: g.chain.block_count(),
+            tip: g.chain.tip_hash().to_hex(),
+            peers: g.peer_addrs.len(),
+            mempool: g.mempool.len(),
+        })
+    }
+}
+
+fn p2p_listen_loop(addr: String, state: SharedState) {
+    let listener = match TcpListener::bind(&addr) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("p2p bind {addr}: {e}");
+            return;
+        }
+    };
+    tracing::info!("p2p listening on {addr}");
+    for conn in listener.incoming() {
+        match conn {
+            Ok(stream) => {
+                let st = Arc::clone(&state);
+                let peer = stream
+                    .peer_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default();
+                thread::spawn(move || {
+                    if let Err(e) = handle_peer(stream, st, peer.clone()) {
+                        tracing::debug!("peer {peer}: {e}");
+                    }
+                });
+            }
+            Err(e) => tracing::warn!("p2p accept: {e}"),
+        }
+    }
+}
+
+fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> anyhow::Result<()> {
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut writer = stream;
+
+    // First message should be Hello or we send Hello
+    let first = read_msg(&mut reader)?;
+    let (network, genesis) = {
+        let g = state.lock().unwrap();
+        (g.network, g.chain.genesis_hash)
+    };
+
+    match first {
+        PeerMsg::Hello {
+            wire: _,
+            network: net,
+            genesis: g,
+            height: peer_h,
+            tip: _,
+            agent: _,
+        } => {
+            if net != network {
+                write_msg(
+                    &mut writer,
+                    &PeerMsg::Error {
+                        message: "network mismatch".into(),
+                    },
+                )?;
+                return Ok(());
+            }
+            if g != genesis.to_hex() {
+                write_msg(
+                    &mut writer,
+                    &PeerMsg::Error {
+                        message: "genesis mismatch".into(),
+                    },
+                )?;
+                return Ok(());
+            }
+            let (height, tip) = {
+                let mut st = state.lock().unwrap();
+                st.peer_addrs.insert(peer_label.clone());
+                (
+                    st.chain.tip_height().map(|h| h.0).unwrap_or(0),
+                    st.chain.tip_hash().to_hex(),
+                )
+            };
+            write_msg(
+                &mut writer,
+                &PeerMsg::HelloOk {
+                    wire: nightfall_types::WIRE_VERSION,
+                    network,
+                    genesis: genesis.to_hex(),
+                    height,
+                    tip,
+                },
+            )?;
+            // If peer is ahead, we sync outbound separately; if we are ahead they will GetBlocks
+            let _ = peer_h;
+        }
+        other => {
+            // Treat as unexpected
+            write_msg(
+                &mut writer,
+                &PeerMsg::Error {
+                    message: format!("expected hello, got {other:?}"),
+                },
+            )?;
+            return Ok(());
+        }
+    }
+
+    loop {
+        let msg = match read_msg(&mut reader) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                write_msg(&mut writer, &PeerMsg::Ping { nonce: now_unix() })?;
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        match msg {
+            PeerMsg::Ping { nonce } => {
+                write_msg(&mut writer, &PeerMsg::Pong { nonce })?;
+            }
+            PeerMsg::GetBlocks { from_height, limit } => {
+                let blocks = {
+                    let g = state.lock().unwrap();
+                    g.chain.blocks_from(from_height, limit.min(500))
+                };
+                write_msg(&mut writer, &PeerMsg::Blocks { blocks })?;
+            }
+            PeerMsg::GetStatus => {
+                let g = state.lock().unwrap();
+                write_msg(
+                    &mut writer,
+                    &PeerMsg::Status {
+                        height: g.chain.tip_height().map(|h| h.0).unwrap_or(0),
+                        tip: g.chain.tip_hash().to_hex(),
+                        bits: g.chain.bits,
+                        peers: g.peer_addrs.len(),
+                        mempool: g.mempool.len(),
+                    },
+                )?;
+            }
+            PeerMsg::Block { block } => {
+                let mut g = state.lock().unwrap();
+                match g.chain.apply_block(block.clone(), now_unix()) {
+                    Ok(()) => {
+                        g.mempool.remove_included(&block);
+                        let _ = g.persist();
+                        tracing::info!(
+                            "accepted block height={} hash={}",
+                            block.header.height.0,
+                            block.pow_hash
+                        );
+                    }
+                    Err(e) => {
+                        tracing::debug!("reject block tip-extend: {e} — requesting full chain");
+                        drop(g);
+                        // Pull peer's chain on this connection and maybe reorg
+                        if write_msg(
+                            &mut writer,
+                            &PeerMsg::GetBlocks {
+                                from_height: 0,
+                                limit: 500,
+                            },
+                        )
+                        .is_ok()
+                        {
+                            if let Ok(PeerMsg::Blocks { blocks }) = read_msg(&mut reader) {
+                                let mut g = state.lock().unwrap();
+                                if let Ok(true) = g.chain.maybe_reorg_to(blocks, now_unix()) {
+                                    let _ = g.persist();
+                                    tracing::info!(
+                                        "reorged to peer chain tip={}",
+                                        g.chain.tip_hash()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            PeerMsg::Tx { tx } => {
+                let mut g = state.lock().unwrap();
+                match g.chain.precheck_tx(&tx) {
+                    Ok(()) => {
+                        g.mempool.insert(tx);
+                    }
+                    Err(e) => tracing::debug!("reject tx: {e}"),
+                }
+            }
+            PeerMsg::InvBlock { hash, height } => {
+                let need = {
+                    let g = state.lock().unwrap();
+                    g.chain.tip_height().map(|h| h.0).unwrap_or(0) < height
+                        || g.chain.tip_hash().to_hex() != hash
+                };
+                if need {
+                    write_msg(&mut writer, &PeerMsg::GetBlock { hash })?;
+                }
+            }
+            PeerMsg::GetBlock { hash } => {
+                let block = {
+                    let g = state.lock().unwrap();
+                    g.chain
+                        .blocks
+                        .iter()
+                        .find(|b| b.pow_hash.to_hex() == hash)
+                        .cloned()
+                };
+                if let Some(block) = block {
+                    write_msg(&mut writer, &PeerMsg::Block { block })?;
+                }
+            }
+            PeerMsg::Hello { .. } => {
+                // ignore re-hello
+            }
+            _ => {}
+        }
+    }
+}
+
+fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
+    let mut stream = connect_peer(addr, 15_000)?;
+    let (network, genesis, our_h, tip) = {
+        let mut g = state.lock().unwrap();
+        g.peer_addrs.insert(addr.to_string());
+        (
+            g.network,
+            g.chain.genesis_hash,
+            g.chain.tip_height().map(|h| h.0).unwrap_or(0),
+            g.chain.tip_hash(),
+        )
+    };
+    let (peer_h, peer_tip) = handshake(&mut stream, network, genesis, our_h, tip)?;
+
+    // Always fetch full chain from 0 when tips differ or peer is ahead — longest wins.
+    let our_tip = tip.to_hex();
+    if peer_tip == our_tip && peer_h == our_h && our_h > 0 {
+        return Ok(());
+    }
+
+    let mut all = Vec::new();
+    let mut from = 0u64;
+    loop {
+        let batch = request_blocks(&mut stream, from, 200)?;
+        if batch.is_empty() {
+            break;
+        }
+        let n = batch.len();
+        from = batch.last().map(|b| b.header.height.0 + 1).unwrap_or(from);
+        all.extend(batch);
+        if n < 200 {
+            break;
+        }
+        if all.len() > 50_000 {
+            break;
+        }
+    }
+
+    if all.is_empty() {
+        return Ok(());
+    }
+
+    let mut g = state.lock().unwrap();
+    // Prefer tip-extend first (cheap)
+    let before = g.chain.block_count();
+    let applied = g.chain.try_ingest_blocks(all.clone(), now_unix()).unwrap_or(0);
+    if applied > 0 {
+        let _ = g.persist();
+        tracing::info!("extended +{applied} from {addr} (blocks={})", g.chain.block_count());
+        return Ok(());
+    }
+    // Reorg / adopt longer valid chain
+    match g.chain.maybe_reorg_to(all, now_unix()) {
+        Ok(true) => {
+            let _ = g.persist();
+            tracing::info!(
+                "reorg/adopt from {addr}: {} -> {} blocks tip={}",
+                before,
+                g.chain.block_count(),
+                g.chain.tip_hash()
+            );
+        }
+        Ok(false) => {
+            tracing::debug!("peer {addr} chain not longer (peer_h={peer_h})");
+        }
+        Err(e) => tracing::warn!("peer chain invalid from {addr}: {e}"),
+    }
+    Ok(())
+}
+
+fn mining_loop(state: SharedState) {
+    tracing::info!("mining loop started");
+    let target = nightfall_types::TARGET_BLOCK_TIME_SECS;
+    loop {
+        let miner = {
+            let g = state.lock().unwrap();
+            match &g.miner {
+                Some(m) => m.clone(),
+                None => {
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            }
+        };
+
+        let start = std::time::Instant::now();
+        let result = {
+            let mut g = state.lock().unwrap();
+            let txs = g.mempool.drain_for_block(64);
+            g.chain.mine_block(&miner, txs, now_unix())
+        };
+
+        match result {
+            Ok(block) => {
+                let mut g = state.lock().unwrap();
+                // If tip moved while we mined (shouldn't under lock), still ok — mine_block applies under lock
+                g.mempool.remove_included(&block);
+                let _ = g.persist();
+                tracing::info!(
+                    "mined height={} hash={} txs={}",
+                    block.header.height.0,
+                    block.pow_hash,
+                    block.txs.len()
+                );
+                let b = block.clone();
+                g.broadcast_block(b);
+            }
+            Err(e) => {
+                tracing::warn!("mine error: {e}");
+                thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+        }
+
+        // Pace toward target block time (devnet still fast if PoW << 15s, but not 100 blk/s)
+        let elapsed = start.elapsed().as_secs();
+        // Devnet: min 1s between blocks to allow peer sync/reorg; mainnet uses full target
+        let pace = {
+            let net = state.lock().unwrap().network;
+            match net {
+                nightfall_types::NetworkId::Devnet => 1u64,
+                nightfall_types::NetworkId::Testnet => target / 3,
+                nightfall_types::NetworkId::Mainnet => target,
+            }
+        };
+        if elapsed < pace {
+            thread::sleep(Duration::from_secs(pace - elapsed));
+        }
+    }
+}
+
+// Silence unused import if Hash256 only used in types
+#[allow(dead_code)]
+fn _h(h: Hash256) -> String {
+    h.to_hex()
+}

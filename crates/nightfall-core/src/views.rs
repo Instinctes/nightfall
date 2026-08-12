@@ -47,7 +47,7 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
     if app.is_mining() && peers == 0 {
         egui::Frame::none()
             .fill(WARN.gamma_multiply(0.12))
-            .stroke(Stroke::new(1.0, WARN.gamma_multiply(0.55)))
+            .stroke(Stroke::new(1.0_f32, WARN.gamma_multiply(0.55)))
             .rounding(Rounding::same(ROUND))
             .inner_margin(egui::Margin::same(16.0))
             .show(ui, |ui| {
@@ -433,7 +433,7 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                     .add(
                         egui::Button::new(RichText::new("MAX").size(10.5).color(ACCENT_HI))
                             .fill(Color32::TRANSPARENT)
-                            .stroke(Stroke::new(1.0, ACCENT_DIM))
+                            .stroke(Stroke::new(1.0_f32, ACCENT_DIM))
                             .rounding(Rounding::same(999.0)),
                     )
                     .on_hover_text("Send everything, minus the fee")
@@ -533,7 +533,7 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                     } else {
                         SURFACE_HI
                     })
-                    .stroke(Stroke::new(1.0, if selected { ACCENT } else { BORDER }))
+                    .stroke(Stroke::new(1.0_f32, if selected { ACCENT } else { BORDER }))
                     .rounding(Rounding::same(ROUND_SM)),
                 );
                 if resp.clicked() {
@@ -575,7 +575,7 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             .frame(
                 egui::Frame::none()
                     .fill(SURFACE)
-                    .stroke(Stroke::new(1.0, BORDER_HI))
+                    .stroke(Stroke::new(1.0_f32, BORDER_HI))
                     .rounding(Rounding::same(12.0))
                     .inner_margin(egui::Margin::same(22.0))
                     .shadow(egui::epaint::Shadow {
@@ -986,7 +986,7 @@ fn sparkline(ui: &mut egui::Ui, data: &[f64], height: f32) {
 
     painter.add(egui::Shape::line(
         points.clone(),
-        Stroke::new(1.8, ACCENT_HI),
+        Stroke::new(1.8_f32, ACCENT_HI),
     ));
 
     if let Some(last) = points.last() {
@@ -1029,7 +1029,7 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 !app.peer_input.trim().is_empty(),
                 egui::Button::new("Connect")
                     .fill(SURFACE_HI)
-                    .stroke(Stroke::new(1.0, BORDER))
+                    .stroke(Stroke::new(1.0_f32, BORDER))
                     .rounding(Rounding::same(ROUND_PILL))
                     .min_size(Vec2::new(0.0, 34.0)),
             );

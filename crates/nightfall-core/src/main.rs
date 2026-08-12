@@ -32,6 +32,7 @@ fn main() -> eframe::Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 780.0])
             .with_min_inner_size([940.0, 620.0])
+            .with_icon(load_window_icon())
             .with_title(format!("{COIN_NAME} Core — {network}")),
         ..Default::default()
     };
@@ -44,6 +45,21 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(App::new(network, datadir)))
         }),
     )
+}
+
+/// Window and taskbar icon. On macOS the bundle's `.icns` takes precedence,
+/// but on Windows and Linux this is the only icon the window manager sees.
+fn load_window_icon() -> eframe::egui::IconData {
+    const BYTES: &[u8] = include_bytes!("../assets/logo-512.png");
+    let image = image::load_from_memory(BYTES)
+        .expect("bundled logo is valid PNG")
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    eframe::egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    }
 }
 
 fn parse_network_arg() -> NetworkId {

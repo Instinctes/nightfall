@@ -84,40 +84,40 @@ pub fn apply(ctx: &egui::Context) {
     v.window_fill = SURFACE;
     v.extreme_bg_color = SURFACE_LOW;
     v.faint_bg_color = SURFACE_HI;
-    v.window_stroke = Stroke::new(1.0, BORDER);
+    v.window_stroke = Stroke::new(1.0_f32, BORDER);
     v.window_rounding = Rounding::same(ROUND);
     v.selection.bg_fill = ACCENT_DIM;
-    v.selection.stroke = Stroke::new(1.0, ACCENT_HI);
+    v.selection.stroke = Stroke::new(1.0_f32, ACCENT_HI);
     v.hyperlink_color = ACCENT_HI;
 
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = SURFACE;
     w.noninteractive.weak_bg_fill = SURFACE;
-    w.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
-    w.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_DIM);
+    w.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    w.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT_DIM);
     w.noninteractive.rounding = Rounding::same(ROUND_SM);
 
     w.inactive.bg_fill = SURFACE_HI;
     w.inactive.weak_bg_fill = SURFACE_HI;
-    w.inactive.bg_stroke = Stroke::new(1.0, BORDER);
-    w.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+    w.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    w.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
     w.inactive.rounding = Rounding::same(ROUND_SM);
 
     w.hovered.bg_fill = SURFACE_HOVER;
     w.hovered.weak_bg_fill = SURFACE_HOVER;
-    w.hovered.bg_stroke = Stroke::new(1.0, BORDER_HI);
-    w.hovered.fg_stroke = Stroke::new(1.0, TEXT);
+    w.hovered.bg_stroke = Stroke::new(1.0_f32, BORDER_HI);
+    w.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT);
     w.hovered.rounding = Rounding::same(ROUND_SM);
     w.hovered.expansion = 1.0;
 
     w.active.bg_fill = ACCENT_DIM;
     w.active.weak_bg_fill = ACCENT_DIM;
-    w.active.bg_stroke = Stroke::new(1.0, ACCENT);
-    w.active.fg_stroke = Stroke::new(1.0, TEXT);
+    w.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+    w.active.fg_stroke = Stroke::new(1.0_f32, TEXT);
     w.active.rounding = Rounding::same(ROUND_SM);
 
     w.open.bg_fill = SURFACE_HI;
-    w.open.bg_stroke = Stroke::new(1.0, BORDER_HI);
+    w.open.bg_stroke = Stroke::new(1.0_f32, BORDER_HI);
 
     style.spacing.item_spacing = egui::vec2(12.0, 12.0);
     style.spacing.button_padding = egui::vec2(16.0, 9.0);

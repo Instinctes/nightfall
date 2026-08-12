@@ -3,6 +3,40 @@
 use crate::theme::*;
 use eframe::egui::{self, Color32, Rect, RichText, Rounding, Sense, Stroke, Vec2};
 
+// ------------------------------------------------------------------ logo ---
+
+/// Decode the bundled logo once and hand back a texture.
+///
+/// egui has no image loader by default, so the PNG is decoded here and
+/// uploaded as a texture on first use. `Context::load_texture` caches by name,
+/// but we keep our own handle so the decode happens exactly once per run.
+pub fn logo_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    use std::sync::OnceLock;
+    static HANDLE: OnceLock<egui::TextureHandle> = OnceLock::new();
+
+    HANDLE
+        .get_or_init(|| {
+            const BYTES: &[u8] = include_bytes!("../assets/logo.png");
+            let image = image::load_from_memory(BYTES)
+                .expect("bundled logo is valid PNG")
+                .into_rgba8();
+            let size = [image.width() as usize, image.height() as usize];
+            let pixels = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+            ctx.load_texture("nightfall-logo", pixels, egui::TextureOptions::LINEAR)
+        })
+        .clone()
+}
+
+/// Draw the logo at the given height.
+pub fn logo(ui: &mut egui::Ui, height: f32) -> egui::Response {
+    let tex = logo_texture(ui.ctx());
+    ui.add(
+        egui::Image::new(&tex)
+            .fit_to_exact_size(Vec2::splat(height))
+            .sense(Sense::hover()),
+    )
+}
+
 // ------------------------------------------------------------- gradients ---
 
 /// Fill a rounded rectangle with a linear gradient.
@@ -107,7 +141,7 @@ pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let width = ui.available_width();
     egui::Frame::none()
         .fill(SURFACE)
-        .stroke(Stroke::new(1.0, BORDER))
+        .stroke(Stroke::new(1.0_f32, BORDER))
         .rounding(Rounding::same(ROUND))
         .inner_margin(egui::Margin::same(20.0))
         .show(ui, |ui| {
@@ -169,7 +203,7 @@ pub fn badge(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
         rect,
         Rounding::same(999.0),
         color.gamma_multiply(0.14),
-        Stroke::new(1.0, color.gamma_multiply(0.45)),
+        Stroke::new(1.0_f32, color.gamma_multiply(0.45)),
     );
     let text_pos = rect.center() - galley.size() / 2.0;
     ui.painter().galley(text_pos, galley, color);
@@ -241,7 +275,7 @@ pub fn on_gradient_chip(ui: &mut egui::Ui, text: &str) {
         rect,
         Rounding::same(ROUND_PILL),
         Color32::from_black_alpha(85),
-        Stroke::new(1.0, Color32::from_white_alpha(45)),
+        Stroke::new(1.0_f32, Color32::from_white_alpha(45)),
     );
     ui.painter()
         .galley(rect.center() - galley.size() / 2.0, galley, Color32::WHITE);
@@ -252,7 +286,7 @@ pub fn ghost_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(text).color(TEXT))
             .fill(SURFACE_HI)
-            .stroke(Stroke::new(1.0, BORDER))
+            .stroke(Stroke::new(1.0_f32, BORDER))
             .rounding(Rounding::same(ROUND_PILL))
             .min_size(Vec2::new(0.0, 38.0)),
     )
@@ -263,7 +297,7 @@ pub fn copyable(ui: &mut egui::Ui, value: &str, wrap: bool) -> bool {
     let mut copied = false;
     egui::Frame::none()
         .fill(SURFACE_LOW)
-        .stroke(Stroke::new(1.0, BORDER))
+        .stroke(Stroke::new(1.0_f32, BORDER))
         .rounding(Rounding::same(ROUND_SM))
         .inner_margin(egui::Margin::symmetric(12.0, 10.0))
         .show(ui, |ui| {
@@ -411,7 +445,7 @@ impl Toasts {
                     ui.set_opacity(alpha);
                     egui::Frame::none()
                         .fill(SURFACE_HI)
-                        .stroke(Stroke::new(1.0, toast.color.gamma_multiply(0.6)))
+                        .stroke(Stroke::new(1.0_f32, toast.color.gamma_multiply(0.6)))
                         .rounding(Rounding::same(ROUND_SM))
                         .inner_margin(egui::Margin::symmetric(14.0, 11.0))
                         .shadow(egui::epaint::Shadow {
@@ -458,7 +492,7 @@ pub fn format_int(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
