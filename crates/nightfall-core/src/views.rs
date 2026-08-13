@@ -135,20 +135,35 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
 
         // The wallet syncs itself every few seconds; this is a status readout,
         // not a button. Nothing here should ever need clicking to stay current.
+        //
+        // "In sync" with no peers is a lie, and an expensive one: it is exactly
+        // what lets someone keep mining a chain nobody will ever accept. With
+        // nobody to be in sync *with*, the only honest thing to report is that
+        // there is nobody.
         ui.add_space(6.0);
         let syncing = app.syncing.load(std::sync::atomic::Ordering::SeqCst);
-        dot(ui, if syncing { WARN } else { SUCCESS }, syncing);
-        ui.add_space(2.0);
+        let connected = peers > 0;
         let scanned = app.wallet.lock().map(|w| w.scanned_to()).unwrap_or(0);
-        ui.label(
-            RichText::new(if syncing {
-                "Scanning…".to_string()
-            } else {
-                format!("In sync · block {}", format_int(scanned))
-            })
-            .size(11.5)
-            .color(TEXT_FAINT),
-        );
+
+        let (colour, pulse, text) = if syncing {
+            (WARN, true, "Scanning…".to_string())
+        } else if connected {
+            (
+                SUCCESS,
+                false,
+                format!("In sync · block {}", format_int(scanned)),
+            )
+        } else {
+            (
+                WARN,
+                false,
+                format!("No peers · local block {}", format_int(scanned)),
+            )
+        };
+
+        dot(ui, colour, pulse);
+        ui.add_space(2.0);
+        ui.label(RichText::new(text).size(11.5).color(TEXT_FAINT));
     });
 
     if balances.immature > 0 {
