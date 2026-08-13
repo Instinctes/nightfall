@@ -98,6 +98,52 @@ fn heavier_chain_is_adopted() {
 }
 
 #[test]
+fn a_lighter_chain_is_declined_not_accused() {
+    // The depth bound is a denial-of-service limit: it stops a peer making us
+    // validate an arbitrarily long chain on demand. It is not a statement about
+    // which chain is correct, and it must not be the reason a candidate is
+    // turned away when work already settles the question.
+    //
+    // Before the check order was fixed, a long lighter chain came back as
+    // ReorgTooDeep — "this looks like an attack" — when the truthful answer was
+    // "we compared the work and yours is lighter". Anyone reading node logs to
+    // diagnose a fork was being pointed at the wrong thing.
+    let mut chain = devnet();
+    let miner = WalletKeys::generate().address();
+
+    // `block_work` floors at 1, so a chain of n blocks is worth at least n no
+    // matter how low its difficulty. Mine until ours outweighs anything the
+    // depth bound would still let through.
+    let mut i = 0u64;
+    while chain.total_work <= chain.block_count() as u128 + MAX_REORG_DEPTH as u128 + 4 {
+        chain
+            .mine_block(&miner, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+        i += 1;
+    }
+
+    // Now a candidate that is past the depth bound *and* lighter. Minimum
+    // difficulty on every block keeps its total at one unit each.
+    let target_len = chain.block_count() as usize + MAX_REORG_DEPTH + 1;
+    let lighter: Vec<_> = (0..target_len)
+        .map(|_| {
+            let mut b = chain.blocks[0].clone();
+            b.header.difficulty = 0;
+            b
+        })
+        .collect();
+    assert!(
+        (lighter.len() as u128) < chain.total_work,
+        "setup: the candidate must genuinely be lighter"
+    );
+
+    assert!(
+        matches!(chain.maybe_reorg_to(lighter, NOW), Ok(false)),
+        "a lighter chain must be declined on work, not reported as too deep"
+    );
+}
+
+#[test]
 fn reorg_depth_is_bounded() {
     let mut chain = devnet();
     let miner = WalletKeys::generate().address();

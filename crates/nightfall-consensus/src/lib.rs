@@ -521,14 +521,35 @@ impl Chain {
         if blocks.is_empty() {
             return Ok(false);
         }
-        if blocks.len() > self.blocks.len() + MAX_REORG_DEPTH {
-            return Err(ConsensusError::ReorgTooDeep);
-        }
 
-        // Quick reject: even if every block were valid, could it out-work us?
+        // Work first, and deliberately so.
+        //
+        // Fork choice is decided by cumulative work, so that is the question
+        // worth asking, and summing declared difficulty is cheaper than
+        // anything that follows. Checking length first meant a candidate could
+        // be turned away for a reason unrelated to how it would have been
+        // judged — and it reported `ReorgTooDeep` while doing it, which reads
+        // as "this chain is suspicious" rather than "we never looked".
         let claimed_work: u128 = blocks.iter().map(|b| b.work()).sum();
         if claimed_work <= self.total_work {
             return Ok(false);
+        }
+
+        // Only now the depth bound, and only against something that claims to
+        // be heavier. The guard exists so a peer cannot make us validate an
+        // arbitrarily long chain on demand; it is a denial-of-service limit,
+        // not a rule about which chain is correct.
+        //
+        // It does mean two chains that drift more than MAX_REORG_DEPTH apart
+        // can never reconcile, whichever carries more work. That is a real
+        // limitation and it has already happened once: two miners on separate
+        // networks diverged by roughly two thousand blocks and had to be
+        // resolved by throwing both away. The bound stays, because the
+        // alternative is letting a stranger dictate unbounded validation work,
+        // but nodes should meet long before it matters — which is what seed
+        // nodes are for.
+        if blocks.len() > self.blocks.len() + MAX_REORG_DEPTH {
+            return Err(ConsensusError::ReorgTooDeep);
         }
 
         let candidate = Self::rebuild_from_blocks(self.network, blocks, now_unix)?;

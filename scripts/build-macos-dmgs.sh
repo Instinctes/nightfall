@@ -4,8 +4,16 @@
 #   ./scripts/build-macos-dmgs.sh
 #
 # Produces, under wallets/:
-#   NIGHTFALLCOIN-Core-macOS-arm64.dmg   Apple Silicon
-#   NIGHTFALLCOIN-Core-macOS-intel.dmg   Intel
+#   NIGHTFALLCOIN-Core-<version>-macOS-arm64.dmg   Apple Silicon
+#   NIGHTFALLCOIN-Core-<version>-macOS-intel.dmg   Intel
+#
+# The version is in the filename on purpose. Without it a new release
+# overwrites the previous file at the same URL, and every cache between here
+# and the user — CDN edge, browser, corporate proxy — may keep handing out the
+# old bytes under the new build's published checksum. A user who verifies the
+# checksum then sees a mismatch and cannot tell whether they are looking at a
+# stale cache or a tampered download. Distinct names make that impossible:
+# a URL always refers to exactly one file.
 #
 # Both target macOS 12.5 or newer. Neither is code-signed — see wallets/README.md.
 set -euo pipefail
@@ -137,7 +145,12 @@ make_app arm64 aarch64-apple-darwin
 make_app intel x86_64-apple-darwin
 
 echo "==> Packaging"
-make_dmg arm64 "NIGHTFALLCOIN-Core-macOS-arm64.dmg"
-make_dmg intel "NIGHTFALLCOIN-Core-macOS-intel.dmg"
+make_dmg arm64 "NIGHTFALLCOIN-Core-${VERSION}-macOS-arm64.dmg"
+make_dmg intel "NIGHTFALLCOIN-Core-${VERSION}-macOS-intel.dmg"
+
+# Checksums, next to the files, so publishing a release does not depend on
+# anyone remembering to run shasum by hand.
+(cd "$OUT" && shasum -a 256 NIGHTFALLCOIN-Core-${VERSION}-macOS-*.dmg > "SHA256SUMS-${VERSION}.txt")
+echo "    SHA256SUMS-${VERSION}.txt"
 
 echo "==> Done. Output in $OUT"
