@@ -76,16 +76,54 @@ command -v cargo >/dev/null || die "cargo still not on PATH"
 
 # -------------------------------------------------------------------- build --
 
+# Compiling this workspace needs more memory than the cheapest VPS tiers have.
+# rustc holds a whole crate's IR in memory, and curve25519-dalek, bulletproofs
+# and argon2 are not small. On a 1 GB box the linker gets killed by the OOM
+# reaper partway through, which surfaces as a build that stops with no error
+# worth reading.
+#
+# Two cheap fixes rather than making people buy a larger machine for a process
+# that will idle at a few dozen megabytes once it is running: temporary swap,
+# and one codegen job at a time.
+TOTAL_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+info "memory: ${TOTAL_MB} MB"
+
+SWAPFILE=""
+if [ "$TOTAL_MB" -lt 2048 ] && [ ! -e /swapfile ]; then
+    info "adding 2 GB of temporary swap for the build"
+    if fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none; then
+        chmod 600 /swapfile
+        mkswap /swapfile >/dev/null 2>&1
+        if swapon /swapfile 2>/dev/null; then
+            SWAPFILE=/swapfile
+        else
+            rm -f /swapfile
+            warn "could not enable swap — the build may run out of memory"
+        fi
+    fi
+fi
+# Removed again afterwards: a node at rest does not need it, and leaving a
+# swapfile behind on a small disk is a surprise for whoever looks next.
+cleanup() {
+    if [ -n "$SWAPFILE" ]; then
+        swapoff "$SWAPFILE" 2>/dev/null || true
+        rm -f "$SWAPFILE"
+    fi
+    rm -rf "${BUILD:-}"
+}
+trap cleanup EXIT
+
 BUILD="$(mktemp -d)"
-trap 'rm -rf "$BUILD"' EXIT
 
 info "fetching source"
 git clone --depth 1 "$REPO" "$BUILD/nightfall" >/dev/null 2>&1 \
     || die "clone failed — check network access to github.com"
 
-info "building (this takes a few minutes on a small VPS)"
-( cd "$BUILD/nightfall" && cargo build --release -p nightfall-node ) \
-    || die "build failed"
+JOBS=1
+[ "$TOTAL_MB" -ge 4096 ] && JOBS=$(nproc)
+info "building with $JOBS job(s) — several minutes on a small VPS"
+( cd "$BUILD/nightfall" && cargo build --release -j "$JOBS" -p nightfall-node ) \
+    || die "build failed — if it was killed without an error, it ran out of memory"
 
 install -m 0755 "$BUILD/nightfall/target/release/nightfalld" "$BINDIR/nightfalld"
 info "installed $BINDIR/nightfalld"
