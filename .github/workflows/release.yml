@@ -1,0 +1,88 @@
+name: Release
+
+# Builds the Windows binaries on a real Windows runner and attaches them to the
+# release for the tag that triggered this.
+#
+# Why not cross-compile from macOS: it needs a mingw toolchain that has to be
+# kept working on one person's laptop, and the result is a binary nobody else
+# can reproduce. Building on GitHub's runner means the artefacts come from a
+# published, inspectable workflow on a machine none of us control — which is a
+# weaker claim than a reproducible build, but a considerably better one than
+# "trust the laptop it came off".
+#
+# macOS .dmg files are still built locally with scripts/build-macos-dmgs.sh and
+# uploaded by hand, because bundling and packaging on a runner would need code
+# signing credentials this project deliberately does not have.
+
+on:
+  push:
+    tags: ["v*"]
+  # Lets the Windows artefacts be rebuilt for an existing tag without moving it.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to attach binaries to (e.g. v0.4.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: windows-x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The tests gate the release. Shipping a binary from a tree that fails
+      # its own exploit regression suite would be worse than shipping nothing.
+      - name: Tests
+        run: cargo test --workspace
+
+      - name: Build
+        run: cargo build --release -p nightfall-core -p nightfall-node -p nightfall-wallet
+
+      - name: Collect and checksum
+        shell: pwsh
+        run: |
+          $tag = if ($env:INPUT_TAG) { $env:INPUT_TAG } else { "${{ github.ref_name }}" }
+          $version = $tag -replace '^v', ''
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          # Version in the filename, same reason as the macOS builds: a URL
+          # should refer to exactly one file, so a cache can never serve an old
+          # binary under a new build's published checksum.
+          $map = @{
+            "nightfall-core.exe"   = "nightfall-core-$version-windows-x64.exe"
+            "nightfalld.exe"       = "nightfalld-$version-windows-x64.exe"
+            "nightfall-wallet.exe" = "nightfall-wallet-$version-windows-x64.exe"
+          }
+          foreach ($src in $map.Keys) {
+            Copy-Item "target/release/$src" "dist/$($map[$src])"
+          }
+
+          $lines = Get-ChildItem dist -Filter *.exe | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          }
+          $lines | Set-Content "dist/SHA256SUMS-$version-windows.txt" -Encoding ascii
+          Get-Content "dist/SHA256SUMS-$version-windows.txt"
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+
+      - name: Attach to release
+        shell: bash
+        run: |
+          TAG="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+          # --clobber so re-running for a tag replaces rather than fails.
+          gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
