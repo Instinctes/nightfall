@@ -20,6 +20,7 @@
 mod commit;
 mod kernel;
 mod keys;
+mod mnemonic;
 mod pow;
 mod rangeproof;
 mod schnorr;
@@ -28,6 +29,7 @@ mod stealth;
 pub use commit::*;
 pub use kernel::*;
 pub use keys::*;
+pub use mnemonic::{MnemonicError, MNEMONIC_WORDS};
 pub use pow::*;
 pub use rangeproof::{RangeError, RangeProofBytes, RANGE_BITS};
 pub use schnorr::{SchnorrSig, SCHNORR_DOMAIN};

@@ -273,10 +273,48 @@ pub fn create_output_with_features(
     Ok((output, SenderSecrets { blind, value }))
 }
 
+/// The parts of an [`Output`] a scanner actually reads.
+///
+/// A light client is served these fields alone — the range proof is ~672 bytes
+/// and irrelevant to discovering ownership, so shipping it to a phone is
+/// several times the bandwidth for no benefit. See the `scan_feed` RPC method.
+///
+/// This type exists so such a client never has to fabricate an [`Output`] with
+/// a placeholder range proof and signature just to call a scan function. That
+/// dummy would be a real object with fields that are lies, and would sooner or
+/// later be passed to something that checks them.
+#[derive(Clone, Debug)]
+pub struct ScanCandidate {
+    pub commit: Commitment,
+    pub ephemeral_pk: [u8; 32],
+    pub output_pk: [u8; 32],
+    pub payload: Vec<u8>,
+}
+
+impl From<&Output> for ScanCandidate {
+    fn from(o: &Output) -> Self {
+        Self {
+            commit: o.commit,
+            ephemeral_pk: o.ephemeral_pk,
+            output_pk: o.output_pk,
+            payload: o.payload.clone(),
+        }
+    }
+}
+
 /// Test whether `output` belongs to this wallet and, if so, open it.
 ///
 /// Works with a view key alone — no spend secret required.
 pub fn scan_output(view: &ViewKey, output: &Output) -> Option<DiscoveredOutput> {
+    scan_candidate(view, &ScanCandidate::from(output))
+}
+
+/// [`scan_output`] against the loose fields a light client receives.
+///
+/// Identical checks, including that the commitment opens to the stated value —
+/// a light client trusts its node for what exists on chain, but it does not
+/// have to trust anyone for what a payment is worth.
+pub fn scan_candidate(view: &ViewKey, output: &ScanCandidate) -> Option<DiscoveredOutput> {
     let ke = CompressedRistretto(output.ephemeral_pk).decompress()?;
     let spend_point = view.spend_point()?;
 
@@ -329,6 +367,33 @@ pub fn scan_output(view: &ViewKey, output: &Output) -> Option<DiscoveredOutput> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A light client scanning the stripped fields must reach exactly the same
+    /// conclusion as a full node scanning the whole output. If these ever
+    /// diverge, a phone silently misses payments a desktop can see.
+    #[test]
+    fn stripped_fields_scan_identically() {
+        use nightfall_types::NetworkId;
+        let ctx = NetworkId::Devnet.proof_context();
+        let me = crate::WalletKeys::generate();
+        let stranger = crate::WalletKeys::generate();
+
+        let (mine, _) = create_output(&me.address(), 7_777, "hallo", ctx).expect("output");
+        let (theirs, _) = create_output(&stranger.address(), 1, "", ctx).expect("output");
+
+        let view = me.view_key();
+        for output in [&mine, &theirs] {
+            let full = scan_output(&view, output);
+            let light = scan_candidate(&view, &ScanCandidate::from(output));
+            assert_eq!(full.is_some(), light.is_some());
+            if let (Some(a), Some(b)) = (full, light) {
+                assert_eq!(a.value, b.value);
+                assert_eq!(a.commit, b.commit);
+                assert_eq!(a.memo, b.memo);
+                assert_eq!(a.blind, b.blind);
+            }
+        }
+    }
 
     const CTX: &[u8] = b"nightfall:test";
 

@@ -21,3 +21,4 @@ bulletproofs = { workspace = true }
 merlin = { workspace = true }
 serde = { workspace = true }
 subtle = { workspace = true }
+bip39 = { workspace = true }

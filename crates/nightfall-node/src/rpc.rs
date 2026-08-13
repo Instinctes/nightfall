@@ -202,6 +202,78 @@ fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
             }
         }
 
+        // Everything a wallet needs to find its own coins, and nothing else.
+        //
+        // A block is dominated by Bulletproofs: ~672 bytes per output, and the
+        // scanner never looks at them — it computes an ECDH against the
+        // ephemeral key and compares the result to the one-time key. Stripping
+        // the proofs and the kernels cuts the wire cost by roughly 5x, which
+        // on a phone is the difference between a sync people tolerate and one
+        // they do not.
+        //
+        // The client asks for height ranges, never for a named commitment.
+        // Asking "do you have this output" would tell the node exactly which
+        // output is yours and throw away the privacy that scanning locally
+        // buys in the first place. There is deliberately no such method.
+        //
+        // Trust: this returns what the node believes. A wallet on a phone
+        // cannot check the proof of work — Argon2id at 32 MiB per hash is not
+        // a thing a battery does — so a hostile node can show a payment that
+        // does not exist. It cannot spend anything, because the seed never
+        // leaves the device. Point the wallet at your own node.
+        "scan_feed" => {
+            let from = req.params.get("from").and_then(|v| v.as_u64()).unwrap_or(0);
+            // Capped server-side. An unbounded range would let one request
+            // serialise the whole chain into memory.
+            let limit = req
+                .params
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(256)
+                .clamp(1, 1_024) as usize;
+
+            let g = state.lock().unwrap();
+            let blocks = g.chain.blocks_from(from, limit);
+
+            let mut outputs = Vec::new();
+            let mut spent = Vec::new();
+            let mut scanned_to = from;
+
+            for block in &blocks {
+                scanned_to = scanned_to.max(block.header.height.0);
+                for input in &block.body.inputs {
+                    spent.push(hex::encode(input.commit.0));
+                }
+                for out in &block.body.outputs {
+                    outputs.push(json!({
+                        "height": block.header.height.0,
+                        "commit": hex::encode(out.commit.0),
+                        "ephemeral_pk": hex::encode(out.ephemeral_pk),
+                        "output_pk": hex::encode(out.output_pk),
+                        "payload": hex::encode(&out.payload),
+                        "coinbase": out.features.is_coinbase(),
+                    }));
+                }
+            }
+
+            ok(
+                json!({
+                    "from": from,
+                    // Where the client should resume. Equal to `from` when the
+                    // client is already at the tip.
+                    "scanned_to": scanned_to,
+                    "blocks": blocks.len(),
+                    "tip_height": g.chain.tip_height().map(|h| h.0),
+                    // So a client can notice it has been handed a different
+                    // chain than the one it synced yesterday.
+                    "genesis": g.chain.genesis_hash.to_hex(),
+                    "outputs": outputs,
+                    "spent": spent,
+                }),
+                id,
+            )
+        }
+
         "get_blocks" => {
             let from = req.params.get("from").and_then(|v| v.as_u64()).unwrap_or(0);
             let limit = req

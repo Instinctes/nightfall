@@ -9,7 +9,7 @@ chain, and the total money supply is something anyone can prove.
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-8b5cf6)](#license)
 [![Protocol](https://img.shields.io/badge/protocol-v5%20Nightproof--%CE%B2-b845d8)](docs/SPEC.md)
-[![Tests](https://img.shields.io/badge/tests-116%20passing-4ae0a8)](#testing)
+[![Tests](https://img.shields.io/badge/tests-131%20passing-4ae0a8)](#testing)
 [![Status](https://img.shields.io/badge/status-pre--launch-ffc85c)](#honest-status)
 
 [Website](https://nightfallcoin.org) ·
@@ -214,7 +214,7 @@ No `unsafe` in the consensus path. Cryptography comes from
 cargo test --workspace
 ```
 
-116 tests. The ones that matter most:
+131 tests. The ones that matter most:
 
 | Suite | What it locks down |
 |-------|--------------------|
@@ -262,6 +262,7 @@ If you find something wrong, see [SECURITY.md](SECURITY.md).
 | [docs/AUDIT-2026-08-12.md](docs/AUDIT-2026-08-12.md) | Security audit of v4 — read this first |
 | [docs/MIGRATION-v5.md](docs/MIGRATION-v5.md) | Moving off the broken chain |
 | [docs/MAINNET.md](docs/MAINNET.md) | Operator guide |
+| [docs/MOBILE.md](docs/MOBILE.md) | iOS and Android wallet — architecture |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Every design decision and why |
 | [docs/ATTRIBUTES.md](docs/ATTRIBUTES.md) | Locked product attributes, with the gaps marked |
 | [MANIFESTO.md](MANIFESTO.md) | Why this exists |

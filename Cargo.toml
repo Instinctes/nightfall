@@ -16,7 +16,7 @@ members = [
 version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/instinctes/nightfall"
+repository = "https://github.com/nightfallcoin/nightfall"
 authors = ["Nightfall contributors"]
 description = "NIGHTFALLCOIN — privacy-by-default sovereign L1"
 
@@ -45,6 +45,9 @@ bulletproofs = "5"
 merlin = "3"
 sha3 = "0.10"
 subtle = "2"
+# Seed backup. Entropy <-> words is bijective, so the 32-byte seed round-trips
+# exactly; no PBKDF2 stretch, nothing to lose in translation.
+bip39 = { version = "2", default-features = false, features = ["std"] }
 anyhow = "1"
 dirs = "5"
 tracing = "0.1"

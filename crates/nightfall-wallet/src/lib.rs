@@ -110,6 +110,21 @@ struct WalletFile {
     scanned_to: u64,
     #[serde(default)]
     history: Vec<HistoryEntry>,
+    /// Chain height when this wallet was created, or the height its owner
+    /// named when restoring from a phrase.
+    ///
+    /// A wallet cannot own an output that predates its keys, so scanning below
+    /// this height is guaranteed to find nothing. That guarantee is what makes
+    /// a mobile wallet feasible at all: there is no index from an address to
+    /// its outputs — deliberately — so discovering a payment costs one scalar
+    /// multiplication per output on chain. Starting at the tip makes a fresh
+    /// wallet's initial scan free; starting at zero makes it grow without
+    /// bound.
+    ///
+    /// Defaults to 0, which is the only safe value for wallets written before
+    /// this field existed: they may well hold coins from genesis.
+    #[serde(default)]
+    birth_height: u64,
 }
 
 /// Balance split by what the user can actually do with it.
@@ -138,11 +153,64 @@ pub struct Wallet {
 }
 
 impl Wallet {
-    /// Open an existing wallet or create a new one.
+    /// Open an existing wallet or create a new one, scanning from genesis.
     pub fn open(datadir: &Path, network: NetworkId, seed_name: &str) -> anyhow::Result<Self> {
+        Self::open_at(datadir, network, seed_name, None, None)
+    }
+
+    /// Create a wallet that begins life at `birth_height`.
+    ///
+    /// Only meaningful when the wallet is actually new — an existing wallet
+    /// keeps the birth height it was created with, because lowering it would
+    /// not re-scan and raising it could skip coins already received.
+    pub fn create_at_height(
+        datadir: &Path,
+        network: NetworkId,
+        seed_name: &str,
+        birth_height: u64,
+    ) -> anyhow::Result<Self> {
+        Self::open_at(datadir, network, seed_name, None, Some(birth_height))
+    }
+
+    /// Restore a wallet from a BIP-39 recovery phrase.
+    ///
+    /// `birth_height` should be a height the wallet certainly did not exist
+    /// before. **Guessing too high silently loses coins**: the scan skips the
+    /// blocks that contain them and the balance is simply wrong, with nothing
+    /// to indicate why. Guessing too low only costs time. When the owner is
+    /// unsure, pass `0`.
+    pub fn restore_from_phrase(
+        datadir: &Path,
+        network: NetworkId,
+        seed_name: &str,
+        phrase: &str,
+        birth_height: u64,
+    ) -> anyhow::Result<Self> {
+        let keys = WalletKeys::from_mnemonic(phrase)?;
+        Self::open_at(datadir, network, seed_name, Some(keys), Some(birth_height))
+    }
+
+    fn open_at(
+        datadir: &Path,
+        network: NetworkId,
+        seed_name: &str,
+        provided: Option<WalletKeys>,
+        birth_height: Option<u64>,
+    ) -> anyhow::Result<Self> {
         fs::create_dir_all(datadir)?;
         let seed_path = datadir.join(seed_name);
         let db_path = datadir.join(format!("{seed_name}.outputs.json"));
+
+        if let Some(keys) = provided {
+            if seed_path.exists() {
+                bail!(
+                    "{} already exists — refusing to overwrite a seed. \
+                     Move it aside first if you really mean to replace it.",
+                    seed_path.display()
+                );
+            }
+            write_secret_file(&seed_path, &hex::encode(keys.seed))?;
+        }
 
         let keys = if seed_path.exists() {
             let hex_seed = fs::read_to_string(&seed_path)?;
@@ -161,19 +229,34 @@ impl Wallet {
             keys
         };
 
-        let db = if db_path.exists() {
+        let existed = db_path.exists();
+        let mut db: WalletFile = if existed {
             serde_json::from_str(&fs::read_to_string(&db_path)?).unwrap_or_default()
         } else {
             WalletFile::default()
         };
 
-        Ok(Self {
+        // A birth height applies to a wallet being created, not to one being
+        // reopened. Changing it later would either skip blocks that were never
+        // scanned or claim to have scanned blocks that were not.
+        if !existed {
+            if let Some(h) = birth_height {
+                db.birth_height = h;
+                db.scanned_to = h;
+            }
+        }
+
+        let wallet = Self {
             keys,
             network,
             seed_path,
             db_path,
             db,
-        })
+        };
+        if !existed {
+            wallet.save()?;
+        }
+        Ok(wallet)
     }
 
     pub fn address(&self) -> Address {
@@ -214,6 +297,25 @@ impl Wallet {
         self.db.scanned_to
     }
 
+    /// Height below which this wallet cannot own anything.
+    pub fn birth_height(&self) -> u64 {
+        self.db.birth_height
+    }
+
+    /// The height a sync should start requesting blocks from.
+    ///
+    /// Never below the birth height even if `scanned_to` somehow is — a
+    /// truncated or hand-edited wallet file should cost time, not correctness.
+    pub fn scan_from(&self) -> u64 {
+        self.db.scanned_to.max(self.db.birth_height)
+    }
+
+    /// This wallet's seed as a BIP-39 recovery phrase. Secret — anyone holding
+    /// these words holds the funds.
+    pub fn recovery_phrase(&self) -> String {
+        self.keys.to_mnemonic()
+    }
+
     fn save(&self) -> anyhow::Result<()> {
         let tmp = self.db_path.with_extension("json.tmp");
         fs::write(&tmp, serde_json::to_vec_pretty(&self.db)?)?;
@@ -231,7 +333,7 @@ impl Wallet {
         let known: BTreeSet<[u8; 32]> = self.db.outputs.iter().map(|o| o.commit.0).collect();
         let mut found = 0u32;
         let mut spent_commits: BTreeSet<[u8; 32]> = BTreeSet::new();
-        let mut highest = self.db.scanned_to;
+        let mut highest = self.scan_from();
         let mut new_history: Vec<HistoryEntry> = Vec::new();
         let mut confirmed: Vec<(String, u64, u64)> = Vec::new();
 
@@ -534,9 +636,19 @@ impl Wallet {
         self.save()
     }
 
-    /// Forget everything discovered and rescan from scratch.
+    /// Forget everything discovered and rescan.
+    ///
+    /// Rescans from the birth height, not from genesis: below it there is
+    /// provably nothing to find, so scanning there is only a way to spend
+    /// time. Pass `0` as the birth height at creation for a wallet that should
+    /// always rescan the whole chain.
     pub fn reset_scan(&mut self) -> anyhow::Result<()> {
-        self.db = WalletFile::default();
+        let birth = self.db.birth_height;
+        self.db = WalletFile {
+            birth_height: birth,
+            scanned_to: birth,
+            ..Default::default()
+        };
         self.save()
     }
 }
@@ -584,6 +696,93 @@ mod tests {
             .unwrap()
             .address_string();
         assert_eq!(a, b);
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_fresh_wallet_starts_at_genesis_unless_told_otherwise() {
+        let d = tmpdir("birth-default");
+        let w = Wallet::open(&d, NetworkId::Devnet, "w.seed").unwrap();
+        assert_eq!(w.birth_height(), 0);
+        assert_eq!(w.scan_from(), 0);
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_birth_height_survives_reopening() {
+        // The height is written at creation. If it were only held in memory,
+        // the second run would rescan the entire chain — which is the exact
+        // cost this field exists to avoid.
+        let d = tmpdir("birth-persist");
+        let created = Wallet::create_at_height(&d, NetworkId::Devnet, "w.seed", 5_000).unwrap();
+        assert_eq!(created.birth_height(), 5_000);
+        assert_eq!(created.scan_from(), 5_000);
+        drop(created);
+
+        let reopened = Wallet::open(&d, NetworkId::Devnet, "w.seed").unwrap();
+        assert_eq!(reopened.birth_height(), 5_000);
+        assert_eq!(reopened.scan_from(), 5_000);
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn reopening_cannot_move_the_birth_height() {
+        // Lowering it would claim blocks were scanned that never were;
+        // raising it would skip blocks that may hold coins. Neither is a
+        // reopen's business.
+        let d = tmpdir("birth-fixed");
+        Wallet::create_at_height(&d, NetworkId::Devnet, "w.seed", 900).unwrap();
+        let again = Wallet::create_at_height(&d, NetworkId::Devnet, "w.seed", 100).unwrap();
+        assert_eq!(again.birth_height(), 900);
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_rescan_returns_to_the_birth_height_not_to_genesis() {
+        let d = tmpdir("birth-reset");
+        let mut w = Wallet::create_at_height(&d, NetworkId::Devnet, "w.seed", 4_242).unwrap();
+        w.reset_scan().unwrap();
+        assert_eq!(w.birth_height(), 4_242);
+        assert_eq!(w.scan_from(), 4_242);
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_phrase_restores_the_same_wallet() {
+        let d1 = tmpdir("phrase-a");
+        let original = Wallet::open(&d1, NetworkId::Devnet, "w.seed").unwrap();
+        let phrase = original.recovery_phrase();
+        let address = original.address_string();
+
+        let d2 = tmpdir("phrase-b");
+        let restored =
+            Wallet::restore_from_phrase(&d2, NetworkId::Devnet, "w.seed", &phrase, 1_234).unwrap();
+
+        assert_eq!(restored.address_string(), address);
+        assert_eq!(restored.birth_height(), 1_234);
+
+        fs::remove_dir_all(&d1).ok();
+        fs::remove_dir_all(&d2).ok();
+    }
+
+    #[test]
+    fn restoring_over_an_existing_seed_is_refused() {
+        // Silently overwriting a seed file is how a wallet destroys funds it
+        // was trusted with. Refuse and let the caller decide.
+        let d = tmpdir("phrase-clobber");
+        let existing = Wallet::open(&d, NetworkId::Devnet, "w.seed").unwrap();
+        let other = WalletKeys::generate().to_mnemonic();
+        let before = existing.address_string();
+        drop(existing);
+
+        assert!(Wallet::restore_from_phrase(&d, NetworkId::Devnet, "w.seed", &other, 0).is_err());
+        assert_eq!(
+            Wallet::open(&d, NetworkId::Devnet, "w.seed")
+                .unwrap()
+                .address_string(),
+            before,
+            "the original seed must be untouched"
+        );
         fs::remove_dir_all(&d).ok();
     }
 

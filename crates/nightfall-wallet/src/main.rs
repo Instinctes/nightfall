@@ -143,7 +143,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         Commands::Sync => {
-            let from = wallet.scanned_to();
+            let from = wallet.scan_from();
             let n = sync(&mut wallet, &rpc, from)?;
             println!("scanned to height {}", wallet.scanned_to());
             println!("new outputs.... {n}");
