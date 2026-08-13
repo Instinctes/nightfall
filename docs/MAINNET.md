@@ -69,21 +69,44 @@ Every release ships with `seed.nightfallcoin.org:17891` compiled in, so a fresh
 install finds the network without being told anything. If you are the one
 operating that machine, this section is for you.
 
+**On a Linux VPS — the recommended home:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Instinctes/nightfall/main/scripts/install-seed-node-linux.sh -o install.sh
+less install.sh          # read it; never pipe an installer into a shell
+sudo bash install.sh
+```
+
+**On macOS:**
+
 ```bash
 cargo build --release -p nightfall-node
 ./scripts/install-seed-node.sh
 ```
 
-The script installs a launchd agent that starts at login and restarts on crash,
-verifies the genesis hash before advertising anything, keeps the RPC on
-loopback, and rotates logs so an unattended node cannot fill the disk. It does
-**not** mine and holds no keys — a seed node whose operator earns rewards has an
-incentive to be selective about what it relays.
+Both create a service that restarts on crash, verify the genesis hash before
+starting, keep the RPC on loopback, and hand logging to the system so an
+unattended node cannot fill a disk. Neither mines or holds keys — a seed whose
+operator earns block rewards has an incentive to be selective about what it
+relays; one with nothing to gain is the only kind worth trusting more than any
+other stranger.
 
-Two things it cannot do for you:
+The Linux unit additionally runs as a dedicated unprivileged user under a
+strict systemd sandbox: read-only filesystem outside its own data directory, no
+privilege escalation, no device access, a syscall filter. It parses untrusted
+bytes from strangers continuously, so it gets as little as it can work with.
 
-- **Forward TCP 17891** to the machine, with a static local IP or a DHCP
-  reservation. Without this the node dials out fine but nobody can dial in,
+**Prefer a VPS over a machine at home or in an office.** Both of those sit
+behind NAT, and NAT is what produced two irreconcilable chains on this network:
+two miners who simply could not reach each other. A public IPv4 removes the
+entire class of problem, and the smallest tier any provider sells is enough.
+
+Two things no script can do for you:
+
+- **Make TCP 17891 reachable.** On a VPS that means the provider's own
+  firewall, which is separate from the one on the host. Behind NAT it means a
+  port forward plus a static local IP or DHCP reservation. Without this the
+  node dials out fine but nobody can dial in,
   which is the entire job.
 - **Point the DNS name at your public address** (`curl -s https://api.ipify.org`).
   Use a dynamic DNS updater if your ISP rotates it.
