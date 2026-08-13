@@ -450,7 +450,12 @@ mod tests {
         let me = crate::WalletKeys::generate();
         let view = me.view_key();
 
-        for i in 0..256u32 {
+        // Sixteen full outputs, not hundreds. Each costs a Bulletproof, which
+        // dominates the runtime and tests nothing about tags. The property is
+        // deterministic, so a handful of independent shared secrets exercises
+        // it as well as a thousand would — and a release should not wait ten
+        // minutes on a slow runner for the difference.
+        for i in 0..16u32 {
             let (out, _) =
                 create_output(&me.address(), 1_000 + u64::from(i), "", ctx).expect("output");
             assert!(
@@ -469,32 +474,50 @@ mod tests {
         let me = crate::WalletKeys::generate();
         let view = me.view_key();
 
+        // The rate needs a large sample; it does not need range proofs. The tag
+        // depends only on the ECDH, so deriving both sides directly measures
+        // the same thing thousands of times over for less than a handful of
+        // full outputs would cost.
         let mut survived_the_tag = 0u32;
-        let total = 512u32;
+        let total = 4_096u32;
         for _ in 0..total {
             let stranger = crate::WalletKeys::generate();
-            let (out, _) = create_output(&stranger.address(), 1, "", ctx).expect("output");
+            let mut wide = [0u8; 64];
+            OsRng.fill_bytes(&mut wide);
+            let ephemeral = Scalar::from_bytes_mod_order_wide(&wide);
+            let ephemeral_pk = (generator_g() * ephemeral).compress().to_bytes();
 
-            // Recompute the scanner's first gate directly.
-            let ke = CompressedRistretto(out.ephemeral_pk).decompress().unwrap();
-            let t = shared_secret(&(ke * view.scan_sk));
-            if derive_view_tag(&t) == out.view_tag {
+            // What a sender paying that stranger would publish.
+            let theirs = derive_view_tag(&shared_secret(
+                &(stranger.address().scan_point().unwrap() * ephemeral),
+            ));
+            // What our scanner derives for the same output.
+            let ours = view.expected_view_tag(&ephemeral_pk).unwrap();
+
+            if ours == theirs {
                 survived_the_tag += 1;
             }
+        }
+
+        // Expected 4096/256 = 16. Sixty is far enough out to catch a tag that
+        // is not derived from the shared secret at all, and loose enough never
+        // to fail on an unlucky seed.
+        assert!(
+            survived_the_tag < 60,
+            "{survived_the_tag} of {total} strangers passed the tag — \
+             it is not discriminating"
+        );
+
+        // A few complete outputs, to confirm the gate is wired into the scan
+        // and not merely derivable on its own.
+        for _ in 0..8 {
+            let stranger = crate::WalletKeys::generate();
+            let (out, _) = create_output(&stranger.address(), 1, "", ctx).expect("output");
             assert!(
                 scan_output(&view, &out).is_none(),
                 "claimed a foreign output"
             );
         }
-
-        // Expectation is total/256 = 2. Ten is far enough out to indicate the
-        // tag is not being derived from the shared secret at all, while being
-        // loose enough not to fail on an unlucky seed.
-        assert!(
-            survived_the_tag < 10,
-            "{survived_the_tag} of {total} strangers passed the tag — \
-             it is not discriminating"
-        );
     }
 
     /// The tag is signed, so a relay cannot flip it. If it could, the recipient
