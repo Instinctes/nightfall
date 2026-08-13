@@ -8,8 +8,8 @@ A sovereign privacy Layer-1 where amounts are hidden, addresses never touch the
 chain, and the total money supply is something anyone can prove.
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-8b5cf6)](#license)
-[![Protocol](https://img.shields.io/badge/protocol-v5%20Nightproof--%CE%B2-b845d8)](docs/SPEC.md)
-[![Tests](https://img.shields.io/badge/tests-131%20passing-4ae0a8)](#testing)
+[![Protocol](https://img.shields.io/badge/protocol-v6%20Nightproof-b845d8)](docs/SPEC.md)
+[![Tests](https://img.shields.io/badge/tests-134%20passing-4ae0a8)](#testing)
 [![Status](https://img.shields.io/badge/status-pre--launch-ffc85c)](#honest-status)
 
 [Website](https://nightfallcoin.org) ·
@@ -214,7 +214,7 @@ No `unsafe` in the consensus path. Cryptography comes from
 cargo test --workspace
 ```
 
-131 tests. The ones that matter most:
+134 tests. The ones that matter most:
 
 | Suite | What it locks down |
 |-------|--------------------|

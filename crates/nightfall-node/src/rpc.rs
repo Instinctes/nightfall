@@ -250,6 +250,9 @@ fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
                         "commit": hex::encode(out.commit.0),
                         "ephemeral_pk": hex::encode(out.ephemeral_pk),
                         "output_pk": hex::encode(out.output_pk),
+                        // One byte that lets a light client discard 255 of
+                        // every 256 foreign outputs before the expensive part.
+                        "view_tag": out.view_tag,
                         "payload": hex::encode(&out.payload),
                         "coinbase": out.features.is_coinbase(),
                     }));

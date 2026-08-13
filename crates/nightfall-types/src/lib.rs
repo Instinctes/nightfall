@@ -7,16 +7,24 @@ pub const COIN_NAME: &str = "NIGHTFALLCOIN";
 pub const TICKER: &str = "NIGHT";
 pub const PROTOCOL_NAME: &str = "nightfall";
 
-/// Protocol v5 — "Nightproof-β".
+/// Protocol v6 — "Nightproof".
 ///
-/// v4 is **consensus-broken and deprecated**: its balance proof was a
-/// tautology, allowing anyone to mint arbitrary NIGHT. v5 nodes will not peer
-/// with v4 nodes and the genesis commitment differs, so the chains cannot mix.
-/// See `docs/AUDIT-2026-08-12.md`.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// v4 was **consensus-broken**: its balance proof was a tautology, so anyone
+/// could mint arbitrary NIGHT. See `docs/AUDIT-2026-08-12.md`.
+///
+/// v5 fixed that and was sound. It is superseded rather than broken: outputs
+/// now carry a one-byte view tag, which changes what the sender signs and
+/// therefore the format itself. That change is cheap while the chain carries no
+/// value and would need a hard fork afterwards, so it was made during a reset
+/// rather than deferred.
+///
+/// This constant is folded into `GenesisConfig`, so bumping it produces a
+/// different genesis hash. Nodes only peer with a matching genesis, which is
+/// what keeps the abandoned v5 chains from ever mixing with this one.
+pub const PROTOCOL_VERSION: u32 = 6;
 
-/// Wire protocol version for P2P/RPC. Bumped in lockstep with the v5 fork.
-pub const WIRE_VERSION: u32 = 2;
+/// Wire protocol version for P2P/RPC. Bumped in lockstep with the v6 reset.
+pub const WIRE_VERSION: u32 = 3;
 
 /// 1 NIGHT = 10^8 darks.
 pub const DARKS_PER_NIGHT: u64 = 100_000_000;
@@ -129,9 +137,9 @@ impl NetworkId {
     /// one network can never be replayed on another.
     pub fn proof_context(self) -> &'static [u8] {
         match self {
-            Self::Mainnet => b"nightfall:mainnet:v5",
-            Self::Testnet => b"nightfall:testnet:v5",
-            Self::Devnet => b"nightfall:devnet:v5",
+            Self::Mainnet => b"nightfall:mainnet:v6",
+            Self::Testnet => b"nightfall:testnet:v6",
+            Self::Devnet => b"nightfall:devnet:v6",
         }
     }
 

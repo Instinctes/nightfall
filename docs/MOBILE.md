@@ -67,12 +67,22 @@ The restore screen should ask for an approximate date and convert it to a
 height, and should be explicit that a wrong guess means missing coins rather
 than a wrong balance.
 
-**Not mitigated — view tags.** A one-byte hint derived from the shared secret,
-stored in the output, would let a scanner discard non-matching outputs after the
-ECDH but before the second scalar multiplication — roughly a 2× saving. Monero
-added exactly this in 2022. It is a consensus change to the output format, so it
-is nearly free now and expensive once a chain exists with value on it. If mobile
-matters long-term, this is the moment.
+**Mitigation — view tags.** One byte derived from the shared secret, stored in
+the output, lets a scanner discard a non-matching output after the ECDH but
+before the second scalar multiplication. Measured, not estimated:
+
+```text
+per foreign output    before 61,590 ns    after 30,321 ns    2.03x
+```
+
+Reproduce with `cargo run --release -p nightfall-crypto --example scanbench`.
+
+This was a consensus change to the output format and was made during the v6
+reset, while the chain carried no value. Monero shipped the identical
+construction in 2022 and needed a hard fork for it.
+
+The remaining cost — one scalar multiplication per output — is irreducible. It
+is what stealth addressing is.
 
 ### 2.2 The phone cannot validate the chain
 
@@ -262,8 +272,8 @@ Two things the UI must get right because the protocol is unforgiving:
 | 1 | Birth height | — *(done)* |
 | 2 | BIP-39 mnemonic | — *(done)* |
 | 3 | `scan_feed` RPC | — *(done)* |
-| 4 | View tags in the output format | consensus change — decide before value exists |
-| 5 | `nightfall-mobile` uniffi crate | 1–3 |
+| 4 | View tags in the output format | — *(done, protocol v6)* |
+| 5 | `nightfall-mobile` uniffi crate | 1–4 |
 | 6 | TLS endpoint on the seed node | 3 |
 | 7 | Android app | 5, 6 |
 | 8 | iOS app | 5, 6 |

@@ -7,12 +7,17 @@
 **Fee:** 100% burn  
 **P2P default:** `0.0.0.0:17891`  
 **RPC default:** `127.0.0.1:17881` (local wallet only)  
-**Protocol:** v5 (Nightproof-β) · **Wire:** v2
+**Protocol:** v6 (Nightproof) · **Wire:** v3
+**Genesis:** `b69d9c81892266a7b89b2e759f9cfd4d9344230b084545d4f92d648ab9eb11a1`
 
-> ⚠ **The v4 genesis `1e2cae4e…` is dead.** v4 was consensus-broken — anyone
-> could mint unlimited NIGHT. See [`AUDIT-2026-08-12.md`](./AUDIT-2026-08-12.md)
-> and [`MIGRATION-v5.md`](./MIGRATION-v5.md). Run `nightfalld init` to obtain the
-> v5 genesis hash; a v5 node refuses to start on a v4 datadir.
+> ⚠ **Every chain before v6 is dead.** v4 was consensus-broken — anyone could
+> mint unlimited NIGHT, see [`AUDIT-2026-08-12.md`](./AUDIT-2026-08-12.md). v5
+> was sound but is superseded: outputs now carry a view tag, which changes what
+> the sender signs and therefore the format. The genesis differs, so nothing
+> can mix. Delete any pre-v6 datadir; a v6 node will refuse it.
+>
+> Coins mined on a pre-v6 chain do not carry over. There is no migration and
+> there was never a claim there would be — see [`FAIR_LAUNCH.md`](../FAIR_LAUNCH.md).
 
 Peers with a different genesis_hash are incompatible — always use matching release builds.
 
@@ -109,7 +114,7 @@ Recent builds connect automatically. For anything else, share:
 1. Your public IP / DNS
 2. Port **17891**
 3. Confirm they use `--network mainnet`
-4. The same release — protocol v5 / wire v2, matching `genesis_hash`
+4. The same release — protocol v6 / wire v3, matching `genesis_hash`
 
 ### Joiner command
 

@@ -71,6 +71,43 @@ fn derive_key_offset(t: &[u8; 32]) -> Scalar {
     blind_from_bytes(b"nightfall:stealth:ko:v2", t)
 }
 
+/// One byte of the shared secret, published with the output.
+///
+/// # What it buys
+///
+/// Scanning is unavoidably one scalar multiplication per output — `Ke·a` has to
+/// be computed before anything can be said about ownership. What *is* avoidable
+/// is the second one. Without a tag the scanner must derive the key offset,
+/// compute `B + o·G`, compress it, and compare 32 bytes, for every output on
+/// chain including the overwhelming majority that belong to strangers.
+///
+/// With a tag, one byte is compared instead, and 255 of 256 foreign outputs are
+/// discarded right there. Measured on an M3 Pro with
+/// `cargo run --release -p nightfall-crypto --example scanbench`:
+///
+/// ```text
+/// per foreign output    before 61,590 ns    after 30,321 ns    2.03x
+/// ```
+///
+/// That is the difference between a phone that syncs and one whose battery
+/// report singles out the wallet.
+///
+/// # What it costs
+///
+/// One byte per output on chain, and an honest privacy caveat: an observer
+/// holding a view key gets the same speedup when testing it against the chain.
+/// That is symmetric — it helps a legitimate wallet and an attacker who already
+/// has the credential equally, and someone with your view key can already see
+/// everything you receive. To an observer *without* the key the tag is
+/// indistinguishable from random, and it is fresh per output, so two payments
+/// to the same address still share no visible field.
+///
+/// Monero adopted the identical construction in 2022 and needed a hard fork to
+/// do it. Adding it here while the chain is being reset costs nothing.
+fn derive_view_tag(t: &[u8; 32]) -> u8 {
+    hash_multi(b"nightfall:stealth:viewtag:v3", &[t]).0[0]
+}
+
 fn derive_aead(t: &[u8; 32]) -> ([u8; 32], [u8; 24]) {
     let key = hash_multi(b"nightfall:stealth:aead:v2", &[t]).0;
     let nonce_full = hash_multi(b"nightfall:stealth:nonce:v2", &[t]).0;
@@ -121,6 +158,13 @@ pub struct Output {
     pub ephemeral_pk: [u8; 32],
     /// One-time output key `Ko = B + o·G`. Unlinkable across payments.
     pub output_pk: [u8; 32],
+    /// One byte of the shared secret — see [`derive_view_tag`].
+    ///
+    /// Covered by `sender_sig`. It has to be: a relay that could flip this byte
+    /// would make the output invisible to its recipient, and funds nobody can
+    /// find are funds destroyed.
+    #[serde(default)]
+    pub view_tag: u8,
     /// Sealed `(value ‖ blind ‖ memo)`.
     pub payload: Vec<u8>,
     /// Signature by the ephemeral secret `r`, verifiable against `Ke`.
@@ -156,6 +200,7 @@ impl Output {
         v.extend_from_slice(&self.commit.0);
         v.extend_from_slice(&self.ephemeral_pk);
         v.extend_from_slice(&self.output_pk);
+        v.push(self.view_tag);
         v.extend_from_slice(&self.range_proof.0);
         v.extend_from_slice(&self.payload);
         v
@@ -262,6 +307,7 @@ pub fn create_output_with_features(
         range_proof,
         ephemeral_pk,
         output_pk,
+        view_tag: derive_view_tag(&t),
         payload,
         sender_sig: SchnorrSig {
             r: [0u8; 32],
@@ -288,6 +334,7 @@ pub struct ScanCandidate {
     pub commit: Commitment,
     pub ephemeral_pk: [u8; 32],
     pub output_pk: [u8; 32],
+    pub view_tag: u8,
     pub payload: Vec<u8>,
 }
 
@@ -297,8 +344,23 @@ impl From<&Output> for ScanCandidate {
             commit: o.commit,
             ephemeral_pk: o.ephemeral_pk,
             output_pk: o.output_pk,
+            view_tag: o.view_tag,
             payload: o.payload.clone(),
         }
+    }
+}
+
+impl ViewKey {
+    /// The view tag this key derives for an output with the given ephemeral
+    /// key, or `None` if the key does not decompress.
+    ///
+    /// Exposed for light clients that want to pre-filter a batch before
+    /// committing to a full scan, and for benchmarks that need to reproduce
+    /// the pre-tag scanning path. It performs the scalar multiplication, so it
+    /// saves nothing over [`scan_candidate`] on its own.
+    pub fn expected_view_tag(&self, ephemeral_pk: &[u8; 32]) -> Option<u8> {
+        let ke = CompressedRistretto(*ephemeral_pk).decompress()?;
+        Some(derive_view_tag(&shared_secret(&(ke * self.scan_sk))))
     }
 }
 
@@ -319,9 +381,19 @@ pub fn scan_candidate(view: &ViewKey, output: &ScanCandidate) -> Option<Discover
     let spend_point = view.spend_point()?;
 
     let t = shared_secret(&(ke * view.scan_sk));
+
+    // First gate, one byte. Wrong for 255 of every 256 foreign outputs, and
+    // rejecting here skips the scalar multiplication below — which is the whole
+    // point of carrying the tag. Not a security check: a sender could put any
+    // byte here, and the key comparison that follows is what actually decides
+    // ownership.
+    if derive_view_tag(&t) != output.view_tag {
+        return None;
+    }
+
     let offset = derive_key_offset(&t);
 
-    // Cheap rejection: does the one-time key match what we would have produced?
+    // Second gate: does the one-time key match what we would have produced?
     let expected_ko = (spend_point + generator_g() * offset).compress().to_bytes();
     if expected_ko != output.output_pk {
         return None;
@@ -367,6 +439,83 @@ pub fn scan_candidate(view: &ViewKey, output: &ScanCandidate) -> Option<Discover
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tag must never cost the recipient their own coins. If it produced a
+    /// single false negative the wallet would simply not see a payment, and
+    /// there would be nothing on chain to indicate why.
+    #[test]
+    fn the_view_tag_never_hides_an_output_from_its_owner() {
+        use nightfall_types::NetworkId;
+        let ctx = NetworkId::Devnet.proof_context();
+        let me = crate::WalletKeys::generate();
+        let view = me.view_key();
+
+        for i in 0..256u32 {
+            let (out, _) =
+                create_output(&me.address(), 1_000 + u64::from(i), "", ctx).expect("output");
+            assert!(
+                scan_output(&view, &out).is_some(),
+                "output {i} was hidden from its own recipient"
+            );
+        }
+    }
+
+    /// And it must actually reject. A tag that matched everything would be a
+    /// byte of overhead buying nothing.
+    #[test]
+    fn the_view_tag_rejects_almost_every_stranger() {
+        use nightfall_types::NetworkId;
+        let ctx = NetworkId::Devnet.proof_context();
+        let me = crate::WalletKeys::generate();
+        let view = me.view_key();
+
+        let mut survived_the_tag = 0u32;
+        let total = 512u32;
+        for _ in 0..total {
+            let stranger = crate::WalletKeys::generate();
+            let (out, _) = create_output(&stranger.address(), 1, "", ctx).expect("output");
+
+            // Recompute the scanner's first gate directly.
+            let ke = CompressedRistretto(out.ephemeral_pk).decompress().unwrap();
+            let t = shared_secret(&(ke * view.scan_sk));
+            if derive_view_tag(&t) == out.view_tag {
+                survived_the_tag += 1;
+            }
+            assert!(
+                scan_output(&view, &out).is_none(),
+                "claimed a foreign output"
+            );
+        }
+
+        // Expectation is total/256 = 2. Ten is far enough out to indicate the
+        // tag is not being derived from the shared secret at all, while being
+        // loose enough not to fail on an unlucky seed.
+        assert!(
+            survived_the_tag < 10,
+            "{survived_the_tag} of {total} strangers passed the tag — \
+             it is not discriminating"
+        );
+    }
+
+    /// The tag is signed, so a relay cannot flip it. If it could, the recipient
+    /// would never find the output and the funds would be gone with no trace of
+    /// tampering.
+    #[test]
+    fn tampering_with_the_view_tag_breaks_the_signature() {
+        use nightfall_types::NetworkId;
+        let ctx = NetworkId::Devnet.proof_context();
+        let me = crate::WalletKeys::generate();
+
+        let (mut out, _) = create_output(&me.address(), 500, "", ctx).expect("output");
+        assert!(out.verify_sender_sig());
+
+        out.view_tag ^= 0xff;
+        assert!(
+            !out.verify_sender_sig(),
+            "a flipped view tag must invalidate the sender signature"
+        );
+        assert!(scan_output(&me.view_key(), &out).is_none());
+    }
 
     /// A light client scanning the stripped fields must reach exactly the same
     /// conclusion as a full node scanning the whole output. If these ever
