@@ -21,7 +21,7 @@ Peers with a different genesis_hash are incompatible — always use matching rel
 ## 1. Build
 
 ```bash
-cd /path/to/0_Crypto
+cd nightfall
 cargo build --release -p nightfall-node -p nightfall-wallet
 ```
 

@@ -5,7 +5,7 @@ User-friendly desktop app: **mine**, **receive**, **send** — no terminal requi
 ## Build
 
 ```bash
-cd /Users/hux/Documents/0_Crypto
+cd nightfall
 cargo build --release -p nightfall-core
 ```
 

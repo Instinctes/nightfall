@@ -106,7 +106,7 @@ rm -f "$NF_OLD/core.notes.json"     # v4 note format, unreadable by v5
 ### 4.4 Rebuild and restart
 
 ```bash
-cd /path/to/0_Crypto
+cd nightfall
 cargo build --release -p nightfall-node -p nightfall-wallet -p nightfall-core
 
 ./target/release/nightfalld --network mainnet init
