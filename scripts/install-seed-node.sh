@@ -57,10 +57,16 @@ fi
 # Verify the genesis matches the published one before advertising this node to
 # the world. A seed serving a different genesis peers with nobody and is worse
 # than no seed at all, because it looks like it is working.
-EXPECTED_GENESIS="5e03be6c423851e6931f9df87058207248867006eb2c2ba53277941f3a56f1ee"
+EXPECTED_GENESIS="b69d9c81892266a7b89b2e759f9cfd4d9344230b084545d4f92d648ab9eb11a1"
+# `init` labels this line "genesis_hash", `status` labels it "genesis". Matching
+# on the start of the line covers both; the previous pattern looked for
+# "genesis_hash" in `status` output, never matched, and left ACTUAL empty —
+# which the check below then skipped over. A verification that quietly does
+# nothing is worse than none, because it reports success.
 ACTUAL="$("$BIN" --network "$NETWORK" --datadir "$DATADIR" status 2>/dev/null \
-    | awk '/genesis_hash/ {print $NF}')"
-if [ -n "$ACTUAL" ] && [ "$ACTUAL" != "$EXPECTED_GENESIS" ]; then
+    | awk '/^genesis/ {print $NF; exit}')"
+[ -n "$ACTUAL" ] || die "could not read the genesis hash back — the node did not start"
+if [ "$ACTUAL" != "$EXPECTED_GENESIS" ]; then
     die "genesis mismatch — this node is on a different chain
   expected: $EXPECTED_GENESIS
   got:      $ACTUAL

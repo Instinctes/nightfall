@@ -88,16 +88,25 @@ command -v cargo >/dev/null || die "cargo still not on PATH"
 TOTAL_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
 info "memory: ${TOTAL_MB} MB"
 
+# Named for this script rather than the conventional /swapfile, so a swapfile
+# the machine already had is never touched — and so a re-run always recognises
+# its own and cleans it up. The first version used /swapfile and skipped
+# creation when one existed, which meant a second run left the first run's file
+# behind while reporting that it had removed it.
 SWAPFILE=""
-if [ "$TOTAL_MB" -lt 2048 ] && [ ! -e /swapfile ]; then
+SWAP_PATH=/var/tmp/nightfall-build.swap
+if [ "$TOTAL_MB" -lt 2048 ]; then
+    swapoff "$SWAP_PATH" 2>/dev/null || true
+    rm -f "$SWAP_PATH"
     info "adding 2 GB of temporary swap for the build"
-    if fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none; then
-        chmod 600 /swapfile
-        mkswap /swapfile >/dev/null 2>&1
-        if swapon /swapfile 2>/dev/null; then
-            SWAPFILE=/swapfile
+    if fallocate -l 2G "$SWAP_PATH" 2>/dev/null \
+        || dd if=/dev/zero of="$SWAP_PATH" bs=1M count=2048 status=none; then
+        chmod 600 "$SWAP_PATH"
+        mkswap "$SWAP_PATH" >/dev/null 2>&1
+        if swapon "$SWAP_PATH" 2>/dev/null; then
+            SWAPFILE="$SWAP_PATH"
         else
-            rm -f /swapfile
+            rm -f "$SWAP_PATH"
             warn "could not enable swap — the build may run out of memory"
         fi
     fi
@@ -133,8 +142,10 @@ info "installed $BINDIR/nightfalld"
 if ! id -u "$NF_USER" >/dev/null 2>&1; then
     # No login shell and no home worth having: this account exists to own one
     # directory and run one process.
+    # No skel: a data directory should not accumulate .bashrc and .profile for
+    # an account that cannot log in.
     useradd --system --shell /usr/sbin/nologin --home-dir "$DATADIR" \
-            --create-home "$NF_USER"
+            --no-create-home "$NF_USER"
     info "created user $NF_USER"
 fi
 install -d -o "$NF_USER" -g "$NF_USER" -m 0750 "$DATADIR"
@@ -146,8 +157,13 @@ if [ ! -e "$DATADIR/chain-meta.json" ]; then
     sudo -u "$NF_USER" "$BINDIR/nightfalld" --network "$NETWORK" --datadir "$DATADIR" init >/dev/null
 fi
 
+# `init` labels this line "genesis_hash", `status` labels it "genesis".
+# Anchoring at the start of the line matches whichever is being read — the
+# earlier pattern looked for "genesis_hash" in `status` output and therefore
+# never matched, which surfaced as "the node did not start" when the node had
+# started perfectly well.
 ACTUAL="$(sudo -u "$NF_USER" "$BINDIR/nightfalld" --network "$NETWORK" --datadir "$DATADIR" status 2>/dev/null \
-    | awk '/genesis_hash/ {print $NF}')"
+    | awk '/^genesis/ {print $NF; exit}')"
 [ -n "$ACTUAL" ] || die "could not read the genesis hash back — the node did not start"
 if [ "$ACTUAL" != "$EXPECTED_GENESIS" ]; then
     die "genesis mismatch — this node would serve a different chain
