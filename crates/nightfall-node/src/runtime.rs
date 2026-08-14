@@ -302,10 +302,31 @@ impl NodeHandle {
                         v.extend(g.peer_addrs.iter().cloned());
                         v.into_iter().collect::<HashSet<_>>().into_iter().collect()
                     };
-                    for addr in targets {
-                        if let Err(e) = sync_from_peer(&st, &addr) {
-                            tracing::debug!("sync {addr}: {e}");
-                        }
+                    // One thread per peer, not one after another.
+                    //
+                    // Sequentially, a single unresponsive peer costs the whole
+                    // round its socket timeout, and every peer behind it waits.
+                    // After the v7 reset the peer list still held addresses
+                    // from the abandoned chain: they accepted the connection,
+                    // failed the genesis check, and burned five seconds each.
+                    // A round took longer than the interval between rounds, so
+                    // the node that actually needed blocks was reached about
+                    // once a minute and the network crawled — with every log
+                    // line looking healthy.
+                    let handles: Vec<_> = targets
+                        .into_iter()
+                        .take(MAX_PEERS)
+                        .map(|addr| {
+                            let st = Arc::clone(&st);
+                            thread::spawn(move || {
+                                if let Err(e) = sync_from_peer(&st, &addr) {
+                                    tracing::debug!("sync {addr}: {e}");
+                                }
+                            })
+                        })
+                        .collect();
+                    for h in handles {
+                        let _ = h.join();
                     }
                     thread::sleep(SYNC_INTERVAL);
                 }
@@ -488,6 +509,15 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
                 return Ok(());
             }
             if g != genesis.to_hex() {
+                // Drop them rather than keeping the address around to dial
+                // again every round. After a reset the old network is still
+                // out there, still listening, and still costing a socket
+                // timeout per attempt for a handshake that cannot succeed.
+                if let Some(addr) = dialable_addr(&peer_label, listen_port) {
+                    if let Ok(mut st) = state.lock() {
+                        st.peer_addrs.remove(&addr);
+                    }
+                }
                 write_msg(
                     &mut writer,
                     &PeerMsg::Error {
