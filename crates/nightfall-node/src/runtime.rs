@@ -66,6 +66,15 @@ pub struct NodeInner {
     /// Bounded, and cleared whenever the tip moves — this is a scratch pad for
     /// resolving a fork in progress, not a second chain store.
     pub branch: HashMap<[u8; 32], Block>,
+    /// Highest tip height any peer has told us about.
+    ///
+    /// Learned from handshakes, in both directions. Used to hold mining back
+    /// while we are behind, so nobody spends hashes extending a tip the network
+    /// has already left. Decays back to our own height when peers vanish, so a
+    /// node whose peers went away can still mine rather than stalling forever.
+    pub best_peer_height: u64,
+    /// When `best_peer_height` was last confirmed by a peer.
+    pub best_peer_seen: u64,
 }
 
 /// Upper bound on buffered branch blocks. A fork deeper than this is past
@@ -199,6 +208,9 @@ pub struct StatusSnap {
     pub coinbase_maturity: u64,
     pub kernels: u64,
     pub started_at: u64,
+    /// How far behind the best peer, so the UI can say why mining is paused
+    /// instead of appearing to do nothing.
+    pub blocks_behind: u64,
 }
 
 pub struct NodeHandle {
@@ -248,6 +260,8 @@ impl NodeHandle {
             blocks_found: Arc::clone(&blocks_found),
             started_at: now_unix(),
             branch: HashMap::new(),
+            best_peer_height: 0,
+            best_peer_seen: 0,
         };
         let state: SharedState = Arc::new(Mutex::new(inner));
 
@@ -391,6 +405,9 @@ impl NodeHandle {
             coinbase_maturity: g.chain.ledger.coinbase_maturity,
             kernels: g.chain.ledger.kernels.count,
             started_at: g.started_at,
+            blocks_behind: g
+                .best_peer_height
+                .saturating_sub(g.chain.tip_height().map(|h| h.0).unwrap_or(0)),
         })
     }
 }
@@ -447,6 +464,7 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
             network: net,
             genesis: g,
             listen_port,
+            height: peer_height,
             ..
         } => {
             if net != network {
@@ -477,6 +495,7 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
                     tracing::info!("learned peer address {addr}");
                 }
             }
+            note_peer_height(&state, peer_height);
 
             let (height, tip, our_port) = {
                 let g = state.lock().unwrap();
@@ -657,6 +676,32 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
     }
 }
 
+/// Remember the best tip height a peer has claimed.
+///
+/// Only ever raised by a peer that is genuinely ahead, and stamped with the
+/// time so it can expire. A peer could lie about being ahead — the cost of
+/// believing one is that mining pauses, not that anything invalid is accepted,
+/// and a node that pauses is strictly safer than one that forks.
+fn note_peer_height(state: &SharedState, height: u64) {
+    if let Ok(mut g) = state.lock() {
+        let now = now_unix();
+        // Expire a stale claim, so a peer that disappeared cannot stall mining
+        // forever on a height nobody can serve any more.
+        if now.saturating_sub(g.best_peer_seen) > PEER_HEIGHT_TTL_SECS {
+            g.best_peer_height = 0;
+        }
+        if height > g.best_peer_height {
+            g.best_peer_height = height;
+        }
+        if height >= g.best_peer_height {
+            g.best_peer_seen = now;
+        }
+    }
+}
+
+/// How long a peer's claimed height stays believed without confirmation.
+const PEER_HEIGHT_TTL_SECS: u64 = 120;
+
 /// Weigh a block that forks from a chain we already hold.
 ///
 /// The receiving side of a push cannot ask for anything: it has one block at a
@@ -672,23 +717,34 @@ fn consider_branch(state: &SharedState, block: Block, peer_label: &str) {
         Err(_) => return,
     };
 
-    // Where does this branch leave our chain?
-    let prev = block.header.prev_hash.0;
-    let Some(fork_at) = g.chain.blocks.iter().position(|b| b.hash().0 == prev) else {
-        // Parent unknown: either far-future junk or a fork deeper than
-        // anything we hold. Not something to accumulate.
-        return;
-    };
-
+    // Keep it first, then look for where the branch meets our chain.
+    //
+    // Only the first block of a branch has a parent we hold; every one after it
+    // descends from a block that exists solely in this buffer. Requiring a
+    // known parent before storing therefore discarded the entire branch after
+    // its first block — the run could never grow past one, and never outweigh
+    // anything.
     if g.branch.len() >= MAX_BRANCH_BLOCKS {
         g.branch.clear();
     }
-    g.branch.insert(prev, block);
+    g.branch.insert(block.header.prev_hash.0, block);
 
-    // Walk the branch forward from the fork point for as far as it is
-    // contiguous. A gap simply ends the run; the next push round fills it.
+    // The fork root is the highest block of ours that something in the buffer
+    // claims as its parent. Searching from the tip backwards finds a recent
+    // fork immediately, which is the common case.
+    let Some(fork_at) = g
+        .chain
+        .blocks
+        .iter()
+        .rposition(|b| g.branch.contains_key(&b.hash().0))
+    else {
+        return;
+    };
+
+    // Walk forward for as far as the run is contiguous. A gap simply ends it;
+    // the next push round fills in what is missing.
     let mut candidate: Vec<Block> = g.chain.blocks[..=fork_at].to_vec();
-    let mut cursor = prev;
+    let mut cursor = g.chain.blocks[fork_at].hash().0;
     let mut added = 0usize;
     while let Some(next) = g.branch.get(&cursor) {
         candidate.push(next.clone());
@@ -697,6 +753,9 @@ fn consider_branch(state: &SharedState, block: Block, peer_label: &str) {
         if added > MAX_BRANCH_BLOCKS {
             break;
         }
+    }
+    if added == 0 {
+        return;
     }
 
     // Cheap rejection before rebuilding anything.
@@ -834,6 +893,7 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
 
     let (peer_h, peer_tip) = handshake(&mut stream, network, genesis, our_h, tip, port)?;
     state.lock().unwrap().peer_addrs.insert(addr.to_string());
+    note_peer_height(state, peer_h);
 
     // Learn about the rest of the network from this peer.
     if write_msg(&mut stream, &PeerMsg::GetPeers).is_ok() {
@@ -979,6 +1039,17 @@ fn fetch_full_chain(
     Ok(all)
 }
 
+/// How far behind the best peer we are, or `None` if we are current.
+///
+/// `None` also covers having no peers at all: there is nothing to be behind,
+/// and a network has to start somewhere.
+pub fn blocks_behind(state: &SharedState) -> Option<u64> {
+    let g = state.lock().ok()?;
+    let ours = g.chain.tip_height().map(|h| h.0).unwrap_or(0);
+    let best = g.best_peer_height;
+    (best > ours).then(|| best - ours)
+}
+
 fn mining_loop(state: SharedState) {
     let threads = std::env::var("NF_MINING_THREADS")
         .ok()
@@ -1010,6 +1081,23 @@ fn mining_loop(state: SharedState) {
 
         if !enabled {
             thread::sleep(Duration::from_millis(300));
+            continue;
+        }
+
+        // Do not mine on a chain we know is not the current one.
+        //
+        // Every block mined while behind a peer is built on a tip that peer has
+        // already moved past, so it lands on a branch that loses the moment the
+        // two reconcile. The work is not merely wasted, it actively deepens a
+        // fork — and it happens exactly when someone is most likely to press
+        // Start: right after opening the wallet, before the first sync lands.
+        //
+        // Mining with *no* peers stays allowed: a network of one has nothing to
+        // be behind, and refusing would make a first node impossible. The
+        // wallet warns about that case separately, and loudly.
+        if let Some(behind) = blocks_behind(&state) {
+            tracing::debug!("holding off mining — {behind} block(s) behind a peer");
+            thread::sleep(Duration::from_secs(1));
             continue;
         }
 

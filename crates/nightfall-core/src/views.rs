@@ -42,6 +42,48 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
         })
         .unwrap_or((0, 0, 0, 0, false, 0, 0));
 
+    let behind = app.status.as_ref().map(|s| s.blocks_behind).unwrap_or(0);
+
+    // Mining is held back while the chain is behind, because a block built on a
+    // tip the network has already left cannot win — it only deepens a fork.
+    // Say that plainly, or the wallet looks broken: the button says "Stop
+    // mining" and the hashrate reads zero.
+    if app.is_mining() && behind > 0 {
+        egui::Frame::none()
+            .fill(ACCENT.gamma_multiply(0.12))
+            .stroke(Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.55)))
+            .rounding(Rounding::same(ROUND))
+            .inner_margin(egui::Margin::same(16.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width() - 32.0);
+                ui.horizontal(|ui| {
+                    dot(ui, ACCENT, true);
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "Catching up — {} block{} behind",
+                            format_int(behind),
+                            if behind == 1 { "" } else { "s" }
+                        ))
+                        .size(14.0)
+                        .color(ACCENT)
+                        .strong(),
+                    );
+                });
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "Mining starts by itself once this reaches zero. A block built on \
+                         an outdated tip cannot be accepted by anyone — it would only \
+                         split the chain.",
+                    )
+                    .size(12.5)
+                    .color(TEXT_DIM),
+                );
+            });
+        ui.add_space(14.0);
+    }
+
     // Mining with no peers is how you end up on a private fork without
     // noticing. Say so loudly, before hours of work get discarded.
     if app.is_mining() && peers == 0 {
