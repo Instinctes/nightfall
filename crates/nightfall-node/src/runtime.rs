@@ -11,6 +11,7 @@ use nightfall_p2p::{
 use nightfall_storage::{now_unix, ChainStore};
 use nightfall_types::NetworkId;
 use std::collections::HashSet;
+use std::fs;
 use std::io::BufReader;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -61,9 +62,48 @@ pub struct NodeInner {
     pub started_at: u64,
 }
 
+/// Where known peer addresses are kept between runs.
+fn peers_file(datadir: &std::path::Path) -> PathBuf {
+    datadir.join("peers.json")
+}
+
+/// Addresses to dial on the next start.
+///
+/// Without this, a peer added by hand lives only as long as the process. The
+/// wallet tells someone with no peers to add one; they do; they quit; and the
+/// next launch is back to knowing nobody — mining alone again, which is the
+/// failure this whole network has already paid for twice. Anything learned or
+/// entered is worth keeping.
+fn load_known_peers(datadir: &std::path::Path) -> Vec<String> {
+    let Ok(raw) = fs::read_to_string(peers_file(datadir)) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<String>>(&raw)
+        .unwrap_or_default()
+        .into_iter()
+        // Re-validate on the way in: the file is editable, and an address that
+        // does not parse should be dropped rather than dialled.
+        .filter(|a| a.parse::<std::net::SocketAddr>().is_ok() || a.contains(':'))
+        .take(MAX_PEERS)
+        .collect()
+}
+
 impl NodeInner {
     pub fn persist(&self) -> anyhow::Result<()> {
         self.store.save(&self.chain)
+    }
+
+    /// Write known peers out, so the next start is not back to zero.
+    pub fn persist_peers(&self, datadir: &std::path::Path) {
+        let mut all: Vec<String> = self.dialable_peers();
+        all.sort();
+        if let Ok(json) = serde_json::to_string_pretty(&all) {
+            let path = peers_file(datadir);
+            let tmp = path.with_extension("json.tmp");
+            if fs::write(&tmp, json).is_ok() {
+                let _ = fs::rename(&tmp, &path);
+            }
+        }
     }
 
     fn bump_tip(&self) {
@@ -173,13 +213,17 @@ impl NodeHandle {
             network: cfg.network,
             peer_addrs: HashSet::new(),
             miner: cfg.miner,
-            // Built-in seeds first, then whatever the user configured.
+            // Built-in seeds first, then whatever the user configured, then
+            // whatever this node knew last time it ran.
             bootstrap: cfg
                 .network
                 .seed_nodes()
                 .iter()
                 .map(|s| s.to_string())
                 .chain(cfg.connect.iter().cloned())
+                .chain(load_known_peers(&cfg.datadir))
+                .collect::<HashSet<_>>()
+                .into_iter()
                 .collect(),
             listen_port: cfg
                 .p2p_listen
@@ -238,12 +282,14 @@ impl NodeHandle {
 
         {
             let st = Arc::clone(&state);
+            let datadir = cfg.datadir.clone();
             thread::spawn(move || loop {
                 thread::sleep(Duration::from_secs(30));
                 if let Ok(g) = st.lock() {
                     if let Err(e) = g.persist() {
                         tracing::warn!("persist: {e}");
                     }
+                    g.persist_peers(&datadir);
                 }
             });
         }
@@ -670,6 +716,26 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // They are behind us. Feed them over the connection we already have, and
+    // do not bother asking for anything back — there is nothing there to want.
+    //
+    // Without this, a node can only catch up by dialling, and a peer behind NAT
+    // can dial out but cannot be dialled. A fresh seed node whose only contact
+    // is a miner behind a router therefore sits at height 0 indefinitely: it
+    // has a peer, it reports healthy, it learns a dial-back address it can
+    // never reach, and it retries that address forever while the miner keeps
+    // mining. Nothing in either log says anything is wrong. Found by standing
+    // up the first real seed node and watching it stay empty while connected.
+    //
+    // This has to happen before the pull loop below: that loop asks the peer
+    // for blocks, gets an empty answer from a peer that has none, and breaks
+    // immediately — so anything placed inside it never runs in exactly the
+    // case that matters.
+    if peer_h < our_h {
+        push_blocks_to(state, &mut stream, peer_h, addr);
+        return Ok(());
+    }
+
     // Fetch forward from just below our tip rather than replaying from genesis.
     // v4 downloaded the whole chain from every peer every 20 seconds.
     let mut from = our_h.saturating_sub(1);
@@ -696,22 +762,8 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
         }
         drop(g);
 
-        // Nothing connected. Either we are ahead of them, or we are on a
-        // different fork.
-        if peer_h < our_h {
-            // They are behind, and we are already talking to them. Send what
-            // they are missing instead of waiting for them to ask.
-            //
-            // Without this, catching up is possible only by dialling — and a
-            // peer behind NAT can dial out but cannot be dialled. A fresh seed
-            // node whose only contact is a miner behind a router therefore sits
-            // at height 0 indefinitely: it has a peer, it reports healthy, it
-            // learns an address it can never reach, and it retries that address
-            // forever. Found by standing up a real seed and watching it stay
-            // empty while connected.
-            push_blocks_to(state, &mut stream, peer_h, addr);
-            break;
-        }
+        // Nothing connected. Either we are already ahead, or we are on a
+        // different fork. Only the second case is worth work.
         if peer_h <= our_h {
             break;
         }
