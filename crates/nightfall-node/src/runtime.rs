@@ -10,7 +10,7 @@ use nightfall_p2p::{
 };
 use nightfall_storage::{now_unix, ChainStore};
 use nightfall_types::NetworkId;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::BufReader;
 use std::net::{TcpListener, TcpStream};
@@ -60,7 +60,18 @@ pub struct NodeInner {
     pub blocks_found: Arc<AtomicU64>,
     /// Unix time the node started, for uptime display.
     pub started_at: u64,
+    /// Blocks that did not extend our tip but whose parent we hold, keyed by
+    /// the parent's hash so a branch can be walked forward and weighed.
+    ///
+    /// Bounded, and cleared whenever the tip moves — this is a scratch pad for
+    /// resolving a fork in progress, not a second chain store.
+    pub branch: HashMap<[u8; 32], Block>,
 }
+
+/// Upper bound on buffered branch blocks. A fork deeper than this is past
+/// MAX_REORG_DEPTH territory anyway, and an unbounded map is somewhere a peer
+/// could put arbitrary data.
+const MAX_BRANCH_BLOCKS: usize = 600;
 
 /// Where known peer addresses are kept between runs.
 fn peers_file(datadir: &std::path::Path) -> PathBuf {
@@ -236,6 +247,7 @@ impl NodeHandle {
             hashes_total: Arc::clone(&hashes_total),
             blocks_found: Arc::clone(&blocks_found),
             started_at: now_unix(),
+            branch: HashMap::new(),
         };
         let state: SharedState = Arc::new(Mutex::new(inner));
 
@@ -567,6 +579,7 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
                             g.mempool.remove_included(&block);
                             g.bump_tip();
                             let _ = g.persist();
+                            g.branch.clear();
                             true
                         }
                         Err(e) => {
@@ -579,11 +592,24 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
                     tracing::info!("accepted block {height} from {peer_label}");
                     let g = state.lock().unwrap();
                     g.announce_block(block);
+                } else {
+                    // It did not extend our tip. If its parent is a block we
+                    // hold, this is a competing branch rather than junk, and
+                    // refusing to look at it is how a fork becomes permanent.
+                    //
+                    // That is not hypothetical. A node behind NAT can push
+                    // blocks but cannot be dialled, so it can never have its
+                    // chain *fetched* and evaluated. When two miners split by
+                    // two blocks, the heavier side pushed its branch every
+                    // round, every block was rejected for not fitting the tip,
+                    // and both sides stayed put — 53 blocks of work against 2,
+                    // and the 2 won by sitting still.
+                    consider_branch(&state, block, &peer_label);
                 }
-                // Deliberately NOT triggering a full chain download here.
-                // v4 responded to every rejected block by pulling the peer's
-                // entire chain — free bandwidth amplification for any attacker.
-                // Divergence is resolved by the periodic sync task instead.
+                // Still no full chain download in response to a stray block:
+                // v4 answered every rejected block by pulling the peer's entire
+                // chain, which is free bandwidth amplification. What happens
+                // here uses only blocks the peer chose to send.
             }
 
             PeerMsg::Tx { tx } => {
@@ -628,6 +654,72 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
 
             _ => {}
         }
+    }
+}
+
+/// Weigh a block that forks from a chain we already hold.
+///
+/// The receiving side of a push cannot ask for anything: it has one block at a
+/// time, arriving in order. So each rejected block whose parent we know is kept
+/// by parent hash, the branch is walked forward as far as it goes, and the
+/// result is offered to `maybe_reorg_to` — which applies the ordinary rule,
+/// cumulative work, and rebuilds from genesis with full validation. Nothing
+/// here shortcuts a check; it only gives the existing check something to look
+/// at.
+fn consider_branch(state: &SharedState, block: Block, peer_label: &str) {
+    let mut g = match state.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+
+    // Where does this branch leave our chain?
+    let prev = block.header.prev_hash.0;
+    let Some(fork_at) = g.chain.blocks.iter().position(|b| b.hash().0 == prev) else {
+        // Parent unknown: either far-future junk or a fork deeper than
+        // anything we hold. Not something to accumulate.
+        return;
+    };
+
+    if g.branch.len() >= MAX_BRANCH_BLOCKS {
+        g.branch.clear();
+    }
+    g.branch.insert(prev, block);
+
+    // Walk the branch forward from the fork point for as far as it is
+    // contiguous. A gap simply ends the run; the next push round fills it.
+    let mut candidate: Vec<Block> = g.chain.blocks[..=fork_at].to_vec();
+    let mut cursor = prev;
+    let mut added = 0usize;
+    while let Some(next) = g.branch.get(&cursor) {
+        candidate.push(next.clone());
+        cursor = next.hash().0;
+        added += 1;
+        if added > MAX_BRANCH_BLOCKS {
+            break;
+        }
+    }
+
+    // Cheap rejection before rebuilding anything.
+    let claimed: u128 = candidate.iter().map(|b| b.work()).sum();
+    if claimed <= g.chain.total_work {
+        return;
+    }
+
+    let before = g.chain.block_count();
+    match g.chain.maybe_reorg_to(candidate, now_unix()) {
+        Ok(true) => {
+            let after = g.chain.block_count();
+            tracing::info!(
+                "reorged onto a heavier branch from {peer_label}: {before} -> {after} blocks, \
+                 work {}",
+                g.chain.total_work
+            );
+            g.branch.clear();
+            g.bump_tip();
+            let _ = g.persist();
+        }
+        Ok(false) => {}
+        Err(e) => tracing::debug!("branch from {peer_label} not adopted: {e}"),
     }
 }
 
