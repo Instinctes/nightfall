@@ -109,7 +109,25 @@ Two things no script can do for you:
   node dials out fine but nobody can dial in,
   which is the entire job.
 - **Point the DNS name at your public address** (`curl -s https://api.ipify.org`).
-  Use a dynamic DNS updater if your ISP rotates it.
+
+On a home or office line the address changes without warning, and when it does
+the name stops resolving to anything useful. That is harmless for nodes already
+connected and quietly bad for new ones: they find one seed instead of two, and
+nothing says so. `scripts/cloudflare-ddns.sh` keeps a Cloudflare A record
+pointed at the machine it runs on:
+
+```bash
+./scripts/cloudflare-ddns.sh --setup      # how to create a scoped API token
+./scripts/cloudflare-ddns.sh --status     # what it would change, changes nothing
+./scripts/cloudflare-ddns.sh --install    # launchd agent, checks every 5 minutes
+```
+
+The token needs exactly `Zone · DNS · Edit` on this one zone — a machine in a
+cupboard should hold the least authority that still does the job. It is read
+from a file the script never prints, and the script forces `proxied: false` on
+every write, because Cloudflare's proxy carries only HTTP: with it on, the name
+resolves to Cloudflare and nobody reaches port 17891, while the record looks
+perfectly healthy.
 
 Verify from a *different* network — the machine will always reach itself:
 
