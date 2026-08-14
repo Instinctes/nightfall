@@ -154,15 +154,18 @@ impl NodeInner {
             self.chain.tip_hash(),
             self.listen_port,
         );
-        thread::spawn(move || {
-            for addr in peers {
+        // Same reasoning as announce_block: one slow peer must not delay the
+        // rest, and a transaction nobody hears about never gets mined.
+        for addr in peers {
+            let tx = tx.clone();
+            thread::spawn(move || {
                 if let Ok(mut s) = connect_peer(&addr, 3000) {
                     if handshake(&mut s, network, genesis, height, tip, port).is_ok() {
                         let _ = broadcast_tx(&mut s, &tx);
                     }
                 }
-            }
-        });
+            });
+        }
         Ok(id)
     }
 
@@ -187,15 +190,28 @@ impl NodeInner {
         let tip = self.chain.tip_hash();
         let port = self.listen_port;
 
-        thread::spawn(move || {
-            for addr in peers {
+        // One thread per peer, not one thread walking all of them.
+        //
+        // Sequentially, a peer that accepts the connection and then stalls
+        // costs its socket timeout, and every peer after it in the list waits
+        // — for a block that is only useful immediately. With a new thread
+        // spawned per mined block, those pile up behind each other.
+        //
+        // This is the main propagation path: the periodic sync is the fallback
+        // for what it misses. Getting it wrong made a node on the same network
+        // receive one block every three minutes while the miner produced one
+        // every few seconds, with no error anywhere and every connection
+        // succeeding.
+        for addr in peers {
+            let block = block.clone();
+            thread::spawn(move || {
                 if let Ok(mut s) = connect_peer(&addr, 5000) {
                     if handshake(&mut s, network, genesis, height, tip, port).is_ok() {
                         let _ = broadcast_block(&mut s, &block);
                     }
                 }
-            }
-        });
+            });
+        }
     }
 }
 
