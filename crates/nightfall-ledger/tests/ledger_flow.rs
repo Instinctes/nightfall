@@ -313,3 +313,79 @@ fn many_blocks_keep_the_invariant() {
         .verify_supply()
         .expect("invariant across many blocks");
 }
+// Does a payment reach a stranger's wallet, end to end, through the same
+// scanning path a real recipient uses?
+#[test]
+fn a_stranger_can_find_a_payment_sent_to_them() {
+    use nightfall_crypto::{scan_output, WalletKeys};
+    use nightfall_ledger::{build_coinbase, build_transfer, BlockBody, Payment, Spendable};
+    use nightfall_types::{NetworkId, DARKS_PER_NIGHT};
+
+    let ctx = NetworkId::Devnet.proof_context();
+    let sender = WalletKeys::generate();
+    let stranger = WalletKeys::generate();
+
+    // Fund the sender with two coinbases, exactly as on the real chain.
+    let mut spendables = Vec::new();
+    for _ in 0..2 {
+        let cb = build_coinbase(&sender.address(), 20 * DARKS_PER_NIGHT, 0, ctx).unwrap();
+        let view = sender.view_key();
+        for o in &cb.outputs {
+            if let Some(d) = scan_output(&view, o) {
+                spendables.push(Spendable {
+                    commit: d.commit,
+                    value: d.value,
+                    blind: d.blind,
+                    spend_secret: d.spend_secret(&sender),
+                });
+            }
+        }
+    }
+    assert_eq!(
+        spendables.len(),
+        2,
+        "sender should hold two coinbase outputs"
+    );
+
+    // 30 NIGHT to the stranger, fee 0.001, change back to the sender.
+    let tx = build_transfer(
+        &sender,
+        &spendables,
+        &[Payment {
+            to: stranger.address(),
+            amount: 30 * DARKS_PER_NIGHT,
+            memo: "Nightfall For Life".into(),
+        }],
+        100_000,
+        &sender.address(),
+        0,
+        ctx,
+    )
+    .expect("transfer builds");
+
+    let body = BlockBody::aggregate(&[tx]);
+
+    // What the stranger's wallet does: scan every output in the block.
+    let their_view = stranger.view_key();
+    let found: Vec<_> = body
+        .outputs
+        .iter()
+        .filter_map(|o| scan_output(&their_view, o))
+        .collect();
+
+    assert_eq!(found.len(), 1, "the stranger must find exactly one output");
+    assert_eq!(found[0].value, 30 * DARKS_PER_NIGHT, "for the amount sent");
+    assert_eq!(found[0].memo, "Nightfall For Life", "with the memo");
+
+    // And the sender finds only their change, never the payment.
+    let mine: Vec<_> = body
+        .outputs
+        .iter()
+        .filter_map(|o| scan_output(&sender.view_key(), o))
+        .collect();
+    assert_eq!(mine.len(), 1, "sender sees only change");
+    assert_eq!(
+        mine[0].value,
+        40 * DARKS_PER_NIGHT - 30 * DARKS_PER_NIGHT - 100_000
+    );
+}
