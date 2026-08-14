@@ -81,6 +81,15 @@ pub struct NodeInner {
     /// claims to be ahead, the gap is a fork rather than lag, and mining
     /// resumes rather than waiting on something unreachable.
     pub behind_since: u64,
+    /// Software version each peer announced, by address.
+    ///
+    /// The handshake has always carried an agent string and the node has always
+    /// thrown it away, which meant the one question worth asking during an
+    /// incident — *what is everyone else running?* — had no answer anywhere.
+    /// A network of a dozen nodes where a known-bad release is still mining is
+    /// a very different situation from one where everybody upgraded, and until
+    /// now the two were indistinguishable from the inside.
+    pub peer_agents: HashMap<String, String>,
     /// Set while a reorg candidate is being rebuilt and verified.
     ///
     /// Rebuilding is measured in tens of seconds on a chain of any size, and
@@ -324,6 +333,7 @@ impl NodeHandle {
             // so a freshly opened wallet would mine on a stale tip the moment
             // someone pressed Start — the exact case this field exists to stop.
             behind_since: now_unix(),
+            peer_agents: HashMap::new(),
             reorg_in_flight: Arc::new(AtomicBool::new(false)),
         };
         let state: SharedState = Arc::new(Mutex::new(inner));
@@ -538,12 +548,42 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
 
     match read_msg(&mut reader)? {
         PeerMsg::Hello {
+            wire,
             network: net,
             genesis: g,
             listen_port,
             height: peer_height,
+            agent,
             ..
         } => {
+            // Inbound never checked this, only outbound did — so the wire
+            // version was a suggestion rather than a gate. An old node simply
+            // dialled us instead of being dialled, and was served normally.
+            // Refusing on one side only is not refusing.
+            if wire != nightfall_types::WIRE_VERSION {
+                tracing::info!(
+                    "refused {peer_label} running {agent}: wire v{wire}, we need \
+                     v{}",
+                    nightfall_types::WIRE_VERSION
+                );
+                if let Some(addr) = dialable_addr(&peer_label, listen_port) {
+                    if let Ok(mut st) = state.lock() {
+                        st.forget_incompatible(&addr);
+                    }
+                }
+                write_msg(
+                    &mut writer,
+                    &PeerMsg::Error {
+                        message: format!(
+                            "wire version mismatch — you speak v{wire}, this network \
+                             speaks v{}. Update from https://nightfallcoin.org; \
+                             your coins are unaffected.",
+                            nightfall_types::WIRE_VERSION
+                        ),
+                    },
+                )?;
+                return Ok(());
+            }
             if net != network {
                 write_msg(
                     &mut writer,
@@ -578,7 +618,10 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
                 let mut g = state.lock().unwrap();
                 if g.peer_addrs.len() < MAX_PEERS {
                     g.peer_addrs.insert(addr.clone());
-                    tracing::info!("learned peer address {addr}");
+                    tracing::info!("learned peer address {addr} running {agent}");
+                }
+                if g.peer_agents.len() < MAX_PEERS * 2 {
+                    g.peer_agents.insert(addr, agent.clone());
                 }
             }
             note_peer_height(&state, peer_height);
@@ -1226,7 +1269,20 @@ fn fetch_full_chain(
 /// politely waited for the other. So the wait now expires. Mining on a chain
 /// that turns out to be the lighter one wastes that miner's own electricity;
 /// a network where nobody mines is broken for everyone.
-const MAX_CATCHUP_WAIT_SECS: u64 = 45;
+///
+/// Raised from 45 seconds to ten minutes in v0.6.0, because 45 was chosen to
+/// escape a deadlock that no longer exists. Reorg verification used to run
+/// under the node's global lock and could take half a minute on its own, so a
+/// node could trivially go 45 seconds without its tip moving while perfectly
+/// healthy — and then start mining on a tip the network had already left,
+/// producing the fork the timeout was meant to resolve. With verification off
+/// the lock, a tip that has not moved in ten minutes while a peer claims more
+/// really is stuck, and the escape means what it says.
+///
+/// The clock measures *time without progress*, not time spent behind:
+/// `bump_tip` resets it whenever our chain moves at all. A node that is
+/// catching up, however far behind it is, never reaches this.
+const MAX_CATCHUP_WAIT_SECS: u64 = 600;
 
 /// How far behind the best peer we are, or `None` if we should mine anyway.
 ///

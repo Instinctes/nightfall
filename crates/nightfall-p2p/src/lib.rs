@@ -228,7 +228,11 @@ pub fn handshake(
             if wire != WIRE_VERSION {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "wire version mismatch",
+                    format!(
+                        "wire version mismatch — peer speaks v{wire}, we speak \
+                         v{WIRE_VERSION}. One of us needs the current release \
+                         from https://nightfallcoin.org"
+                    ),
                 ));
             }
             if net != network {

@@ -137,6 +137,15 @@ fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
             let g = state.lock().unwrap();
             let chain = &g.chain;
             let supply_ok = chain.verify_supply().is_ok();
+            // What the rest of the network is running, counted by version.
+            // During an incident this is the first thing worth knowing, and it
+            // used to be unanswerable from anywhere: the handshake carried an
+            // agent string that the node received and discarded.
+            let mut peer_versions: std::collections::BTreeMap<&str, usize> =
+                std::collections::BTreeMap::new();
+            for agent in g.peer_agents.values() {
+                *peer_versions.entry(agent.as_str()).or_insert(0) += 1;
+            }
             ok(
                 json!({
                     "network": chain.network.as_str(),
@@ -156,6 +165,8 @@ fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
                     "supply_invariant_ok": supply_ok,
                     "mempool": g.mempool.len(),
                     "peers": g.peer_addrs.len(),
+                    "wire_version": nightfall_types::WIRE_VERSION,
+                    "peer_versions": peer_versions,
                     "max_supply": MAX_SUPPLY_NIGHT,
                     "ticker": TICKER,
                 }),

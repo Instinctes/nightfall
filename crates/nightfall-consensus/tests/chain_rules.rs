@@ -485,3 +485,43 @@ fn splitting_the_reorg_did_not_change_the_verdict() {
     assert_eq!(via_wrapper.tip_hash(), via_halves.tip_hash());
     assert_eq!(via_wrapper.total_work, via_halves.total_work);
 }
+
+// --- the v0.6.0 upgrade gate must not be a chain reset -------------------
+
+/// The mainnet genesis hash the live network has run since the v7 reset.
+const MAINNET_GENESIS: &str = "c8614333c0f86a4824df212474632f4b9feecf9bf0593841199d894127f2f9a6";
+
+#[test]
+fn raising_the_wire_version_did_not_move_the_genesis() {
+    // v0.6.0 raises WIRE_VERSION to refuse peering with releases that damage
+    // the network. That is a *networking* decision and it must stay one.
+    //
+    // The trap it has to avoid: PROTOCOL_VERSION is folded into GenesisConfig,
+    // so bumping it changes the genesis hash and silently starts a new chain —
+    // every mined coin stranded on a network nobody is on any more. The two
+    // constants sit four lines apart and mean entirely different things, and
+    // "make old wallets stop mining" sounds like it could reasonably be either.
+    //
+    // So this pins the outcome rather than the intent: if the mainnet genesis
+    // hash ever changes, that is a chain reset, and it must be a decision taken
+    // deliberately with this test updated in the same commit — never a side
+    // effect of an upgrade gate.
+    let chain = Chain::new_fair(NetworkId::Mainnet).unwrap();
+    assert_eq!(
+        chain.genesis_hash.to_hex(),
+        MAINNET_GENESIS,
+        "the mainnet genesis moved — this is a chain reset, not an upgrade"
+    );
+    assert_eq!(
+        nightfall_types::PROTOCOL_VERSION,
+        7,
+        "protocol version is consensus; changing it strands every existing coin"
+    );
+}
+
+/// The gate only works if it differs from what the refused releases speak.
+///
+/// 0.5.4 and earlier speak wire v4, so anything at or below that reopens the
+/// door to them. Checked at compile time because both sides are constants —
+/// a runtime assertion here would only ever fail after shipping.
+const _: () = assert!(nightfall_types::WIRE_VERSION >= 5);

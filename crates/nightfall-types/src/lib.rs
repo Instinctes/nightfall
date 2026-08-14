@@ -28,8 +28,28 @@ pub const PROTOCOL_NAME: &str = "nightfall";
 /// what keeps the abandoned v5 and v6 chains from ever mixing with this one.
 pub const PROTOCOL_VERSION: u32 = 7;
 
-/// Wire protocol version for P2P/RPC. Bumped in lockstep with the v7 reset.
-pub const WIRE_VERSION: u32 = 4;
+/// Wire protocol version for P2P/RPC.
+///
+/// Raised to 5 for v0.6.0, and this time not because the wire format changed —
+/// it did not. It is the only mechanism this project has for refusing to peer
+/// with a release known to damage the network, and 0.5.3 and earlier are such
+/// releases: they verify a reorg while holding the node's global lock, freeze
+/// for tens of seconds at a time, mine on a tip the network has already left,
+/// and fork. A node running one is not merely out of date, it produces branches
+/// everyone else has to reconcile.
+///
+/// What this does: old nodes cannot complete a handshake, so they cannot join,
+/// sync, or propagate. What it deliberately does not do: touch consensus.
+/// `PROTOCOL_VERSION` stays at 7, the genesis hash is unchanged, every block
+/// and every coin ever mined stays exactly as valid as it was. Nobody's balance
+/// moves. An old node keeps its coins and gets them back the moment it upgrades
+/// — it just cannot take part until it does.
+///
+/// The honest limitation: this cannot stop anyone from mining, only from
+/// mining *with us*. Someone who ignores the upgrade keeps hashing on an
+/// isolated chain that no other node will ever accept. The wallet says so
+/// plainly rather than leaving them to discover it later.
+pub const WIRE_VERSION: u32 = 5;
 
 /// 1 NIGHT = 10^8 darks.
 pub const DARKS_PER_NIGHT: u64 = 100_000_000;
