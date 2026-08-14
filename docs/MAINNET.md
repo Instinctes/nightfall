@@ -122,11 +122,15 @@ nodes log the failed dial and carry on. It is not harmless in the sense that
 matters: new installs then find nobody, mine alone, and lose the work when they
 eventually connect. Check it periodically.
 
-> **One seed is a single point of failure for discovery.** No seed can forge a
-> block, hide one, or change the rules — every node validates independently.
-> But if the only one is down, the network is unreachable to newcomers. A
-> second seed run by someone else, on unrelated hardware, is worth more than
-> any amount of hardening on the first.
+> **Seeds are a single point of failure for discovery only.** No seed can forge
+> a block, hide one, or change the rules — every node validates independently.
+> But if none are reachable, the network is invisible to newcomers.
+>
+> Two are listed: `seed.nightfallcoin.org` and `seed2.nightfallcoin.org`. Both
+> currently belong to the same operator, which halves the benefit — they share
+> an owner and, if one sits behind the other's connection, a failure mode. **A
+> seed run by somebody else is worth more than a third run by us.** If you
+> operate one, open an issue and it goes in the list.
 
 ---
 
