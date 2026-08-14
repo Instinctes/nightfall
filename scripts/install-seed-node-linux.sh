@@ -44,7 +44,7 @@ RPC_PORT=17881
 DATADIR="/var/lib/nightfall"
 BINDIR="/usr/local/bin"
 REPO="https://github.com/Instinctes/nightfall"
-EXPECTED_GENESIS="b69d9c81892266a7b89b2e759f9cfd4d9344230b084545d4f92d648ab9eb11a1"
+EXPECTED_GENESIS="c8614333c0f86a4824df212474632f4b9feecf9bf0593841199d894127f2f9a6"
 
 die() { printf '\033[31merror:\033[0m %s\n' "$1" >&2; exit 1; }
 info() { printf '\033[36m==>\033[0m %s\n' "$1"; }

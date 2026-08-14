@@ -7,16 +7,22 @@
 **Fee:** 100% burn  
 **P2P default:** `0.0.0.0:17891`  
 **RPC default:** `127.0.0.1:17881` (local wallet only)  
-**Protocol:** v6 (Nightproof) · **Wire:** v3
-**Genesis:** `b69d9c81892266a7b89b2e759f9cfd4d9344230b084545d4f92d648ab9eb11a1`
+**Protocol:** v7 (Nightproof) · **Wire:** v4
+**Genesis:** `c8614333c0f86a4824df212474632f4b9feecf9bf0593841199d894127f2f9a6`
 
-> ⚠ **Every chain before v6 is dead.** v4 was consensus-broken — anyone could
+> ⚠ **Every chain before v7 is dead.** v4 was consensus-broken — anyone could
 > mint unlimited NIGHT, see [`AUDIT-2026-08-12.md`](./AUDIT-2026-08-12.md). v5
-> was sound but is superseded: outputs now carry a view tag, which changes what
-> the sender signs and therefore the format. The genesis differs, so nothing
-> can mix. Delete any pre-v6 datadir; a v6 node will refuse it.
+> was sound; v6 added view tags to the output format.
 >
-> Coins mined on a pre-v6 chain do not carry over. There is no migration and
+> v7 changes no format. The v6 chain was abandoned because two networking
+> faults made it untrustworthy rather than invalid: nodes stopped mining while
+> waiting for each other across a fork, and wallets never un-did what a reorg
+> had undone, so a confirmed payment could disappear with nothing reporting it.
+> The result was a chain with a transaction on one branch and not the other and
+> no way to say which was true. The genesis differs, so nothing can mix. Delete
+> any pre-v7 datadir.
+>
+> Coins mined on a pre-v7 chain do not carry over. There is no migration and
 > there was never a claim there would be — see [`FAIR_LAUNCH.md`](../FAIR_LAUNCH.md).
 
 Peers with a different genesis_hash are incompatible — always use matching release builds.
@@ -159,7 +165,7 @@ Recent builds connect automatically. For anything else, share:
 1. Your public IP / DNS
 2. Port **17891**
 3. Confirm they use `--network mainnet`
-4. The same release — protocol v6 / wire v3, matching `genesis_hash`
+4. The same release — protocol v7 / wire v4, matching `genesis_hash`
 
 ### Joiner command
 

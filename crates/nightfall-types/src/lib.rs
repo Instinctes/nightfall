@@ -7,24 +7,29 @@ pub const COIN_NAME: &str = "NIGHTFALLCOIN";
 pub const TICKER: &str = "NIGHT";
 pub const PROTOCOL_NAME: &str = "nightfall";
 
-/// Protocol v6 — "Nightproof".
+/// Protocol v7 — "Nightproof".
 ///
 /// v4 was **consensus-broken**: its balance proof was a tautology, so anyone
 /// could mint arbitrary NIGHT. See `docs/AUDIT-2026-08-12.md`.
 ///
-/// v5 fixed that and was sound. It is superseded rather than broken: outputs
-/// now carry a one-byte view tag, which changes what the sender signs and
-/// therefore the format itself. That change is cheap while the chain carries no
-/// value and would need a hard fork afterwards, so it was made during a reset
-/// rather than deferred.
+/// v5 fixed that and was sound; v6 added a one-byte view tag to every output,
+/// changing what the sender signs and therefore the format.
+///
+/// v7 is not a format change at all. The v6 chain was abandoned because two
+/// networking faults made it untrustworthy rather than invalid: nodes stopped
+/// mining while politely waiting for each other across a fork, and wallets
+/// never un-did what a reorg had undone, so a confirmed payment could vanish
+/// with nothing reporting it. The chain that resulted had a transaction on one
+/// branch and not the other, and no way to say which was true. Restarting was
+/// cheaper than explaining.
 ///
 /// This constant is folded into `GenesisConfig`, so bumping it produces a
 /// different genesis hash. Nodes only peer with a matching genesis, which is
-/// what keeps the abandoned v5 chains from ever mixing with this one.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// what keeps the abandoned v5 and v6 chains from ever mixing with this one.
+pub const PROTOCOL_VERSION: u32 = 7;
 
-/// Wire protocol version for P2P/RPC. Bumped in lockstep with the v6 reset.
-pub const WIRE_VERSION: u32 = 3;
+/// Wire protocol version for P2P/RPC. Bumped in lockstep with the v7 reset.
+pub const WIRE_VERSION: u32 = 4;
 
 /// 1 NIGHT = 10^8 darks.
 pub const DARKS_PER_NIGHT: u64 = 100_000_000;
@@ -137,9 +142,9 @@ impl NetworkId {
     /// one network can never be replayed on another.
     pub fn proof_context(self) -> &'static [u8] {
         match self {
-            Self::Mainnet => b"nightfall:mainnet:v6",
-            Self::Testnet => b"nightfall:testnet:v6",
-            Self::Devnet => b"nightfall:devnet:v6",
+            Self::Mainnet => b"nightfall:mainnet:v7",
+            Self::Testnet => b"nightfall:testnet:v7",
+            Self::Devnet => b"nightfall:devnet:v7",
         }
     }
 

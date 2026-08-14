@@ -57,7 +57,7 @@ fi
 # Verify the genesis matches the published one before advertising this node to
 # the world. A seed serving a different genesis peers with nobody and is worse
 # than no seed at all, because it looks like it is working.
-EXPECTED_GENESIS="b69d9c81892266a7b89b2e759f9cfd4d9344230b084545d4f92d648ab9eb11a1"
+EXPECTED_GENESIS="c8614333c0f86a4824df212474632f4b9feecf9bf0593841199d894127f2f9a6"
 # `init` labels this line "genesis_hash", `status` labels it "genesis". Matching
 # on the start of the line covers both; the previous pattern looked for
 # "genesis_hash" in `status` output, never matched, and left ACTUAL empty —
