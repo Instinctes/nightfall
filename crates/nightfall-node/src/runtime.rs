@@ -585,6 +585,57 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
     }
 }
 
+/// How many blocks to push to a lagging peer in one sync round.
+///
+/// Bounded on purpose. Uploading an unlimited run of blocks to whoever asks is
+/// bandwidth amplification, and the periodic sync task comes back shortly, so a
+/// peer that is far behind catches up over several rounds rather than in one
+/// burst that a stranger could trigger at will.
+const PUSH_BATCH: usize = 256;
+
+/// Send a lagging peer the blocks it is missing, over a connection we already
+/// have open.
+///
+/// The receiving side applies each block through its normal inbound path, so
+/// nothing here bypasses validation: every block is checked against its own
+/// rules on arrival, and any that does not connect is simply rejected.
+fn push_blocks_to(state: &SharedState, stream: &mut TcpStream, peer_h: u64, addr: &str) {
+    // Start one below their tip so a peer sitting on a short fork receives the
+    // block that reconnects them, rather than a run they will all reject.
+    let mut from = peer_h.saturating_sub(1);
+    let mut sent = 0usize;
+
+    while sent < PUSH_BATCH {
+        let batch = {
+            let Ok(g) = state.lock() else { return };
+            g.chain
+                .blocks_from(from, (PUSH_BATCH - sent).min(MAX_BLOCKS_PER_REQUEST))
+        };
+        if batch.is_empty() {
+            break;
+        }
+        let next = batch
+            .last()
+            .map(|b| b.header.height.0 + 1)
+            .unwrap_or(from + 1);
+
+        for block in batch {
+            if broadcast_block(stream, &block).is_err() {
+                // A peer that hangs up mid-push is not an error worth
+                // shouting about; the next round picks up where this stopped.
+                tracing::debug!("push to {addr} ended after {sent} block(s)");
+                return;
+            }
+            sent += 1;
+        }
+        from = next;
+    }
+
+    if sent > 0 {
+        tracing::info!("pushed {sent} block(s) to {addr}, which was behind");
+    }
+}
+
 fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
     let mut stream = connect_peer(addr, 15_000)?;
     let (network, genesis, our_h, tip, port) = {
@@ -645,8 +696,22 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
         }
         drop(g);
 
-        // Nothing connected. Either we are already ahead, or we are on a
-        // different fork. Only the second case is worth work.
+        // Nothing connected. Either we are ahead of them, or we are on a
+        // different fork.
+        if peer_h < our_h {
+            // They are behind, and we are already talking to them. Send what
+            // they are missing instead of waiting for them to ask.
+            //
+            // Without this, catching up is possible only by dialling — and a
+            // peer behind NAT can dial out but cannot be dialled. A fresh seed
+            // node whose only contact is a miner behind a router therefore sits
+            // at height 0 indefinitely: it has a peer, it reports healthy, it
+            // learns an address it can never reach, and it retries that address
+            // forever. Found by standing up a real seed and watching it stay
+            // empty while connected.
+            push_blocks_to(state, &mut stream, peer_h, addr);
+            break;
+        }
         if peer_h <= our_h {
             break;
         }
