@@ -1189,7 +1189,7 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
         // Pull the peer's chain in full before judging it. Comparing against a
         // single 128-block page can never outweigh a longer local chain, so a
         // node stuck on a lighter fork would never recover.
-        let candidate = fetch_full_chain(&mut stream, peer_h)?;
+        let candidate = fetch_full_chain(&mut stream, peer_h, our_len)?;
         if candidate.is_empty() {
             break;
         }
@@ -1225,16 +1225,42 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How many blocks it is worth pulling to judge a peer's chain.
+///
+/// Enough to hold all of theirs, never more than we would accept anyway.
+pub fn reorg_fetch_cap(peer_height: u64, our_len: usize) -> usize {
+    let theirs = peer_height.saturating_add(1) as usize;
+    theirs.min(our_len.saturating_add(nightfall_consensus::MAX_REORG_DEPTH))
+}
+
 /// Download a peer's entire chain, paging until we reach their tip.
 ///
-/// Bounded by [`nightfall_consensus::MAX_REORG_DEPTH`] beyond our own height so
-/// a hostile peer cannot make us buffer an unbounded chain.
+/// The bound is "as much as could possibly be accepted", and it has to be
+/// exactly that. It used to be `MAX_REORG_DEPTH * 4` — a flat 2,000 blocks,
+/// chosen when the chain was short enough that the difference never showed.
+///
+/// The day the chain passed 2,000 blocks, that number became a wall. A node
+/// that had diverged asked a peer for its chain, received a truncated 2,000
+/// block *prefix* of it, weighed that prefix against its own longer chain,
+/// correctly concluded it was lighter, and refused it. Then it did the same
+/// thing on the next round, and the next. The peer was not offering a worse
+/// chain; we were only ever looking at part of a better one. Two nodes, one
+/// plainly heavier, permanently unable to reconcile — and every block mined on
+/// the losing side lost with it.
+///
+/// Found at block 2,057, with a laptop stuck on 2,048 while the seed node it
+/// was talking to carried more work and neither would budge.
+///
+/// `our_len + MAX_REORG_DEPTH` is the right ceiling because it is precisely
+/// what [`Chain::evaluate_reorg`] will entertain: anything longer is rejected
+/// as too deep, so fetching it would be wasted bandwidth. Anything shorter,
+/// including any fixed constant, eventually truncates a legitimate chain.
 fn fetch_full_chain(
     stream: &mut TcpStream,
     peer_height: u64,
+    our_len: usize,
 ) -> anyhow::Result<Vec<nightfall_consensus::Block>> {
-    let limit = peer_height.saturating_add(1) as usize;
-    let cap = limit.min(nightfall_consensus::MAX_REORG_DEPTH * 4);
+    let cap = reorg_fetch_cap(peer_height, our_len);
 
     let mut all = Vec::with_capacity(cap.min(4096));
     let mut from = 0u64;
