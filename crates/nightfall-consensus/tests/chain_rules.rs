@@ -355,3 +355,133 @@ fn genesis_is_fair_and_network_separated() {
     );
     assert_ne!(d.proof_ctx(), m.proof_ctx());
 }
+
+// --- reorg verification off the lock ------------------------------------
+
+#[test]
+fn evaluating_a_reorg_needs_no_chain_to_mutate() {
+    // The point of `evaluate_reorg` is that a node can run it with its state
+    // lock released. That is only true if deciding a reorg needs nothing but
+    // borrowed facts, so this test exists to keep it that way: it never
+    // constructs the chain being replaced at all, only the three numbers
+    // describing it.
+    let miner = WalletKeys::generate().address();
+    let mut long = devnet();
+    for i in 0..6u64 {
+        long.mine_block(&miner, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+    let mut short = devnet();
+    short.mine_block(&miner, vec![], NOW).unwrap();
+
+    let verdict = Chain::evaluate_reorg(
+        NetworkId::Devnet,
+        short.total_work,
+        short.blocks.len(),
+        long.blocks.clone(),
+        NOW + 10_000,
+    )
+    .unwrap();
+
+    let candidate = verdict.expect("a heavier chain must be offered");
+    assert_eq!(candidate.tip_hash(), long.tip_hash());
+    assert_eq!(candidate.total_work, long.total_work);
+    candidate.verify_supply().unwrap();
+}
+
+#[test]
+fn a_candidate_that_lost_the_race_is_not_adopted() {
+    // The regression this whole split exists to make safe.
+    //
+    // Verification now runs with the node's lock released, so between the
+    // moment a candidate is judged heavier and the moment it is swapped in,
+    // our own chain may have moved — and may now be heavier than the thing
+    // about to replace it. Adopting blindly at that point would roll the node
+    // *backwards* onto a chain the network has already left, silently undoing
+    // confirmed blocks. `adopt_reorg` therefore repeats the comparison instead
+    // of trusting the earlier verdict.
+    let miner = WalletKeys::generate().address();
+
+    let mut candidate_src = devnet();
+    for i in 0..3u64 {
+        candidate_src
+            .mine_block(&miner, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+
+    let mut ours = devnet();
+    ours.mine_block(&miner, vec![], NOW).unwrap();
+
+    // Judged while we were short: the candidate wins.
+    let candidate = Chain::evaluate_reorg(
+        NetworkId::Devnet,
+        ours.total_work,
+        ours.blocks.len(),
+        candidate_src.blocks.clone(),
+        NOW + 10_000,
+    )
+    .unwrap()
+    .expect("heavier at the time it was judged");
+
+    // Meanwhile we caught up and overtook it.
+    for i in 1..6u64 {
+        ours.mine_block(&miner, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+    assert!(
+        ours.total_work > candidate.total_work,
+        "setup: we must have overtaken the candidate while it was being verified"
+    );
+
+    let tip_before = ours.tip_hash();
+    let work_before = ours.total_work;
+    assert!(
+        !ours.adopt_reorg(candidate),
+        "a candidate our chain has already overtaken must be refused"
+    );
+    assert_eq!(
+        ours.tip_hash(),
+        tip_before,
+        "the tip must not move backwards"
+    );
+    assert_eq!(ours.total_work, work_before);
+    ours.verify_supply().unwrap();
+}
+
+#[test]
+fn splitting_the_reorg_did_not_change_the_verdict() {
+    // `maybe_reorg_to` is now a thin wrapper over the two halves. Same inputs,
+    // same answer, same resulting chain — otherwise the refactor moved a
+    // consensus rule while claiming to move only a lock.
+    let miner = WalletKeys::generate().address();
+    let mut long = devnet();
+    for i in 0..5u64 {
+        long.mine_block(&miner, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+
+    let mut via_wrapper = devnet();
+    via_wrapper.mine_block(&miner, vec![], NOW).unwrap();
+    let mut via_halves = via_wrapper.clone();
+
+    let a = via_wrapper
+        .maybe_reorg_to(long.blocks.clone(), NOW + 10_000)
+        .unwrap();
+
+    let b = match Chain::evaluate_reorg(
+        NetworkId::Devnet,
+        via_halves.total_work,
+        via_halves.blocks.len(),
+        long.blocks.clone(),
+        NOW + 10_000,
+    )
+    .unwrap()
+    {
+        Some(c) => via_halves.adopt_reorg(c),
+        None => false,
+    };
+
+    assert_eq!(a, b, "both routes must reach the same decision");
+    assert_eq!(via_wrapper.tip_hash(), via_halves.tip_hash());
+    assert_eq!(via_wrapper.total_work, via_halves.total_work);
+}

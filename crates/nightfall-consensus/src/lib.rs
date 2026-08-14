@@ -518,8 +518,45 @@ impl Chain {
         blocks: Vec<Block>,
         now_unix: u64,
     ) -> Result<bool, ConsensusError> {
+        match Self::evaluate_reorg(
+            self.network,
+            self.total_work,
+            self.blocks.len(),
+            blocks,
+            now_unix,
+        )? {
+            Some(candidate) => Ok(self.adopt_reorg(candidate)),
+            None => Ok(false),
+        }
+    }
+
+    /// Decide a reorg without touching an existing chain.
+    ///
+    /// This is the expensive half of [`Self::maybe_reorg_to`] — it rebuilds the
+    /// candidate from genesis and re-verifies every block, proof of work
+    /// included — and it is deliberately a free function over borrowed facts
+    /// rather than a method. A caller holding a lock around its chain can copy
+    /// the three numbers this needs, release the lock, run the rebuild, and
+    /// only then come back for [`Self::adopt_reorg`].
+    ///
+    /// That separation is not a micro-optimisation. Measured on a live 1737
+    /// block chain, the rebuild takes 26.7 seconds at 15.4 ms per block, and it
+    /// grows linearly with the chain. Running it inside the node's state mutex
+    /// froze everything else for that entire time: no RPC answer, no interface
+    /// frame, no other peer, no block submission — and every peer thread whose
+    /// blocks failed to connect started its own copy of it. A node that mined
+    /// while slightly behind produced exactly that condition on every round,
+    /// which is what made the wallet appear to hang and the chain appear to
+    /// stop.
+    pub fn evaluate_reorg(
+        network: NetworkId,
+        our_work: u128,
+        our_len: usize,
+        blocks: Vec<Block>,
+        now_unix: u64,
+    ) -> Result<Option<Self>, ConsensusError> {
         if blocks.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
 
         // Work first, and deliberately so.
@@ -531,8 +568,8 @@ impl Chain {
         // judged — and it reported `ReorgTooDeep` while doing it, which reads
         // as "this chain is suspicious" rather than "we never looked".
         let claimed_work: u128 = blocks.iter().map(|b| b.work()).sum();
-        if claimed_work <= self.total_work {
-            return Ok(false);
+        if claimed_work <= our_work {
+            return Ok(None);
         }
 
         // Only now the depth bound, and only against something that claims to
@@ -548,16 +585,29 @@ impl Chain {
         // alternative is letting a stranger dictate unbounded validation work,
         // but nodes should meet long before it matters — which is what seed
         // nodes are for.
-        if blocks.len() > self.blocks.len() + MAX_REORG_DEPTH {
+        if blocks.len() > our_len + MAX_REORG_DEPTH {
             return Err(ConsensusError::ReorgTooDeep);
         }
 
-        let candidate = Self::rebuild_from_blocks(self.network, blocks, now_unix)?;
+        let candidate = Self::rebuild_from_blocks(network, blocks, now_unix)?;
+        if candidate.total_work > our_work {
+            return Ok(Some(candidate));
+        }
+        Ok(None)
+    }
+
+    /// Take a chain produced by [`Self::evaluate_reorg`], if it still wins.
+    ///
+    /// Cheap, and safe to call under a lock. The work comparison is repeated
+    /// rather than assumed: the rebuild ran with the lock released, so this
+    /// chain may have moved on — possibly past the candidate — while it was
+    /// happening. Re-checking here is what makes releasing the lock sound.
+    pub fn adopt_reorg(&mut self, candidate: Self) -> bool {
         if candidate.total_work > self.total_work {
             *self = candidate;
-            return Ok(true);
+            return true;
         }
-        Ok(false)
+        false
     }
 
     pub fn chain_work(&self) -> u128 {

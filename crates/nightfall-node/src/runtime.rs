@@ -81,6 +81,15 @@ pub struct NodeInner {
     /// claims to be ahead, the gap is a fork rather than lag, and mining
     /// resumes rather than waiting on something unreachable.
     pub behind_since: u64,
+    /// Set while a reorg candidate is being rebuilt and verified.
+    ///
+    /// Rebuilding is measured in tens of seconds on a chain of any size, and
+    /// every peer thread that fails to connect a block reaches the same
+    /// conclusion at the same moment. Without this they all start, and because
+    /// each one finishes by taking the state lock to swap chains, the node
+    /// spends minutes doing the same arithmetic n times to arrive at the answer
+    /// the first one already had. One at a time; the rest skip the round.
+    pub reorg_in_flight: Arc<AtomicBool>,
 }
 
 /// Upper bound on buffered branch blocks. A fork deeper than this is past
@@ -315,6 +324,7 @@ impl NodeHandle {
             // so a freshly opened wallet would mine on a stale tip the moment
             // someone pressed Start — the exact case this field exists to stop.
             behind_since: now_unix(),
+            reorg_in_flight: Arc::new(AtomicBool::new(false)),
         };
         let state: SharedState = Arc::new(Mutex::new(inner));
 
@@ -849,20 +859,62 @@ fn consider_branch(state: &SharedState, block: Block, peer_label: &str) {
     }
 
     let before = g.chain.block_count();
-    match g.chain.maybe_reorg_to(candidate, now_unix()) {
-        Ok(true) => {
-            let after = g.chain.block_count();
-            tracing::info!(
-                "reorged onto a heavier branch from {peer_label}: {before} -> {after} blocks, \
-                 work {}",
-                g.chain.total_work
-            );
-            g.branch.clear();
-            g.bump_tip();
-            let _ = g.persist();
+    let network = g.chain.network;
+    let our_work = g.chain.total_work;
+    let our_len = g.chain.blocks.len();
+    let guard = Arc::clone(&g.reorg_in_flight);
+    drop(g);
+
+    let Some(_flight) = ReorgFlight::begin(&guard) else {
+        tracing::debug!("branch from {peer_label} skipped — a reorg is already being verified");
+        return;
+    };
+
+    // Verified with the lock released. See `Chain::evaluate_reorg`.
+    let verdict = Chain::evaluate_reorg(network, our_work, our_len, candidate, now_unix());
+
+    let Ok(g) = state.lock() else { return };
+    let mut g = g;
+    match verdict {
+        Ok(Some(chain)) => {
+            if g.chain.adopt_reorg(chain) {
+                let after = g.chain.block_count();
+                tracing::info!(
+                    "reorged onto a heavier branch from {peer_label}: {before} -> {after} blocks, \
+                     work {}",
+                    g.chain.total_work
+                );
+                g.branch.clear();
+                g.bump_tip();
+                let _ = g.persist();
+            } else {
+                tracing::debug!("branch from {peer_label} lost the race — our chain moved on");
+            }
         }
-        Ok(false) => {}
+        Ok(None) => {}
         Err(e) => tracing::debug!("branch from {peer_label} not adopted: {e}"),
+    }
+}
+
+/// Marks a reorg verification as running, and clears the mark on any exit.
+///
+/// A plain `store(false)` at the end of the function is not enough: the paths
+/// out of a reorg include several `?` returns and a panic would leave the flag
+/// set forever, which would silently disable reorgs for the rest of the
+/// process's life. Nothing would log; the node would simply stop reconciling.
+struct ReorgFlight(Arc<AtomicBool>);
+
+impl ReorgFlight {
+    fn begin(flag: &Arc<AtomicBool>) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| Self(Arc::clone(flag)))
+    }
+}
+
+impl Drop for ReorgFlight {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1073,6 +1125,24 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
             break;
         }
 
+        // Only one thread verifies a reorg at a time, and the claim is staked
+        // before the download rather than after it: eleven peers that all
+        // noticed the same divergence would otherwise each pull an entire
+        // chain over the wire to prove the same point.
+        let (network, our_work, our_len, guard) = {
+            let g = state.lock().unwrap();
+            (
+                g.chain.network,
+                g.chain.total_work,
+                g.chain.blocks.len(),
+                Arc::clone(&g.reorg_in_flight),
+            )
+        };
+        let Some(_flight) = ReorgFlight::begin(&guard) else {
+            tracing::debug!("peer {addr} diverges, but a reorg is already being verified");
+            break;
+        };
+
         // Pull the peer's chain in full before judging it. Comparing against a
         // single 128-block page can never outweigh a longer local chain, so a
         // node stuck on a lighter fork would never recover.
@@ -1081,18 +1151,26 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
             break;
         }
 
+        // Rebuilt and re-verified with the lock released — tens of seconds of
+        // work that used to freeze the whole node. See `Chain::evaluate_reorg`.
+        let verdict = Chain::evaluate_reorg(network, our_work, our_len, candidate, now_unix());
+
         let mut g = state.lock().unwrap();
-        match g.chain.maybe_reorg_to(candidate, now_unix()) {
-            Ok(true) => {
-                g.bump_tip();
-                let _ = g.persist();
-                tracing::info!(
-                    "reorged to heavier chain from {addr} — now {} blocks, work {}",
-                    g.chain.block_count(),
-                    g.chain.total_work
-                );
+        match verdict {
+            Ok(Some(chain)) => {
+                if g.chain.adopt_reorg(chain) {
+                    g.bump_tip();
+                    let _ = g.persist();
+                    tracing::info!(
+                        "reorged to heavier chain from {addr} — now {} blocks, work {}",
+                        g.chain.block_count(),
+                        g.chain.total_work
+                    );
+                } else {
+                    tracing::debug!("peer {addr} chain lost the race — ours moved on meanwhile");
+                }
             }
-            Ok(false) => tracing::debug!("peer {addr} chain is not heavier"),
+            Ok(None) => tracing::debug!("peer {addr} chain is not heavier"),
             Err(e) => tracing::warn!("peer {addr} offered an invalid chain: {e}"),
         }
         break;
