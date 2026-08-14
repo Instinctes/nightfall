@@ -143,7 +143,11 @@ fn main() -> anyhow::Result<()> {
         }
 
         Commands::Sync => {
-            let from = wallet.scan_from();
+            // Always from the birth height, not from `scanned_to`. An
+            // incremental tail cannot see a reorg that replaced earlier
+            // blocks, and that is how a confirmed payment vanished: the
+            // wallet never looked at the part of the chain that changed.
+            let from = wallet.birth_height();
             let n = sync(&mut wallet, &rpc, from)?;
             println!("scanned to height {}", wallet.scanned_to());
             println!("new outputs.... {n}");
@@ -208,10 +212,14 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Pull blocks from the node in batches and scan them.
+/// Pull blocks from the node in batches and scan them as one chain.
+///
+/// Scanning each page on its own made reconcile treat the first page as the
+/// whole history: every output past page one was dropped, and a sync that
+/// stopped there lost them for good.
 fn sync(wallet: &mut Wallet, rpc: &str, from: u64) -> anyhow::Result<u32> {
     let mut height = from;
-    let mut total = 0u32;
+    let mut all = Vec::new();
 
     loop {
         let res = rpc_call(rpc, "get_blocks", json!({ "from": height, "limit": 128 }))?;
@@ -220,13 +228,16 @@ fn sync(wallet: &mut Wallet, rpc: &str, from: u64) -> anyhow::Result<u32> {
             break;
         }
         let last = blocks.last().map(|b| b.header.height.0).unwrap_or(height);
-        total += wallet.scan_blocks(&blocks)?;
+        all.extend(blocks);
         if last < height + 1 {
             break;
         }
         height = last + 1;
     }
-    Ok(total)
+    if all.is_empty() {
+        return Ok(0);
+    }
+    wallet.scan_blocks(&all)
 }
 
 fn rpc_call(

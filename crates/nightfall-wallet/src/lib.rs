@@ -152,6 +152,34 @@ pub struct Wallet {
     db: WalletFile,
 }
 
+/// True when `blocks` is a contiguous history from this wallet's beginning
+/// through at least everything it has already seen.
+///
+/// Reconcile is destructive: anything not in the slice is treated as gone.
+/// That is only safe when the slice cannot simply have omitted later blocks.
+fn covers_canonical_history(
+    blocks: &[Block],
+    birth_height: u64,
+    scanned_to: u64,
+    outputs: &[OwnedOutput],
+) -> bool {
+    let Some(first) = blocks.first() else {
+        return false;
+    };
+    let start = first.header.height.0;
+    if start != 0 && start != birth_height {
+        return false;
+    }
+    for (i, b) in blocks.iter().enumerate() {
+        if b.header.height.0 != start + i as u64 {
+            return false;
+        }
+    }
+    let last = blocks.last().map(|b| b.header.height.0).unwrap_or(start);
+    let max_out = outputs.iter().map(|o| o.height).max().unwrap_or(0);
+    last >= scanned_to && last >= max_out
+}
+
 impl Wallet {
     /// Open an existing wallet or create a new one, scanning from genesis.
     pub fn open(datadir: &Path, network: NetworkId, seed_name: &str) -> anyhow::Result<Self> {
@@ -432,10 +460,17 @@ impl Wallet {
         // in the wallet as spendable balance that no node would accept, and a
         // payment that was undone still read "confirmed in block N".
         //
-        // When handed a chain starting at genesis we can see all of this, so we
-        // check rather than assume. A partial range cannot tell the difference
-        // between "gone" and "outside the range", so it is left alone.
-        if blocks.first().map(|b| b.header.height.0) == Some(0) {
+        // Absence only means absence when the slice is the whole history this
+        // wallet can own. A single 128-block page that happens to start at
+        // height 0 is not that — treating it as one dropped every later
+        // output, and a sync that stopped after the first page lost them
+        // for good.
+        if covers_canonical_history(
+            blocks,
+            self.db.birth_height,
+            self.db.scanned_to,
+            &self.db.outputs,
+        ) {
             self.reconcile_with(blocks, &spent_commits);
         }
 
@@ -952,6 +987,58 @@ mod tests {
             reward,
             "balance must not include a coin the chain no longer has"
         );
+        fs::remove_dir_all(&d).ok();
+    }
+
+    /// The CLI fetches 128-block pages. Reconcile used to fire on any slice
+    /// whose first block was height 0, so page one wiped every later output.
+    /// A sync that stopped there — or a caller that re-scanned only genesis —
+    /// lost those coins until something happened to look at them again.
+    #[test]
+    fn a_partial_page_from_genesis_does_not_drop_later_outputs() {
+        let d = tmpdir("partial-page");
+        let mut w = Wallet::open(&d, NetworkId::Devnet, "w.seed").unwrap();
+        let ctx = NetworkId::Devnet.proof_context();
+        let reward = 20 * DARKS_PER_NIGHT;
+
+        let mk = |w: &Wallet, height: u64| {
+            let cb = build_coinbase(&w.address(), reward, height, ctx).unwrap();
+            let body = BlockBody::aggregate(&[cb]);
+            let mut ledger = LedgerState::genesis();
+            ledger
+                .apply_block(&body, Height(height), reward, ctx)
+                .unwrap();
+            Block {
+                header: nightfall_consensus::BlockHeader {
+                    version: nightfall_types::PROTOCOL_VERSION,
+                    height: Height(height),
+                    prev_hash: nightfall_types::Hash256::ZERO,
+                    body_root: body.hash(),
+                    utxo_root: ledger.utxo_root(),
+                    kernel_sum: ledger.kernel_sum(),
+                    timestamp_unix: 1_800_000_000 + height,
+                    difficulty: 1,
+                    nonce: height,
+                    reward_darks: reward,
+                },
+                body,
+            }
+        };
+
+        let a = mk(&w, 0);
+        let b = mk(&w, 1);
+        w.scan_blocks(&[a.clone(), b]).unwrap();
+        assert_eq!(w.outputs().len(), 2);
+        assert_eq!(w.balance().darks(), 2 * reward);
+
+        // Same first page, nothing after it. The later coin must stay.
+        w.scan_blocks(&[a]).unwrap();
+        assert_eq!(
+            w.outputs().len(),
+            2,
+            "a genesis page is not the whole chain"
+        );
+        assert_eq!(w.balance().darks(), 2 * reward);
         fs::remove_dir_all(&d).ok();
     }
 

@@ -161,11 +161,38 @@ pub fn read_msg(reader: &mut BufReader<TcpStream>) -> std::io::Result<PeerMsg> {
 }
 
 pub fn connect_peer(addr: &str, timeout_ms: u64) -> std::io::Result<TcpStream> {
-    let stream = TcpStream::connect(addr)?;
-    stream.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
-    stream.set_write_timeout(Some(Duration::from_millis(timeout_ms)))?;
-    stream.set_nodelay(true)?;
-    Ok(stream)
+    use std::net::ToSocketAddrs;
+
+    // `TcpStream::connect` has no timeout of its own: a dead address waits
+    // for the OS SYN retry (often more than a minute). The sync loop joins
+    // every peer thread before the next round, so one hung connect used to
+    // stall the whole network — the same class of fault as walking peers
+    // sequentially, just hiding behind a thread.
+    let timeout = Duration::from_millis(timeout_ms.max(1));
+    let mut last_err: Option<std::io::Error> = None;
+    let mut any = false;
+    for sock in addr.to_socket_addrs()? {
+        any = true;
+        match TcpStream::connect_timeout(&sock, timeout) {
+            Ok(stream) => {
+                stream.set_read_timeout(Some(timeout))?;
+                stream.set_write_timeout(Some(timeout))?;
+                stream.set_nodelay(true)?;
+                return Ok(stream);
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(
+            if any {
+                std::io::ErrorKind::TimedOut
+            } else {
+                std::io::ErrorKind::NotFound
+            },
+            format!("{addr} did not accept a connection"),
+        )
+    }))
 }
 
 pub fn handshake(

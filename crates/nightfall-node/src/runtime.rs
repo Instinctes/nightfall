@@ -170,14 +170,32 @@ impl NodeInner {
     }
 
     pub fn dialable_peers(&self) -> Vec<String> {
-        self.bootstrap
+        // Official seeds always stay in the set. A genesis-mismatch drop
+        // removes a learned address; it must not also forget the compiled-in
+        // names, because those are the ones that come back on the right chain
+        // after an upgrade.
+        self.network
+            .seed_nodes()
             .iter()
-            .chain(self.peer_addrs.iter())
-            .cloned()
+            .map(|s| s.to_string())
+            .chain(self.bootstrap.iter().cloned())
+            .chain(self.peer_addrs.iter().cloned())
             .collect::<HashSet<_>>()
             .into_iter()
             .take(MAX_PEERS)
             .collect()
+    }
+
+    /// Stop dialling an address that can never peer with us.
+    ///
+    /// After a chain reset the old network is still out there: same ports,
+    /// same `peers.json` entries, different genesis. Paying a handshake to
+    /// each of them every round is how nodes fell a minute behind a miner
+    /// on the same LAN while every log line looked healthy.
+    fn forget_incompatible(&mut self, addr: &str) {
+        self.peer_addrs.remove(addr);
+        self.bootstrap.retain(|a| a != addr);
+        tracing::info!("dropped {addr}: incompatible genesis");
     }
 
     /// Announce a block. Runs off-thread so block propagation never blocks the
@@ -260,7 +278,12 @@ impl NodeHandle {
             mempool: Mempool::default(),
             store,
             network: cfg.network,
-            peer_addrs: HashSet::new(),
+            // Restored from peers.json so a peer added last session is
+            // actually dialled this session. Without this they lived only
+            // in `bootstrap`, and the sync loop never looked there — the
+            // "peers survive a restart" fix wrote the file and then ignored
+            // it on the way back in.
+            peer_addrs: load_known_peers(&cfg.datadir).into_iter().collect(),
             miner: cfg.miner,
             // Built-in seeds first, then whatever the user configured, then
             // whatever this node knew last time it ran.
@@ -288,7 +311,10 @@ impl NodeHandle {
             branch: HashMap::new(),
             best_peer_height: 0,
             best_peer_seen: 0,
-            behind_since: 0,
+            // Not zero: `now − 0` is already older than the catch-up window,
+            // so a freshly opened wallet would mine on a stale tip the moment
+            // someone pressed Start — the exact case this field exists to stop.
+            behind_since: now_unix(),
         };
         let state: SharedState = Arc::new(Mutex::new(inner));
 
@@ -302,21 +328,16 @@ impl NodeHandle {
 
         {
             let st = Arc::clone(&state);
-            let peers: Vec<String> = cfg
-                .network
-                .seed_nodes()
-                .iter()
-                .map(|s| s.to_string())
-                .chain(cfg.connect.iter().cloned())
-                .collect();
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(200));
                 loop {
+                    // `dialable_peers` includes seeds, `--connect`, and
+                    // whatever `peers.json` remembered. The previous list
+                    // dropped the last of those, so a hand-added peer was
+                    // gone after a restart — mining alone again.
                     let targets: Vec<String> = {
                         let g = st.lock().unwrap();
-                        let mut v = peers.clone();
-                        v.extend(g.peer_addrs.iter().cloned());
-                        v.into_iter().collect::<HashSet<_>>().into_iter().collect()
+                        g.dialable_peers()
                     };
                     // One thread per peer, not one after another.
                     //
@@ -453,9 +474,7 @@ impl NodeHandle {
             coinbase_maturity: g.chain.ledger.coinbase_maturity,
             kernels: g.chain.ledger.kernels.count,
             started_at: g.started_at,
-            blocks_behind: g
-                .best_peer_height
-                .saturating_sub(g.chain.tip_height().map(|h| h.0).unwrap_or(0)),
+            blocks_behind: catchup_behind(&g).unwrap_or(0),
         })
     }
 }
@@ -531,7 +550,7 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
                 // timeout per attempt for a handshake that cannot succeed.
                 if let Some(addr) = dialable_addr(&peer_label, listen_port) {
                     if let Ok(mut st) = state.lock() {
-                        st.peer_addrs.remove(&addr);
+                        st.forget_incompatible(&addr);
                     }
                 }
                 write_msg(
@@ -747,11 +766,19 @@ fn note_peer_height(state: &SharedState, height: u64) {
         if now.saturating_sub(g.best_peer_seen) > PEER_HEIGHT_TTL_SECS {
             g.best_peer_height = 0;
         }
+        let ours = g.chain.tip_height().map(|h| h.0).unwrap_or(0);
+        let was_behind = g.best_peer_height > ours;
         if height > g.best_peer_height {
             g.best_peer_height = height;
         }
         if height >= g.best_peer_height {
             g.best_peer_seen = now;
+        }
+        // The catch-up clock starts when we first *learn* we are behind, not
+        // when the process started. A slow first handshake would otherwise
+        // burn the whole window before anyone had spoken.
+        if g.best_peer_height > ours && !was_behind {
+            g.behind_since = now;
         }
     }
 }
@@ -948,7 +975,20 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
         )
     };
 
-    let (peer_h, peer_tip) = handshake(&mut stream, network, genesis, our_h, tip, port)?;
+    let (peer_h, peer_tip) = match handshake(&mut stream, network, genesis, our_h, tip, port) {
+        Ok(v) => v,
+        Err(e) => {
+            // Inbound already dropped genesis-mismatch peers. Outbound did
+            // not, so `peers.json` entries from an abandoned chain were
+            // redialled forever — reachable, listening, and useless.
+            if e.to_string().contains("genesis mismatch") {
+                if let Ok(mut st) = state.lock() {
+                    st.forget_incompatible(addr);
+                }
+            }
+            return Err(e.into());
+        }
+    };
     state.lock().unwrap().peer_addrs.insert(addr.to_string());
     note_peer_height(state, peer_h);
 
@@ -1119,18 +1159,22 @@ const MAX_CATCHUP_WAIT_SECS: u64 = 45;
 ///   start somewhere;
 /// - we have been waiting too long, which means the gap is a fork rather than
 ///   lag, and waiting cannot close it.
-pub fn blocks_behind(state: &SharedState) -> Option<u64> {
-    let g = state.lock().ok()?;
-    let ours = g.chain.tip_height().map(|h| h.0).unwrap_or(0);
-    if g.best_peer_height <= ours {
+fn catchup_behind(inner: &NodeInner) -> Option<u64> {
+    let ours = inner.chain.tip_height().map(|h| h.0).unwrap_or(0);
+    if inner.best_peer_height <= ours {
         return None;
     }
     // Sync is either working, in which case our height keeps moving and this
     // stays fresh, or it is not, in which case waiting achieves nothing.
-    if now_unix().saturating_sub(g.behind_since) > MAX_CATCHUP_WAIT_SECS {
+    if now_unix().saturating_sub(inner.behind_since) > MAX_CATCHUP_WAIT_SECS {
         return None;
     }
-    Some(g.best_peer_height - ours)
+    Some(inner.best_peer_height - ours)
+}
+
+pub fn blocks_behind(state: &SharedState) -> Option<u64> {
+    let g = state.lock().ok()?;
+    catchup_behind(&g)
 }
 
 fn mining_loop(state: SharedState) {
