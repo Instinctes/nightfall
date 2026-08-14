@@ -723,6 +723,51 @@ fn consider_branch(state: &SharedState, block: Block, peer_label: &str) {
     }
 }
 
+/// Highest height at which we and this peer hold the same block.
+///
+/// Returns their tip height when we already agree there — the ordinary case of
+/// a peer that is merely behind. Otherwise walks backwards in doubling steps,
+/// asking for one block at each probe, until a hash matches. That is a handful
+/// of round trips rather than a linear scan, and it is bounded by
+/// `MAX_REORG_DEPTH` because a fork deeper than that cannot be resolved anyway.
+///
+/// On any failure it falls back to just below the peer's tip: no worse than the
+/// behaviour this replaced.
+fn common_ancestor(
+    state: &SharedState,
+    stream: &mut TcpStream,
+    peer_h: u64,
+    peer_tip: &str,
+) -> u64 {
+    let our_hash_at = |h: u64| -> Option<String> {
+        let g = state.lock().ok()?;
+        g.chain.blocks.get(h as usize).map(|b| b.hash().to_hex())
+    };
+
+    // Fast path: we agree at their tip, so they are simply behind.
+    if our_hash_at(peer_h).as_deref() == Some(peer_tip) {
+        return peer_h;
+    }
+
+    let mut step = 1u64;
+    while step <= nightfall_consensus::MAX_REORG_DEPTH as u64 {
+        let probe = match peer_h.checked_sub(step) {
+            Some(p) => p,
+            None => break,
+        };
+        let Ok(batch) = nightfall_p2p::request_blocks(stream, probe, 1) else {
+            break;
+        };
+        let Some(theirs) = batch.first() else { break };
+        if our_hash_at(probe) == Some(theirs.hash().to_hex()) {
+            return probe;
+        }
+        step = step.saturating_mul(2);
+    }
+
+    peer_h.saturating_sub(1)
+}
+
 /// How many blocks to push to a lagging peer in one sync round.
 ///
 /// Bounded on purpose. Uploading an unlimited run of blocks to whoever asks is
@@ -737,10 +782,10 @@ const PUSH_BATCH: usize = 256;
 /// The receiving side applies each block through its normal inbound path, so
 /// nothing here bypasses validation: every block is checked against its own
 /// rules on arrival, and any that does not connect is simply rejected.
-fn push_blocks_to(state: &SharedState, stream: &mut TcpStream, peer_h: u64, addr: &str) {
-    // Start one below their tip so a peer sitting on a short fork receives the
-    // block that reconnects them, rather than a run they will all reject.
-    let mut from = peer_h.saturating_sub(1);
+fn push_blocks_to(state: &SharedState, stream: &mut TcpStream, from_height: u64, addr: &str) {
+    // `from_height` is the last height we and the peer agree on, so the first
+    // block sent is the one immediately after it — the block they can attach.
+    let mut from = from_height;
     let mut sent = 0usize;
 
     while sent < PUSH_BATCH {
@@ -824,7 +869,18 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
     // immediately — so anything placed inside it never runs in exactly the
     // case that matters.
     if peer_h < our_h {
-        push_blocks_to(state, &mut stream, peer_h, addr);
+        // Where to start pushing from is the whole question.
+        //
+        // Starting just below their tip is right when they are simply behind on
+        // our chain. It is useless when they are on a *branch*: every block we
+        // send then has a parent they have never seen, so nothing connects and
+        // nothing can be evaluated. That is not theoretical — a two-block fork
+        // survived indefinitely this way, with the heavier side pushing into a
+        // void every eight seconds.
+        //
+        // So: find where we last agreed, and push from there.
+        let from = common_ancestor(state, &mut stream, peer_h, &peer_tip);
+        push_blocks_to(state, &mut stream, from, addr);
         return Ok(());
     }
 
