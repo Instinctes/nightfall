@@ -422,6 +422,23 @@ impl Wallet {
             }
         }
 
+        // Everything above only ever adds. That is correct while the chain only
+        // grows, and wrong the moment it does not.
+        //
+        // A reorg replaces blocks that were canonical a second ago. Outputs
+        // received in them no longer exist; inputs spent in them are unspent
+        // again; sends that were confirmed are back to unconfirmed. None of
+        // that was noticed here — a coin received in a discarded block stayed
+        // in the wallet as spendable balance that no node would accept, and a
+        // payment that was undone still read "confirmed in block N".
+        //
+        // When handed a chain starting at genesis we can see all of this, so we
+        // check rather than assume. A partial range cannot tell the difference
+        // between "gone" and "outside the range", so it is left alone.
+        if blocks.first().map(|b| b.header.height.0) == Some(0) {
+            self.reconcile_with(blocks, &spent_commits);
+        }
+
         // Promote pending sends to confirmed.
         for (txid, height, ts) in confirmed {
             if let Some(e) = self
@@ -455,6 +472,82 @@ impl Wallet {
         self.db.scanned_to = highest;
         self.save()?;
         Ok(found)
+    }
+
+    /// Drop what the chain no longer contains, and un-confirm what it no longer
+    /// confirms.
+    ///
+    /// Only ever called with a chain that starts at genesis, so absence here
+    /// really means absence.
+    fn reconcile_with(&mut self, blocks: &[Block], spent: &BTreeSet<[u8; 32]>) {
+        let on_chain: BTreeSet<[u8; 32]> = blocks
+            .iter()
+            .flat_map(|b| b.body.outputs.iter())
+            .map(|o| o.commit.0)
+            .collect();
+
+        // Outputs from blocks that lost a reorg. Keeping them would show a
+        // balance no node agrees with, and coin selection would build
+        // transactions nobody can accept.
+        let before = self.db.outputs.len();
+        let dropped: BTreeSet<[u8; 32]> = self
+            .db
+            .outputs
+            .iter()
+            .filter(|o| !on_chain.contains(&o.commit.0))
+            .map(|o| o.commit.0)
+            .collect();
+        self.db.outputs.retain(|o| on_chain.contains(&o.commit.0));
+
+        // An input that is no longer consumed is no longer spent. Without this
+        // a coin stays invisible after the transaction spending it is undone.
+        for o in self.db.outputs.iter_mut() {
+            o.spent = spent.contains(&o.commit.0);
+        }
+
+        // History for outputs that no longer exist.
+        self.db.history.retain(|e| match e.direction {
+            Direction::Received | Direction::Mined => hex::decode(&e.txid)
+                .ok()
+                .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+                .map(|c| !dropped.contains(&c))
+                .unwrap_or(true),
+            Direction::Sent => true,
+        });
+
+        // A send is confirmed by seeing its inputs consumed. If they are not
+        // consumed any more, it is not confirmed any more — it is waiting to be
+        // mined again, and saying otherwise is how a payment silently vanishes.
+        for e in self
+            .db
+            .history
+            .iter_mut()
+            .filter(|e| e.direction == Direction::Sent && e.height.is_some())
+        {
+            let still_spent =
+                !e.spent_commits.is_empty() && e.spent_commits.iter().all(|c| spent.contains(c));
+            if !still_spent {
+                e.height = None;
+            }
+        }
+
+        if before != self.db.outputs.len() {
+            self.db.scanned_to = blocks.last().map(|b| b.header.height.0).unwrap_or(0);
+        }
+    }
+
+    /// Sends that were confirmed and are not any more, newest first.
+    ///
+    /// A caller that still holds the transaction can resubmit these. Nothing
+    /// else can: block bodies are aggregated, so a discarded block cannot be
+    /// taken apart into the transactions it contained, and the node has no way
+    /// to put them back in its own mempool.
+    pub fn unconfirmed_sends(&self) -> Vec<&HistoryEntry> {
+        self.db
+            .history
+            .iter()
+            .filter(|e| e.direction == Direction::Sent && e.is_pending())
+            .collect()
     }
 
     /// Balance split into spendable, immature and pending-outgoing.
@@ -782,6 +875,82 @@ mod tests {
                 .address_string(),
             before,
             "the original seed must be untouched"
+        );
+        fs::remove_dir_all(&d).ok();
+    }
+
+    /// A reorg that discards a block must discard what it contained.
+    ///
+    /// Before this, a coin received in a block that lost a reorg stayed in the
+    /// wallet as spendable balance no node would accept, and a payment that had
+    /// been undone still read "confirmed".
+    #[test]
+    fn a_discarded_block_takes_its_outputs_with_it() {
+        let d = tmpdir("reorg-drop");
+        let mut w = Wallet::open(&d, NetworkId::Devnet, "w.seed").unwrap();
+        let ctx = NetworkId::Devnet.proof_context();
+        let reward = 20 * DARKS_PER_NIGHT;
+
+        let mk = |w: &Wallet, height: u64| {
+            let cb = build_coinbase(&w.address(), reward, height, ctx).unwrap();
+            let body = BlockBody::aggregate(&[cb]);
+            let mut ledger = LedgerState::genesis();
+            ledger
+                .apply_block(&body, Height(height), reward, ctx)
+                .unwrap();
+            Block {
+                header: nightfall_consensus::BlockHeader {
+                    version: nightfall_types::PROTOCOL_VERSION,
+                    height: Height(height),
+                    prev_hash: nightfall_types::Hash256::ZERO,
+                    body_root: body.hash(),
+                    utxo_root: ledger.utxo_root(),
+                    kernel_sum: ledger.kernel_sum(),
+                    timestamp_unix: 1_800_000_000 + height,
+                    difficulty: 1,
+                    nonce: height,
+                    reward_darks: reward,
+                },
+                body,
+            }
+        };
+
+        // Two blocks, both ours.
+        let a = mk(&w, 0);
+        let b = mk(&w, 1);
+        w.scan_blocks(&[a.clone(), b]).unwrap();
+        assert_eq!(w.outputs().len(), 2);
+        assert_eq!(w.balance().darks(), 2 * reward);
+
+        // A reorg replaces height 1 with a block that is not ours. Rescanning
+        // the canonical chain from genesis must let the old coin go.
+        let stranger = WalletKeys::generate();
+        let cb = build_coinbase(&stranger.address(), reward, 1, ctx).unwrap();
+        let body = BlockBody::aggregate(&[cb]);
+        let mut ledger = LedgerState::genesis();
+        ledger.apply_block(&body, Height(1), reward, ctx).unwrap();
+        let b2 = Block {
+            header: nightfall_consensus::BlockHeader {
+                version: nightfall_types::PROTOCOL_VERSION,
+                height: Height(1),
+                prev_hash: nightfall_types::Hash256::ZERO,
+                body_root: body.hash(),
+                utxo_root: ledger.utxo_root(),
+                kernel_sum: ledger.kernel_sum(),
+                timestamp_unix: 1_800_000_099,
+                difficulty: 1,
+                nonce: 99,
+                reward_darks: reward,
+            },
+            body,
+        };
+
+        w.scan_blocks(&[a, b2]).unwrap();
+        assert_eq!(w.outputs().len(), 1, "the replaced block's output must go");
+        assert_eq!(
+            w.balance().darks(),
+            reward,
+            "balance must not include a coin the chain no longer has"
         );
         fs::remove_dir_all(&d).ok();
     }

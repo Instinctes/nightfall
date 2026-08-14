@@ -75,6 +75,12 @@ pub struct NodeInner {
     pub best_peer_height: u64,
     /// When `best_peer_height` was last confirmed by a peer.
     pub best_peer_seen: u64,
+    /// When we last made progress towards a peer's reported height.
+    ///
+    /// Reset whenever our tip moves. If it stops moving while a peer still
+    /// claims to be ahead, the gap is a fork rather than lag, and mining
+    /// resumes rather than waiting on something unreachable.
+    pub behind_since: u64,
 }
 
 /// Upper bound on buffered branch blocks. A fork deeper than this is past
@@ -126,8 +132,12 @@ impl NodeInner {
         }
     }
 
-    fn bump_tip(&self) {
+    fn bump_tip(&mut self) {
         self.tip_epoch.fetch_add(1, Ordering::SeqCst);
+        // Our chain moved, so whatever gap remains is being closed. Anything
+        // that stops moving while a peer claims more is a fork, and the mining
+        // hold-off gives up on it — see MAX_CATCHUP_WAIT_SECS.
+        self.behind_since = now_unix();
     }
 
     pub fn submit_tx(&mut self, tx: Transaction) -> Result<String, String> {
@@ -262,6 +272,7 @@ impl NodeHandle {
             branch: HashMap::new(),
             best_peer_height: 0,
             best_peer_seen: 0,
+            behind_since: 0,
         };
         let state: SharedState = Arc::new(Mutex::new(inner));
 
@@ -1039,15 +1050,41 @@ fn fetch_full_chain(
     Ok(all)
 }
 
-/// How far behind the best peer we are, or `None` if we are current.
+/// How long a node will hold mining back while it believes it is behind.
 ///
-/// `None` also covers having no peers at all: there is nothing to be behind,
-/// and a network has to start somewhere.
+/// This is a bound on *how wrong the belief may be*, not a tuning parameter.
+/// Peers report a height, not a chain. On a fork the other side reports a
+/// number that is unreachable from where we stand — not because we are behind,
+/// but because we are somewhere else. Waiting for it means waiting forever, and
+/// two nodes on opposite branches will do it to each other simultaneously.
+///
+/// That is exactly what happened: both chains stopped growing while every node
+/// politely waited for the other. So the wait now expires. Mining on a chain
+/// that turns out to be the lighter one wastes that miner's own electricity;
+/// a network where nobody mines is broken for everyone.
+const MAX_CATCHUP_WAIT_SECS: u64 = 45;
+
+/// How far behind the best peer we are, or `None` if we should mine anyway.
+///
+/// `None` covers three cases, and the third is the important one:
+///
+/// - we are level with, or ahead of, every peer;
+/// - we have no peers at all — nothing to be behind, and a network has to
+///   start somewhere;
+/// - we have been waiting too long, which means the gap is a fork rather than
+///   lag, and waiting cannot close it.
 pub fn blocks_behind(state: &SharedState) -> Option<u64> {
     let g = state.lock().ok()?;
     let ours = g.chain.tip_height().map(|h| h.0).unwrap_or(0);
-    let best = g.best_peer_height;
-    (best > ours).then(|| best - ours)
+    if g.best_peer_height <= ours {
+        return None;
+    }
+    // Sync is either working, in which case our height keeps moving and this
+    // stays fresh, or it is not, in which case waiting achieves nothing.
+    if now_unix().saturating_sub(g.behind_since) > MAX_CATCHUP_WAIT_SECS {
+        return None;
+    }
+    Some(g.best_peer_height - ours)
 }
 
 fn mining_loop(state: SharedState) {
