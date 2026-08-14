@@ -4,8 +4,8 @@
 #   ./scripts/build-macos-dmgs.sh
 #
 # Produces, under wallets/:
-#   NIGHTFALLCOIN-Core-<version>-macOS-arm64.dmg   Apple Silicon
-#   NIGHTFALLCOIN-Core-<version>-macOS-intel.dmg   Intel
+#   NIGHTFALLCOIN-Core-<version>-macOS-arm64.dmg   Apple Silicon, macOS 11+
+#   NIGHTFALLCOIN-Core-<version>-macOS-intel.dmg   Intel, macOS 10.15+
 #
 # The version is in the filename on purpose. Without it a new release
 # overwrites the previous file at the same URL, and every cache between here
@@ -15,13 +15,23 @@
 # stale cache or a tampered download. Distinct names make that impossible:
 # a URL always refers to exactly one file.
 #
-# Both target macOS 12.5 or newer. Neither is code-signed — see wallets/README.md.
+# Neither is code-signed — see wallets/README.md.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/wallets"
 WORK="$ROOT/target/macos-bundle"
-export MACOSX_DEPLOYMENT_TARGET=12.5
+# Per-architecture minimums, because they are not the same question.
+#
+# Intel goes back to Catalina (10.15). Nothing in this app needs anything newer
+# — the GUI is OpenGL through glow, not Metal — and Intel Macs stuck on an old
+# release are exactly the machines with spare CPU cycles to mine with. Raising
+# the bar to 12.5 excluded them for no technical reason.
+#
+# Apple Silicon cannot go below 11.0: ARM Macs did not exist before Big Sur, so
+# a lower target would be a claim about machines that never shipped.
+MIN_MACOS_INTEL=10.15
+MIN_MACOS_ARM=11.0
 
 VERSION="$(grep -m1 '^version' "$ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
 BUNDLE_ID="cash.nightfall.core"
@@ -40,15 +50,32 @@ fi
 
 # ------------------------------------------------------------- binaries -----
 build_target() {
-    local TRIPLE="$1"
-    echo "==> Building $TRIPLE"
-    (cd "$ROOT" && cargo build --release --target "$TRIPLE" \
+    local TRIPLE="$1" MIN="$2"
+    echo "==> Building $TRIPLE (macOS $MIN+)"
+    # Set per invocation rather than once at the top: the two architectures have
+    # different floors, and a stale value from the previous build would silently
+    # bake the wrong minimum into the binary.
+    (cd "$ROOT" && MACOSX_DEPLOYMENT_TARGET="$MIN" cargo build --release --target "$TRIPLE" \
         -p nightfall-core -p nightfall-node -p nightfall-wallet)
+
+    # Confirm what the binary actually declares, rather than what we asked for.
+    # A dependency that hardcodes its own target would otherwise go unnoticed
+    # until a user on an older release reports that nothing opens.
+    local GOT
+    GOT="$(vtool -show-build-version "$ROOT/target/$TRIPLE/release/nightfall-core" 2>/dev/null \
+        | awk '/minos/ {print $2; exit}')"
+    if [[ -n "$GOT" ]]; then
+        echo "    declares minos $GOT"
+        if [[ "$GOT" != "$MIN" ]]; then
+            echo "!! expected minos $MIN, binary says $GOT" >&2
+            exit 1
+        fi
+    fi
 }
 
 # ------------------------------------------------------------- bundle -------
 make_app() {
-    local LABEL="$1" TRIPLE="$2"
+    local LABEL="$1" TRIPLE="$2" MIN="$3"
     local APP="$WORK/$LABEL/$APP_NAME.app"
     local BIN="$ROOT/target/$TRIPLE/release"
 
@@ -90,7 +117,7 @@ LAUNCH
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
-    <key>LSMinimumSystemVersion</key><string>12.5</string>
+    <key>LSMinimumSystemVersion</key><string>$MIN</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSHumanReadableCopyright</key><string>NIGHTFALLCOIN — fair launch, no premine</string>
 </dict>
@@ -138,11 +165,11 @@ TXT
 
 mkdir -p "$OUT"
 
-build_target aarch64-apple-darwin
-build_target x86_64-apple-darwin
+build_target aarch64-apple-darwin "$MIN_MACOS_ARM"
+build_target x86_64-apple-darwin "$MIN_MACOS_INTEL"
 
-make_app arm64 aarch64-apple-darwin
-make_app intel x86_64-apple-darwin
+make_app arm64 aarch64-apple-darwin "$MIN_MACOS_ARM"
+make_app intel x86_64-apple-darwin "$MIN_MACOS_INTEL"
 
 echo "==> Packaging"
 make_dmg arm64 "NIGHTFALLCOIN-Core-${VERSION}-macOS-arm64.dmg"
