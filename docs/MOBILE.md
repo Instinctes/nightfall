@@ -272,7 +272,7 @@ Two things the UI must get right because the protocol is unforgiving:
 | 1 | Birth height | — *(done)* |
 | 2 | BIP-39 mnemonic | — *(done)* |
 | 3 | `scan_feed` RPC | — *(done)* |
-| 4 | View tags in the output format | — *(done, protocol v6)* |
+| 4 | View tags in the output format | — *(done, shipped in v6, carried into v7)* |
 | 5 | `nightfall-mobile` uniffi crate | 1–4 |
 | 6 | TLS endpoint on the seed node | 3 |
 | 7 | Android app | 5, 6 |
