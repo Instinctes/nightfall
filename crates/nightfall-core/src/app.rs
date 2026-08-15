@@ -190,31 +190,53 @@ impl App {
 
     /// Wallet scanning runs off the UI thread — trial-decrypting every output on
     /// the chain must never stall a frame.
+    ///
+    /// The scan is tied to the node's tip, not to a timer. A 3-second poll
+    /// meant a payment could sit on disk for three seconds after the block
+    /// arrived, and a reorg could be missed for the same window. `wait_tip_change`
+    /// wakes this thread the moment the chain moves; a 30-second timeout is
+    /// only a safety net if a notify is lost.
     fn spawn_sync_worker(&self, node: Arc<NodeHandle>) {
         let wallet = Arc::clone(&self.wallet);
         let signal = Arc::clone(&self.sync_signal);
         let syncing = Arc::clone(&self.syncing);
 
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_secs(3));
-            syncing.store(true, Ordering::SeqCst);
-            let result = {
-                let mut w = match wallet.lock() {
-                    Ok(w) => w,
-                    Err(_) => {
-                        syncing.store(false, Ordering::SeqCst);
-                        continue;
-                    }
-                };
-                w.sync_from_node(&node).map_err(|e| e.to_string())
-            };
-            syncing.store(false, Ordering::SeqCst);
-            if let Ok(mut slot) = signal.lock() {
-                *slot = Some(result);
+        std::thread::spawn(move || {
+            let mut seen = node.tip_generation();
+            // First pass: pick up whatever is already on disk.
+            run_wallet_scan(&wallet, &node, &signal, &syncing);
+            loop {
+                seen = node.wait_tip_change(seen, Duration::from_secs(30));
+                run_wallet_scan(&wallet, &node, &signal, &syncing);
             }
         });
     }
+}
 
+fn run_wallet_scan(
+    wallet: &Arc<Mutex<WalletState>>,
+    node: &NodeHandle,
+    signal: &Arc<Mutex<Option<Result<u32, String>>>>,
+    syncing: &Arc<AtomicBool>,
+) {
+    syncing.store(true, Ordering::SeqCst);
+    let result = {
+        let mut w = match wallet.lock() {
+            Ok(w) => w,
+            Err(_) => {
+                syncing.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+        w.sync_from_node(node).map_err(|e| e.to_string())
+    };
+    syncing.store(false, Ordering::SeqCst);
+    if let Ok(mut slot) = signal.lock() {
+        *slot = Some(result);
+    }
+}
+
+impl App {
     pub fn is_mining(&self) -> bool {
         self.node.as_ref().map(|n| n.is_mining()).unwrap_or(false)
     }

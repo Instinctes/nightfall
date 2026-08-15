@@ -2,5 +2,6 @@
 
 pub mod rpc;
 pub mod runtime;
+pub mod session;
 
 pub use runtime::{NodeConfig, NodeHandle, NodeInner, SharedState, StatusSnap};

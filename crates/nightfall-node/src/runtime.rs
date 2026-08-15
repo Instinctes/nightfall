@@ -1,12 +1,15 @@
 //! Node state, P2P server, and the mining loop.
 
 use crate::rpc;
+use crate::session::{
+    fanout_block, fanout_tx, inbound_key, outbound_key, SessionHandle, SessionPool,
+};
 use nightfall_consensus::{Block, BlockTemplate, Chain, Mempool};
 use nightfall_crypto::{default_threads, mine_parallel, Address};
 use nightfall_ledger::Transaction;
 use nightfall_p2p::{
-    broadcast_block, broadcast_tx, connect_peer, dialable_addr, handshake, read_msg, write_msg,
-    PeerMsg, MAX_BLOCKS_PER_REQUEST, MAX_PEERS_PER_MSG,
+    broadcast_block, connect_peer, dialable_addr, handshake, read_msg, write_msg, PeerMsg,
+    MAX_BLOCKS_PER_REQUEST, MAX_PEERS_PER_MSG,
 };
 use nightfall_storage::{now_unix, ChainStore};
 use nightfall_types::NetworkId;
@@ -16,17 +19,17 @@ use std::io::BufReader;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
 pub type SharedState = Arc<Mutex<NodeInner>>;
 
-/// Maximum simultaneous peer connections.
+/// Maximum simultaneous peer connections (live sessions + address book).
 const MAX_PEERS: usize = 64;
-/// How often to re-sync from peers. Short, because two miners that drift
-/// apart must reconverge before they waste much work.
-const SYNC_INTERVAL: Duration = Duration::from_secs(8);
+/// How often live sessions are asked for their tip. Push is the main path;
+/// this is the safety net for a missed `InvBlock`.
+const STATUS_TICK: Duration = Duration::from_secs(4);
 
 pub struct NodeConfig {
     pub network: NetworkId,
@@ -99,6 +102,14 @@ pub struct NodeInner {
     /// spends minutes doing the same arithmetic n times to arrive at the answer
     /// the first one already had. One at a time; the rest skip the round.
     pub reorg_in_flight: Arc<AtomicBool>,
+    /// Sockets that are open right now. Announce writes here. A wallet behind
+    /// NAT stays in real time because its outbound to a seed lives in this
+    /// pool, not because anyone can dial it back.
+    pub sessions: Arc<SessionPool>,
+    /// Generation counter + condvar. Bumped with the tip so a wallet scan
+    /// thread can sleep until there is something new to look at, instead of
+    /// polling the whole chain every few seconds.
+    pub tip_notify: Arc<(Mutex<u64>, Condvar)>,
 }
 
 /// Upper bound on buffered branch blocks. A fork deeper than this is past
@@ -156,6 +167,10 @@ impl NodeInner {
         // that stops moving while a peer claims more is a fork, and the mining
         // hold-off gives up on it — see MAX_CATCHUP_WAIT_SECS.
         self.behind_since = now_unix();
+        if let Ok(mut gen) = self.tip_notify.0.lock() {
+            *gen = gen.wrapping_add(1);
+        }
+        self.tip_notify.1.notify_all();
     }
 
     pub fn submit_tx(&mut self, tx: Transaction) -> Result<String, String> {
@@ -164,25 +179,12 @@ impl NodeInner {
         if !self.mempool.insert(tx.clone()) {
             return Ok(id);
         }
-        let peers: Vec<String> = self.dialable_peers();
-        let (network, genesis, height, tip, port) = (
-            self.network,
-            self.chain.genesis_hash,
-            self.chain.tip_height().map(|h| h.0).unwrap_or(0),
-            self.chain.tip_hash(),
-            self.listen_port,
-        );
-        // Same reasoning as announce_block: one slow peer must not delay the
-        // rest, and a transaction nobody hears about never gets mined.
-        for addr in peers {
-            let tx = tx.clone();
-            thread::spawn(move || {
-                if let Ok(mut s) = connect_peer(&addr, 3000) {
-                    if handshake(&mut s, network, genesis, height, tip, port).is_ok() {
-                        let _ = broadcast_tx(&mut s, &tx);
-                    }
-                }
-            });
+        // Live sockets first. A NAT peer that is holding a connection to us
+        // hears the transaction immediately; dialling their listen port would
+        // just time out.
+        fanout_tx(&self.sessions.all(), &tx);
+        if self.sessions.is_empty() {
+            fallback_dial_tx(&self.dialable_peers(), &tx, self);
         }
         Ok(id)
     }
@@ -213,41 +215,66 @@ impl NodeInner {
     fn forget_incompatible(&mut self, addr: &str) {
         self.peer_addrs.remove(addr);
         self.bootstrap.retain(|a| a != addr);
+        self.sessions.remove(addr);
+        self.sessions.remove(&outbound_key(addr));
+        self.sessions.remove(&inbound_key(addr));
         tracing::info!("dropped {addr}: incompatible genesis");
     }
 
-    /// Announce a block. Runs off-thread so block propagation never blocks the
-    /// state lock — v4 dialled every peer synchronously while holding it.
+    /// Announce a block on every live socket.
+    ///
+    /// The old path dialled each listen address from scratch. That is how a
+    /// miner behind NAT never heard the next block: nobody could complete the
+    /// SYN. Writing the block onto the socket the peer already opened is the
+    /// whole difference between "in real time" and "on the next poll".
     pub fn announce_block(&self, block: Block) {
-        let peers = self.dialable_peers();
-        let network = self.network;
-        let genesis = self.chain.genesis_hash;
-        let height = self.chain.tip_height().map(|h| h.0).unwrap_or(0);
-        let tip = self.chain.tip_hash();
-        let port = self.listen_port;
-
-        // One thread per peer, not one thread walking all of them.
-        //
-        // Sequentially, a peer that accepts the connection and then stalls
-        // costs its socket timeout, and every peer after it in the list waits
-        // — for a block that is only useful immediately. With a new thread
-        // spawned per mined block, those pile up behind each other.
-        //
-        // This is the main propagation path: the periodic sync is the fallback
-        // for what it misses. Getting it wrong made a node on the same network
-        // receive one block every three minutes while the miner produced one
-        // every few seconds, with no error anywhere and every connection
-        // succeeding.
-        for addr in peers {
-            let block = block.clone();
-            thread::spawn(move || {
-                if let Ok(mut s) = connect_peer(&addr, 5000) {
-                    if handshake(&mut s, network, genesis, height, tip, port).is_ok() {
-                        let _ = broadcast_block(&mut s, &block);
-                    }
-                }
-            });
+        let live = self.sessions.all();
+        if live.is_empty() {
+            fallback_dial_block(&self.dialable_peers(), &block, self);
+            return;
         }
+        fanout_block(&live, &block);
+    }
+}
+
+/// Last-resort dial when we have no live sessions yet (process just started,
+/// or every socket dropped at once). Seeds only — learned NAT addresses will
+/// not answer.
+fn fallback_dial_block(peers: &[String], block: &Block, inner: &NodeInner) {
+    let network = inner.network;
+    let genesis = inner.chain.genesis_hash;
+    let height = inner.chain.tip_height().map(|h| h.0).unwrap_or(0);
+    let tip = inner.chain.tip_hash();
+    let port = inner.listen_port;
+    for addr in peers.iter().take(4) {
+        let block = block.clone();
+        let addr = addr.clone();
+        thread::spawn(move || {
+            if let Ok(mut s) = connect_peer(&addr, 3000) {
+                if handshake(&mut s, network, genesis, height, tip, port).is_ok() {
+                    let _ = broadcast_block(&mut s, &block);
+                }
+            }
+        });
+    }
+}
+
+fn fallback_dial_tx(peers: &[String], tx: &Transaction, inner: &NodeInner) {
+    let network = inner.network;
+    let genesis = inner.chain.genesis_hash;
+    let height = inner.chain.tip_height().map(|h| h.0).unwrap_or(0);
+    let tip = inner.chain.tip_hash();
+    let port = inner.listen_port;
+    for addr in peers.iter().take(4) {
+        let tx = tx.clone();
+        let addr = addr.clone();
+        thread::spawn(move || {
+            if let Ok(mut s) = connect_peer(&addr, 3000) {
+                if handshake(&mut s, network, genesis, height, tip, port).is_ok() {
+                    let _ = nightfall_p2p::broadcast_tx(&mut s, &tx);
+                }
+            }
+        });
     }
 }
 
@@ -273,11 +300,14 @@ pub struct StatusSnap {
     /// How far behind the best peer, so the UI can say why mining is paused
     /// instead of appearing to do nothing.
     pub blocks_behind: u64,
+    /// Sockets that are actually open, not entries in the address book.
+    pub live_peers: usize,
 }
 
 pub struct NodeHandle {
     state: SharedState,
     mining_enabled: Arc<AtomicBool>,
+    tip_notify: Arc<(Mutex<u64>, Condvar)>,
 }
 
 impl NodeHandle {
@@ -290,6 +320,8 @@ impl NodeHandle {
         let tip_epoch = Arc::new(AtomicU64::new(0));
         let hashes_total = Arc::new(AtomicU64::new(0));
         let blocks_found = Arc::new(AtomicU64::new(0));
+        let sessions = Arc::new(SessionPool::new());
+        let tip_notify = Arc::new((Mutex::new(0u64), Condvar::new()));
 
         let inner = NodeInner {
             chain,
@@ -335,6 +367,8 @@ impl NodeHandle {
             behind_since: now_unix(),
             peer_agents: HashMap::new(),
             reorg_in_flight: Arc::new(AtomicBool::new(false)),
+            sessions: Arc::clone(&sessions),
+            tip_notify: Arc::clone(&tip_notify),
         };
         let state: SharedState = Arc::new(Mutex::new(inner));
 
@@ -346,49 +380,8 @@ impl NodeHandle {
 
         rpc::spawn_rpc(cfg.rpc_listen.clone(), Arc::clone(&state));
 
-        {
-            let st = Arc::clone(&state);
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(200));
-                loop {
-                    // `dialable_peers` includes seeds, `--connect`, and
-                    // whatever `peers.json` remembered. The previous list
-                    // dropped the last of those, so a hand-added peer was
-                    // gone after a restart — mining alone again.
-                    let targets: Vec<String> = {
-                        let g = st.lock().unwrap();
-                        g.dialable_peers()
-                    };
-                    // One thread per peer, not one after another.
-                    //
-                    // Sequentially, a single unresponsive peer costs the whole
-                    // round its socket timeout, and every peer behind it waits.
-                    // After the v7 reset the peer list still held addresses
-                    // from the abandoned chain: they accepted the connection,
-                    // failed the genesis check, and burned five seconds each.
-                    // A round took longer than the interval between rounds, so
-                    // the node that actually needed blocks was reached about
-                    // once a minute and the network crawled — with every log
-                    // line looking healthy.
-                    let handles: Vec<_> = targets
-                        .into_iter()
-                        .take(MAX_PEERS)
-                        .map(|addr| {
-                            let st = Arc::clone(&st);
-                            thread::spawn(move || {
-                                if let Err(e) = sync_from_peer(&st, &addr) {
-                                    tracing::debug!("sync {addr}: {e}");
-                                }
-                            })
-                        })
-                        .collect();
-                    for h in handles {
-                        let _ = h.join();
-                    }
-                    thread::sleep(SYNC_INTERVAL);
-                }
-            });
-        }
+        spawn_outbound_supervisor(Arc::clone(&state));
+        spawn_status_ticker(Arc::clone(&state));
 
         if cfg.miner.is_some() {
             let st = Arc::clone(&state);
@@ -412,6 +405,7 @@ impl NodeHandle {
         Ok(Self {
             state,
             mining_enabled,
+            tip_notify,
         })
     }
 
@@ -495,8 +489,176 @@ impl NodeHandle {
             kernels: g.chain.ledger.kernels.count,
             started_at: g.started_at,
             blocks_behind: catchup_behind(&g).unwrap_or(0),
+            live_peers: g.sessions.len(),
         })
     }
+
+    /// Sleep until the tip moves, or `timeout` elapses. Returns the current
+    /// generation so the caller can wait again without missing a bump.
+    pub fn wait_tip_change(&self, seen: u64, timeout: Duration) -> u64 {
+        let (lock, cv) = &*self.tip_notify;
+        let Ok(guard) = lock.lock() else {
+            return seen;
+        };
+        if *guard != seen {
+            return *guard;
+        }
+        match cv.wait_timeout(guard, timeout) {
+            Ok((g, _)) => *g,
+            Err(_) => seen,
+        }
+    }
+
+    pub fn tip_generation(&self) -> u64 {
+        self.tip_notify.0.lock().map(|g| *g).unwrap_or(0)
+    }
+}
+
+// -------------------------------------------------------- live sessions ---
+
+fn spawn_outbound_supervisor(state: SharedState) {
+    thread::spawn(move || {
+        let mut launched: HashSet<String> = HashSet::new();
+        loop {
+            let targets = outbound_targets(&state);
+            for addr in targets {
+                if launched.contains(&addr) {
+                    continue;
+                }
+                launched.insert(addr.clone());
+                let st = Arc::clone(&state);
+                thread::spawn(move || stay_connected(st, addr));
+            }
+            thread::sleep(Duration::from_secs(2));
+        }
+    });
+}
+
+fn outbound_targets(state: &SharedState) -> Vec<String> {
+    let Ok(g) = state.lock() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for s in g.network.seed_nodes() {
+        out.push((*s).to_string());
+    }
+    for a in g.dialable_peers() {
+        if !out.contains(&a) {
+            out.push(a);
+        }
+    }
+    out
+}
+
+fn stay_connected(state: SharedState, addr: String) {
+    let mut backoff = Duration::from_millis(250);
+    loop {
+        match open_outbound_session(&state, &addr) {
+            Ok(()) => {
+                backoff = Duration::from_millis(250);
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("genesis mismatch")
+                    || msg.contains("network mismatch")
+                    || msg.contains("self-dial")
+                {
+                    if msg.contains("genesis") || msg.contains("network") {
+                        if let Ok(mut g) = state.lock() {
+                            g.forget_incompatible(&addr);
+                        }
+                    }
+                    tracing::info!("outbound {addr} abandoned: {msg}");
+                    return;
+                }
+                tracing::debug!("outbound {addr}: {e}");
+            }
+        }
+        thread::sleep(backoff);
+        backoff = (backoff * 2).min(Duration::from_secs(8));
+    }
+}
+
+fn is_self_connection(stream: &TcpStream, listen_port: u16) -> bool {
+    match (stream.local_addr(), stream.peer_addr()) {
+        (Ok(local), Ok(peer)) => local.ip() == peer.ip() && peer.port() == listen_port,
+        _ => false,
+    }
+}
+
+fn open_outbound_session(state: &SharedState, addr: &str) -> anyhow::Result<()> {
+    let mut stream = connect_peer(addr, 8_000)?;
+    prepare_live_socket(&stream)?;
+
+    let (network, genesis, our_h, tip, port) = {
+        let g = state.lock().unwrap();
+        (
+            g.network,
+            g.chain.genesis_hash,
+            g.chain.tip_height().map(|h| h.0).unwrap_or(0),
+            g.chain.tip_hash(),
+            g.listen_port,
+        )
+    };
+
+    if is_self_connection(&stream, port) {
+        anyhow::bail!("self-dial");
+    }
+
+    let (peer_h, peer_tip) = handshake(&mut stream, network, genesis, our_h, tip, port)?;
+    note_peer_height(state, peer_h);
+    state.lock().unwrap().peer_addrs.insert(addr.to_string());
+
+    let write_clone = stream.try_clone()?;
+    let sess = {
+        let g = state.lock().unwrap();
+        g.sessions.insert(outbound_key(addr), write_clone, true)
+    };
+    tracing::info!("outbound session {addr} height={peer_h}");
+
+    // Catch up on this socket before we sit in the read loop. A NAT wallet
+    // that just opened Core is often tens of blocks behind; one GetBlocks
+    // here, then the loop chains pages if the peer is still ahead.
+    if peer_h > our_h || peer_tip != tip.to_hex() {
+        let _ = sess.send(&PeerMsg::GetBlocks {
+            from_height: our_h.saturating_sub(1),
+            limit: MAX_BLOCKS_PER_REQUEST,
+        });
+    } else if peer_h < our_h {
+        // They are behind us. Push from their tip on this same session —
+        // do not do request/response on it, the read loop is about to own
+        // the socket. A fork is handled when the first pushed block fails
+        // to connect and `consider_branch` runs on their side.
+        push_blocks_via_session(state, &sess, peer_h, addr);
+    }
+
+    let mut reader = BufReader::new(stream);
+    let result = peer_io_loop(&mut reader, &sess, state, addr, peer_h);
+    if let Ok(g) = state.lock() {
+        g.sessions.remove(&outbound_key(addr));
+    }
+    result
+}
+
+fn spawn_status_ticker(state: SharedState) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(400));
+        loop {
+            let sessions = {
+                let Ok(g) = state.lock() else {
+                    thread::sleep(STATUS_TICK);
+                    continue;
+                };
+                g.sessions.all()
+            };
+            for s in sessions {
+                if let Err(e) = s.send(&PeerMsg::GetStatus) {
+                    tracing::debug!("status tick {}: {e}", s.key);
+                }
+            }
+            thread::sleep(STATUS_TICK);
+        }
+    });
 }
 
 // -------------------------------------------------------------------- p2p ---
@@ -514,9 +676,9 @@ fn p2p_listen_loop(addr: String, state: SharedState) {
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
-                let peer_count = state.lock().map(|g| g.peer_addrs.len()).unwrap_or(0);
-                if peer_count >= MAX_PEERS {
-                    tracing::debug!("peer limit reached, dropping connection");
+                let live = state.lock().map(|g| g.sessions.len()).unwrap_or(MAX_PEERS);
+                if live >= MAX_PEERS {
+                    tracing::debug!("session limit reached, dropping connection");
                     continue;
                 }
                 let st = Arc::clone(&state);
@@ -536,17 +698,16 @@ fn p2p_listen_loop(addr: String, state: SharedState) {
 }
 
 fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> anyhow::Result<()> {
-    stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+    prepare_live_socket(&stream)?;
     let mut reader = BufReader::new(stream.try_clone()?);
-    let mut writer = stream;
+    let mut hello_writer = stream.try_clone()?;
 
     let (network, genesis) = {
         let g = state.lock().unwrap();
         (g.network, g.chain.genesis_hash)
     };
 
-    match read_msg(&mut reader)? {
+    let (session_key, peer_height) = match read_msg(&mut reader)? {
         PeerMsg::Hello {
             wire,
             network: net,
@@ -572,7 +733,7 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
                     }
                 }
                 write_msg(
-                    &mut writer,
+                    &mut hello_writer,
                     &PeerMsg::Error {
                         message: format!(
                             "wire version mismatch — you speak v{wire}, this network \
@@ -586,7 +747,7 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
             }
             if net != network {
                 write_msg(
-                    &mut writer,
+                    &mut hello_writer,
                     &PeerMsg::Error {
                         message: "network mismatch".into(),
                     },
@@ -604,7 +765,7 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
                     }
                 }
                 write_msg(
-                    &mut writer,
+                    &mut hello_writer,
                     &PeerMsg::Error {
                         message: "genesis mismatch".into(),
                     },
@@ -624,6 +785,9 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
                     g.peer_agents.insert(addr, agent.clone());
                 }
             }
+            // Always key inbound sockets by the observed connection, never
+            // by the advertised listen address. See `outbound_key`.
+            let session_key = inbound_key(&peer_label);
             note_peer_height(&state, peer_height);
 
             let (height, tip, our_port) = {
@@ -635,7 +799,7 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
                 )
             };
             write_msg(
-                &mut writer,
+                &mut hello_writer,
                 &PeerMsg::HelloOk {
                     wire: nightfall_types::WIRE_VERSION,
                     network,
@@ -645,23 +809,51 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
                     listen_port: our_port,
                 },
             )?;
+            (session_key, peer_height)
         }
         other => {
             write_msg(
-                &mut writer,
+                &mut hello_writer,
                 &PeerMsg::Error {
                     message: format!("expected hello, got {other:?}"),
                 },
             )?;
             return Ok(());
         }
-    }
+    };
 
+    let sess = {
+        let g = state.lock().unwrap();
+        g.sessions.insert(session_key.clone(), hello_writer, false)
+    };
+    let result = peer_io_loop(&mut reader, &sess, &state, &peer_label, peer_height);
+    if let Ok(g) = state.lock() {
+        g.sessions.remove(&session_key);
+    }
+    result
+}
+
+fn prepare_live_socket(stream: &TcpStream) -> std::io::Result<()> {
+    stream.set_nodelay(true)?;
+    // Long read timeout: the peer may be quiet between 15-second blocks.
+    // Writes are short so a stuck announce cannot pin a session forever.
+    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    Ok(())
+}
+
+fn peer_io_loop(
+    reader: &mut BufReader<TcpStream>,
+    sess: &SessionHandle,
+    state: &SharedState,
+    peer_label: &str,
+    mut last_peer_height: u64,
+) -> anyhow::Result<()> {
     loop {
-        let msg = match read_msg(&mut reader) {
+        let msg = match read_msg(reader) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                write_msg(&mut writer, &PeerMsg::Ping { nonce: now_unix() })?;
+                sess.send(&PeerMsg::Ping { nonce: now_unix() })?;
                 continue;
             }
             // A peer that sends us garbage or an oversized frame is dropped,
@@ -670,7 +862,7 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
         };
 
         match msg {
-            PeerMsg::Ping { nonce } => write_msg(&mut writer, &PeerMsg::Pong { nonce })?,
+            PeerMsg::Ping { nonce } => sess.send(&PeerMsg::Pong { nonce })?,
             PeerMsg::Pong { .. } => {}
 
             PeerMsg::GetPeers => {
@@ -681,7 +873,7 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
                         .take(MAX_PEERS_PER_MSG)
                         .collect()
                 };
-                write_msg(&mut writer, &PeerMsg::Peers { addrs })?;
+                sess.send(&PeerMsg::Peers { addrs })?;
             }
 
             PeerMsg::Peers { addrs } => {
@@ -701,21 +893,51 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
                     g.chain
                         .blocks_from(from_height, limit.min(MAX_BLOCKS_PER_REQUEST))
                 };
-                write_msg(&mut writer, &PeerMsg::Blocks { blocks })?;
+                sess.send(&PeerMsg::Blocks { blocks })?;
             }
 
             PeerMsg::GetStatus => {
                 let g = state.lock().unwrap();
-                write_msg(
-                    &mut writer,
-                    &PeerMsg::Status {
-                        height: g.chain.tip_height().map(|h| h.0).unwrap_or(0),
-                        tip: g.chain.tip_hash().to_hex(),
-                        bits: g.chain.next_difficulty() as u32,
-                        peers: g.peer_addrs.len(),
-                        mempool: g.mempool.len(),
-                    },
-                )?;
+                sess.send(&PeerMsg::Status {
+                    height: g.chain.tip_height().map(|h| h.0).unwrap_or(0),
+                    tip: g.chain.tip_hash().to_hex(),
+                    bits: g.chain.next_difficulty() as u32,
+                    peers: g.sessions.len(),
+                    mempool: g.mempool.len(),
+                })?;
+            }
+
+            PeerMsg::Status { height, tip, .. } => {
+                last_peer_height = height;
+                note_peer_height(state, height);
+                let (our_h, our_tip) = {
+                    let g = state.lock().unwrap();
+                    (
+                        g.chain.tip_height().map(|h| h.0).unwrap_or(0),
+                        g.chain.tip_hash().to_hex(),
+                    )
+                };
+                if height > our_h {
+                    sess.send(&PeerMsg::GetBlocks {
+                        from_height: our_h.saturating_sub(1),
+                        limit: MAX_BLOCKS_PER_REQUEST,
+                    })?;
+                } else if height >= our_h && tip != our_tip && sess.outbound {
+                    // Same height, different tip — a fork. Pull on a fresh
+                    // socket so the multiplexed session is not asked to do
+                    // request/response.
+                    let addr = sess
+                        .key
+                        .strip_prefix("out:")
+                        .unwrap_or(&sess.key)
+                        .to_string();
+                    let st = Arc::clone(state);
+                    thread::spawn(move || {
+                        if let Err(e) = sync_from_peer(&st, &addr) {
+                            tracing::debug!("reorg fetch {addr}: {e}");
+                        }
+                    });
+                }
             }
 
             PeerMsg::Block { block } => {
@@ -744,45 +966,39 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
                     // It did not extend our tip. If its parent is a block we
                     // hold, this is a competing branch rather than junk, and
                     // refusing to look at it is how a fork becomes permanent.
-                    //
-                    // That is not hypothetical. A node behind NAT can push
-                    // blocks but cannot be dialled, so it can never have its
-                    // chain *fetched* and evaluated. When two miners split by
-                    // two blocks, the heavier side pushed its branch every
-                    // round, every block was rejected for not fitting the tip,
-                    // and both sides stayed put — 53 blocks of work against 2,
-                    // and the 2 won by sitting still.
-                    consider_branch(&state, block, &peer_label);
+                    consider_branch(state, block, peer_label);
                 }
-                // Still no full chain download in response to a stray block:
-                // v4 answered every rejected block by pulling the peer's entire
-                // chain, which is free bandwidth amplification. What happens
-                // here uses only blocks the peer chose to send.
             }
 
             PeerMsg::Tx { tx } => {
-                let mut g = state.lock().unwrap();
-                match g.chain.precheck_tx(&tx) {
-                    Ok(()) => {
-                        g.mempool.insert(tx);
+                let newly = {
+                    let mut g = state.lock().unwrap();
+                    match g.chain.precheck_tx(&tx) {
+                        Ok(()) => g.mempool.insert(tx.clone()),
+                        Err(e) => {
+                            tracing::debug!("reject tx: {e}");
+                            false
+                        }
                     }
-                    Err(e) => tracing::debug!("reject tx: {e}"),
+                };
+                if newly {
+                    let g = state.lock().unwrap();
+                    fanout_tx(&g.sessions.all(), &tx);
                 }
             }
 
             PeerMsg::InvBlock { height, .. } => {
+                last_peer_height = last_peer_height.max(height);
+                note_peer_height(state, height);
                 let our_height = {
                     let g = state.lock().unwrap();
                     g.chain.tip_height().map(|h| h.0).unwrap_or(0)
                 };
                 if height > our_height {
-                    write_msg(
-                        &mut writer,
-                        &PeerMsg::GetBlocks {
-                            from_height: our_height.saturating_sub(1),
-                            limit: MAX_BLOCKS_PER_REQUEST,
-                        },
-                    )?;
+                    sess.send(&PeerMsg::GetBlocks {
+                        from_height: our_height.saturating_sub(1),
+                        limit: MAX_BLOCKS_PER_REQUEST,
+                    })?;
                 }
             }
 
@@ -790,12 +1006,33 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
                 if blocks.len() > MAX_BLOCKS_PER_REQUEST {
                     return Err(anyhow::anyhow!("peer sent an oversized block batch"));
                 }
-                let mut g = state.lock().unwrap();
-                if let Ok(n) = g.chain.try_ingest_blocks(blocks, now_unix()) {
-                    if n > 0 {
-                        g.bump_tip();
-                        let _ = g.persist();
-                        tracing::info!("extended +{n} from {peer_label}");
+                let n = {
+                    let mut g = state.lock().unwrap();
+                    match g.chain.try_ingest_blocks(blocks, now_unix()) {
+                        Ok(n) => {
+                            if n > 0 {
+                                g.bump_tip();
+                                let _ = g.persist();
+                                tracing::info!("extended +{n} from {peer_label}");
+                            }
+                            n
+                        }
+                        Err(_) => 0,
+                    }
+                };
+                // Keep pulling on this live socket until we catch the peer.
+                // One 128-block page per Status tick would take a minute to
+                // close a 2,000-block gap; chaining pages closes it now.
+                if n > 0 {
+                    let our_h = {
+                        let g = state.lock().unwrap();
+                        g.chain.tip_height().map(|h| h.0).unwrap_or(0)
+                    };
+                    if last_peer_height > our_h {
+                        sess.send(&PeerMsg::GetBlocks {
+                            from_height: our_h,
+                            limit: MAX_BLOCKS_PER_REQUEST,
+                        })?;
                     }
                 }
             }
@@ -1054,6 +1291,41 @@ fn push_blocks_to(state: &SharedState, stream: &mut TcpStream, from_height: u64,
 
     if sent > 0 {
         tracing::info!("pushed {sent} block(s) to {addr}, which was behind");
+    }
+}
+
+fn push_blocks_via_session(
+    state: &SharedState,
+    sess: &SessionHandle,
+    from_height: u64,
+    addr: &str,
+) {
+    let mut from = from_height;
+    let mut sent = 0usize;
+    while sent < PUSH_BATCH {
+        let batch = {
+            let Ok(g) = state.lock() else { return };
+            g.chain
+                .blocks_from(from, (PUSH_BATCH - sent).min(MAX_BLOCKS_PER_REQUEST))
+        };
+        if batch.is_empty() {
+            break;
+        }
+        let next = batch
+            .last()
+            .map(|b| b.header.height.0 + 1)
+            .unwrap_or(from + 1);
+        for block in batch {
+            if sess.send_block(&block).is_err() {
+                tracing::debug!("push to {addr} ended after {sent} block(s)");
+                return;
+            }
+            sent += 1;
+        }
+        from = next;
+    }
+    if sent > 0 {
+        tracing::info!("pushed {sent} block(s) to {addr} on live session");
     }
 }
 

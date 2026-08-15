@@ -215,7 +215,7 @@ The mobile endpoint is therefore a **separate, narrow, public surface**:
 |--|--|--|
 | Bind | loopback | public, TLS |
 | Auth | none | none needed — read-only + submit |
-| Methods | all, incl. `mine_one` | `status`, `scan_feed`, `submit_tx`, `get_utxo_root` |
+| Methods | all, incl. `mine_one` | `status`, `scan_feed`, `scan_subscribe`, `submit_tx`, `get_utxo_root` |
 | Transport | line JSON / TCP | HTTPS |
 
 Simplest correct deployment: run the node with RPC on loopback, put a reverse
@@ -235,6 +235,21 @@ That is roughly 150 bytes per output instead of 850 — about 5–6× less mobil
 data. The client asks for full ranges, never for specific commitments: asking
 for one output by name tells the node which output is yours and throws away the
 privacy that local scanning buys.
+
+### `scan_subscribe`
+
+The same page as `scan_feed`, but the TCP connection stays open. After the
+first page the node writes another line every time its tip moves, and an empty
+`heartbeat: true` page every 30 seconds if nothing happened. The phone scans
+each page locally with the same view key it would use on a one-shot `scan_feed`.
+Closing the socket is how it unsubscribes.
+
+A phone that polls `scan_feed` every few seconds is a phone that is always
+behind the next block and always burning radio. One long-lived subscribe is
+how a payment that lands while the app is open shows up before the user looks
+away.
+
+The CLI exposes this as `nightfall-wallet follow`.
 
 ---
 
@@ -272,6 +287,7 @@ Two things the UI must get right because the protocol is unforgiving:
 | 1 | Birth height | — *(done)* |
 | 2 | BIP-39 mnemonic | — *(done)* |
 | 3 | `scan_feed` RPC | — *(done)* |
+| 3b | `scan_subscribe` stream | 3 *(done)* |
 | 4 | View tags in the output format | — *(done, shipped in v6, carried into v7)* |
 | 5 | `nightfall-mobile` uniffi crate | 1–4 |
 | 6 | TLS endpoint on the seed node | 3 |

@@ -46,6 +46,8 @@ enum Commands {
     ExportViewKey,
     /// Pull blocks from the node and find outputs belonging to this wallet.
     Sync,
+    /// Stay connected to the node and scan every new block as it lands.
+    Follow,
     /// Discard local scan state and re-scan from genesis.
     Rescan,
     Balance,
@@ -154,6 +156,10 @@ fn main() -> anyhow::Result<()> {
             println!("balance........ {}", wallet.balance());
         }
 
+        Commands::Follow => {
+            follow(&mut wallet, &rpc)?;
+        }
+
         Commands::Balance => {
             println!("{}", wallet.balance());
             println!("outputs........ {}", wallet.spendable_count());
@@ -238,6 +244,62 @@ fn sync(wallet: &mut Wallet, rpc: &str, from: u64) -> anyhow::Result<u32> {
         return Ok(0);
     }
     wallet.scan_blocks(&all)
+}
+
+/// Open `scan_subscribe` and rescan whenever the tip moves.
+fn follow(wallet: &mut Wallet, rpc: &str) -> anyhow::Result<()> {
+    let n = sync(wallet, rpc, wallet.birth_height())?;
+    println!(
+        "initial scan... {n} new output(s), height {}",
+        wallet.scanned_to()
+    );
+    println!("balance........ {}", wallet.balance());
+    println!("following tip — Ctrl+C to stop");
+
+    let stream = TcpStream::connect(rpc)
+        .map_err(|e| anyhow::anyhow!("cannot reach nightfalld at {rpc}: {e}"))?;
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let mut writer = stream.try_clone()?;
+    let mut reader = BufReader::new(stream);
+
+    let req = json!({
+        "method": "scan_subscribe",
+        "params": { "from": wallet.scanned_to(), "limit": 256 },
+        "id": 1
+    });
+    writeln!(writer, "{req}")?;
+    writer.flush()?;
+
+    let mut line = String::new();
+    while reader.read_line(&mut line)? > 0 {
+        let res: serde_json::Value = serde_json::from_str(line.trim())
+            .map_err(|e| anyhow::anyhow!("bad response from node: {e}"))?;
+        line.clear();
+        if let Some(e) = res.get("error").and_then(|v| v.as_str()) {
+            anyhow::bail!("node error: {e}");
+        }
+        let Some(page) = res.get("result") else {
+            continue;
+        };
+        if page
+            .get("heartbeat")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let tip = page.get("tip_height").and_then(|v| v.as_u64()).unwrap_or(0);
+        let from = wallet
+            .scanned_to()
+            .saturating_sub(64)
+            .max(wallet.birth_height());
+        let n = sync(wallet, rpc, from)?;
+        if n > 0 {
+            println!("height {tip}  +{n} output(s)  balance {}", wallet.balance());
+        }
+    }
+    Ok(())
 }
 
 fn rpc_call(

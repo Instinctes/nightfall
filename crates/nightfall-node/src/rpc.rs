@@ -15,6 +15,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 #[derive(Debug, Deserialize)]
 struct RpcReq {
@@ -123,6 +124,10 @@ fn handle_client(stream: TcpStream, state: SharedState) -> anyhow::Result<()> {
                 continue;
             }
         };
+        if req.method == "scan_subscribe" {
+            handle_scan_subscribe(&req, &state, &mut writer)?;
+            break;
+        }
         let res = dispatch(&req, &state);
         writeln!(writer, "{}", serde_json::to_string(&res)?)?;
     }
@@ -164,7 +169,9 @@ fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
                     "utxo_root": chain.ledger.utxo_root().to_hex(),
                     "supply_invariant_ok": supply_ok,
                     "mempool": g.mempool.len(),
-                    "peers": g.peer_addrs.len(),
+                    "peers": g.sessions.len(),
+                    "known_peers": g.peer_addrs.len(),
+                    "live_peers": g.sessions.len(),
                     "wire_version": nightfall_types::WIRE_VERSION,
                     "peer_versions": peer_versions,
                     "max_supply": MAX_SUPPLY_NIGHT,
@@ -234,58 +241,13 @@ fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
         // leaves the device. Point the wallet at your own node.
         "scan_feed" => {
             let from = req.params.get("from").and_then(|v| v.as_u64()).unwrap_or(0);
-            // Capped server-side. An unbounded range would let one request
-            // serialise the whole chain into memory.
             let limit = req
                 .params
                 .get("limit")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(256)
                 .clamp(1, 1_024) as usize;
-
-            let g = state.lock().unwrap();
-            let blocks = g.chain.blocks_from(from, limit);
-
-            let mut outputs = Vec::new();
-            let mut spent = Vec::new();
-            let mut scanned_to = from;
-
-            for block in &blocks {
-                scanned_to = scanned_to.max(block.header.height.0);
-                for input in &block.body.inputs {
-                    spent.push(hex::encode(input.commit.0));
-                }
-                for out in &block.body.outputs {
-                    outputs.push(json!({
-                        "height": block.header.height.0,
-                        "commit": hex::encode(out.commit.0),
-                        "ephemeral_pk": hex::encode(out.ephemeral_pk),
-                        "output_pk": hex::encode(out.output_pk),
-                        // One byte that lets a light client discard 255 of
-                        // every 256 foreign outputs before the expensive part.
-                        "view_tag": out.view_tag,
-                        "payload": hex::encode(&out.payload),
-                        "coinbase": out.features.is_coinbase(),
-                    }));
-                }
-            }
-
-            ok(
-                json!({
-                    "from": from,
-                    // Where the client should resume. Equal to `from` when the
-                    // client is already at the tip.
-                    "scanned_to": scanned_to,
-                    "blocks": blocks.len(),
-                    "tip_height": g.chain.tip_height().map(|h| h.0),
-                    // So a client can notice it has been handed a different
-                    // chain than the one it synced yesterday.
-                    "genesis": g.chain.genesis_hash.to_hex(),
-                    "outputs": outputs,
-                    "spent": spent,
-                }),
-                id,
-            )
+            ok(scan_feed_snapshot(state, from, limit), id)
         }
 
         "get_blocks" => {
@@ -370,6 +332,118 @@ fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
 
         other => err(format!("unknown method {other}"), id),
     }
+}
+
+/// One page of the light-client feed. Shared by `scan_feed` and the
+/// long-lived `scan_subscribe` stream so a phone and a one-shot CLI see
+/// the same shape.
+fn scan_feed_snapshot(state: &SharedState, from: u64, limit: usize) -> serde_json::Value {
+    let g = state.lock().unwrap();
+    let blocks = g.chain.blocks_from(from, limit);
+
+    let mut outputs = Vec::new();
+    let mut spent = Vec::new();
+    let mut scanned_to = from;
+
+    for block in &blocks {
+        scanned_to = scanned_to.max(block.header.height.0);
+        for input in &block.body.inputs {
+            spent.push(hex::encode(input.commit.0));
+        }
+        for out in &block.body.outputs {
+            outputs.push(json!({
+                "height": block.header.height.0,
+                "commit": hex::encode(out.commit.0),
+                "ephemeral_pk": hex::encode(out.ephemeral_pk),
+                "output_pk": hex::encode(out.output_pk),
+                "view_tag": out.view_tag,
+                "payload": hex::encode(&out.payload),
+                "coinbase": out.features.is_coinbase(),
+            }));
+        }
+    }
+
+    json!({
+        "from": from,
+        "scanned_to": scanned_to,
+        "blocks": blocks.len(),
+        "tip_height": g.chain.tip_height().map(|h| h.0),
+        "genesis": g.chain.genesis_hash.to_hex(),
+        "outputs": outputs,
+        "spent": spent,
+        "heartbeat": false,
+    })
+}
+
+/// Push a `scan_feed` page every time the tip moves. The client keeps the
+/// TCP connection open; a disconnect is how it unsubscribes.
+///
+/// A 30-second idle tick sends an empty page (`heartbeat: true`) so a
+/// phone can tell a silent node from a dead one without polling.
+fn handle_scan_subscribe(
+    req: &RpcReq,
+    state: &SharedState,
+    writer: &mut TcpStream,
+) -> anyhow::Result<()> {
+    let mut from = req.params.get("from").and_then(|v| v.as_u64()).unwrap_or(0);
+    let limit = req
+        .params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(256)
+        .clamp(1, 1_024) as usize;
+    let id = req.id.clone();
+
+    loop {
+        let snap = scan_feed_snapshot(state, from, limit);
+        let scanned_to = snap
+            .get("scanned_to")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(from);
+        let blocks = snap.get("blocks").and_then(|v| v.as_u64()).unwrap_or(0);
+        let res = ok(snap, id.clone());
+        writeln!(writer, "{}", serde_json::to_string(&res)?)?;
+        writer.flush()?;
+
+        if blocks > 0 && scanned_to >= from {
+            from = scanned_to.saturating_add(1);
+        }
+
+        let notify = {
+            let g = state.lock().unwrap();
+            Arc::clone(&g.tip_notify)
+        };
+        let (lock, cv) = &*notify;
+        let seen = lock.lock().map(|g| *g).unwrap_or(0);
+        let Ok(guard) = lock.lock() else {
+            break;
+        };
+        if *guard == seen {
+            let (g, timeout) = cv
+                .wait_timeout(guard, Duration::from_secs(30))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if timeout.timed_out() {
+                let heartbeat = ok(
+                    json!({
+                        "from": from,
+                        "scanned_to": from,
+                        "blocks": 0,
+                        "tip_height": state.lock().ok().and_then(|st| st.chain.tip_height().map(|h| h.0)),
+                        "genesis": state.lock().ok().map(|st| st.chain.genesis_hash.to_hex()),
+                        "outputs": [],
+                        "spent": [],
+                        "heartbeat": true,
+                    }),
+                    id.clone(),
+                );
+                writeln!(writer, "{}", serde_json::to_string(&heartbeat)?)?;
+                writer.flush()?;
+                drop(g);
+                continue;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

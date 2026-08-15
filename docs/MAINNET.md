@@ -150,11 +150,14 @@ eventually connect. Check it periodically.
 > a block, hide one, or change the rules — every node validates independently.
 > But if none are reachable, the network is invisible to newcomers.
 >
-> Two are listed: `seed.nightfallcoin.org` and `seed2.nightfallcoin.org`. Both
-> currently belong to the same operator, which halves the benefit — they share
-> an owner and, if one sits behind the other's connection, a failure mode. **A
-> seed run by somebody else is worth more than a third run by us.** If you
-> operate one, open an issue and it goes in the list.
+> Two names are compiled in: `seed.nightfallcoin.org` (live, Vultr Frankfurt)
+> and `seed2.nightfallcoin.org`. seed2 is reserved for a **second machine on a
+> second network** — not a second process on the first seed, and not a miner
+> behind NAT. A name that does not resolve is cheaper than a name that points
+> at the same host and pretends to be redundant. Bring a second VPS up with
+> `scripts/install-seed-node-linux.sh`, point the A record (unproxied) at it,
+> and the compiled name starts working without a new release. **A seed run by
+> somebody else is worth more than a third run by us.**
 
 ---
 

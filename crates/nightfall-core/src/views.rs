@@ -32,7 +32,7 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
         .map(|s| {
             (
                 s.blocks,
-                s.peers,
+                s.live_peers,
                 s.mempool,
                 s.difficulty,
                 s.supply_ok,
@@ -1058,7 +1058,7 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 
     card(ui, |ui| {
         ui.set_width(ui.available_width());
-        let peers = s.map(|s| s.peers).unwrap_or(0);
+        let peers = s.map(|s| s.live_peers).unwrap_or(0);
         ui.horizontal(|ui| {
             dot(ui, if peers > 0 { SUCCESS } else { WARN }, false);
             ui.add_space(6.0);
@@ -1107,8 +1107,9 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.add_space(6.0);
         ui.label(
             RichText::new(format!(
-                "Others reach you on port {}. Forward it in your router to accept \
-                 incoming connections.",
+                "Live sockets: {peers}. Others reach you on port {}. Forward it to \
+                 accept incoming connections. Outbound to a seed is enough to \
+                 stay on the tip — you do not have to be dialable.",
                 app.network.default_p2p_port()
             ))
             .size(11.0)
