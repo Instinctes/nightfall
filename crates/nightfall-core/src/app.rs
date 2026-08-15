@@ -112,6 +112,7 @@ pub struct App {
 
     // Network
     pub peer_input: String,
+    pub proxy_input: String,
 }
 
 impl App {
@@ -124,6 +125,7 @@ impl App {
             }
         };
 
+        let proxy_input = load_proxy(&datadir);
         let mut app = Self {
             network,
             datadir,
@@ -148,6 +150,7 @@ impl App {
             reveal_view_key: false,
             activity_filter: String::new(),
             peer_input: String::new(),
+            proxy_input,
         };
         app.start_node();
         app
@@ -173,6 +176,16 @@ impl App {
             // Mining starts off. The user turns it on deliberately.
             mine: false,
             miner,
+            proxy: {
+                let from_env = std::env::var("NIGHTFALL_PROXY").ok();
+                if from_env.as_ref().map(|s| !s.is_empty()).unwrap_or(false) {
+                    from_env
+                } else if self.proxy_input.trim().is_empty() {
+                    None
+                } else {
+                    Some(self.proxy_input.trim().to_string())
+                }
+            },
         };
 
         match NodeHandle::start(cfg) {
@@ -245,6 +258,19 @@ impl App {
         if let Some(n) = &self.node {
             n.set_mining(on);
         }
+    }
+
+    pub fn apply_proxy(&mut self) -> anyhow::Result<()> {
+        let trimmed = self.proxy_input.trim().to_string();
+        if let Some(n) = &self.node {
+            n.set_proxy(if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.as_str())
+            })?;
+        }
+        save_proxy(&self.datadir, &trimmed);
+        Ok(())
     }
 
     pub fn tip_height(&self) -> u64 {
@@ -609,6 +635,32 @@ impl eframe::App for App {
             });
 
         self.toasts.show(ctx);
+    }
+}
+
+fn proxy_file(datadir: &std::path::Path) -> PathBuf {
+    datadir.join("socks_proxy")
+}
+
+fn load_proxy(datadir: &std::path::Path) -> String {
+    if let Ok(s) = std::env::var("NIGHTFALL_PROXY") {
+        if !s.trim().is_empty() {
+            return s;
+        }
+    }
+    std::fs::read_to_string(proxy_file(datadir))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| nightfall_p2p::DEFAULT_TOR_PROXY.to_string())
+}
+
+fn save_proxy(datadir: &std::path::Path, value: &str) {
+    let path = proxy_file(datadir);
+    if value.is_empty() {
+        let _ = std::fs::remove_file(path);
+    } else {
+        let _ = std::fs::write(path, value);
     }
 }
 

@@ -7,56 +7,23 @@ pub const COIN_NAME: &str = "NIGHTFALLCOIN";
 pub const TICKER: &str = "NIGHT";
 pub const PROTOCOL_NAME: &str = "nightfall";
 
-/// Protocol v7 — "Nightproof".
+/// Protocol v8 — Nightproof on a new genesis.
 ///
-/// v4 was **consensus-broken**: its balance proof was a tautology, so anyone
-/// could mint arbitrary NIGHT. See `docs/AUDIT-2026-08-12.md`.
-///
-/// v5 fixed that and was sound; v6 added a one-byte view tag to every output,
-/// changing what the sender signs and therefore the format.
-///
-/// v7 is not a format change at all. The v6 chain was abandoned because two
-/// networking faults made it untrustworthy rather than invalid: nodes stopped
-/// mining while politely waiting for each other across a fork, and wallets
-/// never un-did what a reorg had undone, so a confirmed payment could vanish
-/// with nothing reporting it. The chain that resulted had a transaction on one
-/// branch and not the other, and no way to say which was true. Restarting was
-/// cheaper than explaining.
-///
-/// This constant is folded into `GenesisConfig`, so bumping it produces a
-/// different genesis hash. Nodes only peer with a matching genesis, which is
-/// what keeps the abandoned v5 and v6 chains from ever mixing with this one.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// Folded into `GenesisConfig`. Bumping it produces a different genesis hash,
+/// so every earlier chain (v4 unsound, v5–v7 abandoned) cannot mix with this
+/// one. See `docs/HISTORY.md` and `docs/RESET.md`.
+pub const PROTOCOL_VERSION: u32 = 8;
 
-/// Wire protocol version for P2P/RPC.
-///
-/// Raised to 5 for v0.6.0, and this time not because the wire format changed —
-/// it did not. It is the only mechanism this project has for refusing to peer
-/// with a release known to damage the network, and 0.5.3 and earlier are such
-/// releases: they verify a reorg while holding the node's global lock, freeze
-/// for tens of seconds at a time, mine on a tip the network has already left,
-/// and fork. A node running one is not merely out of date, it produces branches
-/// everyone else has to reconcile.
-///
-/// What this does: old nodes cannot complete a handshake, so they cannot join,
-/// sync, or propagate. What it deliberately does not do: touch consensus.
-/// `PROTOCOL_VERSION` stays at 7, the genesis hash is unchanged, every block
-/// and every coin ever mined stays exactly as valid as it was. Nobody's balance
-/// moves. An old node keeps its coins and gets them back the moment it upgrades
-/// — it just cannot take part until it does.
-///
-/// The honest limitation: this cannot stop anyone from mining, only from
-/// mining *with us*. Someone who ignores the upgrade keeps hashing on an
-/// isolated chain that no other node will ever accept. The wallet says so
-/// plainly rather than leaving them to discover it later.
-pub const WIRE_VERSION: u32 = 5;
+/// P2P handshake version. Raised so 0.6.x nodes cannot complete a handshake
+/// with this genesis. Not a wire-format change — the messages are the same.
+pub const WIRE_VERSION: u32 = 6;
 
 /// 1 NIGHT = 10^8 darks.
 pub const DARKS_PER_NIGHT: u64 = 100_000_000;
 pub const MAX_SUPPLY_NIGHT: u64 = 90_000_000;
 pub const MAX_SUPPLY_DARKS: u64 = MAX_SUPPLY_NIGHT * DARKS_PER_NIGHT;
-pub const INITIAL_BLOCK_REWARD_NIGHT: u64 = 20;
-pub const HALVING_INTERVAL_BLOCKS: u64 = 2_250_000;
+pub const INITIAL_BLOCK_REWARD_NIGHT: u64 = 6;
+pub const HALVING_INTERVAL_BLOCKS: u64 = 7_500_000;
 pub const TARGET_BLOCK_TIME_SECS: u64 = 15;
 pub const NIGHT_ASSET_ID: u32 = 0;
 
@@ -162,9 +129,9 @@ impl NetworkId {
     /// one network can never be replayed on another.
     pub fn proof_context(self) -> &'static [u8] {
         match self {
-            Self::Mainnet => b"nightfall:mainnet:v7",
-            Self::Testnet => b"nightfall:testnet:v7",
-            Self::Devnet => b"nightfall:devnet:v7",
+            Self::Mainnet => b"nightfall:mainnet:v8",
+            Self::Testnet => b"nightfall:testnet:v8",
+            Self::Devnet => b"nightfall:devnet:v8",
         }
     }
 

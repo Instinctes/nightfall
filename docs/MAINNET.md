@@ -168,7 +168,7 @@ Recent builds connect automatically. For anything else, share:
 1. Your public IP / DNS
 2. Port **17891**
 3. Confirm they use `--network mainnet`
-4. The same release — protocol v7 / wire v4, matching `genesis_hash`
+4. The same release — protocol v8 / wire v6, genesis `061a052d…`
 
 ### Joiner command
 
@@ -252,8 +252,8 @@ Or:
 | Parameter | Value |
 |-----------|--------|
 | Max supply | 90,000,000 NIGHT |
-| Era-0 reward | 20 NIGHT / block |
-| Halving | every 2,250,000 blocks |
+| Era-0 reward | 6 NIGHT / block |
+| Halving | every 7,500,000 blocks (~3.56 years) |
 | Block time target | 15s |
 | Difficulty | LWMA-1, retargeted every block, 90-block window, floor 2,000 |
 | PoW | Nighthash-v2 (Argon2id), 32 MiB / hash |
@@ -272,8 +272,11 @@ Or:
   so nobody can tell which input paid which output within a block, but spent
   outputs remain visible. Cut-through would delete the per-input signature that
   makes non-interactive payments safe; the two are mutually exclusive.
-- **No network-layer privacy.** No Dandelion++; the first relaying node is
-  probably the origin.
+- **Network-layer privacy is stem/fluff.** A locally submitted transaction
+  is sent to one random peer first. Relays stay in the stem with 90 %
+  probability and fluff after 12–28 s. The wire message is still `Tx`, so
+  0.6.3 peers accept it — they just broadcast immediately. Optional Tor:
+  `--proxy 127.0.0.1:9050` or `NIGHTFALL_PROXY`. See [PRIVACY.md](PRIVACY.md).
 - **PoW is Argon2id** (Nighthash-v2) at 32 MiB per hash on mainnet. Verification
   costs the same as one mining attempt — that is the price of ASIC resistance.
 - The RPC is **unauthenticated**. Binding it to a non-loopback address is
@@ -289,6 +292,9 @@ Or:
 ```bash
 ./target/release/nightfalld --network mainnet status | grep supply_proof
 # supply_proof... OK — Σ UTXO − Σ excess == circulating·G
+
+# outbound through Tor (optional)
+./target/release/nightfalld --network mainnet run --proxy 127.0.0.1:9050
 ```
 
 If that ever reads `FAILED`, stop the node and do not relay.

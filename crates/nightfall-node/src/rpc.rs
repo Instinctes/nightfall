@@ -176,6 +176,9 @@ fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
                     "peer_versions": peer_versions,
                     "max_supply": MAX_SUPPLY_NIGHT,
                     "ticker": TICKER,
+                    "tor_proxy": g.proxy.is_some()
+                        && g.last_tor_ok.load(std::sync::atomic::Ordering::Relaxed),
+                    "dandelion": true,
                 }),
                 id,
             )

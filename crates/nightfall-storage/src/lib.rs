@@ -255,9 +255,13 @@ impl ChainStore {
     }
 }
 
+/// Datadir epoch. The August 2026 v7 chain used `nightfall/<network>/`.
+/// This chain uses a sibling folder so an old wallet cannot mine the corpse.
+pub const DATADIR_EPOCH: &str = "n8";
+
 pub fn default_data_dir(network: NetworkId) -> PathBuf {
     let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join("nightfall").join(network.as_str())
+    base.join("nightfall").join(network.as_str()).join(DATADIR_EPOCH)
 }
 
 pub fn wallet_dir(datadir: &Path) -> PathBuf {

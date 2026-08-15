@@ -58,6 +58,9 @@ enum Commands {
         mine: bool,
         #[arg(long, default_value = "miner.seed")]
         miner_seed: PathBuf,
+        /// SOCKS5 proxy for outbound P2P. Tor: `127.0.0.1:9050`.
+        #[arg(long)]
+        proxy: Option<String>,
     },
 }
 
@@ -151,6 +154,7 @@ fn main() -> anyhow::Result<()> {
             connect,
             mine,
             miner_seed,
+            proxy,
         } => {
             let listen =
                 listen.unwrap_or_else(|| format!("0.0.0.0:{}", network.default_p2p_port()));
@@ -166,6 +170,11 @@ fn main() -> anyhow::Result<()> {
                 println!("miner.......... {}", m.encode());
             }
 
+            let proxy = proxy.or_else(|| std::env::var("NIGHTFALL_PROXY").ok());
+            println!(
+                "proxy.......... {}",
+                proxy.as_deref().unwrap_or("127.0.0.1:9050 (Tor default)")
+            );
             let cfg = NodeConfig {
                 network,
                 datadir: datadir.clone(),
@@ -174,6 +183,7 @@ fn main() -> anyhow::Result<()> {
                 connect,
                 mine,
                 miner,
+                proxy,
             };
 
             println!("{COIN_NAME} node starting");

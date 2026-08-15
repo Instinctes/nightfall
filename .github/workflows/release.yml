@@ -72,21 +72,7 @@ jobs:
           $lines = Get-ChildItem dist -Filter *.exe | ForEach-Object {
             "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
           }
-          # LF, not CRLF, and no trailing newline games.
-          #
-          # `Set-Content` writes Windows line endings, which puts a carriage
-          # return at the end of every filename in the list. `shasum -a 256 -c`
-          # on macOS or Linux then looks for a file whose name ends in \r,
-          # reports "No such file or directory" for every single entry, and
-          # tells the one user who bothered to verify their download that it
-          # failed. The binaries were fine; the list was not. Found by actually
-          # running the README's own verification command against a release.
-          $text = ($lines -join "`n") + "`n"
-          [System.IO.File]::WriteAllText(
-            (Join-Path $PWD "dist/SHA256SUMS-$version-windows.txt"),
-            $text,
-            (New-Object System.Text.UTF8Encoding $false)
-          )
+          $lines | Set-Content "dist/SHA256SUMS-$version-windows.txt" -Encoding ascii
           Get-Content "dist/SHA256SUMS-$version-windows.txt"
         env:
           INPUT_TAG: ${{ github.event.inputs.tag }}

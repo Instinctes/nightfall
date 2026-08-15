@@ -58,7 +58,7 @@ Genesis **must not** include:
 | Max supply | **LOCKED: 90,000,000 NIGHT hard cap** — **no tail emission** |
 | Fairness test | A random node joining at block 1 and a random node joining at block 100_000 play by the same rules |
 
-**Emission (locked model D):** initial **20 NIGHT**/block, halving every **2_250_000** blocks, clamp to cap. Ideal geometric sum = 90M. Details: `docs/SPEC.md`, `docs/ATTRIBUTES.md`.
+**Emission (v8):** initial **6 NIGHT**/block, halving every **7_500_000** blocks, clamp to cap. Ideal geometric sum = 90M. Details: `docs/SPEC.md`, `docs/RESET.md`.
 
 ---
 

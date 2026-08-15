@@ -16,6 +16,7 @@ nightfall-ledger = { workspace = true }
 nightfall-consensus = { workspace = true }
 nightfall-storage = { workspace = true }
 nightfall-node = { path = "../nightfall-node" }
+nightfall-p2p = { workspace = true }
 nightfall-wallet = { path = "../nightfall-wallet" }
 anyhow = { workspace = true }
 hex = { workspace = true }

@@ -24,11 +24,13 @@ consensus-broken.
 | 14 | PoW algorithm | **Argon2id (Nighthash-v2)**, 32 MiB per hash on mainnet. Memory-hardness is what makes purpose-built hardware uneconomical. Accepted cost: verification is as expensive as one mining attempt (~11 ms), so nodes keep a local validation marker instead of re-hashing their own chain on restart. |
 | 15 | Block structure | **Aggregated.** A block holds one flat, canonically sorted set of inputs, outputs and kernels; transactions do not survive into it. Kernels therefore sign only their own fields, and output integrity moved to a per-output sender signature. |
 | 16 | Cut-through | **Not applied.** It would delete the per-input signature that makes one-sided payments safe. Choosing non-interactive payments (row 4) rules it out. Documented rather than hidden. |
+| 17 | Tx diffusion | **Dandelion-class stem/fluff** on the existing `Tx` message (90 % stem, 12–28 s embargo). Tor/SOCKS5 **on by default**, clearnet fallback. |
+| 18 | v8 reset | New genesis. 6 NIGHT / 7.5 M blocks. Fees to miner after subsidy. Datadir `n8`. See `RESET.md`. |
 
 ### Open, deliberately
 
 - **Cut-through**, or a spend-authorisation scheme that does not require a per-input signature. Until then the transaction graph is obscured, not erased.
-- **Dandelion++** — no network-layer privacy today.
+- **Full Dandelion++** (separate stem graph, fail-safe fluff on black-hole stems) — today's stem uses the same gossip set as blocks.
 - **Independent audit** — the v5 code was written by the same party that audited v4.
 - **UTXO snapshots / headers-first sync** — initial sync still replays and re-verifies every block, which memory-hard PoW makes expensive.
 

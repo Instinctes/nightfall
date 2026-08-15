@@ -14,6 +14,9 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod receipt;
+pub use receipt::{verify_receipt, PaymentReceipt};
+
 /// An output this wallet owns, as persisted to disk.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OwnedOutput {

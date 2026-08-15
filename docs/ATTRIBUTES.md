@@ -9,9 +9,9 @@
 > | Locked claim | Reality after v5 |
 > |---|---|
 > | *Anonymity-set goal: **Protocol-scale / full-set class*** | **Partly delivered.** Blocks now aggregate every transaction into one sorted set, so the anonymity set is every transaction in the block rather than one. Cut-through is still absent and is incompatible with one-sided payments, so spent outputs remain visible and the graph is obscured rather than erased. |
-> | *Network-layer privacy: **Dandelion-class or better*** | **Not implemented.** The first relaying node is very likely the origin. |
+> | *Network-layer privacy: **Dandelion-class or better*** | **Stem/fluff implemented** over the existing `Tx` message. Optional SOCKS5/Tor for outbound dials. A hop onto a node that still fluffs immediately remains a leak. |
 > | *Bootstrap: **memory-hard / CPU-fair (not SHA-256 ASIC day-one)*** | ✅ **Delivered.** Nighthash-v2 is Argon2id at 32 MiB per hash on mainnet. |
-> | *Max supply **90,000,000*** | Correct as a **ceiling**. The emission curve terminates at 89,999,999.7075 due to integer truncation at each halving. |
+> | *Max supply **90,000,000*** | Ceiling. v8 curve terminates at **89,999,999.25** (0.75 NIGHT short). |
 >
 > Delivered in v5: mandatory confidential amounts, no on-chain recipient,
 > unlinkable one-time output keys, real user-controlled view keys, 0 premine
@@ -49,10 +49,10 @@ This document is binding product intent. Protocol numbers that implement it live
 |-----------|--------|--------|
 | Premine | **0** | Fair launch |
 | Team / foundation / VC allocation | **0** | No privileged bags |
-| **Max supply** | **90,000,000 NIGHT** | Hard ceiling. Curve terminates at 89,999,999.7075 (integer truncation); cap enforced as an upper bound and verified by test. |
-| **Tail emission** | **None** | After cap: block reward = 0 |
-| Emission shape | Disinflationary (halving eras) summing to ≤ cap | Exact curve in SPEC |
-| Fee model | Base fee **burn** (share TBD in SPEC freeze) + no metadata-leaking priority tips in v1 | Security budget after cap = fees |
+| **Max supply** | **90,000,000 NIGHT** | Ceiling. Curve terminates at 89,999,999.25. |
+| **Tail emission** | **None** | After last subsidy the reward is 0. Fees then pay the miner. |
+| Emission shape | 6 NIGHT, halving every 7,500,000 blocks | 50 % in ~3.6 y, 89 M in ~23.5 y |
+| Fee model | Burned while a subsidy exists. After that, fees go to the miner (not minted, not burned). | |
 | Dev tax in protocol | **0** at genesis | Voluntary community funding only |
 
 **Why not 21M:** Explicit anti-clone choice. **90M** is own scarcity identity.  
@@ -70,9 +70,9 @@ This document is binding product intent. Protocol numbers that implement it live
 | View keys | **Yes** (user-controlled) — ✅ implemented in v5 as `nfview1…` |
 | ZK disclosure packs | **Yes** (prove without full open) |
 | Admin freeze / blacklist keys | **Forbidden** |
-| Anonymity-set goal | **Protocol-scale / full-set class** — ⚠ **partial**: block-level aggregation, no cut-through; see banner |
+| Anonymity-set goal | Block-level aggregation. **Not** protocol-scale. Do not advertise it as such. |
 | Wallet UX | Anonymity-set / privacy strength as visible metric |
-| Network-layer privacy | Resistant tx diffusion (Dandelion-class or better) — ⚠ **not implemented** |
+| Network-layer privacy | Dandelion-class stem/fluff ✅ · Tor/SOCKS5 optional ✅ · first hop to a pre-stem node still fluffs |
 | Trusted setup | Prefer none; if ever used, public multi-party only |
 
 ---

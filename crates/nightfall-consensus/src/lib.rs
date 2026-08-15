@@ -291,14 +291,17 @@ impl Chain {
     ) -> Result<BlockTemplate, ConsensusError> {
         let height = self.next_height();
         let difficulty = self.next_difficulty();
-        let reward = self
+        let subsidy = self
             .emission
             .reward_at(height, self.ledger.supply.total_minted_darks)
             .darks();
-
         extra_txs.truncate(MAX_TXS_PER_BLOCK - 1);
+        let fees: u64 = extra_txs.iter().map(|t| t.total_fee()).sum();
+        // After the last subsidy the miner is paid in fees. Those coins are
+        // already circulating; they are not minted and they are not burned.
+        let coinbase_darks = if subsidy > 0 { subsidy } else { fees };
 
-        let coinbase = build_coinbase(miner, reward, height.0, self.proof_ctx())
+        let coinbase = build_coinbase(miner, coinbase_darks, height.0, self.proof_ctx())
             .map_err(|e| ConsensusError::Tx(e.to_string()))?;
 
         let mut txs = vec![coinbase];
@@ -311,7 +314,7 @@ impl Chain {
         // clone of the ledger, never the live one.
         let mut trial = self.ledger.clone();
         trial
-            .apply_block(&body, height, reward, self.proof_ctx())
+            .apply_block(&body, height, subsidy, self.proof_ctx())
             .map_err(|e| ConsensusError::Ledger(e.to_string()))?;
 
         // Timestamp must beat median-time-past.
@@ -329,7 +332,7 @@ impl Chain {
                 timestamp_unix,
                 difficulty,
                 nonce: 0,
-                reward_darks: reward,
+                reward_darks: coinbase_darks,
             },
             body,
             built_on: self.tip_hash(),
@@ -437,11 +440,13 @@ impl Chain {
         }
 
         // --- emission ---
-        let reward = self
+        let subsidy = self
             .emission
             .reward_at(block.header.height, self.ledger.supply.total_minted_darks)
             .darks();
-        if block.header.reward_darks != reward {
+        let fees = block.body.total_fee();
+        let coinbase_due = if subsidy > 0 { subsidy } else { fees };
+        if block.header.reward_darks != coinbase_due {
             return Err(ConsensusError::BadReward);
         }
 
@@ -453,7 +458,7 @@ impl Chain {
         // --- full ledger validation on a scratch copy ---
         let mut trial = self.ledger.clone();
         trial
-            .apply_block(&block.body, block.header.height, reward, self.proof_ctx())
+            .apply_block(&block.body, block.header.height, subsidy, self.proof_ctx())
             .map_err(|e| ConsensusError::Ledger(e.to_string()))?;
 
         if trial.utxo_root() != block.header.utxo_root {

@@ -1,18 +1,20 @@
-# Nightfall L1 — Protocol Spec v5 ("Nightproof-β")
+# Nightfall L1 — Protocol Spec (Nightproof)
 
 **Native asset:** NIGHTFALLCOIN (`NIGHT`)
-**Protocol version:** 5 · **Wire version:** 2
-**Supersedes:** v4 / Nightproof-α, which was consensus-broken — see [`AUDIT-2026-08-12.md`](./AUDIT-2026-08-12.md)
+**Protocol version:** 8 · **Wire version:** 6 · **Magic:** `NFL2`
+**Genesis:** `061a052d49607ff8f4b306c75d622ebd230cff4ec3a45a6dffc2f7738d4b20de`
+**History:** [HISTORY.md](HISTORY.md) · [RESET.md](RESET.md)
+**v4 was consensus-broken** — see [`AUDIT-2026-08-12.md`](./AUDIT-2026-08-12.md).
 
 ---
 
 ## 0. Invariants
 
-1. Max supply **90,000,000 NIGHT**, no tail. (Emission terminates at 89,999,999.7075 — §3.)
+1. Max supply **90,000,000 NIGHT**, no tail. (Emission terminates at 89,999,999.25 — §3.)
 2. Premine **0**.
 3. Confidential amounts, no addresses on chain.
 4. No admin / freeze / mint keys.
-5. **100 % fee burn.**
+5. Fees **burned while a subsidy exists**; after the last subsidy they **pay the miner**.
 6. No bridges, no transparent unshield.
 7. **`Σ UTXO − Σ kernel_excess = (minted − burned)·G`** holds at every height.
 
@@ -222,20 +224,20 @@ blocks are refused.
 
 ## 3. Emission
 
-Era-0 reward **20 NIGHT**, halving every **2,250,000 blocks**, hard cap
+Era-0 reward **6 NIGHT**, halving every **7,500,000 blocks**, hard cap
 **90,000,000 NIGHT**, no tail.
 
 Because each halving truncates (`reward >> halvings`), the curve terminates at
-**89,999,999.70750000 NIGHT** — 0.2925 below the ceiling. The cap is enforced as
-an upper bound and is never exceeded.
+**89,999,999.25 NIGHT** — 0.75 below the ceiling. The cap is an upper bound.
 
 ---
 
 ## 4. Fees
 
-`fee_darks` is destroyed. The miner receives only `reward_darks`. The fee appears
-as a public `fee·G` term in the balance equation, which is what makes the burn
-auditable rather than merely asserted.
+While the subsidy is positive, `fee_darks` is burned. The miner receives only
+the subsidy. After the subsidy is zero, the coinbase kernel carries the block's
+fee total: nothing is minted, nothing is burned, circulating is unchanged, the
+miner is paid. The fee remains a public `fee·G` term so the books still close.
 
 ---
 
@@ -299,7 +301,7 @@ Deliberately listed in the spec so they are not forgotten.
   is obscured by aggregation but not erased.** Closing the remaining gap needs
   a proof system that can authorise a spend without publishing a per-input
   signature.
-- **No Dandelion++** or other network-layer privacy.
+- **Dandelion-class stem/fluff** on the existing `Tx` message (not a separate stem graph). Optional SOCKS5/Tor for outbound dials. See `docs/PRIVACY.md`.
 
 - **UTXO root is O(n log n) per block.** A Merkle Mountain Range would make it
   incremental.

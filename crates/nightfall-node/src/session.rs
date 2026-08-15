@@ -166,7 +166,15 @@ pub fn fanout_block(sessions: &[SessionHandle], block: &Block) {
 }
 
 pub fn fanout_tx(sessions: &[SessionHandle], tx: &Transaction) {
+    fluff_tx(sessions, tx, None);
+}
+
+/// Broadcast a transaction to every live socket except `exclude`.
+pub fn fluff_tx(sessions: &[SessionHandle], tx: &Transaction, exclude: Option<&str>) {
     for s in sessions {
+        if exclude == Some(s.key.as_str()) {
+            continue;
+        }
         let s = s.clone();
         let tx = tx.clone();
         std::thread::spawn(move || {
@@ -175,6 +183,45 @@ pub fn fanout_tx(sessions: &[SessionHandle], tx: &Transaction) {
             }
         });
     }
+}
+
+/// Pick the Dandelion stem hop: prefer an outbound peer that is not `exclude`.
+pub fn pick_stem_peer<'a>(
+    sessions: &'a [SessionHandle],
+    exclude: Option<&str>,
+) -> Option<&'a SessionHandle> {
+    let outbound: Vec<&SessionHandle> = sessions
+        .iter()
+        .filter(|s| s.outbound && exclude != Some(s.key.as_str()))
+        .collect();
+    let pool = if outbound.is_empty() {
+        sessions
+            .iter()
+            .filter(|s| exclude != Some(s.key.as_str()))
+            .collect::<Vec<_>>()
+    } else {
+        outbound
+    };
+    if pool.is_empty() {
+        return None;
+    }
+    let idx = rand::random::<usize>() % pool.len();
+    Some(pool[idx])
+}
+
+/// Forward a transaction to exactly one peer. Returns false if nobody is left.
+pub fn stem_tx(sessions: &[SessionHandle], tx: &Transaction, exclude: Option<&str>) -> bool {
+    let Some(chosen) = pick_stem_peer(sessions, exclude) else {
+        return false;
+    };
+    let s = chosen.clone();
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = s.send_tx(&tx) {
+            tracing::debug!("session {} stem send: {e}", s.key);
+        }
+    });
+    true
 }
 
 #[cfg(test)]
@@ -212,6 +259,19 @@ mod tests {
         assert_eq!(pool.outbound_count(), 0);
         assert!(pool.outbound_keys().is_empty());
         assert!(!pool.has_outbound_to("1.2.3.4:9"));
+    }
+
+    #[test]
+    fn stem_skips_the_peer_we_heard_the_tx_from() {
+        let (a, _a2) = pair();
+        let (b, _b2) = pair();
+        let pool = SessionPool::new();
+        pool.insert(outbound_key("10.0.0.1:1"), a, true);
+        pool.insert(inbound_key("10.0.0.2:2"), b, false);
+        let all = pool.all();
+        let picked = pick_stem_peer(&all, Some(&outbound_key("10.0.0.1:1"))).unwrap();
+        assert_eq!(picked.key, inbound_key("10.0.0.2:2"));
+        assert!(pick_stem_peer(&all, None).is_some());
     }
 
     #[test]

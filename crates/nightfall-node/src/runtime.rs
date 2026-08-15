@@ -2,14 +2,14 @@
 
 use crate::rpc;
 use crate::session::{
-    fanout_block, fanout_tx, inbound_key, outbound_key, SessionHandle, SessionPool,
+    fanout_block, fluff_tx, inbound_key, outbound_key, stem_tx, SessionHandle, SessionPool,
 };
 use nightfall_consensus::{Block, BlockTemplate, Chain, Mempool};
 use nightfall_crypto::{default_threads, mine_parallel, Address};
 use nightfall_ledger::Transaction;
 use nightfall_p2p::{
-    broadcast_block, connect_peer, dialable_addr, handshake, read_msg, write_msg, PeerMsg,
-    MAX_BLOCKS_PER_REQUEST, MAX_PEERS_PER_MSG,
+    broadcast_block, connect_peer_via, dialable_addr, handshake, looks_like_dial_target, read_msg,
+    write_msg, PeerMsg, SocksProxy, DEFAULT_TOR_PROXY, MAX_BLOCKS_PER_REQUEST, MAX_PEERS_PER_MSG,
 };
 use nightfall_storage::{now_unix, ChainStore};
 use nightfall_types::NetworkId;
@@ -39,6 +39,8 @@ pub struct NodeConfig {
     pub connect: Vec<String>,
     pub mine: bool,
     pub miner: Option<Address>,
+    /// SOCKS5 proxy for outbound P2P (`127.0.0.1:9050` for Tor).
+    pub proxy: Option<String>,
 }
 
 pub struct NodeInner {
@@ -116,6 +118,15 @@ pub struct NodeInner {
     /// thread can sleep until there is something new to look at, instead of
     /// polling the whole chain every few seconds.
     pub tip_notify: Arc<(Mutex<u64>, Condvar)>,
+    /// Outbound dials go through this when set. Inbound listen is unchanged.
+    pub proxy: Option<SocksProxy>,
+    /// Last successful outbound went through the SOCKS proxy.
+    pub last_tor_ok: Arc<AtomicBool>,
+    /// Transactions in the Dandelion stem phase, waiting to fluff.
+    ///
+    /// Keyed by txid. The embargo is a few tens of seconds so a stem that
+    /// dies mid-path still reaches the network.
+    pub stem_embargo: HashMap<String, u64>,
 }
 
 /// Upper bound on buffered branch blocks. A fork deeper than this is past
@@ -185,13 +196,9 @@ impl NodeInner {
         if !self.mempool.insert(tx.clone()) {
             return Ok(id);
         }
-        // Live sockets first. A NAT peer that is holding a connection to us
-        // hears the transaction immediately; dialling their listen port would
-        // just time out.
-        fanout_tx(&self.sessions.all(), &tx);
-        if self.sessions.is_empty() {
-            fallback_dial_tx(&self.dialable_peers(), &tx, self);
-        }
+        // Origin always stems: the first hop is one random peer, not a
+        // broadcast that paints this node as the sender.
+        propagate_from_inner(self, &tx, None, true);
         Ok(id)
     }
 
@@ -246,6 +253,18 @@ impl NodeInner {
 /// Last-resort dial when we have no live sessions yet (process just started,
 /// or every socket dropped at once). Seeds only — learned NAT addresses will
 /// not answer.
+fn parse_proxy_cfg(raw: Option<&str>) -> anyhow::Result<Option<SocksProxy>> {
+    match raw.map(str::trim) {
+        None | Some("") => SocksProxy::parse(DEFAULT_TOR_PROXY)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("{e}")),
+        Some("off") | Some("none") | Some("clearnet") => Ok(None),
+        Some(s) => SocksProxy::parse(s)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("{e}")),
+    }
+}
+
 fn fallback_dial_block(peers: &[String], block: &Block, inner: &NodeInner) {
     let network = inner.network;
     let genesis = inner.chain.genesis_hash;
@@ -255,8 +274,9 @@ fn fallback_dial_block(peers: &[String], block: &Block, inner: &NodeInner) {
     for addr in peers.iter().take(4) {
         let block = block.clone();
         let addr = addr.clone();
+        let proxy = inner.proxy.clone();
         thread::spawn(move || {
-            if let Ok(mut s) = connect_peer(&addr, 3000) {
+            if let Ok((mut s, _tor)) = connect_peer_via(&addr, 3000, proxy.as_ref()) {
                 if handshake(&mut s, network, genesis, height, tip, port).is_ok() {
                     let _ = broadcast_block(&mut s, &block);
                 }
@@ -265,25 +285,96 @@ fn fallback_dial_block(peers: &[String], block: &Block, inner: &NodeInner) {
     }
 }
 
-fn fallback_dial_tx(peers: &[String], tx: &Transaction, inner: &NodeInner) {
+fn fallback_stem_tx(peers: &[String], tx: &Transaction, inner: &NodeInner) {
+    let Some(addr) = peers.iter().next().cloned() else {
+        return;
+    };
     let network = inner.network;
     let genesis = inner.chain.genesis_hash;
     let height = inner.chain.tip_height().map(|h| h.0).unwrap_or(0);
     let tip = inner.chain.tip_hash();
     let port = inner.listen_port;
-    for addr in peers.iter().take(4) {
-        let tx = tx.clone();
-        let addr = addr.clone();
-        thread::spawn(move || {
-            if let Ok(mut s) = connect_peer(&addr, 3000) {
-                if handshake(&mut s, network, genesis, height, tip, port).is_ok() {
-                    let _ = nightfall_p2p::broadcast_tx(&mut s, &tx);
-                }
+    let proxy = inner.proxy.clone();
+    let tx = tx.clone();
+    thread::spawn(move || {
+        if let Ok((mut s, _tor)) = connect_peer_via(&addr, 3000, proxy.as_ref()) {
+            if handshake(&mut s, network, genesis, height, tip, port).is_ok() {
+                let _ = nightfall_p2p::broadcast_tx(&mut s, &tx);
             }
-        });
+        }
+    });
+}
+
+/// Probability a relay stays in the stem phase (Dandelion++).
+const DANDELION_STEM_P: f64 = 0.90;
+const DANDELION_EMBARGO_MIN: u64 = 12;
+const DANDELION_EMBARGO_MAX: u64 = 28;
+
+fn embargo_deadline() -> u64 {
+    let span = DANDELION_EMBARGO_MAX - DANDELION_EMBARGO_MIN + 1;
+    now_unix() + DANDELION_EMBARGO_MIN + (rand::random::<u64>() % span)
+}
+
+fn propagate_from_inner(
+    inner: &mut NodeInner,
+    tx: &Transaction,
+    from_key: Option<&str>,
+    origin: bool,
+) {
+    let stem = origin || rand::random::<f64>() < DANDELION_STEM_P;
+    let live = inner.sessions.all();
+    if stem && stem_tx(&live, tx, from_key) {
+        inner
+            .stem_embargo
+            .insert(tx.txid().to_hex(), embargo_deadline());
+        return;
+    }
+    if live.is_empty() {
+        fallback_stem_tx(&inner.dialable_peers(), tx, inner);
+        return;
+    }
+    fluff_tx(&live, tx, from_key);
+    inner.stem_embargo.remove(&tx.txid().to_hex());
+}
+
+fn propagate_tx(state: &SharedState, tx: &Transaction, from_key: Option<&str>, origin: bool) {
+    if let Ok(mut g) = state.lock() {
+        propagate_from_inner(&mut g, tx, from_key, origin);
     }
 }
 
+fn spawn_dandelion_fluff(state: SharedState) {
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(2));
+        let now = now_unix();
+        let due: Vec<Transaction> = {
+            let Ok(mut g) = state.lock() else {
+                continue;
+            };
+            let ids: Vec<String> = g
+                .stem_embargo
+                .iter()
+                .filter(|(_, t)| **t <= now)
+                .map(|(id, _)| id.clone())
+                .collect();
+            let mut txs = Vec::new();
+            for id in ids {
+                g.stem_embargo.remove(&id);
+                if let Some(tx) = g.mempool.txs.get(&id).cloned() {
+                    txs.push(tx);
+                }
+            }
+            txs
+        };
+        for tx in due {
+            if let Ok(g) = state.lock() {
+                fluff_tx(&g.sessions.all(), &tx, None);
+            }
+        }
+    });
+}
+
+#[derive(Clone)]
 pub struct StatusSnap {
     pub blocks: u64,
     pub tip: String,
@@ -308,6 +399,10 @@ pub struct StatusSnap {
     pub blocks_behind: u64,
     /// Sockets that are actually open, not entries in the address book.
     pub live_peers: usize,
+    /// Outbound P2P is going through SOCKS5 (typically Tor).
+    pub tor_proxy: bool,
+    /// Transaction relay uses Dandelion-class stem/fluff.
+    pub dandelion: bool,
 }
 
 pub struct NodeHandle {
@@ -376,6 +471,9 @@ impl NodeHandle {
             last_reorg_fetch: AtomicU64::new(0),
             sessions: Arc::clone(&sessions),
             tip_notify: Arc::clone(&tip_notify),
+            proxy: parse_proxy_cfg(cfg.proxy.as_deref())?,
+            last_tor_ok: Arc::new(AtomicBool::new(false)),
+            stem_embargo: HashMap::new(),
         };
         let state: SharedState = Arc::new(Mutex::new(inner));
 
@@ -389,6 +487,7 @@ impl NodeHandle {
 
         spawn_outbound_supervisor(Arc::clone(&state));
         spawn_status_ticker(Arc::clone(&state));
+        spawn_dandelion_fluff(Arc::clone(&state));
 
         if cfg.miner.is_some() {
             let st = Arc::clone(&state);
@@ -437,17 +536,26 @@ impl NodeHandle {
     /// nothing.
     pub fn add_peer(&self, addr: &str) -> anyhow::Result<()> {
         let addr = addr.trim();
-        if addr.is_empty() {
+        if !looks_like_dial_target(addr) {
             anyhow::bail!("enter an address as host:port");
         }
-        // Accept either a literal socket address or a resolvable hostname.
-        use std::net::ToSocketAddrs;
-        let resolved = addr
-            .to_socket_addrs()
-            .map_err(|e| anyhow::anyhow!("{addr} is not reachable: {e}"))?
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("{addr} resolved to nothing"))?;
-        let _ = resolved;
+        // Through Tor we must not touch the system resolver — that is the
+        // DNS leak Dandelion cannot fix. Clearnet still fails fast here.
+        let using_proxy = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|g| g.proxy.clone())
+            .is_some();
+        if !using_proxy {
+            use std::net::ToSocketAddrs;
+            let resolved = addr
+                .to_socket_addrs()
+                .map_err(|e| anyhow::anyhow!("{addr} is not reachable: {e}"))?
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("{addr} resolved to nothing"))?;
+            let _ = resolved;
+        }
 
         let mut g = self
             .state
@@ -497,7 +605,28 @@ impl NodeHandle {
             started_at: g.started_at,
             blocks_behind: catchup_behind(&g).unwrap_or(0),
             live_peers: g.sessions.len(),
+            tor_proxy: g.proxy.is_some() && g.last_tor_ok.load(Ordering::Relaxed),
+            dandelion: true,
         })
+    }
+
+    /// Change the outbound SOCKS5 proxy. Existing sockets stay up; new dials
+    /// use the new value. Empty string clears it.
+    pub fn set_proxy(&self, proxy: Option<&str>) -> anyhow::Result<()> {
+        let parsed = parse_proxy_cfg(proxy)?;
+        let mut g = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("node state lock poisoned"))?;
+        g.proxy = parsed;
+        Ok(())
+    }
+
+    pub fn proxy_addr(&self) -> Option<String> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|g| g.proxy.as_ref().map(|p| p.addr.clone()))
     }
 
     /// Sleep until the tip moves, or `timeout` elapses. Returns the current
@@ -594,7 +723,11 @@ fn is_self_connection(stream: &TcpStream, listen_port: u16) -> bool {
 }
 
 fn open_outbound_session(state: &SharedState, addr: &str) -> anyhow::Result<()> {
-    let mut stream = connect_peer(addr, 8_000)?;
+    let proxy = state.lock().ok().and_then(|g| g.proxy.clone());
+    let (mut stream, used_tor) = connect_peer_via(addr, 8_000, proxy.as_ref())?;
+    if let Ok(g) = state.lock() {
+        g.last_tor_ok.store(used_tor, Ordering::Relaxed);
+    }
     prepare_live_socket(&stream)?;
 
     let (network, genesis, our_h, next, tip, port) = {
@@ -1022,8 +1155,7 @@ fn peer_io_loop(
                     }
                 };
                 if newly {
-                    let g = state.lock().unwrap();
-                    fanout_tx(&g.sessions.all(), &tx);
+                    propagate_tx(state, &tx, Some(sess.key.as_str()), false);
                 }
             }
 
@@ -1376,7 +1508,11 @@ fn push_blocks_via_session(
 }
 
 fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
-    let mut stream = connect_peer(addr, 15_000)?;
+    let proxy = state.lock().ok().and_then(|g| g.proxy.clone());
+    let (mut stream, used_tor) = connect_peer_via(addr, 15_000, proxy.as_ref())?;
+    if let Ok(g) = state.lock() {
+        g.last_tor_ok.store(used_tor, Ordering::Relaxed);
+    }
     let (network, genesis, our_h, tip, port) = {
         let g = state.lock().unwrap();
         (

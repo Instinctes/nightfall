@@ -109,8 +109,13 @@ impl LedgerState {
 
         // ---- Stage 1: validate against a staged view. ----
 
-        // Exactly one coinbase kernel, minting exactly the scheduled subsidy,
-        // pinned to this height so it cannot be replayed at another.
+        // Exactly one coinbase kernel, pinned to this height so it cannot be
+        // replayed at another.
+        //
+        // `expected_reward` is the *subsidy* (newly minted). While it is
+        // positive, fees are burned. After the subsidy ends the miner is paid
+        // the block's fees instead: the coinbase kernel then carries the fee
+        // total, nothing is minted, nothing is burned, circulating is unchanged.
         if body.coinbase_kernels() != 1 {
             return Err(LedgerError::MissingCoinbase);
         }
@@ -119,10 +124,16 @@ impl LedgerState {
             .iter()
             .find(|k| k.feature == KernelFeature::Coinbase)
             .ok_or(LedgerError::MissingCoinbase)?;
-        if coinbase.reward_darks != expected_reward {
+        let fees = body.total_fee();
+        let coinbase_due = if expected_reward > 0 {
+            expected_reward
+        } else {
+            fees
+        };
+        if coinbase.reward_darks != coinbase_due {
             return Err(LedgerError::WrongReward {
                 got: coinbase.reward_darks,
-                expected: expected_reward,
+                expected: coinbase_due,
             });
         }
         if coinbase.lock_height != height.0 {
@@ -243,16 +254,18 @@ impl LedgerState {
                 .add(&k.excess)
                 .ok_or(LedgerError::MalformedKernelExcess)?;
         }
-        self.supply.total_minted_darks = self
-            .supply
-            .total_minted_darks
-            .checked_add(expected_reward)
-            .ok_or(LedgerError::ArithmeticOverflow)?;
-        self.supply.total_burned_darks = self
-            .supply
-            .total_burned_darks
-            .checked_add(body.total_fee())
-            .ok_or(LedgerError::ArithmeticOverflow)?;
+        if expected_reward > 0 {
+            self.supply.total_minted_darks = self
+                .supply
+                .total_minted_darks
+                .checked_add(expected_reward)
+                .ok_or(LedgerError::ArithmeticOverflow)?;
+            self.supply.total_burned_darks = self
+                .supply
+                .total_burned_darks
+                .checked_add(fees)
+                .ok_or(LedgerError::ArithmeticOverflow)?;
+        }
         self.tx_count += body.kernels.len() as u64;
         self.height = height;
 

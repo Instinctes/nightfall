@@ -284,13 +284,9 @@ fn rejected_block_leaves_the_chain_untouched() {
 
 /// Terminal supply actually produced by the emission curve, in darks.
 ///
-/// The idealised geometric sum `2 · 20 · 2_250_000` is exactly 90 M NIGHT, but
-/// each halving truncates via integer shift, so the curve lands
-/// **0.2925 NIGHT short** of the cap and stops there. That is safe — the
-/// invariant is `total_minted ≤ cap` — but the docs previously claimed the
-/// supply *equals* 90 M, which is not true. Recorded here so the number can
-/// never drift silently.
-const TERMINAL_SUPPLY_DARKS: u128 = 8_999_999_970_750_000;
+/// Ideal sum `2 · 6 · 7_500_000` is 90 M NIGHT. Integer shifts land
+/// **0.75 NIGHT short**. The invariant is `total_minted ≤ cap`.
+const TERMINAL_SUPPLY_DARKS: u128 = 8_999_999_925_000_000;
 
 #[test]
 fn emission_sums_below_the_cap_and_stops() {
@@ -312,10 +308,8 @@ fn emission_sums_below_the_cap_and_stops() {
         "the cap is a hard ceiling and must never be exceeded"
     );
 
-    // The shortfall is 0.2925 NIGHT — assert it precisely so nobody has to
-    // rediscover it.
     let shortfall = nightfall_types::MAX_SUPPLY_DARKS as u128 - total;
-    assert_eq!(shortfall, 29_250_000, "shortfall changed unexpectedly");
+    assert_eq!(shortfall, 75_000_000, "shortfall changed unexpectedly");
 
     // Once the cap is reached, the reward is zero — no tail emission.
     assert_eq!(
@@ -486,37 +480,23 @@ fn splitting_the_reorg_did_not_change_the_verdict() {
     assert_eq!(via_wrapper.total_work, via_halves.total_work);
 }
 
-// --- the v0.6.0 upgrade gate must not be a chain reset -------------------
+// --- n8 genesis is pinned ------------------------------------------------
 
-/// The mainnet genesis hash the live network has run since the v7 reset.
-const MAINNET_GENESIS: &str = "c8614333c0f86a4824df212474632f4b9feecf9bf0593841199d894127f2f9a6";
+/// Mainnet genesis for protocol v8 (6 NIGHT / 7.5 M blocks). The previous
+/// live hash `c8614333…` is archived in `docs/HISTORY.md`.
+const MAINNET_GENESIS: &str = "061a052d49607ff8f4b306c75d622ebd230cff4ec3a45a6dffc2f7738d4b20de";
 
 #[test]
-fn raising_the_wire_version_did_not_move_the_genesis() {
-    // v0.6.0 raises WIRE_VERSION to refuse peering with releases that damage
-    // the network. That is a *networking* decision and it must stay one.
-    //
-    // The trap it has to avoid: PROTOCOL_VERSION is folded into GenesisConfig,
-    // so bumping it changes the genesis hash and silently starts a new chain —
-    // every mined coin stranded on a network nobody is on any more. The two
-    // constants sit four lines apart and mean entirely different things, and
-    // "make old wallets stop mining" sounds like it could reasonably be either.
-    //
-    // So this pins the outcome rather than the intent: if the mainnet genesis
-    // hash ever changes, that is a chain reset, and it must be a decision taken
-    // deliberately with this test updated in the same commit — never a side
-    // effect of an upgrade gate.
+fn n8_genesis_is_pinned() {
     let chain = Chain::new_fair(NetworkId::Mainnet).unwrap();
     assert_eq!(
         chain.genesis_hash.to_hex(),
         MAINNET_GENESIS,
-        "the mainnet genesis moved — this is a chain reset, not an upgrade"
+        "the mainnet genesis moved — update docs/HISTORY.md in the same commit"
     );
-    assert_eq!(
-        nightfall_types::PROTOCOL_VERSION,
-        7,
-        "protocol version is consensus; changing it strands every existing coin"
-    );
+    assert_eq!(nightfall_types::PROTOCOL_VERSION, 8);
+    assert_eq!(nightfall_types::INITIAL_BLOCK_REWARD_NIGHT, 6);
+    assert_eq!(nightfall_types::HALVING_INTERVAL_BLOCKS, 7_500_000);
 }
 
 /// The gate only works if it differs from what the refused releases speak.
@@ -524,4 +504,4 @@ fn raising_the_wire_version_did_not_move_the_genesis() {
 /// 0.5.4 and earlier speak wire v4, so anything at or below that reopens the
 /// door to them. Checked at compile time because both sides are constants —
 /// a runtime assertion here would only ever fail after shipping.
-const _: () = assert!(nightfall_types::WIRE_VERSION >= 5);
+const _: () = assert!(nightfall_types::WIRE_VERSION >= 6);

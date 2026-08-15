@@ -1,5 +1,8 @@
 //! Nightfall P2P: newline-delimited JSON messages over TCP.
 
+mod socks;
+pub use socks::{looks_like_dial_target, SocksProxy};
+
 use nightfall_consensus::Block;
 use nightfall_ledger::Transaction;
 use nightfall_types::{Hash256, NetworkId, MAX_MESSAGE_BYTES, WIRE_VERSION};
@@ -34,9 +37,9 @@ pub fn dialable_addr(observed: &str, advertised_port: u16) -> Option<String> {
 
 pub fn network_magic(network: NetworkId) -> [u8; 4] {
     match network {
-        NetworkId::Mainnet => *b"NFL1",
-        NetworkId::Testnet => *b"NFT1",
-        NetworkId::Devnet => *b"NFD1",
+        NetworkId::Mainnet => *b"NFL2",
+        NetworkId::Testnet => *b"NFT2",
+        NetworkId::Devnet => *b"NFD2",
     }
 }
 
@@ -160,7 +163,41 @@ pub fn read_msg(reader: &mut BufReader<TcpStream>) -> std::io::Result<PeerMsg> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
 }
 
+/// Local Tor SOCKS by default. Opt out with `--proxy off`.
+pub const DEFAULT_TOR_PROXY: &str = "127.0.0.1:9050";
+
 pub fn connect_peer(addr: &str, timeout_ms: u64) -> std::io::Result<TcpStream> {
+    connect_peer_via(addr, timeout_ms, None).map(|(s, _)| s)
+}
+
+/// Dial `addr`, optionally through SOCKS5.
+///
+/// Returns `(stream, used_tor)`. If the proxy is down, a clearnet destination
+/// falls back to a direct connect. `.onion` never falls back — that would
+/// leak the name to DNS.
+pub fn connect_peer_via(
+    addr: &str,
+    timeout_ms: u64,
+    proxy: Option<&SocksProxy>,
+) -> std::io::Result<(TcpStream, bool)> {
+    let onion = addr.contains(".onion");
+    if let Some(p) = proxy {
+        match p.connect(addr, timeout_ms) {
+            Ok(s) => return Ok((s, true)),
+            Err(e) if onion => return Err(e),
+            Err(_) => {}
+        }
+    }
+    if onion {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "onion destinations require a working SOCKS5 proxy",
+        ));
+    }
+    Ok((connect_direct(addr, timeout_ms)?, false))
+}
+
+pub(crate) fn connect_direct(addr: &str, timeout_ms: u64) -> std::io::Result<TcpStream> {
     use std::net::ToSocketAddrs;
 
     // `TcpStream::connect` has no timeout of its own: a dead address waits

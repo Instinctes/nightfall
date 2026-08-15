@@ -2341,7 +2341,7 @@ dependencies = [
 
 [[package]]
 name = "nightfall-consensus"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "hex",
  "nightfall-crypto",
@@ -2354,7 +2354,7 @@ dependencies = [
 
 [[package]]
 name = "nightfall-core"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2367,6 +2367,7 @@ dependencies = [
  "nightfall-crypto",
  "nightfall-ledger",
  "nightfall-node",
+ "nightfall-p2p",
  "nightfall-storage",
  "nightfall-types",
  "nightfall-wallet",
@@ -2379,7 +2380,7 @@ dependencies = [
 
 [[package]]
 name = "nightfall-crypto"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "argon2",
  "bip39",
@@ -2401,7 +2402,7 @@ dependencies = [
 
 [[package]]
 name = "nightfall-ledger"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "curve25519-dalek",
  "hex",
@@ -2415,7 +2416,7 @@ dependencies = [
 
 [[package]]
 name = "nightfall-node"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2435,7 +2436,7 @@ dependencies = [
 
 [[package]]
 name = "nightfall-p2p"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "hex",
  "nightfall-consensus",
@@ -2448,7 +2449,7 @@ dependencies = [
 
 [[package]]
 name = "nightfall-storage"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -2464,7 +2465,7 @@ dependencies = [
 
 [[package]]
 name = "nightfall-types"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "hex",
  "serde",
@@ -2473,7 +2474,7 @@ dependencies = [
 
 [[package]]
 name = "nightfall-wallet"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "clap",

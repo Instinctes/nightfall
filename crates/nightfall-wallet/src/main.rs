@@ -70,6 +70,22 @@ enum Commands {
     NodeStatus,
     /// Ask the node to re-prove the global supply invariant.
     VerifySupply,
+    /// Prove one received output without sharing the view key.
+    ProveOutput {
+        /// Output commitment hex (txid of a receive/mine history line).
+        #[arg(long)]
+        commit: String,
+    },
+    /// Export a signed receipt for a history entry (txid prefix ok).
+    ExportReceipt {
+        #[arg(long)]
+        txid: String,
+    },
+    /// Verify a receipt JSON file.
+    VerifyReceipt {
+        #[arg(long)]
+        file: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -114,6 +130,23 @@ fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&res)?);
             return Ok(());
         }
+        Commands::VerifyReceipt { file } => {
+            let raw = std::fs::read_to_string(&file)?;
+            let receipt: nightfall_wallet::PaymentReceipt = serde_json::from_str(&raw)?;
+            nightfall_wallet::verify_receipt(&receipt)?;
+            println!("receipt ok");
+            println!("kind........... {}", receipt.kind);
+            println!("address........ {}", receipt.address);
+            println!(
+                "amount......... {}",
+                Amount(receipt.amount_darks)
+            );
+            println!("height......... {}", receipt.height);
+            if !receipt.memo.is_empty() {
+                println!("memo........... {}", receipt.memo);
+            }
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -135,6 +168,16 @@ fn main() -> anyhow::Result<()> {
             eprintln!();
             eprintln!("This key reveals every amount and memo you send or receive.");
             eprintln!("It cannot spend. Share it only with someone you want to have that view.");
+        }
+
+        Commands::ProveOutput { commit } => {
+            let r = wallet.prove_output(&commit)?;
+            println!("{}", r.to_json()?);
+        }
+
+        Commands::ExportReceipt { txid } => {
+            let r = wallet.prove_history(&txid)?;
+            println!("{}", r.to_json()?);
         }
 
         Commands::Rescan => {
@@ -212,7 +255,10 @@ fn main() -> anyhow::Result<()> {
             println!("The transaction is in the mempool until a block is mined.");
         }
 
-        Commands::About | Commands::NodeStatus | Commands::VerifySupply => unreachable!(),
+        Commands::About
+        | Commands::NodeStatus
+        | Commands::VerifySupply
+        | Commands::VerifyReceipt { .. } => unreachable!(),
     }
 
     Ok(())

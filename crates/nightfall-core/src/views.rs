@@ -819,7 +819,33 @@ pub fn activity(app: &mut App, ui: &mut egui::Ui) {
         } else {
             let now = now_unix();
             for e in filtered {
-                activity_row(ui, e, now);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(ui.available_width() - 88.0);
+                        activity_row(ui, e, now);
+                    });
+                    if matches!(
+                        e.direction,
+                        Direction::Received | Direction::Mined
+                    ) && ghost_button(ui, "Receipt").clicked()
+                    {
+                        match app
+                            .wallet
+                            .lock()
+                            .ok()
+                            .and_then(|w| w.receipt_json(&e.txid).ok())
+                        {
+                            Some(json) => {
+                                ui.ctx().copy_text(json);
+                                app.toasts.success(
+                                    ui.ctx(),
+                                    "Receipt copied — proves this one payment, not the whole wallet",
+                                );
+                            }
+                            None => app.toasts.error(ui.ctx(), "Could not build a receipt"),
+                        }
+                    }
+                });
             }
         }
     });
@@ -1054,7 +1080,8 @@ fn sparkline(ui: &mut egui::Ui, data: &[f64], height: f32) {
 // --------------------------------------------------------------- network ---
 
 pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
-    let s = app.status.as_ref();
+    let status = app.status.clone();
+    let s = status.as_ref();
 
     card(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -1109,7 +1136,9 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             RichText::new(format!(
                 "Live sockets: {peers}. Others reach you on port {}. Forward it to \
                  accept incoming connections. Outbound to a seed is enough to \
-                 stay on the tip — you do not have to be dialable.",
+                 stay on the tip — you do not have to be dialable. Transactions \
+                 leave this node as a Dandelion stem (one random hop), not a \
+                 broadcast.",
                 app.network.default_p2p_port()
             ))
             .size(11.0)
@@ -1125,6 +1154,70 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 ui.label(RichText::new(p).monospace().size(11.5).color(TEXT_FAINT));
             }
         }
+    });
+
+    ui.add_space(14.0);
+
+    let tor_on = app.status.as_ref().map(|st| st.tor_proxy).unwrap_or(false);
+    titled_card(ui, "Network privacy", |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(
+            RichText::new(
+                "Outbound connections can go through Tor. Your ISP then sees only \
+                 a SOCKS handshake, not which seed you dial. Destination hostnames \
+                 are not resolved locally.",
+            )
+            .size(12.0)
+            .color(TEXT_DIM),
+        );
+        ui.add_space(10.0);
+        kv(
+            ui,
+            "SOCKS5 / Tor",
+            RichText::new(if tor_on { "on" } else { "off" })
+                .monospace()
+                .color(if tor_on { SUCCESS } else { TEXT_FAINT }),
+        );
+        kv(
+            ui,
+            "Tx relay",
+            RichText::new("Dandelion stem / fluff").monospace(),
+        );
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut app.proxy_input)
+                    .desired_width(280.0)
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text("127.0.0.1:9050"),
+            );
+            if ghost_button(ui, "Apply").clicked() {
+                match app.apply_proxy() {
+                    Ok(()) => app.toasts.success(
+                        ctx,
+                        if matches!(
+                            app.proxy_input.trim(),
+                            "" | "off" | "none" | "clearnet"
+                        ) {
+                            "Tor off — new dials go clearnet"
+                        } else {
+                            "SOCKS5 saved — new outbound dials try Tor first"
+                        },
+                    ),
+                    Err(e) => app.toasts.error(ctx, e.to_string()),
+                }
+            }
+        });
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(
+                "Tor is the default (127.0.0.1:9050). If Tor is down, dials \
+                 fall back to clearnet and this meter goes off. Type off to \
+                 disable. .onion seeds never fall back.",
+            )
+            .size(11.0)
+            .color(TEXT_FAINT),
+        );
     });
 
     ui.add_space(14.0);
@@ -1257,7 +1350,8 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.label(
             RichText::new(
                 "A view key lets someone see every amount and memo you send or receive — an \
-                 accountant or auditor, for example. It cannot spend anything.",
+                 accountant or auditor, for example. It cannot spend anything. To prove a \
+                 single payment instead, copy a Receipt from the Activity list.",
             )
             .size(12.0)
             .color(TEXT_DIM),
