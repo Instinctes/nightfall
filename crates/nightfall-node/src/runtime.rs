@@ -102,6 +102,12 @@ pub struct NodeInner {
     /// spends minutes doing the same arithmetic n times to arrive at the answer
     /// the first one already had. One at a time; the rest skip the round.
     pub reorg_in_flight: Arc<AtomicBool>,
+    /// Unix time of the last side-channel reorg fetch. A peer that is
+    /// ahead on a *fork* cannot be caught by `GetBlocks` — those blocks
+    /// do not connect to our tip — so we pull their chain on a fresh
+    /// socket. Without a throttle, every 4-second Status tick would
+    /// start the same download.
+    pub last_reorg_fetch: AtomicU64,
     /// Sockets that are open right now. Announce writes here. A wallet behind
     /// NAT stays in real time because its outbound to a seed lives in this
     /// pool, not because anyone can dial it back.
@@ -367,6 +373,7 @@ impl NodeHandle {
             behind_since: now_unix(),
             peer_agents: HashMap::new(),
             reorg_in_flight: Arc::new(AtomicBool::new(false)),
+            last_reorg_fetch: AtomicU64::new(0),
             sessions: Arc::clone(&sessions),
             tip_notify: Arc::clone(&tip_notify),
         };
@@ -590,12 +597,13 @@ fn open_outbound_session(state: &SharedState, addr: &str) -> anyhow::Result<()> 
     let mut stream = connect_peer(addr, 8_000)?;
     prepare_live_socket(&stream)?;
 
-    let (network, genesis, our_h, tip, port) = {
+    let (network, genesis, our_h, next, tip, port) = {
         let g = state.lock().unwrap();
         (
             g.network,
             g.chain.genesis_hash,
             g.chain.tip_height().map(|h| h.0).unwrap_or(0),
+            next_needed_height(&g),
             g.chain.tip_hash(),
             g.listen_port,
         )
@@ -619,9 +627,9 @@ fn open_outbound_session(state: &SharedState, addr: &str) -> anyhow::Result<()> 
     // Catch up on this socket before we sit in the read loop. A NAT wallet
     // that just opened Core is often tens of blocks behind; one GetBlocks
     // here, then the loop chains pages if the peer is still ahead.
-    if peer_h > our_h || peer_tip != tip.to_hex() {
+    if peer_h + 1 > next || peer_tip != tip.to_hex() {
         let _ = sess.send(&PeerMsg::GetBlocks {
-            from_height: our_h.saturating_sub(1),
+            from_height: next,
             limit: MAX_BLOCKS_PER_REQUEST,
         });
     } else if peer_h < our_h {
@@ -638,6 +646,49 @@ fn open_outbound_session(state: &SharedState, addr: &str) -> anyhow::Result<()> 
         g.sessions.remove(&outbound_key(addr));
     }
     result
+}
+
+/// Height of the next block this chain will accept. 0 on an empty node.
+fn next_needed_height(inner: &NodeInner) -> u64 {
+    inner
+        .chain
+        .tip_height()
+        .map(|h| h.0.saturating_add(1))
+        .unwrap_or(0)
+}
+
+const REORG_FETCH_COOLDOWN_SECS: u64 = 15;
+
+/// Pull a peer's chain on a fresh socket and weigh it. Used when live
+/// `GetBlocks` cannot extend our tip — we are on a fork, not merely late.
+fn kick_reorg_fetch(state: &SharedState, sess: &SessionHandle) {
+    if !sess.outbound {
+        return;
+    }
+    let addr = sess
+        .key
+        .strip_prefix("out:")
+        .unwrap_or(&sess.key)
+        .to_string();
+    if addr.starts_with("in:") {
+        return;
+    }
+    let now = now_unix();
+    {
+        let Ok(g) = state.lock() else { return };
+        let last = g.last_reorg_fetch.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < REORG_FETCH_COOLDOWN_SECS {
+            return;
+        }
+        g.last_reorg_fetch.store(now, Ordering::Relaxed);
+    }
+    tracing::info!("peer {addr} is ahead on a fork — fetching their chain");
+    let st = Arc::clone(state);
+    thread::spawn(move || {
+        if let Err(e) = sync_from_peer(&st, &addr) {
+            tracing::debug!("reorg fetch {addr}: {e}");
+        }
+    });
 }
 
 fn spawn_status_ticker(state: SharedState) {
@@ -910,33 +961,22 @@ fn peer_io_loop(
             PeerMsg::Status { height, tip, .. } => {
                 last_peer_height = height;
                 note_peer_height(state, height);
-                let (our_h, our_tip) = {
+                let (next, our_tip) = {
                     let g = state.lock().unwrap();
-                    (
-                        g.chain.tip_height().map(|h| h.0).unwrap_or(0),
-                        g.chain.tip_hash().to_hex(),
-                    )
+                    (next_needed_height(&g), g.chain.tip_hash().to_hex())
                 };
-                if height > our_h {
+                if height + 1 > next {
+                    // Ask for blocks we do not yet have. Starting at
+                    // `tip − 1` used to include a block we already hold;
+                    // apply_block then returned BadHeight and the rest of
+                    // the page was thrown away — a node 120 blocks behind
+                    // on a one-block fork sat there forever.
                     sess.send(&PeerMsg::GetBlocks {
-                        from_height: our_h.saturating_sub(1),
+                        from_height: next,
                         limit: MAX_BLOCKS_PER_REQUEST,
                     })?;
-                } else if height >= our_h && tip != our_tip && sess.outbound {
-                    // Same height, different tip — a fork. Pull on a fresh
-                    // socket so the multiplexed session is not asked to do
-                    // request/response.
-                    let addr = sess
-                        .key
-                        .strip_prefix("out:")
-                        .unwrap_or(&sess.key)
-                        .to_string();
-                    let st = Arc::clone(state);
-                    thread::spawn(move || {
-                        if let Err(e) = sync_from_peer(&st, &addr) {
-                            tracing::debug!("reorg fetch {addr}: {e}");
-                        }
-                    });
+                } else if tip != our_tip && sess.outbound {
+                    kick_reorg_fetch(state, sess);
                 }
             }
 
@@ -990,13 +1030,13 @@ fn peer_io_loop(
             PeerMsg::InvBlock { height, .. } => {
                 last_peer_height = last_peer_height.max(height);
                 note_peer_height(state, height);
-                let our_height = {
+                let next = {
                     let g = state.lock().unwrap();
-                    g.chain.tip_height().map(|h| h.0).unwrap_or(0)
+                    next_needed_height(&g)
                 };
-                if height > our_height {
+                if height + 1 > next {
                     sess.send(&PeerMsg::GetBlocks {
-                        from_height: our_height.saturating_sub(1),
+                        from_height: next,
                         limit: MAX_BLOCKS_PER_REQUEST,
                     })?;
                 }
@@ -1023,17 +1063,23 @@ fn peer_io_loop(
                 // Keep pulling on this live socket until we catch the peer.
                 // One 128-block page per Status tick would take a minute to
                 // close a 2,000-block gap; chaining pages closes it now.
+                let next = {
+                    let g = state.lock().unwrap();
+                    next_needed_height(&g)
+                };
                 if n > 0 {
-                    let our_h = {
-                        let g = state.lock().unwrap();
-                        g.chain.tip_height().map(|h| h.0).unwrap_or(0)
-                    };
-                    if last_peer_height > our_h {
+                    if last_peer_height + 1 > next {
                         sess.send(&PeerMsg::GetBlocks {
-                            from_height: our_h,
+                            from_height: next,
                             limit: MAX_BLOCKS_PER_REQUEST,
                         })?;
                     }
+                } else if last_peer_height + 1 > next {
+                    // The page did not connect. Either we already have those
+                    // heights (a competing block at our tip) or we are on a
+                    // lighter fork. GetBlocks cannot fix that — pull and
+                    // weigh their chain.
+                    kick_reorg_fetch(state, sess);
                 }
             }
 
