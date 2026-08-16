@@ -333,6 +333,7 @@ vulnerability reporting is enabled on this repository.
 | [docs/HISTORY.md](docs/HISTORY.md) | Every buried genesis, including this reset |
 | [docs/RESET.md](docs/RESET.md) | What v8 changed and what we do not claim |
 | [docs/MOBILE.md](docs/MOBILE.md) | iOS and Android wallet architecture |
+| [mobile/README.md](mobile/README.md) | Sideload Android APK / EU iOS install |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Every design decision and why |
 | [docs/ATTRIBUTES.md](docs/ATTRIBUTES.md) | Locked product attributes, with the gaps marked |
 | [MANIFESTO.md](MANIFESTO.md) | Why this exists |

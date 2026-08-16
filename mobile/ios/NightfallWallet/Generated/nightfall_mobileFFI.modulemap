@@ -1,0 +1,4 @@
+module nightfall_mobileFFI {
+    header "nightfall_mobileFFI.h"
+    export *
+}

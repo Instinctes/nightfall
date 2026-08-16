@@ -3,7 +3,9 @@
 **Scope:** a full iOS and Android wallet. Holds its own seed, receives, shows a
 balance, and sends. Not a watch-only viewer.
 
-**Status:** design locked, foundations landed, apps not started.
+**Status:** design locked. Light HTTP API, `nightfall-mobile` UniFFI crate,
+Android (Compose) and iOS (SwiftUI) sources are in `mobile/`. Apps are
+sideloaded — not listed on Apple’s or Google’s stores. See `mobile/README.md`.
 
 ---
 
@@ -108,9 +110,9 @@ two independent nodes and flagging disagreement is cheap and worth doing.
 
 ### 2.3 Sending reveals the origin
 
-There is no Dandelion++. The node a transaction is submitted to is, with high
-probability, its origin. On a phone this is worse than on a desktop because the
-device also carries a mobile IP that maps to a person and a location.
+The node a transaction is submitted to is, with high probability, its origin
+(stem/fluff starts *after* that hop). On a phone this is worse than on a
+desktop because the device also carries a mobile IP that maps to a person.
 
 The app must say this in plain language on the send screen, once, and not bury
 it. Claiming privacy the implementation does not provide is the failure mode
@@ -289,10 +291,10 @@ Two things the UI must get right because the protocol is unforgiving:
 | 3 | `scan_feed` RPC | — *(done)* |
 | 3b | `scan_subscribe` stream | 3 *(done)* |
 | 4 | View tags in the output format | — *(done, shipped in v6, carried into v7)* |
-| 5 | `nightfall-mobile` uniffi crate | 1–4 |
-| 6 | TLS endpoint on the seed node | 3 |
-| 7 | Android app | 5, 6 |
-| 8 | iOS app | 5, 6 |
+| 5 | `nightfall-mobile` uniffi crate | 1–4 | **done** |
+| 6 | Public HTTP mobile API (`--mobile-listen`) | 3 | **done** (TLS = reverse proxy) |
+| 7 | Android app | 5, 6 | **sources in `mobile/android`** |
+| 8 | iOS app (sideload / EU, no App Store) | 5, 6 | **sources in `mobile/ios`** |
 
 Android first, deliberately: no review gate, no developer-programme fee, and
 sideloading a build onto a real device takes minutes. Every protocol-level

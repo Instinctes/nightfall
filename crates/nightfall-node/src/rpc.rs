@@ -18,16 +18,16 @@ use std::thread;
 use std::time::Duration;
 
 #[derive(Debug, Deserialize)]
-struct RpcReq {
-    method: String,
+pub(crate) struct RpcReq {
+    pub(crate) method: String,
     #[serde(default)]
-    params: serde_json::Value,
+    pub(crate) params: serde_json::Value,
     #[serde(default)]
-    id: serde_json::Value,
+    pub(crate) id: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
-struct RpcRes {
+pub(crate) struct RpcRes {
     result: Option<serde_json::Value>,
     error: Option<String>,
     id: serde_json::Value,
@@ -134,7 +134,7 @@ fn handle_client(stream: TcpStream, state: SharedState) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
+pub(crate) fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
     let id = req.id.clone();
 
     match req.method.as_str() {
@@ -356,6 +356,7 @@ fn scan_feed_snapshot(state: &SharedState, from: u64, limit: usize) -> serde_jso
         for out in &block.body.outputs {
             outputs.push(json!({
                 "height": block.header.height.0,
+                "timestamp": block.header.timestamp_unix,
                 "commit": hex::encode(out.commit.0),
                 "ephemeral_pk": hex::encode(out.ephemeral_pk),
                 "output_pk": hex::encode(out.output_pk),

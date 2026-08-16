@@ -5,7 +5,7 @@
 use anyhow::{bail, Context};
 use curve25519_dalek::scalar::Scalar;
 use nightfall_consensus::Block;
-use nightfall_crypto::{scan_output, Address, Commitment, WalletKeys};
+use nightfall_crypto::{scan_candidate, scan_output, Address, Commitment, ScanCandidate, WalletKeys};
 use nightfall_ledger::{build_transfer, Payment, Spendable, Transaction};
 use nightfall_storage::write_secret_file;
 use nightfall_types::{Amount, NetworkId};
@@ -58,6 +58,48 @@ impl OwnedOutput {
             spend_secret: keys.spend_secret() + offset,
         })
     }
+}
+
+/// One output from the light-client `scan_feed`.
+#[derive(Clone, Debug)]
+pub struct LightOutput {
+    pub height: u64,
+    pub timestamp: u64,
+    pub commit: String,
+    pub ephemeral_pk: String,
+    pub output_pk: String,
+    pub view_tag: u8,
+    pub payload: String,
+    pub coinbase: bool,
+}
+
+impl LightOutput {
+    fn as_candidate(&self) -> Option<ScanCandidate> {
+        let commit = decode32(&self.commit)?;
+        let ephemeral_pk = decode32(&self.ephemeral_pk)?;
+        let output_pk = decode32(&self.output_pk)?;
+        let payload = hex::decode(&self.payload).ok()?;
+        Some(ScanCandidate {
+            commit: Commitment(commit),
+            ephemeral_pk,
+            output_pk,
+            view_tag: self.view_tag,
+            payload,
+        })
+    }
+}
+
+fn decode32(hex_str: &str) -> Option<[u8; 32]> {
+    let raw = hex::decode(hex_str).ok()?;
+    (raw.len() == 32).then(|| {
+        let mut a = [0u8; 32];
+        a.copy_from_slice(&raw);
+        a
+    })
+}
+
+fn outputs_share_spent_with_us(spent: &BTreeSet<[u8; 32]>, known: &BTreeSet<[u8; 32]>) -> bool {
+    spent.iter().any(|c| known.contains(c))
 }
 
 /// Which way value moved.
@@ -354,6 +396,123 @@ impl Wallet {
         // The output file contains blinding factors — treat it as secret.
         let _ = nightfall_storage::harden_permissions(&self.db_path);
         Ok(())
+    }
+
+    /// Ingest one light-client `scan_feed` page. Used by phones.
+    pub fn ingest_scan_page(
+        &mut self,
+        outputs: &[LightOutput],
+        spent_hex: &[String],
+        scanned_to: u64,
+    ) -> anyhow::Result<u32> {
+        let view = self.keys.view_key();
+        let known: BTreeSet<[u8; 32]> = self.db.outputs.iter().map(|o| o.commit.0).collect();
+        let mut found = 0u32;
+        let mut spent_commits: BTreeSet<[u8; 32]> = BTreeSet::new();
+        for h in spent_hex {
+            if let Ok(raw) = hex::decode(h) {
+                if raw.len() == 32 {
+                    let mut c = [0u8; 32];
+                    c.copy_from_slice(&raw);
+                    spent_commits.insert(c);
+                }
+            }
+        }
+        let mut new_history: Vec<HistoryEntry> = Vec::new();
+        let pending: Vec<(String, BTreeSet<[u8; 32]>)> = self
+            .db
+            .history
+            .iter()
+            .filter(|e| e.is_pending() && e.direction == Direction::Sent)
+            .map(|e| (e.txid.clone(), e.spent_commits.iter().copied().collect()))
+            .collect();
+        let mut confirmed: Vec<(String, u64, u64)> = Vec::new();
+
+        for out in outputs {
+            let Some(cand) = out.as_candidate() else {
+                continue;
+            };
+            if spent_commits.iter().any(|c| pending.iter().any(|(_, s)| s.contains(c))) {
+                // fall through — confirmation checked below
+            }
+            if known.contains(&cand.commit.0) {
+                continue;
+            }
+            if let Some(d) = scan_candidate(&view, &cand) {
+                self.db.outputs.push(OwnedOutput {
+                    commit: d.commit,
+                    value: d.value,
+                    blind_hex: hex::encode(d.blind.to_bytes()),
+                    key_offset_hex: hex::encode(d.key_offset.to_bytes()),
+                    memo: d.memo.clone(),
+                    height: out.height,
+                    spent: false,
+                    is_coinbase: out.coinbase,
+                });
+                if out.coinbase || !outputs_share_spent_with_us(&spent_commits, &known) {
+                    new_history.push(HistoryEntry {
+                        direction: if out.coinbase {
+                            Direction::Mined
+                        } else {
+                            Direction::Received
+                        },
+                        amount: d.value,
+                        fee: 0,
+                        memo: d.memo,
+                        height: Some(out.height),
+                        txid: hex::encode(d.commit.0),
+                        timestamp: out.timestamp,
+                        spent_commits: Vec::new(),
+                    });
+                }
+                found += 1;
+            }
+        }
+
+        for (txid, commits) in &pending {
+            if !commits.is_empty() && commits.iter().all(|c| spent_commits.contains(c)) {
+                let h = outputs.iter().map(|o| o.height).max().unwrap_or(scanned_to);
+                let ts = outputs.iter().map(|o| o.timestamp).max().unwrap_or(0);
+                confirmed.push((txid.clone(), h, ts));
+            }
+        }
+
+        for o in self.db.outputs.iter_mut() {
+            if spent_commits.contains(&o.commit.0) {
+                o.spent = true;
+            }
+        }
+        for (txid, height, ts) in confirmed {
+            if let Some(e) = self
+                .db
+                .history
+                .iter_mut()
+                .find(|e| e.txid == txid && e.height.is_none())
+            {
+                e.height = Some(height);
+                e.timestamp = ts;
+            }
+        }
+        for e in new_history {
+            if !self
+                .db
+                .history
+                .iter()
+                .any(|x| x.txid == e.txid && x.direction == e.direction)
+            {
+                self.db.history.push(e);
+            }
+        }
+        self.db.history.sort_by(|a, b| {
+            b.height
+                .unwrap_or(u64::MAX)
+                .cmp(&a.height.unwrap_or(u64::MAX))
+        });
+        if scanned_to > self.db.scanned_to {
+            self.db.scanned_to = scanned_to;
+        }
+        self.save()?;
+        Ok(found)
     }
 
     /// Scan blocks for outputs belonging to this wallet and mark spent ones.

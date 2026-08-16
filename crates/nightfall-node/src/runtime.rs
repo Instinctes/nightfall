@@ -41,6 +41,8 @@ pub struct NodeConfig {
     pub miner: Option<Address>,
     /// SOCKS5 proxy for outbound P2P (`127.0.0.1:9050` for Tor).
     pub proxy: Option<String>,
+    /// Public light-client HTTP API. Empty / None = off.
+    pub mobile_listen: Option<String>,
 }
 
 pub struct NodeInner {
@@ -484,6 +486,9 @@ impl NodeHandle {
         }
 
         rpc::spawn_rpc(cfg.rpc_listen.clone(), Arc::clone(&state));
+        if let Some(addr) = cfg.mobile_listen.clone().filter(|s| !s.is_empty()) {
+            crate::mobile::spawn_mobile(addr, Arc::clone(&state));
+        }
 
         spawn_outbound_supervisor(Arc::clone(&state));
         spawn_status_ticker(Arc::clone(&state));

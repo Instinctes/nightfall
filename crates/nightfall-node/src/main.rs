@@ -61,6 +61,10 @@ enum Commands {
         /// SOCKS5 proxy for outbound P2P. Tor: `127.0.0.1:9050`.
         #[arg(long)]
         proxy: Option<String>,
+        /// Public phone API (HTTP). Only status/scan_feed/submit_tx.
+        /// Example: 0.0.0.0:17888
+        #[arg(long)]
+        mobile_listen: Option<String>,
     },
 }
 
@@ -155,6 +159,7 @@ fn main() -> anyhow::Result<()> {
             mine,
             miner_seed,
             proxy,
+            mobile_listen,
         } => {
             let listen =
                 listen.unwrap_or_else(|| format!("0.0.0.0:{}", network.default_p2p_port()));
@@ -184,6 +189,7 @@ fn main() -> anyhow::Result<()> {
                 mine,
                 miner,
                 proxy,
+                mobile_listen: mobile_listen.clone(),
             };
 
             println!("{COIN_NAME} node starting");
@@ -191,6 +197,9 @@ fn main() -> anyhow::Result<()> {
             println!("datadir........ {}", datadir.display());
             println!("p2p............ {listen}");
             println!("rpc............ {rpc_listen}");
+            if let Some(ref m) = mobile_listen {
+                println!("mobile......... {m}");
+            }
             println!("mine........... {mine}");
 
             let handle = NodeHandle::start(cfg)?;

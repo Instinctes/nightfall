@@ -10,6 +10,7 @@ members = [
     "crates/nightfall-node",
     "crates/nightfall-wallet",
     "crates/nightfall-core",
+    "crates/nightfall-mobile",
 ]
 
 [workspace.package]
@@ -28,6 +29,9 @@ nightfall-consensus = { path = "crates/nightfall-consensus" }
 nightfall-storage = { path = "crates/nightfall-storage" }
 nightfall-p2p = { path = "crates/nightfall-p2p" }
 nightfall-node = { path = "crates/nightfall-node" }
+nightfall-wallet = { path = "crates/nightfall-wallet" }
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+uniffi = "0.28"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

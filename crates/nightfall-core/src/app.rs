@@ -176,6 +176,7 @@ impl App {
             // Mining starts off. The user turns it on deliberately.
             mine: false,
             miner,
+            mobile_listen: None,
             proxy: {
                 let from_env = std::env::var("NIGHTFALL_PROXY").ok();
                 if from_env.as_ref().map(|s| !s.is_empty()).unwrap_or(false) {

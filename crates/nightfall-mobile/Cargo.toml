@@ -1,0 +1,26 @@
+[package]
+name = "nightfall-mobile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FFI surface for the Nightfall phone wallets"
+
+[lib]
+name = "nightfall_mobile"
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[dependencies]
+nightfall-types = { workspace = true }
+nightfall-crypto = { workspace = true }
+nightfall-ledger = { workspace = true }
+nightfall-wallet = { workspace = true }
+anyhow = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+ureq = { workspace = true }
+uniffi = { workspace = true, features = ["cli"] }
+
+[build-dependencies]
+uniffi = { workspace = true, features = ["build"] }

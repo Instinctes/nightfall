@@ -169,6 +169,7 @@ Recent builds connect automatically. For anything else, share:
 2. Port **17891**
 3. Confirm they use `--network mainnet`
 4. The same release — protocol v8 / wire v6, genesis `061a052d…`
+5. Phones: `--mobile-listen 0.0.0.0:17888` (light API only)
 
 ### Joiner command
 

@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.Nightfall" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">#0E0B18</item>
+        <item name="android:navigationBarColor">#0E0B18</item>
+        <item name="android:windowBackground">#0E0B18</item>
+    </style>
+</resources>
