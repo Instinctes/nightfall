@@ -1,6 +1,9 @@
 # Phone wallets — 0.7.0
 
-## Android (built)
+Binaries: [v0.7.0 release](https://github.com/Instinctes/nightfall/releases/tag/v0.7.0)
+and https://nightfallcoin.org/#download.
+
+## Android
 
 `NIGHTFALLCOIN-0.7.0-android-arm64.apk` — 64-bit Android, sideload.
 

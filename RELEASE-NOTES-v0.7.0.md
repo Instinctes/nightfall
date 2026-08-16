@@ -14,8 +14,9 @@ here. The archive is [docs/HISTORY.md](docs/HISTORY.md).
 Build 0.7.0. 0.6.x cannot peer.
 
 Browser wallet: https://nightfallcoin.org/wallet/ (PWA, seed stays in
-the browser). iOS IPA: `NIGHTFALLCOIN-0.7.0-ios-arm64.ipa` (unsigned,
-sideload).
+the browser).
+Android APK: `NIGHTFALLCOIN-0.7.0-android-arm64.apk` (sideload).
+iOS IPA: `NIGHTFALLCOIN-0.7.0-ios-arm64.ipa` (unsigned, sideload).
 
 Internal security review (not independent):
 https://nightfallcoin.org/audit/ · docs/AUDIT-2026-08-16.md
