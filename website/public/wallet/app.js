@@ -13,7 +13,7 @@ import init, {
   wallet_history,
   build_send,
   probe_crypto,
-} from "./pkg/nightfall_web.js?v=s3";
+} from "./pkg/nightfall_web.js?v=s4";
 
 const STORE = "nf-web-wallet-v1";
 const NODE_STORE = "nf-web-node";
@@ -25,7 +25,7 @@ const WARN =
   "This phone or browser trusts a node for what it shows. A hostile node can hide a payment or invent one on the screen. It cannot spend — the seed never leaves this device. Anyone who can run script on this page can read a saved wallet. The 24 words are the real backup.";
 
 const FEE = "0.001";
-const BUILD = "0.7.0+s3";
+const BUILD = "0.7.0+s4";
 
 let wasmReady = init();
 let state = null;
@@ -180,13 +180,41 @@ function onboard() {
   $("#do-restore").onclick = onRestore;
 }
 
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (_) {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  }
+}
+
+function wordGrid(phrase) {
+  return `<div class="words">${phrase
+    .trim()
+    .split(/\s+/)
+    .map((w, i) => `<span><i>${i + 1}</i>${escapeHtml(w)}</span>`)
+    .join("")}</div>`;
+}
+
 function backup(phrase) {
   const words = phrase.trim().split(/\s+/);
   screen(`
     <div class="onboard">
       <h1>Write these 24 words down</h1>
-      <p class="hint">On paper. Not a screenshot, not the cloud. Nobody can reset this.</p>
-      <div class="card mono">${escapeHtml(phrase)}</div>
+      <p class="hint">Paper first. A password manager is next-best. Not a screenshot, not chat, not email. Anyone with these words can spend. Nobody can reset this.</p>
+      ${wordGrid(phrase)}
+      <button class="ghost" id="copy">Copy all 24 words</button>
+      <p class="ok" id="copied" hidden>Copied. Clear the clipboard when you have stored them.</p>
       <p class="hint">Type word 4 and word 18 to continue.</p>
       <input id="w4" placeholder="Word 4" autocomplete="off">
       <input id="w18" placeholder="Word 18" autocomplete="off">
@@ -194,6 +222,17 @@ function backup(phrase) {
       <p id="err" class="warn"></p>
     </div>
   `);
+  $("#copy").onclick = async () => {
+    const ok = await copyText(phrase);
+    const n = $("#copied");
+    if (n) {
+      n.hidden = !ok;
+      n.textContent = ok
+        ? "Copied. Clear the clipboard when you have stored them."
+        : "Could not copy. Select the words and copy them yourself.";
+      n.className = ok ? "ok" : "warn";
+    }
+  };
   const check = () => {
     const ok =
       $("#w4").value.trim().toLowerCase() === (words[3] || "") &&
@@ -410,10 +449,11 @@ function renderSeed() {
     <div class="screen">
       <button class="linkish" id="back">← Settings</button>
       <h1>Recovery phrase</h1>
-      <p class="hint">On paper. Not a screenshot. These 24 words are the wallet.</p>
-      <div class="secret mono" id="secret" hidden>${escapeHtml(phrase)}</div>
+      <p class="hint">Paper first. A password manager is next-best. Anyone with these words can spend.</p>
+      <div id="secret" hidden>${wordGrid(phrase)}</div>
       <button class="primary" id="reveal">Show the 24 words</button>
-      <button class="ghost" id="copy" hidden>Copy phrase</button>
+      <button class="ghost" id="copy" hidden>Copy all 24 words</button>
+      <p class="ok" id="copied" hidden></p>
       <p class="warn">${escapeHtml(err)}</p>
     </div>
   `);
@@ -427,8 +467,15 @@ function renderSeed() {
     $("#reveal").hidden = true;
   };
   $("#copy").onclick = async () => {
-    await navigator.clipboard.writeText(phrase);
-    lastStatus = "phrase copied — clear the clipboard when you can";
+    const ok = await copyText(phrase);
+    const n = $("#copied");
+    if (n) {
+      n.hidden = false;
+      n.textContent = ok
+        ? "Copied. Clear the clipboard when you have stored them."
+        : "Could not copy. Select the words and copy them yourself.";
+      n.className = ok ? "ok" : "warn";
+    }
   };
 }
 

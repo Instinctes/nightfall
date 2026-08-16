@@ -170,18 +170,51 @@ private fun Backup(phrase: String, err: String?, onDone: () -> Unit) {
     val words = phrase.trim().split(Regex("\\s+"))
     var a by remember { mutableStateOf("") }
     var b by remember { mutableStateOf("") }
+    var copied by remember { mutableStateOf(false) }
+    val ctx = LocalContext.current
     Column(Modifier.fillMaxSize().padding(24.dp).verticalScroll(rememberScrollState())) {
         Text("Write these 24 words down.", color = TextCol, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
-        Text("On paper. Not a photo, not the cloud. Nobody can reset this.", color = Dim, modifier = Modifier.padding(vertical = 8.dp))
-        SelectionContainer {
-            Text(phrase, color = TextCol, fontFamily = FontFamily.Monospace, fontSize = 16.sp, modifier = Modifier.padding(vertical = 12.dp))
-        }
-        Text("Type word 4 and word 18.", color = Dim)
+        Text(
+            "Paper first. A password manager is next-best. Not a photo, not chat. Anyone with these words can spend.",
+            color = Dim,
+            modifier = Modifier.padding(vertical = 8.dp),
+        )
+        WordGrid(words)
+        OutlinedButton(
+            onClick = {
+                val cm = ctx.getSystemService(ClipboardManager::class.java)
+                cm.setPrimaryClip(ClipData.newPlainText("night-seed", phrase))
+                copied = true
+            },
+            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+        ) { Text("Copy all 24 words") }
+        if (copied) Text("Copied. Clear the clipboard when you have stored them.", color = Ok, fontSize = 13.sp, modifier = Modifier.padding(top = 6.dp))
+        Text("Type word 4 and word 18.", color = Dim, modifier = Modifier.padding(top = 16.dp))
         OutlinedTextField(a, { a = it }, label = { Text("Word 4") }, modifier = Modifier.fillMaxWidth())
         OutlinedTextField(b, { b = it }, label = { Text("Word 18") }, modifier = Modifier.fillMaxWidth())
         val ok = words.getOrNull(3).equals(a.trim(), true) && words.getOrNull(17).equals(b.trim(), true)
         Button(onClick = onDone, enabled = ok, modifier = Modifier.fillMaxWidth().padding(top = 16.dp)) { Text("I have the words") }
         err?.let { Text(it, color = Bad) }
+    }
+}
+
+@Composable
+private fun WordGrid(words: List<String>) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        words.chunked(2).forEachIndexed { row, pair ->
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                pair.forEachIndexed { col, w ->
+                    val n = row * 2 + col + 1
+                    Surface(shape = RoundedCornerShape(10.dp), color = Card, modifier = Modifier.weight(1f)) {
+                        Row(Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text("$n", color = Dim, fontSize = 11.sp, modifier = Modifier.width(22.dp))
+                            Text(w, color = TextCol, fontFamily = FontFamily.Monospace, fontSize = 14.sp)
+                        }
+                    }
+                }
+                if (pair.size == 1) Spacer(Modifier.weight(1f))
+            }
+        }
     }
 }
 
@@ -591,17 +624,25 @@ private fun SecretPane(
         TextButton(onClick = onBack) { Text("← Settings", color = Dim) }
         Text(title, color = TextCol, fontSize = 28.sp, fontWeight = FontWeight.Bold)
         Text(body, color = Dim, fontSize = 13.sp, modifier = Modifier.padding(bottom = 12.dp))
+        var copied by remember { mutableStateOf(false) }
         if (!show) {
             Button(onClick = { show = true }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = Accent)) {
                 Text("Show")
             }
         } else {
-            Surface(shape = RoundedCornerShape(16.dp), color = Card, modifier = Modifier.fillMaxWidth()) {
-                SelectionContainer {
-                    Text(secret, color = TextCol, fontFamily = FontFamily.Monospace, fontSize = 15.sp, modifier = Modifier.padding(14.dp))
+            val words = secret.trim().split(Regex("\\s+"))
+            if (words.size >= 12) WordGrid(words) else {
+                Surface(shape = RoundedCornerShape(16.dp), color = Card, modifier = Modifier.fillMaxWidth()) {
+                    SelectionContainer {
+                        Text(secret, color = TextCol, fontFamily = FontFamily.Monospace, fontSize = 15.sp, modifier = Modifier.padding(14.dp))
+                    }
                 }
             }
-            Button(onClick = { onCopy(secret) }, modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) { Text("Copy") }
+            Button(
+                onClick = { onCopy(secret); copied = true },
+                modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+            ) { Text("Copy all 24 words") }
+            if (copied) Text("Copied. Clear the clipboard when you have stored them.", color = Ok, fontSize = 13.sp, modifier = Modifier.padding(top = 6.dp))
         }
     }
 }

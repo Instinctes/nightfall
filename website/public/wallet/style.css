@@ -268,6 +268,29 @@ textarea { min-height: 5.5rem; }
   font-size: .92rem;
   line-height: 1.55;
 }
+.words {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin: 12px 0;
+}
+.words span {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  background: #12091c;
+  border: 1px solid #3a3450;
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: .92rem;
+}
+.words i {
+  color: var(--dim);
+  font-style: normal;
+  font-size: .72rem;
+  min-width: 1.4em;
+}
 
 /* ——— bottom nav ——— */
 .nav {

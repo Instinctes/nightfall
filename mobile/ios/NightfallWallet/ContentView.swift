@@ -134,25 +134,53 @@ struct BackupView: View {
     var onDone: () -> Void
     @State private var a = ""
     @State private var b = ""
+    @State private var copied = false
 
     var body: some View {
         let words = phrase.split(whereSeparator: \.isWhitespace).map(String.init)
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 Text("Write these 24 words down.").font(.title2.bold())
-                Text("On paper. Not a photo, not the cloud.").foregroundStyle(dim)
-                Text(phrase).font(.system(.body, design: .monospaced)).textSelection(.enabled)
+                Text("Paper first. A password manager is next-best. Not a photo, not chat. Anyone with these words can spend.")
+                    .foregroundStyle(dim)
+                WordGrid(words: words)
+                Button("Copy all 24 words") {
+                    UIPasteboard.general.string = phrase
+                    copied = true
+                }
+                .buttonStyle(.bordered)
+                if copied {
+                    Text("Copied. Clear the clipboard when you have stored them.")
+                        .font(.footnote).foregroundStyle(ok)
+                }
                 Text("Type word 4 and word 18.").foregroundStyle(dim)
                 TextField("Word 4", text: $a).textFieldStyle(.roundedBorder)
                 TextField("Word 18", text: $b).textFieldStyle(.roundedBorder)
-                let ok = words.dropFirst(3).first?.lowercased() == a.trimmingCharacters(in: .whitespaces).lowercased()
+                let okConfirm = words.dropFirst(3).first?.lowercased() == a.trimmingCharacters(in: .whitespaces).lowercased()
                     && words.dropFirst(17).first?.lowercased() == b.trimmingCharacters(in: .whitespaces).lowercased()
                 Button("I have the words", action: onDone)
-                    .disabled(!ok)
+                    .disabled(!okConfirm)
                     .buttonStyle(.borderedProminent)
                     .tint(accent)
                 if let err { Text(err).foregroundStyle(.red) }
             }.padding(24)
+        }
+    }
+}
+
+struct WordGrid: View {
+    let words: [String]
+    var body: some View {
+        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+            ForEach(Array(words.enumerated()), id: \.offset) { i, w in
+                HStack(spacing: 8) {
+                    Text("\(i + 1)").font(.caption2).foregroundStyle(dim).frame(width: 18, alignment: .trailing)
+                    Text(w).font(.system(.subheadline, design: .monospaced))
+                    Spacer(minLength: 0)
+                }
+                .padding(8)
+                .background(card, in: RoundedRectangle(cornerRadius: 10))
+            }
         }
     }
 }
@@ -484,8 +512,10 @@ struct SecretView: View {
     let gated: Bool
     var onClose: () -> Void
     @State private var show = false
+    @State private var copied = false
 
     var body: some View {
+        let words = value.split(whereSeparator: \.isWhitespace).map(String.init)
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 Text(warn).font(.footnote).foregroundStyle(dim)
@@ -493,13 +523,24 @@ struct SecretView: View {
                     Button("Show") { show = true }
                         .buttonStyle(.borderedProminent).tint(accent)
                 } else {
-                    Text(value)
-                        .font(.system(.body, design: .monospaced))
-                        .textSelection(.enabled)
-                        .padding()
-                        .background(card, in: RoundedRectangle(cornerRadius: 16))
-                    Button("Copy") { UIPasteboard.general.string = value }
-                        .buttonStyle(.borderedProminent).tint(accent)
+                    if words.count >= 12 {
+                        WordGrid(words: words)
+                    } else {
+                        Text(value)
+                            .font(.system(.body, design: .monospaced))
+                            .textSelection(.enabled)
+                            .padding()
+                            .background(card, in: RoundedRectangle(cornerRadius: 16))
+                    }
+                    Button(words.count >= 12 ? "Copy all 24 words" : "Copy") {
+                        UIPasteboard.general.string = value
+                        copied = true
+                    }
+                    .buttonStyle(.borderedProminent).tint(accent)
+                    if copied {
+                        Text("Copied. Clear the clipboard when you have stored them.")
+                            .font(.footnote).foregroundStyle(ok)
+                    }
                 }
             }.padding(20)
         }
