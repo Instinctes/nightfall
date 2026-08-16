@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Security review — NIGHTFALLCOIN v8</title>
+<meta name="description" content="Internal security review of protocol v8. Not an independent audit. Not 100% anonymous.">
+<meta name="theme-color" content="#0e0b18">
+<link rel="icon" href="/assets/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<nav id="nav">
+  <div class="wrap">
+    <a class="brand" href="/"><img class="mark" src="/assets/logo-256.png" alt="" width="34" height="34"> NIGHTFALL</a>
+    <div class="nav-links">
+      <a href="/#proof">Provable supply</a>
+      <a href="/#honest">Limitations</a>
+      <a href="/wallet/">Web wallet</a>
+      <a class="btn btn-primary" href="/#download">Download</a>
+    </div>
+  </div>
+</nav>
+
+<article class="doc">
+  <div class="wrap">
+    <p class="kicker" style="color:var(--warn);letter-spacing:.08em;text-transform:uppercase;font-size:.78rem;font-weight:700">Internal review · 16 August 2026</p>
+    <h1>Security review of protocol v8</h1>
+    <p class="lede">
+      This is <em>not</em> an independent third-party audit. The same people
+      who wrote the cryptography wrote this page. Passing tests are not an
+      outside review. The v4 inflation class is closed. New risk lives in
+      light clients, a browser that stores a seed, and a network that is
+      still small.
+    </p>
+
+    <div class="notice" style="margin:28px 0">
+      Live chain this was written against: protocol <b>8</b>, wire <b>6</b>,
+      magic <code>NFL2</code>, genesis <code>061a052d…8d4b20de</code>,
+      build 0.7.0. Full text:
+      <a href="https://github.com/Instinctes/nightfall/blob/main/docs/AUDIT-2026-08-16.md">AUDIT-2026-08-16.md</a>.
+      The v4 write-up stays at
+      <a href="https://github.com/Instinctes/nightfall/blob/main/docs/AUDIT-2026-08-12.md">AUDIT-2026-08-12.md</a>.
+    </div>
+
+    <h2>Closed — the v4 class</h2>
+    <p>
+      Unlimited mint, negative amounts, fake inputs, unsigned bodies,
+      cleartext recipients, height-based fork choice, world-readable seeds,
+      public wallet RPC. All closed. Locked by
+      <code>exploit_regression.rs</code>. Do not weaken that file.
+    </p>
+
+    <h2>Open on this chain</h2>
+    <table>
+      <thead>
+        <tr><th>#</th><th>Finding</th><th>Severity</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>I-01</td><td>No review by anyone outside the project. This page is not that review.</td><td class="sev-high">High</td></tr>
+        <tr><td>H-01</td><td>Hashrate is small. A laptop farm can reorg recent blocks.</td><td class="sev-high">High</td></tr>
+        <tr><td>L-01</td><td>Phone and browser trust a node for what they <em>show</em>. The node cannot spend.</td><td class="sev-high">High</td></tr>
+        <tr><td>L-02</td><td>The web wallet keeps the seed in <code>localStorage</code>. Script on that page = theft. The 24 words are the wallet.</td><td class="sev-high">High</td></tr>
+        <tr><td>L-03</td><td>The website Worker sees every web-wallet <code>scan_feed</code> and <code>submit_tx</code>.</td><td class="sev-high">High</td></tr>
+        <tr><td>A-01</td><td>Anonymity set = the other transactions in the same block. The network is tiny.</td><td class="sev-high">High</td></tr>
+        <tr><td>G-01</td><td>Graph is mixed inside a block, not erased. No cut-through (one-sided payments).</td><td class="sev-med">Medium</td></tr>
+        <tr><td>N-11</td><td>Stem/fluff is not full Dandelion++. A hop onto an old node still broadcasts.</td><td class="sev-med">Medium</td></tr>
+        <tr><td>N-12</td><td>Tor is on by default. If it is down, the node falls back to clearnet and says so.</td><td class="sev-med">Medium</td></tr>
+        <tr><td>P-05</td><td>The node you submit to is probably the origin of the transaction.</td><td class="sev-med">Medium</td></tr>
+        <tr><td>D-01</td><td>Binaries are unsigned. Checksums are published. Verify them.</td><td class="sev-med">Medium</td></tr>
+        <tr><td>D-02</td><td>One seed answers P2P, phones, and the web proxy.</td><td class="sev-med">Medium</td></tr>
+        <tr><td>L-04</td><td>Light API is plain HTTP on :17888 and :80. Allowlist, not TLS.</td><td class="sev-med">Medium</td></tr>
+        <tr><td>W-05</td><td>Wallet CSP needs <code>'wasm-unsafe-eval'</code> to instantiate the module.</td><td class="sev-info">Low</td></tr>
+        <tr><td>S-01</td><td>Terminal minted supply is 89,999,999.25, not 90 million. 0.75 NIGHT never exists.</td><td class="sev-info">Info</td></tr>
+        <tr><td>S-02</td><td>Second public genesis in a month. Both failures are published.</td><td class="sev-info">Info</td></tr>
+      </tbody>
+    </table>
+
+    <h2>What a stranger still cannot do</h2>
+    <p>
+      Assuming they do not have your seed and do not out-mine the network:
+      they cannot mint NIGHT, spend your output, put a negative amount on
+      chain, freeze an address, or read an amount or an <code>nf1</code>
+      off the ledger. They <em>can</em> lie to a phone, lie to a browser,
+      watch a web-wallet submit, and — with enough hashes — rewrite recent
+      blocks.
+    </p>
+
+    <h2>What still holds</h2>
+    <p>
+      Every full node checks
+      <code>Σ UTXO − Σ kernel excess = (minted − burned) · G</code>.
+      A kernel is a Schnorr signature over generator <code>H</code>.
+      Every output has a Bulletproof. Addresses never appear on chain.
+      View keys cannot spend. Fees burn while a subsidy exists, then pay
+      the miner. Zero premine, no admin key.
+    </p>
+
+    <h2>Recommendations</h2>
+    <ol>
+      <li>Pay someone who did not write <code>nightfall-crypto</code> to read it (I-01).</li>
+      <li>Run a second seed, not by the same operator (D-02).</li>
+      <li>Put TLS in front of the light API if you point a phone at your own node (L-04).</li>
+      <li>Treat the 24 words as the wallet. <code>localStorage</code> is a cache (L-02).</li>
+      <li>Do not mine most of the blocks if you invented the chain (H-01, A-01).</li>
+      <li>Leave <code>exploit_regression.rs</code> alone.</li>
+    </ol>
+
+    <p style="margin-top:36px">
+      Reproduce:
+      <code>cargo test -p nightfall-ledger --test exploit_regression</code>.
+      Private reports: <code>SECURITY.md</code> on GitHub.
+    </p>
+    <p class="faint">Not a certificate. Not 100% anonymous.</p>
+  </div>
+</article>
+
+<footer>
+  <div class="wrap">
+    <div class="foot-grid">
+      <div class="foot-col">
+        <a class="brand" href="/" style="margin-bottom:14px"><img class="mark" src="/assets/logo-256.png" alt="" width="30" height="30"> NIGHTFALL</a>
+      </div>
+      <div class="foot-col">
+        <h4>Project</h4>
+        <a href="https://github.com/Instinctes/nightfall">Source</a>
+        <a href="https://github.com/Instinctes/nightfall/blob/main/docs/AUDIT-2026-08-16.md">This review (source)</a>
+        <a href="https://github.com/Instinctes/nightfall/blob/main/docs/AUDIT-2026-08-12.md">v4 audit</a>
+      </div>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

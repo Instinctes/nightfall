@@ -78,3 +78,8 @@ together, and describe the actual impact rather than downplaying it.
 If a vulnerability is being actively exploited, we will say so publicly and
 immediately, even before a fix exists. Users losing money quietly is worse than
 users being warned.
+
+## Current review
+
+Internal (not independent): [docs/AUDIT-2026-08-16.md](docs/AUDIT-2026-08-16.md)
+

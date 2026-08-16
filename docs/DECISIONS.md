@@ -31,7 +31,7 @@ consensus-broken.
 
 - **Cut-through**, or a spend-authorisation scheme that does not require a per-input signature. Until then the transaction graph is obscured, not erased.
 - **Full Dandelion++** (separate stem graph, fail-safe fluff on black-hole stems) — today's stem uses the same gossip set as blocks.
-- **Independent audit** — the v5 code was written by the same party that audited v4.
+- **Independent audit** — the v5/v8 code was written by the same party that audited v4. Internal review: [AUDIT-2026-08-16.md](./AUDIT-2026-08-16.md).
 - **UTXO snapshots / headers-first sync** — initial sync still replays and re-verifies every block, which memory-hard PoW makes expensive.
 
 ---

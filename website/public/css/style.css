@@ -931,6 +931,72 @@ section {
     color: var(--text);
 }
 
+/* ---------------------------------------------------------------- audit -- */
+
+.doc {
+    padding: 120px 0 80px;
+}
+
+.doc h1 {
+    font-size: 2.1rem;
+    margin: 0 0 12px;
+}
+
+.doc .lede {
+    color: var(--text-dim);
+    font-size: 1.05rem;
+    max-width: 42em;
+}
+
+.doc h2 {
+    margin: 42px 0 14px;
+    font-size: 1.35rem;
+}
+
+.doc h3 {
+    margin: 28px 0 10px;
+    font-size: 1.08rem;
+}
+
+.doc p,
+.doc li {
+    color: var(--text-dim);
+    max-width: 46em;
+}
+
+.doc a {
+    color: var(--violet-hi);
+}
+
+.doc table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+    margin: 16px 0 28px;
+}
+
+.doc th,
+.doc td {
+    text-align: left;
+    vertical-align: top;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+}
+
+.doc th {
+    color: var(--text-faint);
+    font-weight: 600;
+}
+
+.doc code {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 0.86em;
+}
+
+.doc .sev-high { color: var(--warn); }
+.doc .sev-med { color: var(--teal); }
+.doc .sev-info { color: var(--text-faint); }
+
 /* ---------------------------------------------------------------- footer -- */
 
 footer {

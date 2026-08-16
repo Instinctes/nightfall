@@ -20,7 +20,8 @@ never touch the chain, and hidden inflation isn't something you take on trust �
 [Web wallet](https://nightfallcoin.org/wallet/) ·
 [Start mining](#start-mining) ·
 [Protocol spec](docs/SPEC.md) ·
-[Security audit](docs/AUDIT-2026-08-12.md)
+[Security review (v8)](docs/AUDIT-2026-08-16.md) ·
+[v4 audit](docs/AUDIT-2026-08-12.md)
 
 </div>
 
@@ -303,7 +304,8 @@ from public data, recomputed the same value, and compared it to itself. It
 could not fail. Anyone could have minted unlimited NIGHT, and the recipient of
 every payment was published in cleartext. We found it, wrote it up in full,
 threw the chain away and started over. The whole analysis, including working
-exploits, is in [docs/AUDIT-2026-08-12.md](docs/AUDIT-2026-08-12.md) — including
+exploits, is in [docs/AUDIT-2026-08-12.md](docs/AUDIT-2026-08-12.md). The live
+chain is reviewed in [docs/AUDIT-2026-08-16.md](docs/AUDIT-2026-08-16.md) — including
 the parts that are embarrassing.
 
 The chain was reset at v6 to add view tags to the output format while that was
@@ -328,8 +330,9 @@ vulnerability reporting is enabled on this repository.
 
 | | |
 |--|--|
-| [docs/SPEC.md](docs/SPEC.md) | Protocol v7 in full |
-| [docs/AUDIT-2026-08-12.md](docs/AUDIT-2026-08-12.md) | Security audit of v4 — read this first |
+| [docs/SPEC.md](docs/SPEC.md) | Protocol v8 in full |
+| [docs/AUDIT-2026-08-16.md](docs/AUDIT-2026-08-16.md) | Current internal review of v8 (not independent) |
+| [docs/AUDIT-2026-08-12.md](docs/AUDIT-2026-08-12.md) | Security audit of v4 — history |
 | [docs/MAINNET.md](docs/MAINNET.md) | Operator guide, seed node setup |
 | [docs/PRIVACY.md](docs/PRIVACY.md) | What is hidden, Tor, receipts |
 | [docs/GETTING-NIGHT.md](docs/GETTING-NIGHT.md) | How a price forms — nobody sets one |
