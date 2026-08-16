@@ -1195,10 +1195,7 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 match app.apply_proxy() {
                     Ok(()) => app.toasts.success(
                         ctx,
-                        if matches!(
-                            app.proxy_input.trim(),
-                            "" | "off" | "none" | "clearnet"
-                        ) {
+                        if matches!(app.proxy_input.trim(), "" | "off" | "none" | "clearnet") {
                             "Tor off — new dials go clearnet"
                         } else {
                             "SOCKS5 saved — new outbound dials try Tor first"

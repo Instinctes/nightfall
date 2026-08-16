@@ -81,7 +81,11 @@ fn night(darks: u64) -> String {
     Amount(darks).to_string()
 }
 
-fn rpc(node: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value, MobileError> {
+fn rpc(
+    node: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, MobileError> {
     let url = node.trim_end_matches('/');
     let body = json!({ "method": method, "params": params, "id": 1 });
     let resp = ureq::post(url)
@@ -206,7 +210,11 @@ impl MobileWallet {
         let r = rpc(&node, "status", json!({}))?;
         Ok(r.get("tip_height")
             .and_then(|v| v.as_u64())
-            .or_else(|| r.get("blocks").and_then(|v| v.as_u64()).map(|b| b.saturating_sub(1)))
+            .or_else(|| {
+                r.get("blocks")
+                    .and_then(|v| v.as_u64())
+                    .map(|b| b.saturating_sub(1))
+            })
             .unwrap_or(0))
     }
 
@@ -215,12 +223,11 @@ impl MobileWallet {
         let mut from = w.scan_from();
         let mut found = 0u32;
         loop {
-            let page = rpc(
-                &node,
-                "scan_feed",
-                json!({ "from": from, "limit": 256 }),
-            )?;
-            let scanned_to = page.get("scanned_to").and_then(|v| v.as_u64()).unwrap_or(from);
+            let page = rpc(&node, "scan_feed", json!({ "from": from, "limit": 256 }))?;
+            let scanned_to = page
+                .get("scanned_to")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(from);
             let nblocks = page.get("blocks").and_then(|v| v.as_u64()).unwrap_or(0);
             let outputs = page
                 .get("outputs")
@@ -321,7 +328,8 @@ impl MobileWallet {
                 MATURITY,
             )?
         };
-        let raw = serde_json::to_value(&tx).map_err(|e| MobileError::Failed { msg: e.to_string() })?;
+        let raw =
+            serde_json::to_value(&tx).map_err(|e| MobileError::Failed { msg: e.to_string() })?;
         let res = rpc(&node, "submit_tx", json!({ "tx": raw }))?;
         {
             let mut w = self.lock()?;
@@ -352,10 +360,8 @@ pub fn privacy_warning() -> String {
 
 impl MobileWallet {
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Wallet>, MobileError> {
-        self.inner
-            .lock()
-            .map_err(|_| MobileError::Failed {
-                msg: "wallet lock poisoned".into(),
-            })
+        self.inner.lock().map_err(|_| MobileError::Failed {
+            msg: "wallet lock poisoned".into(),
+        })
     }
 }

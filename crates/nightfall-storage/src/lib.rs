@@ -261,7 +261,9 @@ pub const DATADIR_EPOCH: &str = "n8";
 
 pub fn default_data_dir(network: NetworkId) -> PathBuf {
     let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join("nightfall").join(network.as_str()).join(DATADIR_EPOCH)
+    base.join("nightfall")
+        .join(network.as_str())
+        .join(DATADIR_EPOCH)
 }
 
 pub fn wallet_dir(datadir: &Path) -> PathBuf {

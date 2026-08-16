@@ -54,7 +54,10 @@ impl WalletState {
     }
 
     pub fn receipt_json(&self, txid_or_commit: &str) -> anyhow::Result<String> {
-        let w = self.inner.as_ref().ok_or_else(|| anyhow::anyhow!("wallet not initialised"))?;
+        let w = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("wallet not initialised"))?;
         let r = w
             .prove_history(txid_or_commit)
             .or_else(|_| w.prove_output(txid_or_commit))?;

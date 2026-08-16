@@ -137,10 +137,7 @@ fn main() -> anyhow::Result<()> {
             println!("receipt ok");
             println!("kind........... {}", receipt.kind);
             println!("address........ {}", receipt.address);
-            println!(
-                "amount......... {}",
-                Amount(receipt.amount_darks)
-            );
+            println!("amount......... {}", Amount(receipt.amount_darks));
             println!("height......... {}", receipt.height);
             if !receipt.memo.is_empty() {
                 println!("memo........... {}", receipt.memo);

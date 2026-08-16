@@ -106,7 +106,9 @@ pub fn ingest_page(
     let mut w = Wallet::import_state(state).map_err(err)?;
     let lights = lights_from_json(outputs_json)?;
     let spent: Vec<String> = serde_json::from_str(spent_json).unwrap_or_default();
-    let found = w.ingest_scan_page(&lights, &spent, scanned_to).map_err(err)?;
+    let found = w
+        .ingest_scan_page(&lights, &spent, scanned_to)
+        .map_err(err)?;
     let out = json!({
         "state": w.export_state().map_err(err)?,
         "found": found,

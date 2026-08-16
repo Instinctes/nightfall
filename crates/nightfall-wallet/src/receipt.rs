@@ -8,9 +8,7 @@
 use anyhow::{bail, Context};
 use curve25519_dalek::ristretto::CompressedRistretto;
 use curve25519_dalek::scalar::Scalar;
-use nightfall_crypto::{
-    generator_g, hash_multi, Address, Commitment, SchnorrSig, WalletKeys,
-};
+use nightfall_crypto::{generator_g, hash_multi, Address, Commitment, SchnorrSig, WalletKeys};
 use serde::{Deserialize, Serialize};
 
 use crate::{Direction, HistoryEntry, OwnedOutput, Wallet};
@@ -82,9 +80,15 @@ impl Wallet {
             .db
             .outputs
             .iter()
-            .find(|o| hex::encode(o.commit.0) == needle || hex::encode(o.commit.0).starts_with(&needle))
+            .find(|o| {
+                hex::encode(o.commit.0) == needle || hex::encode(o.commit.0).starts_with(&needle)
+            })
             .context("no owned output matches that commitment")?;
-        let hist = self.db.history.iter().find(|e| e.txid == hex::encode(out.commit.0));
+        let hist = self
+            .db
+            .history
+            .iter()
+            .find(|e| e.txid == hex::encode(out.commit.0));
         Ok(self.receipt_from_output(out, hist))
     }
 
@@ -118,12 +122,12 @@ impl Wallet {
         }
     }
 
-    fn receipt_from_output(&self, out: &OwnedOutput, hist: Option<&HistoryEntry>) -> PaymentReceipt {
-        let kind = if out.is_coinbase {
-            "mined"
-        } else {
-            "received"
-        };
+    fn receipt_from_output(
+        &self,
+        out: &OwnedOutput,
+        hist: Option<&HistoryEntry>,
+    ) -> PaymentReceipt {
+        let kind = if out.is_coinbase { "mined" } else { "received" };
         let mut r = PaymentReceipt {
             v: 1,
             kind: kind.into(),
@@ -181,7 +185,10 @@ pub fn verify_receipt(receipt: &PaymentReceipt) -> anyhow::Result<()> {
     if r.len() != 32 || s.len() != 32 {
         bail!("signature fields must be 32 bytes");
     }
-    let mut sig = SchnorrSig { r: [0; 32], s: [0; 32] };
+    let mut sig = SchnorrSig {
+        r: [0; 32],
+        s: [0; 32],
+    };
     sig.r.copy_from_slice(&r);
     sig.s.copy_from_slice(&s);
     let pk = CompressedRistretto(addr.spend_pk)

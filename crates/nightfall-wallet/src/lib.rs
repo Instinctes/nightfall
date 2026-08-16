@@ -5,7 +5,9 @@
 use anyhow::{bail, Context};
 use curve25519_dalek::scalar::Scalar;
 use nightfall_consensus::Block;
-use nightfall_crypto::{scan_candidate, scan_output, Address, Commitment, ScanCandidate, WalletKeys};
+use nightfall_crypto::{
+    scan_candidate, scan_output, Address, Commitment, ScanCandidate, WalletKeys,
+};
 use nightfall_ledger::{build_transfer, Payment, Spendable, Transaction};
 use nightfall_storage::write_secret_file;
 use nightfall_types::{Amount, NetworkId};
@@ -444,7 +446,11 @@ impl Wallet {
         let mut seed = [0u8; 32];
         seed.copy_from_slice(&raw);
         let keys = WalletKeys::from_seed(seed);
-        let network = match v.get("network").and_then(|x| x.as_str()).unwrap_or("mainnet") {
+        let network = match v
+            .get("network")
+            .and_then(|x| x.as_str())
+            .unwrap_or("mainnet")
+        {
             "testnet" => NetworkId::Testnet,
             "devnet" => NetworkId::Devnet,
             _ => NetworkId::Mainnet,
@@ -497,7 +503,10 @@ impl Wallet {
             let Some(cand) = out.as_candidate() else {
                 continue;
             };
-            if spent_commits.iter().any(|c| pending.iter().any(|(_, s)| s.contains(c))) {
+            if spent_commits
+                .iter()
+                .any(|c| pending.iter().any(|(_, s)| s.contains(c)))
+            {
                 // fall through — confirmation checked below
             }
             if known.contains(&cand.commit.0) {

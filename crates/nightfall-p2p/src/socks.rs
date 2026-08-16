@@ -58,7 +58,9 @@ pub fn looks_like_dial_target(addr: &str) -> bool {
         return !host.is_empty() && port.parse::<u16>().map(|p| p > 0).unwrap_or(false);
     }
     match addr.rsplit_once(':') {
-        Some((host, port)) => !host.is_empty() && port.parse::<u16>().map(|p| p > 0).unwrap_or(false),
+        Some((host, port)) => {
+            !host.is_empty() && port.parse::<u16>().map(|p| p > 0).unwrap_or(false)
+        }
         None => false,
     }
 }
@@ -69,9 +71,9 @@ fn split_host_port(addr: &str) -> std::io::Result<(String, u16)> {
         let (host, port) = rest.split_once("]:").ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad IPv6 dial target")
         })?;
-        let port: u16 = port.parse().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad port")
-        })?;
+        let port: u16 = port
+            .parse()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad port"))?;
         if port == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -80,12 +82,18 @@ fn split_host_port(addr: &str) -> std::io::Result<(String, u16)> {
         }
         return Ok((host.to_string(), port));
     }
-    let (host, port) = addr.split_once(':').filter(|(h, _)| !h.is_empty()).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "dial target must be host:port")
-    })?;
-    let port: u16 = port.parse().map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad port")
-    })?;
+    let (host, port) = addr
+        .split_once(':')
+        .filter(|(h, _)| !h.is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "dial target must be host:port",
+            )
+        })?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad port"))?;
     if port == 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
