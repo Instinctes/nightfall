@@ -1,26 +1,26 @@
 /* tslint:disable */
 /* eslint-disable */
-export function create_wallet(birth_height: bigint): any;
-export function restore_wallet(phrase: string, birth_height: bigint): any;
+export function create_wallet(birth_height: number): any;
+export function restore_wallet(phrase: string, birth_height: number): any;
 export function wallet_address(state: string): string;
-export function wallet_scan_from(state: string): bigint;
-export function ingest_page(state: string, outputs_json: string, spent_json: string, scanned_to: bigint): any;
-export function wallet_balance(state: string, tip: bigint): any;
+export function wallet_scan_from(state: string): number;
+export function ingest_page(state: string, outputs_json: string, spent_json: string, scanned_to: number): any;
+export function wallet_balance(state: string, tip: number): any;
 export function wallet_history(state: string): any;
-export function build_send(state: string, to: string, amount: string, memo: string, tip: bigint): any;
+export function build_send(state: string, to: string, amount: string, memo: string, tip: number): any;
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
   readonly memory: WebAssembly.Memory;
-  readonly create_wallet: (a: bigint) => [number, number, number];
-  readonly restore_wallet: (a: number, b: number, c: bigint) => [number, number, number];
+  readonly create_wallet: (a: number) => [number, number, number];
+  readonly restore_wallet: (a: number, b: number, c: number) => [number, number, number];
   readonly wallet_address: (a: number, b: number) => [number, number, number, number];
-  readonly wallet_scan_from: (a: number, b: number) => [bigint, number, number];
-  readonly ingest_page: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint) => [number, number, number];
-  readonly wallet_balance: (a: number, b: number, c: bigint) => [number, number, number];
+  readonly wallet_scan_from: (a: number, b: number) => [number, number, number];
+  readonly ingest_page: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
+  readonly wallet_balance: (a: number, b: number, c: number) => [number, number, number];
   readonly wallet_history: (a: number, b: number) => [number, number, number];
-  readonly build_send: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: bigint) => [number, number, number];
+  readonly build_send: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => [number, number, number];
   readonly __wbindgen_exn_store: (a: number) => void;
   readonly __externref_table_alloc: () => number;
   readonly __wbindgen_export_2: WebAssembly.Table;

@@ -43,7 +43,7 @@ function takeFromExternrefTable0(idx) {
     return value;
 }
 /**
- * @param {bigint} birth_height
+ * @param {number} birth_height
  * @returns {any}
  */
 export function create_wallet(birth_height) {
@@ -111,7 +111,7 @@ function passStringToWasm0(arg, malloc, realloc) {
 }
 /**
  * @param {string} phrase
- * @param {bigint} birth_height
+ * @param {number} birth_height
  * @returns {any}
  */
 export function restore_wallet(phrase, birth_height) {
@@ -151,7 +151,7 @@ export function wallet_address(state) {
 
 /**
  * @param {string} state
- * @returns {bigint}
+ * @returns {number}
  */
 export function wallet_scan_from(state) {
     const ptr0 = passStringToWasm0(state, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
@@ -160,14 +160,14 @@ export function wallet_scan_from(state) {
     if (ret[2]) {
         throw takeFromExternrefTable0(ret[1]);
     }
-    return BigInt.asUintN(64, ret[0]);
+    return ret[0];
 }
 
 /**
  * @param {string} state
  * @param {string} outputs_json
  * @param {string} spent_json
- * @param {bigint} scanned_to
+ * @param {number} scanned_to
  * @returns {any}
  */
 export function ingest_page(state, outputs_json, spent_json, scanned_to) {
@@ -186,7 +186,7 @@ export function ingest_page(state, outputs_json, spent_json, scanned_to) {
 
 /**
  * @param {string} state
- * @param {bigint} tip
+ * @param {number} tip
  * @returns {any}
  */
 export function wallet_balance(state, tip) {
@@ -218,7 +218,7 @@ export function wallet_history(state) {
  * @param {string} to
  * @param {string} amount
  * @param {string} memo
- * @param {bigint} tip
+ * @param {number} tip
  * @returns {any}
  */
 export function build_send(state, to, amount, memo, tip) {

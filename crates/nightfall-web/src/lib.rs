@@ -13,6 +13,18 @@ fn err(e: impl ToString) -> JsError {
     JsError::new(&e.to_string())
 }
 
+/// JS `Number` in, never `BigInt`. Safari's `ToBigInt` rejects a plain
+/// number and shows "Invalid argument type in ToBigInt operation".
+fn height(n: f64) -> u64 {
+    if !n.is_finite() || n < 0.0 {
+        0
+    } else if n >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        n.trunc() as u64
+    }
+}
+
 fn parse_amount(s: &str) -> Result<u64, JsError> {
     let s = s.trim().replace(',', ".");
     if s.is_empty() || s.starts_with('-') {
@@ -63,10 +75,10 @@ fn lights_from_json(raw: &str) -> Result<Vec<LightOutput>, JsError> {
 }
 
 #[wasm_bindgen]
-pub fn create_wallet(birth_height: u64) -> Result<JsValue, JsError> {
+pub fn create_wallet(birth_height: f64) -> Result<JsValue, JsError> {
     let keys = WalletKeys::generate();
     let phrase = keys.to_mnemonic();
-    let w = Wallet::in_memory(NetworkId::Mainnet, keys, birth_height);
+    let w = Wallet::in_memory(NetworkId::Mainnet, keys, height(birth_height));
     let out = json!({
         "state": w.export_state().map_err(err)?,
         "address": w.address_string(),
@@ -76,9 +88,9 @@ pub fn create_wallet(birth_height: u64) -> Result<JsValue, JsError> {
 }
 
 #[wasm_bindgen]
-pub fn restore_wallet(phrase: &str, birth_height: u64) -> Result<JsValue, JsError> {
+pub fn restore_wallet(phrase: &str, birth_height: f64) -> Result<JsValue, JsError> {
     let keys = WalletKeys::from_mnemonic(phrase).map_err(err)?;
-    let w = Wallet::in_memory(NetworkId::Mainnet, keys, birth_height);
+    let w = Wallet::in_memory(NetworkId::Mainnet, keys, height(birth_height));
     let out = json!({
         "state": w.export_state().map_err(err)?,
         "address": w.address_string(),
@@ -92,8 +104,8 @@ pub fn wallet_address(state: &str) -> Result<String, JsError> {
 }
 
 #[wasm_bindgen]
-pub fn wallet_scan_from(state: &str) -> Result<u64, JsError> {
-    Ok(Wallet::import_state(state).map_err(err)?.scan_from())
+pub fn wallet_scan_from(state: &str) -> Result<f64, JsError> {
+    Ok(Wallet::import_state(state).map_err(err)?.scan_from() as f64)
 }
 
 #[wasm_bindgen]
@@ -101,13 +113,13 @@ pub fn ingest_page(
     state: &str,
     outputs_json: &str,
     spent_json: &str,
-    scanned_to: u64,
+    scanned_to: f64,
 ) -> Result<JsValue, JsError> {
     let mut w = Wallet::import_state(state).map_err(err)?;
     let lights = lights_from_json(outputs_json)?;
     let spent: Vec<String> = serde_json::from_str(spent_json).unwrap_or_default();
     let found = w
-        .ingest_scan_page(&lights, &spent, scanned_to)
+        .ingest_scan_page(&lights, &spent, height(scanned_to))
         .map_err(err)?;
     let out = json!({
         "state": w.export_state().map_err(err)?,
@@ -118,9 +130,9 @@ pub fn ingest_page(
 }
 
 #[wasm_bindgen]
-pub fn wallet_balance(state: &str, tip: u64) -> Result<JsValue, JsError> {
+pub fn wallet_balance(state: &str, tip: f64) -> Result<JsValue, JsError> {
     let w = Wallet::import_state(state).map_err(err)?;
-    let b = w.balances(tip, MATURITY);
+    let b = w.balances(height(tip), MATURITY);
     let out = json!({
         "available": Amount(b.available).to_string(),
         "immature": Amount(b.immature).to_string(),
@@ -158,7 +170,7 @@ pub fn build_send(
     to: &str,
     amount: &str,
     memo: &str,
-    tip: u64,
+    tip: f64,
 ) -> Result<JsValue, JsError> {
     let mut w = Wallet::import_state(state).map_err(err)?;
     let addr = Address::decode(to).map_err(err)?;
@@ -167,7 +179,7 @@ pub fn build_send(
     }
     let darks = parse_amount(amount)?;
     let tx = w
-        .create_payment_at(&addr, darks, DEFAULT_FEE, memo, tip, MATURITY)
+        .create_payment_at(&addr, darks, DEFAULT_FEE, memo, height(tip), MATURITY)
         .map_err(err)?;
     w.record_send(&tx, darks, memo.to_string()).map_err(err)?;
     let out = json!({

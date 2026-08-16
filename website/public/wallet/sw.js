@@ -1,4 +1,4 @@
-const CACHE = "night-wallet-v1";
+const CACHE = "night-wallet-v2";
 const SHELL = ["./", "./index.html", "./style.css", "./app.js", "./pkg/nightfall_web.js", "./pkg/nightfall_web_bg.wasm"];
 
 self.addEventListener("install", (e) => {
