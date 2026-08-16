@@ -81,6 +81,14 @@ fn night(darks: u64) -> String {
     Amount(darks).to_string()
 }
 
+fn post_json(url: &str, body: &serde_json::Value) -> Result<ureq::Response, MobileError> {
+    ureq::post(url)
+        .timeout(std::time::Duration::from_secs(30))
+        .set("content-type", "application/json")
+        .send_json(body)
+        .map_err(MobileError::from)
+}
+
 fn rpc(
     node: &str,
     method: &str,
@@ -88,17 +96,11 @@ fn rpc(
 ) -> Result<serde_json::Value, MobileError> {
     let url = node.trim_end_matches('/');
     let body = json!({ "method": method, "params": params, "id": 1 });
-    let resp = ureq::post(url)
-        .timeout(std::time::Duration::from_secs(30))
-        .set("content-type", "application/json")
-        .send_json(&body)
-        .or_else(|_| {
-            ureq::post(&format!("{url}/rpc"))
-                .timeout(std::time::Duration::from_secs(30))
-                .set("content-type", "application/json")
-                .send_json(&body)
-        })?;
-    let v: serde_json::Value = resp.into_json()?;
+    let resp = match post_json(url, &body) {
+        Ok(r) => r,
+        Err(_) => post_json(&format!("{url}/rpc"), &body)?,
+    };
+    let v: serde_json::Value = resp.into_json().map_err(MobileError::from)?;
     if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
         return Err(MobileError::Failed { msg: e.to_string() });
     }
