@@ -19,8 +19,12 @@ android {
     }
     ndkVersion = "29.0.14206865"
     buildTypes {
+        // Sideload. Android will not install an APK with no signature at all.
+        // This is the debug cert, not a Play Store key — same honesty as
+        // "unsigned" in the docs: checksums are the trust, not a store.
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
     compileOptions {
