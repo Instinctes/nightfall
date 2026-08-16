@@ -75,7 +75,7 @@
     const ticker = document.getElementById("ticker");
     if (ticker && !reduced) {
         let value = 0;
-        const target = 6240;
+        const target = 1872;
         const tick = () => {
             value += (target - value) * 0.06;
             const shown = value < target - 0.5 ? value : target;
@@ -87,7 +87,7 @@
         };
         setTimeout(() => requestAnimationFrame(tick), 700);
     } else if (ticker) {
-        ticker.textContent = "6,240.00000000";
+        ticker.textContent = "1,872.00000000";
     }
 
     /* ------------------------------------------------ equation spotlight --- */
@@ -106,7 +106,7 @@
         const makeBlock = (height, fresh) => {
             const el = document.createElement("div");
             el.className = "blk" + (fresh ? " new" : "");
-            el.innerHTML = `<b>#${height}</b>20 NIGHT`;
+            el.innerHTML = `<b>#${height}</b>6 NIGHT`;
             return el;
         };
         const link = () => {

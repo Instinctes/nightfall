@@ -16,7 +16,7 @@
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
-<link rel="stylesheet" href="css/style.css">
+<link rel="stylesheet" href="css/style.css?v=v8-1">
 </head>
 <body>
 
@@ -66,11 +66,11 @@
           <div class="label">TOTAL BALANCE</div>
           <div class="amount"><span id="ticker">0.00000000</span> NIGHT</div>
           <div class="wallet-chips">
-            <span>440.00000000 unlocking</span>
+            <span>132.00000000 unlocking</span>
             <span>22 outputs</span>
           </div>
           <div class="wallet-rows">
-            <div><span>Mined · block 318</span><span>+20.00000000</span></div>
+            <div><span>Mined · block 318</span><span>+6.00000000</span></div>
             <div><span>Received · "invoice 42"</span><span>+5.00000000</span></div>
             <div><span>Sent</span><span>−1.00100000</span></div>
           </div>
@@ -105,7 +105,8 @@
       <p class="caption">
         Sum every unspent output, subtract every transaction kernel, and the
         result must equal exactly the coins that were legitimately mined minus
-        the fees that were burned. Inflation cannot hide in this equation — it
+        the fees that were burned — and, after the subsidy ends, not minted
+        as extra. Inflation cannot hide in this equation — it
         breaks it, and every node sees the break instantly.
       </p>
       <div class="verdict"><span class="dot" style="width:8px;height:8px;border-radius:50%;background:currentColor;display:inline-block"></span> supply_proof… OK</div>
@@ -124,8 +125,8 @@
       </div>
       <div class="card reveal" data-delay="2">
         <div class="ico"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg></div>
-        <h3>An auditable burn</h3>
-        <p>Fees are destroyed, never paid to a miner. The fee is the one public number in a transaction, precisely so the burn can be checked rather than merely claimed.</p>
+        <h3>An auditable fee</h3>
+        <p>While blocks still pay a subsidy, fees are burned — the fee is the one public number in a transaction, so the burn can be checked rather than merely claimed. After the last reward, that same public fee goes to the miner. Nothing is minted either way.</p>
       </div>
     </div>
   </div>
@@ -252,7 +253,7 @@
       <div class="spec"><span class="val" data-count="90000000">0</span><span class="key">Max supply</span></div>
       <div class="spec"><span class="val" data-count="0">0</span><span class="key">Premine</span></div>
       <div class="spec"><span class="val" data-count="15" data-suffix="s">0</span><span class="key">Block time</span></div>
-      <div class="spec"><span class="val" data-count="100" data-suffix="%">0</span><span class="key">Fees burned</span></div>
+      <div class="spec"><span class="val" data-count="6">0</span><span class="key">NIGHT / block</span></div>
     </div>
 
     <div class="grid grid-3" style="margin-top:22px">
@@ -266,7 +267,7 @@
       </div>
       <div class="card reveal" data-delay="2">
         <h3>Written in Rust</h3>
-        <p>Eight crates, no unsafe code in the consensus path, 116 tests — including a suite that replays six real attacks against the previous protocol version and asserts every one of them now fails.</p>
+        <p>Workspace crates, no unsafe code in the consensus path, and a regression suite that replays the six real attacks against the previous protocol version and asserts every one of them now fails.</p>
       </div>
     </div>
   </div>
@@ -410,6 +411,6 @@
   </div>
 </footer>
 
-<script src="js/main.js"></script>
+<script src="js/main.js?v=v8-1"></script>
 </body>
 </html>
