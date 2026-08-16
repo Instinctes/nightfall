@@ -98,6 +98,10 @@ function cacheControlFor(pathname) {
         }
         return "public, max-age=31536000, immutable";
     }
+    if (pathname.startsWith("/wallet/")) {
+        // The PWA used to keep a stale wasm that could not send.
+        return "no-store";
+    }
     if (/\.(css|js|svg|png|woff2?|wasm)$/i.test(pathname)) {
         return "public, max-age=86400";
     }

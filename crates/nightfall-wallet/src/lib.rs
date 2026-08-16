@@ -972,6 +972,20 @@ impl Wallet {
         amount: u64,
         memo: String,
     ) -> anyhow::Result<()> {
+        self.record_send_at(tx, amount, memo, unix_secs())
+    }
+
+    /// Like [`Self::record_send`], but the caller supplies the timestamp.
+    ///
+    /// `SystemTime::now()` is not implemented on `wasm32-unknown-unknown` and
+    /// aborts the browser wallet after the proofs already succeeded.
+    pub fn record_send_at(
+        &mut self,
+        tx: &Transaction,
+        amount: u64,
+        memo: String,
+        timestamp: u64,
+    ) -> anyhow::Result<()> {
         let spent: BTreeSet<[u8; 32]> = tx.inputs.iter().map(|i| i.commit.0).collect();
         for o in self.db.outputs.iter_mut() {
             if spent.contains(&o.commit.0) {
@@ -989,10 +1003,7 @@ impl Wallet {
                     memo,
                     height: None,
                     txid,
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
+                    timestamp,
                     spent_commits: tx.inputs.iter().map(|i| i.commit.0).collect(),
                 },
             );
@@ -1014,6 +1025,22 @@ impl Wallet {
             ..Default::default()
         };
         self.save()
+    }
+}
+
+fn unix_secs() -> u64 {
+    // wasm32-unknown-unknown has no clock. SystemTime::now() panics there
+    // (Safari reports that as "Unreachable code" in build_send).
+    #[cfg(target_arch = "wasm32")]
+    {
+        0
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
     }
 }
 

@@ -13,7 +13,7 @@ import init, {
   wallet_history,
   build_send,
   probe_crypto,
-} from "./pkg/nightfall_web.js";
+} from "./pkg/nightfall_web.js?v=s3";
 
 const STORE = "nf-web-wallet-v1";
 const NODE_STORE = "nf-web-node";
@@ -25,6 +25,7 @@ const WARN =
   "This phone or browser trusts a node for what it shows. A hostile node can hide a payment or invent one on the screen. It cannot spend — the seed never leaves this device. Anyone who can run script on this page can read a saved wallet. The 24 words are the real backup.";
 
 const FEE = "0.001";
+const BUILD = "0.7.0+s3";
 
 let wasmReady = init();
 let state = null;
@@ -282,6 +283,7 @@ function renderHome() {
         <div class="stat"><span class="dim">Tip</span><span>${lastTip || lastBal?.tip || "—"}</span></div>
         <div class="stat"><span class="dim">Scanned to</span><span>${lastBal?.scanned_to ?? "—"}</span></div>
         <div class="stat"><span class="dim">Fee</span><span>${FEE} NIGHT · burned while subsidy lasts</span></div>
+        <div class="stat"><span class="dim">Build</span><span>${BUILD}</span></div>
         <p class="status-line" id="status">${status}</p>
       </section>
       <section class="section">
@@ -357,7 +359,7 @@ function renderSettings() {
         <p class="kicker">Trusted node</p>
         <p class="hint">The website Worker proxies to the seed. This field is informational — the browser always talks to /wallet-api.</p>
         <input id="node" value="${escapeHtml(nodeUrl() || "seed.nightfallcoin.org (via /wallet-api)")}" readonly>
-        <p class="hint">Tip ${lastTip || lastBal?.tip || "—"} · protocol v8 · wallet 0.7.0</p>
+        <p class="hint">Tip ${lastTip || lastBal?.tip || "—"} · protocol v8 · ${BUILD}</p>
       </div>
       <div class="card"><p class="hint">${WARN}</p></div>
       <button class="ghost" id="wipe">Remove wallet from this browser</button>
@@ -543,7 +545,7 @@ async function doSend(to, amt, memo) {
     lastStatus = "proving range proofs…";
     renderHome();
     await new Promise((r) => setTimeout(r, 40));
-    const built = parseJson(wasmCall(build_send, state, to, amt, memo, tip));
+    const built = parseJson(wasmCall(build_send, state, to, amt, memo, tip, Date.now() / 1000));
     lastStatus = "broadcasting…";
     renderHome();
     const res = await rpc("submit_tx", { tx: built.tx });

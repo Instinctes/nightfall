@@ -18,7 +18,7 @@ export function wallet_history(state: string): any;
  * Returns `"ok <proof-bytes>"` or a recoverable error.
  */
 export function probe_crypto(): string;
-export function build_send(state: string, to: string, amount: string, memo: string, tip: number): any;
+export function build_send(state: string, to: string, amount: string, memo: string, tip: number, now: number): any;
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
@@ -38,7 +38,7 @@ export interface InitOutput {
   readonly wallet_balance: (a: number, b: number, c: number) => [number, number, number];
   readonly wallet_history: (a: number, b: number) => [number, number, number];
   readonly probe_crypto: () => [number, number, number, number];
-  readonly build_send: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => [number, number, number];
+  readonly build_send: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number];
   readonly __wbindgen_exn_store: (a: number) => void;
   readonly __externref_table_alloc: () => number;
   readonly __wbindgen_export_2: WebAssembly.Table;

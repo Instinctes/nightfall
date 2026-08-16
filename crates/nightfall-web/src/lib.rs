@@ -243,6 +243,7 @@ pub fn build_send(
     amount: &str,
     memo: &str,
     tip: f64,
+    now: f64,
 ) -> Result<JsValue, JsError> {
     let mut w = load(state)?;
     let addr = Address::decode(to).map_err(err)?;
@@ -253,7 +254,8 @@ pub fn build_send(
     let tx = w
         .create_payment_at(&addr, darks, DEFAULT_FEE, memo, height(tip), MATURITY)
         .map_err(err)?;
-    w.record_send(&tx, darks, memo.to_string()).map_err(err)?;
+    w.record_send_at(&tx, darks, memo.to_string(), height(now))
+        .map_err(err)?;
     let tx_val = serde_json::to_value(&tx).map_err(err)?;
     let out = json!({
         "state": dump(&w)?,

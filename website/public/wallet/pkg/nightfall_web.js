@@ -360,9 +360,10 @@ export function probe_crypto() {
  * @param {string} amount
  * @param {string} memo
  * @param {number} tip
+ * @param {number} now
  * @returns {any}
  */
-export function build_send(state, to, amount, memo, tip) {
+export function build_send(state, to, amount, memo, tip, now) {
     const ptr0 = passStringToWasm0(state, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passStringToWasm0(to, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
@@ -371,7 +372,7 @@ export function build_send(state, to, amount, memo, tip) {
     const len2 = WASM_VECTOR_LEN;
     const ptr3 = passStringToWasm0(memo, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len3 = WASM_VECTOR_LEN;
-    const ret = wasm.build_send(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, tip);
+    const ret = wasm.build_send(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, tip, now);
     if (ret[2]) {
         throw takeFromExternrefTable0(ret[1]);
     }
