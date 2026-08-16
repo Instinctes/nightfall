@@ -1,46 +1,56 @@
 /**
  * NIGHTFALLCOIN — website Worker.
  *
- * The site is entirely static, so this Worker does one useful thing: it puts
- * strict security headers on every response.
- *
- * That is not decoration for a project like this. The page serves wallet
- * binaries. If someone could inject a script into it, they could swap a
- * download link and drain everyone who trusted the domain. A strict
- * `script-src 'self'` makes that class of attack fail even if markup is
- * somehow compromised — and it costs nothing, because the site deliberately
- * loads no third-party code at all.
+ * Two jobs:
+ *   1. Strict security headers on every response. The page serves wallet
+ *      binaries. If someone could inject a script into it, they could swap a
+ *      download link and drain everyone who trusted the domain.
+ *   2. POST /wallet-api — a same-origin proxy onto the seed's light HTTP
+ *      API. The browser wallet is served over HTTPS and cannot speak
+ *      `http://seed:17888` (mixed content). Cloudflare `fetch()` only
+ *      reaches ports 80/443, so the seed forwards :80 → :17888.
  */
 
-const SECURITY_HEADERS = {
-    // Nothing external is loaded, so the policy can be strict. `unsafe-inline`
-    // is permitted for styles only — the markup carries a handful of inline
-    // style attributes, and injected CSS cannot exfiltrate or execute.
-    "Content-Security-Policy": [
-        "default-src 'self'",
-        "script-src 'self'",
-        "style-src 'self' 'unsafe-inline'",
-        "img-src 'self' data:",
-        "font-src 'self'",
-        "connect-src 'self'",
-        "frame-ancestors 'none'",
-        "base-uri 'none'",
-        "form-action 'none'",
-        "object-src 'none'",
-        "upgrade-insecure-requests",
-    ].join("; "),
+const MOBILE_UPSTREAM = "http://seed.nightfallcoin.org/";
+const MOBILE_ALLOWED = new Set([
+    "status",
+    "scan_feed",
+    "submit_tx",
+    "get_utxo_root",
+    "banner",
+]);
+const MOBILE_MAX_BODY = 512 * 1024;
 
-    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
-    "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "DENY",
-    "Referrer-Policy": "no-referrer",
-    // A page about privacy has no business asking for any of these.
-    "Permissions-Policy":
-        "accelerometer=(), camera=(), geolocation=(), gyroscope=(), " +
-        "magnetometer=(), microphone=(), payment=(), usb=(), interest-cohort=()",
-    "Cross-Origin-Opener-Policy": "same-origin",
-    "Cross-Origin-Resource-Policy": "same-origin",
-};
+function securityHeaders(pathname) {
+    // wasm-bindgen instantiates the wallet module with WebAssembly.instantiate,
+    // which Chromium treats as eval unless the policy names it.
+    const wallet = pathname.startsWith("/wallet");
+    return {
+        "Content-Security-Policy": [
+            "default-src 'self'",
+            wallet ? "script-src 'self' 'wasm-unsafe-eval'" : "script-src 'self'",
+            "style-src 'self' 'unsafe-inline'",
+            "img-src 'self' data:",
+            "font-src 'self'",
+            "connect-src 'self'",
+            "frame-ancestors 'none'",
+            "base-uri 'none'",
+            "form-action 'none'",
+            "object-src 'none'",
+            "upgrade-insecure-requests",
+        ].join("; "),
+
+        "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "no-referrer",
+        "Permissions-Policy":
+            "accelerometer=(), camera=(), geolocation=(), gyroscope=(), " +
+            "magnetometer=(), microphone=(), payment=(), usb=(), interest-cohort=()",
+        "Cross-Origin-Opener-Policy": "same-origin",
+        "Cross-Origin-Resource-Policy": "same-origin",
+    };
+}
 
 /**
  * One address, not three.
@@ -67,7 +77,7 @@ function canonicalRedirect(url) {
         headers: {
             Location: target.toString(),
             "Cache-Control": "public, max-age=3600",
-            ...SECURITY_HEADERS,
+            ...securityHeaders(url.pathname),
         },
     });
 }
@@ -88,10 +98,85 @@ function cacheControlFor(pathname) {
         }
         return "public, max-age=31536000, immutable";
     }
-    if (/\.(css|js|svg|png|woff2?)$/i.test(pathname)) {
+    if (/\.(css|js|svg|png|woff2?|wasm)$/i.test(pathname)) {
         return "public, max-age=86400";
     }
     return "public, max-age=300, must-revalidate";
+}
+
+function jsonResponse(status, obj, extra = {}) {
+    return new Response(JSON.stringify(obj), {
+        status,
+        headers: {
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": "no-store",
+            ...securityHeaders("/wallet-api"),
+            ...extra,
+        },
+    });
+}
+
+async function proxyWalletApi(request) {
+    if (request.method === "OPTIONS") {
+        return new Response(null, {
+            status: 204,
+            headers: {
+                Allow: "POST, OPTIONS",
+                "Cache-Control": "no-store",
+                ...securityHeaders("/wallet-api"),
+            },
+        });
+    }
+    if (request.method !== "POST") {
+        return jsonResponse(
+            405,
+            { error: "POST a JSON-RPC body" },
+            { Allow: "POST, OPTIONS" },
+        );
+    }
+
+    const text = await request.text();
+    if (text.length > MOBILE_MAX_BODY) {
+        return jsonResponse(413, { error: "body too large" });
+    }
+    let payload;
+    try {
+        payload = JSON.parse(text);
+    } catch {
+        return jsonResponse(400, { error: "bad json" });
+    }
+    if (!MOBILE_ALLOWED.has(payload.method)) {
+        return jsonResponse(403, {
+            error: `method '${payload.method || ""}' is not available on the mobile API`,
+        });
+    }
+
+    const body = JSON.stringify({
+        method: payload.method,
+        params: payload.params ?? {},
+        id: payload.id ?? 1,
+    });
+
+    try {
+        const upstream = await fetch(MOBILE_UPSTREAM, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body,
+        });
+        const out = await upstream.text();
+        return new Response(out, {
+            status: upstream.status,
+            headers: {
+                "Content-Type": "application/json; charset=utf-8",
+                "Cache-Control": "no-store",
+                ...securityHeaders("/wallet-api"),
+            },
+        });
+    } catch (e) {
+        return jsonResponse(502, {
+            error: `node unreachable: ${e.message || e}`,
+        });
+    }
 }
 
 export default {
@@ -106,18 +191,26 @@ export default {
             }
         }
 
-        // Only reads. The site has no forms and no API.
+        // Browser wallet → seed light API. Must run before the GET-only gate.
+        if (url.pathname === "/wallet-api" || url.pathname === "/wallet-api/") {
+            return proxyWalletApi(request);
+        }
+
+        // Everything else is static. No forms, no other API.
         if (request.method !== "GET" && request.method !== "HEAD") {
             return new Response("Method not allowed", {
                 status: 405,
-                headers: { Allow: "GET, HEAD", ...SECURITY_HEADERS },
+                headers: {
+                    Allow: "GET, HEAD",
+                    ...securityHeaders(url.pathname),
+                },
             });
         }
 
         const asset = await env.ASSETS.fetch(request);
         const headers = new Headers(asset.headers);
 
-        for (const [key, value] of Object.entries(SECURITY_HEADERS)) {
+        for (const [key, value] of Object.entries(securityHeaders(url.pathname))) {
             headers.set(key, value);
         }
 
@@ -138,6 +231,10 @@ export default {
         // Downloads should save rather than try to render — but only when there
         // is something to save. Attaching a filename to an error page makes a
         // browser write the 404 body to disk under the name of the wallet.
+        if (ok && url.pathname.endsWith(".wasm")) {
+            headers.set("Content-Type", "application/wasm");
+        }
+
         if (ok && url.pathname.startsWith("/downloads/")) {
             const name = url.pathname.split("/").pop();
             if (name) {

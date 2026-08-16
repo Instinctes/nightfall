@@ -10,7 +10,9 @@ mine** a block on your own hardware.
 
 - **Mine it.** Core → Start mining. Reward is 6 NIGHT per block, ~15 s
   target, CPU (Nighthash-v2 / Argon2id). There is no pool and no premine.
-- **Receive it.** Someone already mining can send you `nf1…`.
+- **Receive it.** Someone already mining can send you `nf1…`. The
+  browser wallet at https://nightfallcoin.org/wallet/ makes an address
+  without installing anything. Same 24 words as Core.
 - **No official ticker.** Any EUR/USD figure you see that did not come
   from a trade you made is fiction.
 

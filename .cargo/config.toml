@@ -1,3 +1,8 @@
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
 ar = "x86_64-w64-mingw32-ar"
+
+# getrandom 0.3/0.4 on wasm32 need an explicit JS backend. Without this,
+# `rand` / `curve25519-dalek` fail at compile time for the browser wallet.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", "getrandom_backend=\"wasm_js\""]

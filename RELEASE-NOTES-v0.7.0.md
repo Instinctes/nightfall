@@ -12,3 +12,6 @@ here. The archive is [docs/HISTORY.md](docs/HISTORY.md).
 - Datadir `nightfall/<network>/n8/`
 
 Build 0.7.0. 0.6.x cannot peer.
+
+Browser wallet: https://nightfallcoin.org/wallet/ (PWA, seed stays in
+the browser). Native iOS waits on Xcode.

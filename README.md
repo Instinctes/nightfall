@@ -17,6 +17,7 @@ never touch the chain, and hidden inflation isn't something you take on trust �
 [![Status](https://img.shields.io/badge/status-new%20genesis-ffc85c)](#honest-status)
 
 **[Download](https://nightfallcoin.org)** ·
+[Web wallet](https://nightfallcoin.org/wallet/) ·
 [Start mining](#start-mining) ·
 [Protocol spec](docs/SPEC.md) ·
 [Security audit](docs/AUDIT-2026-08-12.md)
@@ -261,7 +262,9 @@ crates/
 ├── nightfall-p2p        wire protocol, handshake, peer exchange
 ├── nightfall-node       node runtime, mining loop, JSON-RPC
 ├── nightfall-wallet     scanning, coin selection, spending (lib + CLI)
-└── nightfall-core       desktop wallet (egui)
+├── nightfall-core       desktop wallet (egui)
+├── nightfall-mobile     UniFFI bindings for the Android / iOS apps
+└── nightfall-web        wasm-bindgen bindings for the browser wallet
 ```
 
 No `unsafe` in the consensus path. Cryptography comes from `curve25519-dalek`,
@@ -332,7 +335,7 @@ vulnerability reporting is enabled on this repository.
 | [docs/GETTING-NIGHT.md](docs/GETTING-NIGHT.md) | How a price forms — nobody sets one |
 | [docs/HISTORY.md](docs/HISTORY.md) | Every buried genesis, including this reset |
 | [docs/RESET.md](docs/RESET.md) | What v8 changed and what we do not claim |
-| [docs/MOBILE.md](docs/MOBILE.md) | iOS and Android wallet architecture |
+| [docs/MOBILE.md](docs/MOBILE.md) | iOS, Android and browser wallet |
 | [mobile/README.md](mobile/README.md) | Sideload Android APK / EU iOS install |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Every design decision and why |
 | [docs/ATTRIBUTES.md](docs/ATTRIBUTES.md) | Locked product attributes, with the gaps marked |

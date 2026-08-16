@@ -13,14 +13,21 @@ privacy has no business loading fonts or analytics from someone else's server.
 ```
 website/
 ├── wrangler.toml       Worker + static asset config
-├── src/index.js        the Worker: security headers, nothing else
+├── src/index.js        headers + POST /wallet-api proxy
 └── public/             everything served
     ├── index.html
     ├── 404.html
     ├── css/style.css   palette mirrors the Core Wallet
     ├── js/main.js      scroll reveals, counters, canvas mesh gradient
     ├── assets/         logo and favicon (SVG)
+    ├── wallet/         browser PWA (WASM + UI)
     └── downloads/      wallet binaries
+```
+
+Rebuild the WASM module after changing `nightfall-web` or `nightfall-wallet`:
+
+```bash
+./scripts/build-web-wallet.sh
 ```
 
 ## Why a Worker and not plain Pages
@@ -31,6 +38,12 @@ domain. The Worker exists to put a strict `script-src 'self'` policy — plus
 HSTS, `nosniff`, `frame-ancestors 'none'` and a locked-down permissions
 policy — on every response. That costs nothing here, because the site
 deliberately loads no external code at all.
+
+`/wallet/` is the exception that needs `'wasm-unsafe-eval'` so the
+browser can instantiate the wallet module. The homepage keeps the
+stricter policy. `POST /wallet-api` is a same-origin proxy onto
+`seed.nightfallcoin.org:17888` (allowlisted methods only) because an
+HTTPS page cannot call that HTTP port itself.
 
 Two settings in `wrangler.toml` are load-bearing:
 

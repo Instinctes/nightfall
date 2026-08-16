@@ -22,3 +22,9 @@ merlin = { workspace = true }
 serde = { workspace = true }
 subtle = { workspace = true }
 bip39 = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+# bulletproofs → merlin → clear_on_drop tries to compile C by default.
+# There is no clang wasm target here; the crate has a pure-Rust fallback.
+clear_on_drop = { version = "0.2", features = ["no_cc"] }

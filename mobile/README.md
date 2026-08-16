@@ -8,6 +8,10 @@ The phone **trusts a node** for what it displays. It cannot steal coins.
 Default node: `http://seed.nightfallcoin.org:17888` (light API only —
 no mining RPC).
 
+Until a Mac with Xcode builds the iOS app, iPhone users open
+https://nightfallcoin.org/wallet/ and add it to the Home Screen. Same
+24 words as Core. The page trusts the seed node for what it shows.
+
 ## What is here
 
 ```

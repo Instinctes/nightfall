@@ -1,0 +1,13 @@
+{
+  "name": "NIGHT wallet",
+  "short_name": "NIGHT",
+  "description": "Money that refuses to snitch. Seed stays on this device.",
+  "start_url": "/wallet/",
+  "scope": "/wallet/",
+  "display": "standalone",
+  "background_color": "#0e0b18",
+  "theme_color": "#0e0b18",
+  "icons": [
+    { "src": "/assets/logo-256.png", "sizes": "256x256", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

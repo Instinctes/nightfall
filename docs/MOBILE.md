@@ -3,8 +3,10 @@
 **Scope:** a full iOS and Android wallet. Holds its own seed, receives, shows a
 balance, and sends. Not a watch-only viewer.
 
-**Status:** design locked. Light HTTP API, `nightfall-mobile` UniFFI crate,
-Android (Compose) and iOS (SwiftUI) sources are in `mobile/`. Apps are
+**Status:** Android APK ships (sideload). iOS sources are in `mobile/ios`
+and wait on Xcode on the build machine. The browser wallet at
+`https://nightfallcoin.org/wallet/` is the path that works on iPhone
+today — same `nightfall-wallet` code, compiled to WebAssembly. Apps are
 sideloaded — not listed on Apple’s or Google’s stores. See `mobile/README.md`.
 
 ---
@@ -123,21 +125,19 @@ that this project already documented once in `AUDIT-2026-08-12.md`.
 ## 3. Shape
 
 ```
-┌──────────────────────┐   ┌──────────────────────┐
-│  iOS — SwiftUI       │   │  Android — Compose   │
-└──────────┬───────────┘   └──────────┬───────────┘
-           │  generated bindings      │
-           └────────────┬─────────────┘
-                        │ uniffi
-              ┌─────────▼──────────┐
-              │  nightfall-mobile  │   FFI surface, no logic
-              └─────────┬──────────┘
-                        │
-     ┌──────────────────┼──────────────────┐
-     │                  │                  │
-nightfall-wallet  nightfall-crypto  nightfall-ledger
-     │
-     └── scan, coin selection, transaction building — shared with desktop
+┌──────────────┐  ┌──────────────┐  ┌────────────────────┐
+│ iOS SwiftUI  │  │ Android      │  │ Browser PWA        │
+│ (Xcode)      │  │ Compose      │  │ nightfallcoin.org  │
+└──────┬───────┘  └──────┬───────┘  │ /wallet/           │
+       │ uniffi          │ uniffi   └─────────┬──────────┘
+       └────────┬────────┘                    │ wasm-bindgen
+                ▼                             ▼
+        nightfall-mobile              nightfall-web
+                │                             │
+                └──────────┬──────────────────┘
+                           ▼
+                   nightfall-wallet
+                   scan, coins, spend — same as desktop
 ```
 
 `nightfall-mobile` is a thin crate. Every rule it needs already exists in

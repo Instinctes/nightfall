@@ -3,9 +3,8 @@
 #   wrangler deploy          publish
 #   wrangler dev             run locally on http://localhost:8787
 #
-# The Worker exists to attach strict security headers; the site itself is
-# static. See src/index.js for why that matters on a page that serves wallet
-# binaries.
+# The Worker attaches strict security headers and proxies POST /wallet-api
+# onto the seed light HTTP API. See src/index.js.
 
 name = "nightfallcoin"
 main = "src/index.js"

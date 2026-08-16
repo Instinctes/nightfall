@@ -29,6 +29,7 @@
       <a href="#mining">Mining</a>
       <a href="#specs">Specs</a>
       <a href="#honest">Limitations</a>
+      <a href="/wallet/">Web wallet</a>
       <a class="btn btn-primary" href="#download">Download</a>
     </div>
   </div>
@@ -49,12 +50,12 @@
         </p>
         <div class="hero-cta reveal" data-delay="3">
           <a class="btn btn-primary" href="#download">Get the wallet</a>
-          <a class="btn btn-ghost" href="https://github.com/Instinctes/nightfall">Read the source</a>
+          <a class="btn btn-ghost" href="/wallet/">Open in the browser</a>
         </div>
         <div class="hero-meta reveal" data-delay="4">
           <span><b>0</b> premine</span>
           <span><b>90,000,000</b> hard cap</span>
-          <span><b>100%</b> of fees burned</span>
+          <span><b>fees</b> burn, then pay miners</span>
           <span><b>CPU</b> mineable</span>
         </div>
       </div>
@@ -309,15 +310,31 @@
         <div class="req">64-bit · Windows 10+</div>
         <a class="btn btn-primary" href="downloads/nightfall-core-0.7.0-windows-x64.exe">Download 0.7.0</a>
       </div>
+      <div class="dl reveal">
+        <div class="os">Android · arm64</div>
+        <div class="req">Sideload APK · 64-bit</div>
+        <a class="btn btn-primary" href="downloads/NIGHTFALLCOIN-0.7.0-android-arm64.apk">Download 0.7.0</a>
+      </div>
+      <div class="dl reveal">
+        <div class="os">Browser · any device</div>
+        <div class="req">iPhone, iPad, desktop · Add to Home Screen</div>
+        <a class="btn btn-primary" href="/wallet/">Open the web wallet</a>
+      </div>
     </div>
+    <p class="faint reveal" style="margin-top:16px;text-align:center;font-size:.9rem">
+      Native iOS is written (SwiftUI) and waits on Xcode on the build machine.
+      Until then the web wallet is the iPhone path — same seed words as Core.
+    </p>
 
     <p class="faint reveal" style="margin-top:24px;text-align:center;font-size:.9rem">
       Builds are unsigned. macOS: right-click → Open on first launch.
       Windows: More info → Run anyway.
       <br>
       Verify what you downloaded against
-      <a href="downloads/SHA256SUMS-0.7.0.txt">SHA256SUMS-0.7.0.txt</a> and
-      <a href="downloads/SHA256SUMS-0.7.0-windows.txt">SHA256SUMS-0.7.0-windows.txt</a>,
+      <a href="downloads/SHA256SUMS-0.7.0.txt">SHA256SUMS-0.7.0.txt</a>,
+      <a href="downloads/SHA256SUMS-0.7.0-windows.txt">SHA256SUMS-0.7.0-windows.txt</a>
+      and
+      <a href="downloads/SHA256SUMS-0.7.0-android.txt">SHA256SUMS-0.7.0-android.txt</a>,
       or <a href="https://github.com/Instinctes/nightfall">build it yourself from source</a> —
       that is the point.
     </p>
@@ -338,6 +355,8 @@
         <li><b>Not audited by anyone outside the project.</b> The cryptography was written and reviewed by the same people. Passing tests is not an outside review.</li>
         <li><b>This is the second public genesis in a month.</b> v4 was unsound. v7 was too front-loaded. We published both failures. A third silence would be worse than a reset.</li>
         <li><b>No official price, no listing, no premine.</b> Mine it or receive it. A ticker we invented would be a lie.</li>
+        <li><b>The browser wallet trusts the seed node for what it shows.</b> A hostile node can hide a payment or invent one on the screen. It cannot spend — the seed never leaves the device. Anyone who can run script on that page can read a saved wallet. Write the 24 words down.</li>
+        <li><b>No native iOS build yet.</b> The sources are in the repo. Add the web wallet to the home screen until Xcode is on the machine that builds releases.</li>
       </ul>
       <p class="muted" style="margin-top:20px;margin-bottom:0">
         The previous protocol version had a balance proof that proved nothing —
@@ -369,6 +388,7 @@
       <div class="foot-col">
         <h4>Run it</h4>
         <a href="#download">Download wallet</a>
+        <a href="/wallet/">Web wallet</a>
         <a href="https://github.com/Instinctes/nightfall/blob/main/docs/MAINNET.md">Run a node</a>
         <a href="https://github.com/Instinctes/nightfall/blob/main/FAIR_LAUNCH.md">Fair launch rules</a>
         <a href="https://github.com/Instinctes/nightfall/blob/main/MANIFESTO.md">Manifesto</a>

@@ -170,6 +170,9 @@ Recent builds connect automatically. For anything else, share:
 3. Confirm they use `--network mainnet`
 4. The same release — protocol v8 / wire v6, genesis `061a052d…`
 5. Phones: `--mobile-listen 0.0.0.0:17888` (light API only)
+6. Browser wallet: Cloudflare can only `fetch()` ports 80/443, so the
+   seed also forwards TCP 80 → 17888 (`nightfall-mobile-http.service`).
+   `POST https://nightfallcoin.org/wallet-api` is the same allowlist.
 
 ### Joiner command
 

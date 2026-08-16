@@ -195,6 +195,9 @@ pub struct Wallet {
     pub seed_path: PathBuf,
     db_path: PathBuf,
     db: WalletFile,
+    /// Desktop/CLI write the output file. The web wallet keeps state in the
+    /// browser and must not touch a filesystem that is not there.
+    persist: bool,
 }
 
 /// True when `blocks` is a contiguous history from this wallet's beginning
@@ -325,6 +328,7 @@ impl Wallet {
             seed_path,
             db_path,
             db,
+            persist: true,
         };
         if !existed {
             wallet.save()?;
@@ -390,12 +394,73 @@ impl Wallet {
     }
 
     fn save(&self) -> anyhow::Result<()> {
+        if !self.persist {
+            return Ok(());
+        }
         let tmp = self.db_path.with_extension("json.tmp");
         fs::write(&tmp, serde_json::to_vec_pretty(&self.db)?)?;
         fs::rename(&tmp, &self.db_path)?;
         // The output file contains blinding factors — treat it as secret.
         let _ = nightfall_storage::harden_permissions(&self.db_path);
         Ok(())
+    }
+
+    /// Wallet that never writes disk. Used by the browser build.
+    pub fn in_memory(network: NetworkId, keys: WalletKeys, birth_height: u64) -> Self {
+        Self {
+            keys,
+            network,
+            seed_path: PathBuf::new(),
+            db_path: PathBuf::new(),
+            db: WalletFile {
+                birth_height,
+                scanned_to: birth_height,
+                ..WalletFile::default()
+            },
+            persist: false,
+        }
+    }
+
+    /// Seed + scan database as JSON, for the browser to store.
+    pub fn export_state(&self) -> anyhow::Result<String> {
+        Ok(serde_json::to_string(&serde_json::json!({
+            "v": 1,
+            "network": self.network.as_str(),
+            "seed": hex::encode(self.keys.seed),
+            "db": self.db,
+        }))?)
+    }
+
+    pub fn import_state(blob: &str) -> anyhow::Result<Self> {
+        let v: serde_json::Value = serde_json::from_str(blob)?;
+        let seed_hex = v
+            .get("seed")
+            .and_then(|x| x.as_str())
+            .context("state missing seed")?;
+        let raw = hex::decode(seed_hex).context("seed hex")?;
+        if raw.len() != 32 {
+            anyhow::bail!("seed must be 32 bytes");
+        }
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&raw);
+        let keys = WalletKeys::from_seed(seed);
+        let network = match v.get("network").and_then(|x| x.as_str()).unwrap_or("mainnet") {
+            "testnet" => NetworkId::Testnet,
+            "devnet" => NetworkId::Devnet,
+            _ => NetworkId::Mainnet,
+        };
+        let db: WalletFile = match v.get("db") {
+            Some(d) => serde_json::from_value(d.clone())?,
+            None => WalletFile::default(),
+        };
+        Ok(Self {
+            keys,
+            network,
+            seed_path: PathBuf::new(),
+            db_path: PathBuf::new(),
+            db,
+            persist: false,
+        })
     }
 
     /// Ingest one light-client `scan_feed` page. Used by phones.
@@ -1259,5 +1324,23 @@ mod tests {
         let e = w.create_payment(&other, 1_000, 10, "").unwrap_err();
         assert!(e.to_string().contains("insufficient funds"), "got: {e}");
         fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn in_memory_export_import_roundtrips() {
+        let keys = WalletKeys::generate();
+        let phrase = keys.to_mnemonic();
+        let w = Wallet::in_memory(NetworkId::Devnet, keys, 7);
+        let blob = w.export_state().unwrap();
+        assert!(
+            !blob.contains(&phrase),
+            "mnemonic must not leak into the export blob"
+        );
+        let w2 = Wallet::import_state(&blob).unwrap();
+        assert_eq!(w.address_string(), w2.address_string());
+        assert_eq!(w.scan_from(), 7);
+        assert_eq!(w2.scan_from(), 7);
+        let restored = WalletKeys::from_mnemonic(&phrase).unwrap();
+        assert_eq!(restored.address(), w.address());
     }
 }
