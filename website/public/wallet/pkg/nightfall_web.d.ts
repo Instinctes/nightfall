@@ -13,12 +13,18 @@ export function address_qr_svg(address: string): string;
 export function ingest_page(state: string, outputs_json: string, spent_json: string, scanned_to: number): any;
 export function wallet_balance(state: string, tip: number): any;
 export function wallet_history(state: string): any;
+/**
+ * Isolate the send-path crypto so a Safari trap tells us *which* step died.
+ * Returns `"ok <proof-bytes>"` or a recoverable error.
+ */
+export function probe_crypto(): string;
 export function build_send(state: string, to: string, amount: string, memo: string, tip: number): any;
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
   readonly memory: WebAssembly.Memory;
+  readonly wasm_start: () => void;
   readonly create_wallet: (a: number) => [number, number, number];
   readonly restore_wallet: (a: number, b: number, c: number) => [number, number, number];
   readonly wallet_address: (a: number, b: number) => [number, number, number, number];
@@ -31,8 +37,8 @@ export interface InitOutput {
   readonly ingest_page: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
   readonly wallet_balance: (a: number, b: number, c: number) => [number, number, number];
   readonly wallet_history: (a: number, b: number) => [number, number, number];
+  readonly probe_crypto: () => [number, number, number, number];
   readonly build_send: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => [number, number, number];
-  readonly wasm_start: () => void;
   readonly __wbindgen_exn_store: (a: number) => void;
   readonly __externref_table_alloc: () => number;
   readonly __wbindgen_export_2: WebAssembly.Table;

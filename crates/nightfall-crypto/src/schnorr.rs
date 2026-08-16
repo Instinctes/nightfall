@@ -47,7 +47,9 @@ pub fn sign(secret: &Scalar, generator: &RistrettoPoint, msg: &[u8]) -> SchnorrS
 
     let mut entropy = [0u8; 32];
     use rand::RngCore;
-    OsRng.fill_bytes(&mut entropy);
+    // Do not panic if the OS RNG is briefly unavailable (Safari wasm).
+    // The nonce still mixes the secret and the message.
+    let _ = OsRng.try_fill_bytes(&mut entropy);
 
     let k = {
         let a = hash_multi(

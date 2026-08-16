@@ -4,12 +4,15 @@ ar = "x86_64-w64-mingw32-ar"
 
 # getrandom 0.3/0.4 on wasm32 need an explicit JS backend. Without this,
 # `rand` / `curve25519-dalek` fail at compile time for the browser wallet.
-# Bulletproof proving (send) is stack-heavy; the wasm-ld default is 1 MiB
-# and iOS Safari traps that as "Unreachable code should not be executed".
+# Keep the wasm stack modest (2 MiB). A 16 MiB stack plus the heap OOMs
+# iOS Safari and shows up as the same "Unreachable" trap as a panic.
+# SIMD is off: some iOS WebKit builds trap mid-dalek, not at instantiate.
 [target.wasm32-unknown-unknown]
 rustflags = [
     "--cfg",
     "getrandom_backend=\"wasm_js\"",
     "-C",
-    "link-arg=-zstack-size=16777216",
+    "link-arg=-zstack-size=2097152",
+    "-C",
+    "target-feature=-simd128",
 ]

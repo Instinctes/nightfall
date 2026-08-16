@@ -12,6 +12,7 @@ import init, {
   wallet_balance,
   wallet_history,
   build_send,
+  probe_crypto,
 } from "./pkg/nightfall_web.js";
 
 const STORE = "nf-web-wallet-v1";
@@ -528,16 +529,20 @@ function renderSend() {
 
 async function doSend(to, amt, memo) {
   lastErr = "";
-  lastStatus = "building transaction…";
+  lastStatus = "checking this browser…";
   tab = "wallet";
   sheet = null;
   renderHome();
   try {
+    const probe = wasmCall(probe_crypto);
+    lastStatus = "browser ok (" + probe + "). fetching tip…";
+    renderHome();
     const tipPage = await rpc("status", {});
     const tip = Number(tipPage.tip_height ?? 0) || 0;
     lastTip = tip;
     lastStatus = "proving range proofs…";
     renderHome();
+    await new Promise((r) => setTimeout(r, 40));
     const built = parseJson(wasmCall(build_send, state, to, amt, memo, tip));
     lastStatus = "broadcasting…";
     renderHome();

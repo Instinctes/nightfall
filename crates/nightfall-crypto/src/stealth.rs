@@ -273,7 +273,9 @@ pub fn create_output_with_features(
     let spend_point = to.spend_point().ok_or(CryptoError::BadAddress)?;
 
     let mut r_bytes = [0u8; 64];
-    OsRng.fill_bytes(&mut r_bytes);
+    OsRng
+        .try_fill_bytes(&mut r_bytes)
+        .map_err(|_| CryptoError::Encrypt)?;
     let r = Scalar::from_bytes_mod_order_wide(&r_bytes);
     let ephemeral_pk = (generator_g() * r).compress().to_bytes();
 

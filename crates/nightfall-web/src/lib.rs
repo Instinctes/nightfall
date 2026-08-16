@@ -227,6 +227,15 @@ pub fn wallet_history(state: &str) -> Result<JsValue, JsError> {
     JsValue::from_str(&serde_json::to_string(&rows).map_err(err)?).pipe_ok()
 }
 
+/// Isolate the send-path crypto so a Safari trap tells us *which* step died.
+/// Returns `"ok <proof-bytes>"` or a recoverable error.
+#[wasm_bindgen]
+pub fn probe_crypto() -> Result<String, JsError> {
+    let keys = WalletKeys::from_seed([7u8; 32]);
+    let (out, _) = nightfall_crypto::create_output(&keys.address(), 1, "", b"probe").map_err(err)?;
+    Ok(format!("ok {}", out.range_proof.len()))
+}
+
 #[wasm_bindgen]
 pub fn build_send(
     state: &str,

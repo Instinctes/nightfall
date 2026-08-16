@@ -63,9 +63,18 @@ lto = true
 codegen-units = 1
 panic = "abort"
 
-# LTO + opt-level 3 inlines dalek field ops into huge stack frames.
-# On wasm that is the send-path trap Safari reports as "Unreachable".
-[profile.release.package.curve25519-dalek]
-opt-level = 2
-[profile.release.package.bulletproofs]
-opt-level = 2
+# Browser wallet only. Full-workspace LTO inlines dalek field ops into
+# frames that blow the iOS WebKit call stack (not the wasm linear-memory
+# stack). Package-level opt-level cannot stop LTO from doing that.
+[profile.wasm-release]
+inherits = "release"
+lto = false
+opt-level = "s"
+codegen-units = 16
+
+[profile.wasm-release.package.curve25519-dalek]
+opt-level = "s"
+[profile.wasm-release.package.bulletproofs]
+opt-level = "s"
+[profile.wasm-release.package.nightfall-crypto]
+opt-level = "s"

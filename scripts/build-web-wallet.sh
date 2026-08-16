@@ -10,10 +10,11 @@ if ! command -v wasm-bindgen >/dev/null; then
   exit 1
 fi
 
-cargo build --release --target wasm32-unknown-unknown -p nightfall-web
+# wasm-release: no LTO, opt-level s. See Cargo.toml.
+cargo build --profile wasm-release --target wasm32-unknown-unknown -p nightfall-web
 wasm-bindgen --target web \
   --out-dir website/public/wallet/pkg \
-  target/wasm32-unknown-unknown/release/nightfall_web.wasm
+  target/wasm32-unknown-unknown/wasm-release/nightfall_web.wasm
 
 echo "wrote website/public/wallet/pkg/"
 ls -lh website/public/wallet/pkg

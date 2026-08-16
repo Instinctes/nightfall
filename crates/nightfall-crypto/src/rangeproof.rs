@@ -23,8 +23,9 @@ const GENS_CAPACITY: usize = 64;
 /// otherwise verification fails — this is Fiat–Shamir domain separation.
 const TRANSCRIPT_LABEL: &[u8] = b"nightfall:rangeproof:v2";
 
-fn bp_gens() -> BulletproofGens {
-    BulletproofGens::new(GENS_CAPACITY, 1)
+fn bp_gens() -> &'static BulletproofGens {
+    static G: std::sync::OnceLock<BulletproofGens> = std::sync::OnceLock::new();
+    G.get_or_init(|| BulletproofGens::new(GENS_CAPACITY, 1))
 }
 
 fn transcript(extra: &[u8]) -> Transcript {
@@ -51,6 +52,10 @@ impl RangeProofBytes {
 ///
 /// Returns the proof plus the commitment the proof is bound to. Callers must
 /// use the returned commitment verbatim.
+///
+/// `inline(never)` keeps dalek's field ops out of the caller's frame. On
+/// iOS Safari that is the difference between a send and an `unreachable` trap.
+#[inline(never)]
 pub fn prove(
     value: u64,
     blind: &Scalar,
@@ -59,7 +64,7 @@ pub fn prove(
     let pc = gens();
     let bp = bp_gens();
     let mut t = transcript(ctx);
-    let (proof, committed) = RangeProof::prove_single(&bp, &pc, &mut t, value, blind, RANGE_BITS)
+    let (proof, committed) = RangeProof::prove_single(bp, &pc, &mut t, value, blind, RANGE_BITS)
         .map_err(|_| RangeError::ProveFailed)?;
     Ok((
         RangeProofBytes(proof.to_bytes()),
@@ -78,7 +83,7 @@ pub fn verify(proof: &RangeProofBytes, commitment: &Commitment, ctx: &[u8]) -> b
     let mut t = transcript(ctx);
     parsed
         .verify_single(
-            &bp,
+            bp,
             &pc,
             &mut t,
             &CompressedRistretto(commitment.0),
