@@ -316,25 +316,30 @@
         <a class="btn btn-primary" href="downloads/NIGHTFALLCOIN-0.7.0-android-arm64.apk">Download 0.7.0</a>
       </div>
       <div class="dl reveal">
+        <div class="os">iPhone · arm64</div>
+        <div class="req">Sideload IPA · iOS 17+</div>
+        <a class="btn btn-primary" href="downloads/NIGHTFALLCOIN-0.7.0-ios-arm64.ipa">Download 0.7.0</a>
+      </div>
+      <div class="dl reveal">
         <div class="os">Browser · any device</div>
         <div class="req">iPhone, iPad, desktop · Add to Home Screen</div>
         <a class="btn btn-primary" href="/wallet/">Open the web wallet</a>
       </div>
     </div>
-    <p class="faint reveal" style="margin-top:16px;text-align:center;font-size:.9rem">
-      Native iOS is written (SwiftUI) and waits on Xcode on the build machine.
-      Until then the web wallet is the iPhone path — same seed words as Core.
-    </p>
 
     <p class="faint reveal" style="margin-top:24px;text-align:center;font-size:.9rem">
       Builds are unsigned. macOS: right-click → Open on first launch.
       Windows: More info → Run anyway.
+      iPhone: the IPA is unsigned. Install with AltStore, Sideloadly or
+      Xcode using your own Apple ID. Tapping the file does nothing — that
+      is Apple, not us. The web wallet needs no install.
       <br>
       Verify what you downloaded against
       <a href="downloads/SHA256SUMS-0.7.0.txt">SHA256SUMS-0.7.0.txt</a>,
-      <a href="downloads/SHA256SUMS-0.7.0-windows.txt">SHA256SUMS-0.7.0-windows.txt</a>
+      <a href="downloads/SHA256SUMS-0.7.0-windows.txt">SHA256SUMS-0.7.0-windows.txt</a>,
+      <a href="downloads/SHA256SUMS-0.7.0-android.txt">SHA256SUMS-0.7.0-android.txt</a>
       and
-      <a href="downloads/SHA256SUMS-0.7.0-android.txt">SHA256SUMS-0.7.0-android.txt</a>,
+      <a href="downloads/SHA256SUMS-0.7.0-ios.txt">SHA256SUMS-0.7.0-ios.txt</a>,
       or <a href="https://github.com/Instinctes/nightfall">build it yourself from source</a> —
       that is the point.
     </p>
@@ -355,8 +360,8 @@
         <li><b>Not audited by anyone outside the project.</b> The cryptography was written and reviewed by the same people. Passing tests is not an outside review.</li>
         <li><b>This is the second public genesis in a month.</b> v4 was unsound. v7 was too front-loaded. We published both failures. A third silence would be worse than a reset.</li>
         <li><b>No official price, no listing, no premine.</b> Mine it or receive it. A ticker we invented would be a lie.</li>
-        <li><b>The browser wallet trusts the seed node for what it shows.</b> A hostile node can hide a payment or invent one on the screen. It cannot spend — the seed never leaves the device. Anyone who can run script on that page can read a saved wallet. Write the 24 words down.</li>
-        <li><b>No native iOS build yet.</b> The sources are in the repo. Add the web wallet to the home screen until Xcode is on the machine that builds releases.</li>
+        <li><b>The phone and browser wallets trust a node for what they show.</b> A hostile node can hide a payment or invent one on the screen. It cannot spend — the seed never leaves the device. Write the 24 words down.</li>
+        <li><b>The iOS IPA is unsigned.</b> It is not in the App Store. You install it with AltStore, Sideloadly or Xcode and your own Apple ID. That lasts seven days on a free account. The web wallet is the path that needs no Apple ID.</li>
       </ul>
       <p class="muted" style="margin-top:20px;margin-bottom:0">
         The previous protocol version had a balance proof that proved nothing —

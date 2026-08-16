@@ -3,11 +3,10 @@
 **Scope:** a full iOS and Android wallet. Holds its own seed, receives, shows a
 balance, and sends. Not a watch-only viewer.
 
-**Status:** Android APK ships (sideload). iOS sources are in `mobile/ios`
-and wait on Xcode on the build machine. The browser wallet at
-`https://nightfallcoin.org/wallet/` is the path that works on iPhone
-today — same `nightfall-wallet` code, compiled to WebAssembly. Apps are
-sideloaded — not listed on Apple’s or Google’s stores. See `mobile/README.md`.
+**Status:** Android APK and an unsigned iOS IPA ship (sideload). Neither
+is in a store. The browser wallet at `https://nightfallcoin.org/wallet/`
+is the path that needs no Apple ID. Same `nightfall-wallet` code. See
+`mobile/README.md`.
 
 ---
 

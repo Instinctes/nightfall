@@ -6,20 +6,25 @@
 .idea/
 .vscode/
 
-# Never commit key material or chain data
+# Build outputs and packaged binaries (large, reproducible from source)
+/dist/macos/build_*/
+/dist/macos/*.dmg
+/dist/macos/nightfall-core-macos-*
+/dist/windows/*.zip
+/dist/windows/*.exe
+/dist/windows/*.dll
+
+# Never commit key material
 *.seed
 *.addr.json
 *.outputs.json
-blocks.jsonl
-chain-meta.json
+core.notes.json
 
-# Release artifacts — rebuild with scripts/build-macos-dmgs.sh
+# Release artifacts (rebuild with scripts/build-macos-dmgs.sh)
 /wallets/*.dmg
+/wallets/*.ipa
 /wallets/windows-x64/*.exe
-/website/public/downloads/*
-website/.wrangler/
-
-# Editor and scratch leftovers
-*.bak
-*.orig
-*.rej
+/mobile/ios/build/
+/mobile/ios/Libs/*.a
+*.xcuserstate
+xcuserdata/

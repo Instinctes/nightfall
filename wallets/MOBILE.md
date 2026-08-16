@@ -11,8 +11,9 @@ Checksum: `SHA256SUMS-0.7.0-android.txt`
 
 The app talks to `http://seed.nightfallcoin.org:17888` (light API only).
 
-iPhone without a native build: https://nightfallcoin.org/wallet/ — add
-to the Home Screen. Same 24 words as Core.
+iPhone: `NIGHTFALLCOIN-0.7.0-ios-arm64.ipa` (unsigned). Sideload with
+AltStore, Sideloadly or Xcode. Or https://nightfallcoin.org/wallet/ —
+add to the Home Screen. Same 24 words as Core.
 
 ## iOS (not in this folder)
 

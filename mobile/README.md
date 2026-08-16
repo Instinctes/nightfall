@@ -8,9 +8,10 @@ The phone **trusts a node** for what it displays. It cannot steal coins.
 Default node: `http://seed.nightfallcoin.org:17888` (light API only —
 no mining RPC).
 
-Until a Mac with Xcode builds the iOS app, iPhone users open
+iPhone: download the IPA from https://nightfallcoin.org and sideload it
+(AltStore / Sideloadly / Xcode + your Apple ID). Or open
 https://nightfallcoin.org/wallet/ and add it to the Home Screen. Same
-24 words as Core. The page trusts the seed node for what it shows.
+24 words as Core. The phone trusts the seed node for what it shows.
 
 ## What is here
 
@@ -32,18 +33,18 @@ reimplement key derivation in Swift or Kotlin.
 **Android** — Android Studio → open `mobile/android`. Needs NDK. Then
 Build → Build APK. Install with `adb install` or by tapping the APK.
 
-**iOS** — Mac with the iOS SDK (full Xcode, not just CLT). Then:
+**iOS** — Mac with full Xcode (not just the Command Line Tools):
 
 ```bash
+sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
 brew install xcodegen
 ./scripts/build-mobile.sh
-cd mobile/ios && xcodegen generate
-open NightfallWallet.xcodeproj
 ```
 
-Sign with your free Apple ID, plug in a phone, Run. In the EU you can
-also export an unsigned/ad-hoc IPA and install via AltStore or an
-alternative marketplace. No App Store listing is required.
+That writes `wallets/NIGHTFALLCOIN-0.7.0-ios-arm64.ipa` (unsigned).
+Sideload with AltStore, Sideloadly, or open
+`mobile/ios/NightfallWallet.xcodeproj`, sign with your Apple ID, plug
+in a phone, Run. No App Store listing.
 
 ## Seed node
 

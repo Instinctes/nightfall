@@ -1,0 +1,404 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		235F0FE1CB9E11C8117CE3E0 /* NightfallWalletApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 963ED6C26F5BA1E58FF39B52 /* NightfallWalletApp.swift */; };
+		4F670EE2F0A4F78DA7BFF577 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 7DD5D2547397A4ED662AA143 /* Assets.xcassets */; };
+		734475E14E357B78AB520A1C /* nightfall_mobile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 55E6AF16426C5B5BD57F15B0 /* nightfall_mobile.swift */; };
+		7AF5806DCE3F848922C55DBA /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5F14ADD4A2445429D5E8F552 /* SystemConfiguration.framework */; };
+		D1CC66AD81AFB0AC90948CAA /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 26E06F1C78CD3345799E6082 /* ContentView.swift */; };
+		D59BE0DF526A319F70386448 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = FF48DA9E089D9AE98B1467E5 /* Security.framework */; };
+		E69F0D5065AE33A73AF4142B /* libnightfall_mobile.a in Frameworks */ = {isa = PBXBuildFile; fileRef = D5B5423DC4277CE6A9C9036D /* libnightfall_mobile.a */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		26E06F1C78CD3345799E6082 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		55E6AF16426C5B5BD57F15B0 /* nightfall_mobile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = nightfall_mobile.swift; sourceTree = "<group>"; };
+		5F14ADD4A2445429D5E8F552 /* SystemConfiguration.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemConfiguration.framework; path = System/Library/Frameworks/SystemConfiguration.framework; sourceTree = SDKROOT; };
+		66F321C12CCD94BB4EB2B888 /* nightfall_mobileFFI.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = nightfall_mobileFFI.h; sourceTree = "<group>"; };
+		7DD5D2547397A4ED662AA143 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		963ED6C26F5BA1E58FF39B52 /* NightfallWalletApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NightfallWalletApp.swift; sourceTree = "<group>"; };
+		B4C7B1AF0BC210DA8B06B33D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		BBB6B3711839F570D11B25C6 /* nightfall_mobileFFI.modulemap */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.module-map"; path = nightfall_mobileFFI.modulemap; sourceTree = "<group>"; };
+		BE9DC49355648D6AFBCD56E5 /* NightfallWallet.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = NightfallWallet.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		C0A087094BC96DA2D1ECDFB5 /* BridgingHeader.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = BridgingHeader.h; sourceTree = "<group>"; };
+		D5B5423DC4277CE6A9C9036D /* libnightfall_mobile.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libnightfall_mobile.a; path = Libs/libnightfall_mobile.a; sourceTree = "<group>"; };
+		FF48DA9E089D9AE98B1467E5 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		21107F1D041D6A89CD0CBB90 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D59BE0DF526A319F70386448 /* Security.framework in Frameworks */,
+				7AF5806DCE3F848922C55DBA /* SystemConfiguration.framework in Frameworks */,
+				E69F0D5065AE33A73AF4142B /* libnightfall_mobile.a in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		0FF3222BD088DCE2A82DAF79 /* Generated */ = {
+			isa = PBXGroup;
+			children = (
+				55E6AF16426C5B5BD57F15B0 /* nightfall_mobile.swift */,
+				66F321C12CCD94BB4EB2B888 /* nightfall_mobileFFI.h */,
+				BBB6B3711839F570D11B25C6 /* nightfall_mobileFFI.modulemap */,
+			);
+			path = Generated;
+			sourceTree = "<group>";
+		};
+		18727DC15E10390FAE1BCEBE /* NightfallWallet */ = {
+			isa = PBXGroup;
+			children = (
+				7DD5D2547397A4ED662AA143 /* Assets.xcassets */,
+				C0A087094BC96DA2D1ECDFB5 /* BridgingHeader.h */,
+				26E06F1C78CD3345799E6082 /* ContentView.swift */,
+				B4C7B1AF0BC210DA8B06B33D /* Info.plist */,
+				963ED6C26F5BA1E58FF39B52 /* NightfallWalletApp.swift */,
+				0FF3222BD088DCE2A82DAF79 /* Generated */,
+			);
+			path = NightfallWallet;
+			sourceTree = "<group>";
+		};
+		61C0C2C5AC1793C77D8279AE /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				D5B5423DC4277CE6A9C9036D /* libnightfall_mobile.a */,
+				FF48DA9E089D9AE98B1467E5 /* Security.framework */,
+				5F14ADD4A2445429D5E8F552 /* SystemConfiguration.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		9C35F8EB6867E33962D9EFA1 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				BE9DC49355648D6AFBCD56E5 /* NightfallWallet.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		DB5D3E293CA2F9C292503D59 = {
+			isa = PBXGroup;
+			children = (
+				18727DC15E10390FAE1BCEBE /* NightfallWallet */,
+				61C0C2C5AC1793C77D8279AE /* Frameworks */,
+				9C35F8EB6867E33962D9EFA1 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		FED7F74E5B36960CB6AA8679 /* NightfallWallet */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = DBD72DC660A11CBEA7869375 /* Build configuration list for PBXNativeTarget "NightfallWallet" */;
+			buildPhases = (
+				3B01BED28F9EFD96CE51DEE9 /* Sources */,
+				5AAB5CBA79D992B8ECFA4067 /* Resources */,
+				21107F1D041D6A89CD0CBB90 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = NightfallWallet;
+			packageProductDependencies = (
+			);
+			productName = NightfallWallet;
+			productReference = BE9DC49355648D6AFBCD56E5 /* NightfallWallet.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		917B9FC16C3EB49BFBF9C440 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					FED7F74E5B36960CB6AA8679 = {
+						DevelopmentTeam = D95878A649;
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 4F7A43A93A25DE308409AB11 /* Build configuration list for PBXProject "NightfallWallet" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = DB5D3E293CA2F9C292503D59;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 9C35F8EB6867E33962D9EFA1 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				FED7F74E5B36960CB6AA8679 /* NightfallWallet */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		5AAB5CBA79D992B8ECFA4067 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4F670EE2F0A4F78DA7BFF577 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		3B01BED28F9EFD96CE51DEE9 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D1CC66AD81AFB0AC90948CAA /* ContentView.swift in Sources */,
+				235F0FE1CB9E11C8117CE3E0 /* NightfallWalletApp.swift in Sources */,
+				734475E14E357B78AB520A1C /* nightfall_mobile.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		0F73187FC1608208E3DA2CEA /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CURRENT_PROJECT_VERSION = 70;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"Libs\"",
+				);
+				INFOPLIST_FILE = NightfallWallet/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.7.0;
+				PRODUCT_NAME = NIGHT;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		6A775D9FEA9DCC48D07DEE2B /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = D95878A649;
+				ENABLE_BITCODE = NO;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/NightfallWallet/Generated",
+				);
+				INFOPLIST_FILE = NightfallWallet/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LIBRARY_SEARCH_PATHS = (
+					"$(SRCROOT)/Libs",
+				);
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				OTHER_LDFLAGS = (
+					"-lc++",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = org.nightfallcoin.wallet;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OBJC_BRIDGING_HEADER = NightfallWallet/BridgingHeader.h;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+		6CCA7DC1061E3FE313C736A8 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CURRENT_PROJECT_VERSION = 70;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"Libs\"",
+				);
+				INFOPLIST_FILE = NightfallWallet/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.7.0;
+				PRODUCT_NAME = NIGHT;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		A65354FCC8865B1C80E388C9 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = D95878A649;
+				ENABLE_BITCODE = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/NightfallWallet/Generated",
+				);
+				INFOPLIST_FILE = NightfallWallet/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LIBRARY_SEARCH_PATHS = (
+					"$(SRCROOT)/Libs",
+				);
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				OTHER_LDFLAGS = (
+					"-lc++",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = org.nightfallcoin.wallet;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OBJC_BRIDGING_HEADER = NightfallWallet/BridgingHeader.h;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		4F7A43A93A25DE308409AB11 /* Build configuration list for PBXProject "NightfallWallet" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A65354FCC8865B1C80E388C9 /* Debug */,
+				6A775D9FEA9DCC48D07DEE2B /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		DBD72DC660A11CBEA7869375 /* Build configuration list for PBXNativeTarget "NightfallWallet" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0F73187FC1608208E3DA2CEA /* Debug */,
+				6CCA7DC1061E3FE313C736A8 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 917B9FC16C3EB49BFBF9C440 /* Project object */;
+}

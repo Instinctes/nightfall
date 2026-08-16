@@ -7,7 +7,7 @@ options:
 settings:
   base:
     PRODUCT_BUNDLE_IDENTIFIER: org.nightfallcoin.wallet
-    DEVELOPMENT_TEAM: ""
+    DEVELOPMENT_TEAM: "D95878A649"
     CODE_SIGN_STYLE: Automatic
     SWIFT_VERSION: "5.0"
     IPHONEOS_DEPLOYMENT_TARGET: "17.0"
@@ -19,6 +19,8 @@ settings:
     SWIFT_OBJC_BRIDGING_HEADER: NightfallWallet/BridgingHeader.h
     INFOPLIST_FILE: NightfallWallet/Info.plist
     GENERATE_INFOPLIST_FILE: false
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS: "YES"
 targets:
   NightfallWallet:
     type: application
@@ -28,8 +30,28 @@ targets:
     settings:
       base:
         PRODUCT_NAME: NIGHT
+        MARKETING_VERSION: "0.7.0"
+        CURRENT_PROJECT_VERSION: "70"
     info:
       path: NightfallWallet/Info.plist
+      properties:
+        CFBundleDisplayName: NIGHT
+        CFBundleShortVersionString: "0.7.0"
+        CFBundleVersion: "70"
+        CFBundleIconName: AppIcon
+        ITSAppUsesNonExemptEncryption: false
+        LSRequiresIPhoneOS: true
+        UIRequiresFullScreen: true
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSAppTransportSecurity:
+          NSExceptionDomains:
+            nightfallcoin.org:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+            localhost:
+              NSExceptionAllowsInsecureHTTPLoads: true
     dependencies:
       - sdk: Security.framework
       - sdk: SystemConfiguration.framework
