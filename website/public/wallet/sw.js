@@ -1,4 +1,4 @@
-const CACHE = "night-wallet-v2";
+const CACHE = "night-wallet-v3";
 const SHELL = ["./", "./index.html", "./style.css", "./app.js", "./pkg/nightfall_web.js", "./pkg/nightfall_web_bg.wasm"];
 
 self.addEventListener("install", (e) => {
@@ -14,6 +14,12 @@ self.addEventListener("fetch", (e) => {
   if (u.pathname.startsWith("/wallet-api")) return;
   if (e.request.method !== "GET") return;
   e.respondWith(
-    caches.match(e.request).then((hit) => hit || fetch(e.request)),
+    fetch(e.request)
+      .then((r) => {
+        const copy = r.clone();
+        caches.open(CACHE).then((c) => c.put(e.request, copy));
+        return r;
+      })
+      .catch(() => caches.match(e.request)),
   );
 });

@@ -55,9 +55,20 @@ pub struct BalanceView {
 pub struct HistoryView {
     pub direction: String,
     pub amount: String,
+    pub fee: String,
     pub memo: String,
     pub height: Option<u64>,
     pub pending: bool,
+    pub timestamp: u64,
+    pub txid: String,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WalletInfo {
+    pub address: String,
+    pub birth_height: u64,
+    pub scanned_to: u64,
+    pub outputs: u32,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -78,7 +89,7 @@ fn net(s: &str) -> Result<NetworkId, MobileError> {
 }
 
 fn night(darks: u64) -> String {
-    Amount(darks).to_string()
+    Amount(darks).decimal_string()
 }
 
 fn post_json(url: &str, body: &serde_json::Value) -> Result<ureq::Response, MobileError> {
@@ -208,6 +219,25 @@ impl MobileWallet {
         Ok(self.lock()?.recovery_phrase())
     }
 
+    pub fn view_key(&self) -> Result<String, MobileError> {
+        Ok(self.lock()?.view_key_string())
+    }
+
+    pub fn info(&self) -> Result<WalletInfo, MobileError> {
+        let w = self.lock()?;
+        Ok(WalletInfo {
+            address: w.address_string(),
+            birth_height: w.birth_height(),
+            scanned_to: w.scanned_to(),
+            outputs: w.spendable_count() as u32,
+        })
+    }
+
+    pub fn reset_scan(&self) -> Result<(), MobileError> {
+        self.lock()?.reset_scan()?;
+        Ok(())
+    }
+
     pub fn fetch_tip(&self, node: String) -> Result<u64, MobileError> {
         let r = rpc(&node, "status", json!({}))?;
         Ok(r.get("tip_height")
@@ -295,9 +325,12 @@ impl MobileWallet {
             .map(|e| HistoryView {
                 direction: e.direction.label().to_string(),
                 amount: night(e.amount),
+                fee: night(e.fee),
                 memo: e.memo.clone(),
                 height: e.height,
                 pending: e.is_pending(),
+                timestamp: e.timestamp,
+                txid: e.txid.clone(),
             })
             .collect())
     }
@@ -351,8 +384,38 @@ pub fn wallet_exists(datadir: String) -> bool {
 }
 
 #[uniffi::export]
+pub fn wipe_wallet(datadir: String) -> Result<(), MobileError> {
+    let dir = std::path::Path::new(&datadir);
+    for name in [SEED_FILE, &format!("{SEED_FILE}.outputs.json")] {
+        let p = dir.join(name);
+        if p.exists() {
+            std::fs::remove_file(&p)?;
+        }
+    }
+    Ok(())
+}
+
+#[uniffi::export]
+pub fn node_tip(node: String) -> Result<u64, MobileError> {
+    let r = rpc(&node, "status", json!({}))?;
+    Ok(r.get("tip_height")
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            r.get("blocks")
+                .and_then(|v| v.as_u64())
+                .map(|b| b.saturating_sub(1))
+        })
+        .unwrap_or(0))
+}
+
+#[uniffi::export]
 pub fn default_node() -> String {
     DEFAULT_NODE.to_string()
+}
+
+#[uniffi::export]
+pub fn default_fee() -> String {
+    Amount(DEFAULT_FEE_DARKS).decimal_string()
 }
 
 #[uniffi::export]

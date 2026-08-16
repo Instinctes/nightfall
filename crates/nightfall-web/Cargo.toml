@@ -15,7 +15,10 @@ nightfall-wallet = { workspace = true }
 serde_json = { workspace = true }
 wasm-bindgen = "=0.2.100"
 
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
 getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
 clear_on_drop = { version = "0.2", features = ["no_cc"] }
+console_error_panic_hook = "0.1"

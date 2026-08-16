@@ -296,9 +296,19 @@ uint64_t uniffi_nightfall_mobile_fn_method_mobilewallet_fetch_tip(void*_Nonnull 
 RustBuffer uniffi_nightfall_mobile_fn_method_mobilewallet_history(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_FN_METHOD_MOBILEWALLET_INFO
+#define UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_FN_METHOD_MOBILEWALLET_INFO
+RustBuffer uniffi_nightfall_mobile_fn_method_mobilewallet_info(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_FN_METHOD_MOBILEWALLET_RECOVERY_PHRASE
 #define UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_FN_METHOD_MOBILEWALLET_RECOVERY_PHRASE
 RustBuffer uniffi_nightfall_mobile_fn_method_mobilewallet_recovery_phrase(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_FN_METHOD_MOBILEWALLET_RESET_SCAN
+#define UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_FN_METHOD_MOBILEWALLET_RESET_SCAN
+void uniffi_nightfall_mobile_fn_method_mobilewallet_reset_scan(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_FN_METHOD_MOBILEWALLET_SEND
@@ -311,10 +321,26 @@ RustBuffer uniffi_nightfall_mobile_fn_method_mobilewallet_send(void*_Nonnull ptr
 uint32_t uniffi_nightfall_mobile_fn_method_mobilewallet_sync(void*_Nonnull ptr, RustBuffer node, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_FN_METHOD_MOBILEWALLET_VIEW_KEY
+#define UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_FN_METHOD_MOBILEWALLET_VIEW_KEY
+RustBuffer uniffi_nightfall_mobile_fn_method_mobilewallet_view_key(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_FN_FUNC_DEFAULT_FEE
+#define UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_FN_FUNC_DEFAULT_FEE
+RustBuffer uniffi_nightfall_mobile_fn_func_default_fee(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_FN_FUNC_DEFAULT_NODE
 #define UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_FN_FUNC_DEFAULT_NODE
 RustBuffer uniffi_nightfall_mobile_fn_func_default_node(RustCallStatus *_Nonnull out_status
     
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_FN_FUNC_NODE_TIP
+#define UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_FN_FUNC_NODE_TIP
+uint64_t uniffi_nightfall_mobile_fn_func_node_tip(RustBuffer node, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_FN_FUNC_PRIVACY_WARNING
@@ -326,6 +352,11 @@ RustBuffer uniffi_nightfall_mobile_fn_func_privacy_warning(RustCallStatus *_Nonn
 #ifndef UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_FN_FUNC_WALLET_EXISTS
 #define UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_FN_FUNC_WALLET_EXISTS
 int8_t uniffi_nightfall_mobile_fn_func_wallet_exists(RustBuffer datadir, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_FN_FUNC_WIPE_WALLET
+#define UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_FN_FUNC_WIPE_WALLET
+void uniffi_nightfall_mobile_fn_func_wipe_wallet(RustBuffer datadir, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_FFI_NIGHTFALL_MOBILE_RUSTBUFFER_ALLOC
@@ -608,9 +639,21 @@ void ffi_nightfall_mobile_rust_future_free_void(uint64_t handle
 void ffi_nightfall_mobile_rust_future_complete_void(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_CHECKSUM_FUNC_DEFAULT_FEE
+#define UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_CHECKSUM_FUNC_DEFAULT_FEE
+uint16_t uniffi_nightfall_mobile_checksum_func_default_fee(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_CHECKSUM_FUNC_DEFAULT_NODE
 #define UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_CHECKSUM_FUNC_DEFAULT_NODE
 uint16_t uniffi_nightfall_mobile_checksum_func_default_node(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_CHECKSUM_FUNC_NODE_TIP
+#define UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_CHECKSUM_FUNC_NODE_TIP
+uint16_t uniffi_nightfall_mobile_checksum_func_node_tip(void
     
 );
 #endif
@@ -623,6 +666,12 @@ uint16_t uniffi_nightfall_mobile_checksum_func_privacy_warning(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_CHECKSUM_FUNC_WALLET_EXISTS
 #define UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_CHECKSUM_FUNC_WALLET_EXISTS
 uint16_t uniffi_nightfall_mobile_checksum_func_wallet_exists(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_CHECKSUM_FUNC_WIPE_WALLET
+#define UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_CHECKSUM_FUNC_WIPE_WALLET
+uint16_t uniffi_nightfall_mobile_checksum_func_wipe_wallet(void
     
 );
 #endif
@@ -650,9 +699,21 @@ uint16_t uniffi_nightfall_mobile_checksum_method_mobilewallet_history(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_CHECKSUM_METHOD_MOBILEWALLET_INFO
+#define UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_CHECKSUM_METHOD_MOBILEWALLET_INFO
+uint16_t uniffi_nightfall_mobile_checksum_method_mobilewallet_info(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_CHECKSUM_METHOD_MOBILEWALLET_RECOVERY_PHRASE
 #define UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_CHECKSUM_METHOD_MOBILEWALLET_RECOVERY_PHRASE
 uint16_t uniffi_nightfall_mobile_checksum_method_mobilewallet_recovery_phrase(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_CHECKSUM_METHOD_MOBILEWALLET_RESET_SCAN
+#define UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_CHECKSUM_METHOD_MOBILEWALLET_RESET_SCAN
+uint16_t uniffi_nightfall_mobile_checksum_method_mobilewallet_reset_scan(void
     
 );
 #endif
@@ -665,6 +726,12 @@ uint16_t uniffi_nightfall_mobile_checksum_method_mobilewallet_send(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_CHECKSUM_METHOD_MOBILEWALLET_SYNC
 #define UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_CHECKSUM_METHOD_MOBILEWALLET_SYNC
 uint16_t uniffi_nightfall_mobile_checksum_method_mobilewallet_sync(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_CHECKSUM_METHOD_MOBILEWALLET_VIEW_KEY
+#define UNIFFI_FFIDEF_UNIFFI_NIGHTFALL_MOBILE_CHECKSUM_METHOD_MOBILEWALLET_VIEW_KEY
+uint16_t uniffi_nightfall_mobile_checksum_method_mobilewallet_view_key(void
     
 );
 #endif

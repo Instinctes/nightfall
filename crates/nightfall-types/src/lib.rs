@@ -253,13 +253,19 @@ impl Amount {
     pub fn checked_sub(self, other: Self) -> Option<Self> {
         self.0.checked_sub(other.0).map(Self)
     }
+
+    /// `whole.frac` with 8 decimals, no ticker. UIs that draw "NIGHT"
+    /// themselves should use this; [`Display`] still includes the ticker.
+    pub fn decimal_string(self) -> String {
+        let whole = self.0 / DARKS_PER_NIGHT;
+        let frac = self.0 % DARKS_PER_NIGHT;
+        format!("{whole}.{frac:08}")
+    }
 }
 
 impl fmt::Display for Amount {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let whole = self.0 / DARKS_PER_NIGHT;
-        let frac = self.0 % DARKS_PER_NIGHT;
-        write!(f, "{whole}.{frac:08} {TICKER}")
+        write!(f, "{} {TICKER}", self.decimal_string())
     }
 }
 

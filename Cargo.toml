@@ -62,3 +62,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# LTO + opt-level 3 inlines dalek field ops into huge stack frames.
+# On wasm that is the send-path trap Safari reports as "Unreachable".
+[profile.release.package.curve25519-dalek]
+opt-level = 2
+[profile.release.package.bulletproofs]
+opt-level = 2

@@ -9,6 +9,12 @@ use wasm_bindgen::prelude::*;
 const MATURITY: u64 = 1_440;
 const DEFAULT_FEE: u64 = DARKS_PER_NIGHT / 1_000;
 
+#[wasm_bindgen(start)]
+pub fn wasm_start() {
+    #[cfg(target_arch = "wasm32")]
+    console_error_panic_hook::set_once();
+}
+
 fn err(e: impl ToString) -> JsError {
     JsError::new(&e.to_string())
 }
@@ -74,13 +80,21 @@ fn lights_from_json(raw: &str) -> Result<Vec<LightOutput>, JsError> {
         .collect())
 }
 
+fn load(state: &str) -> Result<Wallet, JsError> {
+    Wallet::import_state(state).map_err(err)
+}
+
+fn dump(w: &Wallet) -> Result<String, JsError> {
+    w.export_state().map_err(err)
+}
+
 #[wasm_bindgen]
 pub fn create_wallet(birth_height: f64) -> Result<JsValue, JsError> {
     let keys = WalletKeys::generate();
     let phrase = keys.to_mnemonic();
     let w = Wallet::in_memory(NetworkId::Mainnet, keys, height(birth_height));
     let out = json!({
-        "state": w.export_state().map_err(err)?,
+        "state": dump(&w)?,
         "address": w.address_string(),
         "phrase": phrase,
     });
@@ -92,7 +106,7 @@ pub fn restore_wallet(phrase: &str, birth_height: f64) -> Result<JsValue, JsErro
     let keys = WalletKeys::from_mnemonic(phrase).map_err(err)?;
     let w = Wallet::in_memory(NetworkId::Mainnet, keys, height(birth_height));
     let out = json!({
-        "state": w.export_state().map_err(err)?,
+        "state": dump(&w)?,
         "address": w.address_string(),
     });
     JsValue::from_str(&out.to_string()).pipe_ok()
@@ -100,12 +114,58 @@ pub fn restore_wallet(phrase: &str, birth_height: f64) -> Result<JsValue, JsErro
 
 #[wasm_bindgen]
 pub fn wallet_address(state: &str) -> Result<String, JsError> {
-    Ok(Wallet::import_state(state).map_err(err)?.address_string())
+    Ok(load(state)?.address_string())
+}
+
+#[wasm_bindgen]
+pub fn wallet_phrase(state: &str) -> Result<String, JsError> {
+    Ok(load(state)?.recovery_phrase())
+}
+
+#[wasm_bindgen]
+pub fn wallet_view_key(state: &str) -> Result<String, JsError> {
+    Ok(load(state)?.view_key_string())
 }
 
 #[wasm_bindgen]
 pub fn wallet_scan_from(state: &str) -> Result<f64, JsError> {
-    Ok(Wallet::import_state(state).map_err(err)?.scan_from() as f64)
+    Ok(load(state)?.scan_from() as f64)
+}
+
+#[wasm_bindgen]
+pub fn wallet_info(state: &str) -> Result<JsValue, JsError> {
+    let w = load(state)?;
+    let out = json!({
+        "address": w.address_string(),
+        "birth_height": w.birth_height(),
+        "scanned_to": w.scanned_to(),
+        "scan_from": w.scan_from(),
+        "outputs": w.spendable_count(),
+    });
+    JsValue::from_str(&out.to_string()).pipe_ok()
+}
+
+#[wasm_bindgen]
+pub fn reset_scan(state: &str) -> Result<JsValue, JsError> {
+    let mut w = load(state)?;
+    w.reset_scan().map_err(err)?;
+    let out = json!({
+        "state": dump(&w)?,
+        "scan_from": w.scan_from(),
+    });
+    JsValue::from_str(&out.to_string()).pipe_ok()
+}
+
+#[wasm_bindgen]
+pub fn address_qr_svg(address: &str) -> Result<String, JsError> {
+    let code = qrcode::QrCode::new(address.as_bytes()).map_err(err)?;
+    Ok(code
+        .render::<qrcode::render::svg::Color>()
+        .min_dimensions(240, 240)
+        .dark_color(qrcode::render::svg::Color("#12091c"))
+        .light_color(qrcode::render::svg::Color("#f4f0ff"))
+        .quiet_zone(true)
+        .build())
 }
 
 #[wasm_bindgen]
@@ -115,14 +175,14 @@ pub fn ingest_page(
     spent_json: &str,
     scanned_to: f64,
 ) -> Result<JsValue, JsError> {
-    let mut w = Wallet::import_state(state).map_err(err)?;
+    let mut w = load(state)?;
     let lights = lights_from_json(outputs_json)?;
     let spent: Vec<String> = serde_json::from_str(spent_json).unwrap_or_default();
     let found = w
         .ingest_scan_page(&lights, &spent, height(scanned_to))
         .map_err(err)?;
     let out = json!({
-        "state": w.export_state().map_err(err)?,
+        "state": dump(&w)?,
         "found": found,
         "scanned_to": w.scanned_to(),
     });
@@ -131,22 +191,22 @@ pub fn ingest_page(
 
 #[wasm_bindgen]
 pub fn wallet_balance(state: &str, tip: f64) -> Result<JsValue, JsError> {
-    let w = Wallet::import_state(state).map_err(err)?;
+    let w = load(state)?;
     let b = w.balances(height(tip), MATURITY);
     let out = json!({
-        "available": Amount(b.available).to_string(),
-        "immature": Amount(b.immature).to_string(),
-        "pending_out": Amount(b.pending_out).to_string(),
-        "total": Amount(b.total()).to_string(),
+        "available": Amount(b.available).decimal_string(),
+        "immature": Amount(b.immature).decimal_string(),
+        "pending_out": Amount(b.pending_out).decimal_string(),
+        "total": Amount(b.total()).decimal_string(),
         "scanned_to": w.scanned_to(),
-        "tip": tip,
+        "tip": height(tip),
     });
     JsValue::from_str(&out.to_string()).pipe_ok()
 }
 
 #[wasm_bindgen]
 pub fn wallet_history(state: &str) -> Result<JsValue, JsError> {
-    let w = Wallet::import_state(state).map_err(err)?;
+    let w = load(state)?;
     let rows: Vec<_> = w
         .history()
         .iter()
@@ -154,10 +214,13 @@ pub fn wallet_history(state: &str) -> Result<JsValue, JsError> {
         .map(|e| {
             json!({
                 "direction": e.direction.label(),
-                "amount": Amount(e.amount).to_string(),
+                "amount": Amount(e.amount).decimal_string(),
+                "fee": Amount(e.fee).decimal_string(),
                 "memo": e.memo,
                 "height": e.height,
                 "pending": e.is_pending(),
+                "timestamp": e.timestamp,
+                "txid": e.txid,
             })
         })
         .collect();
@@ -172,7 +235,7 @@ pub fn build_send(
     memo: &str,
     tip: f64,
 ) -> Result<JsValue, JsError> {
-    let mut w = Wallet::import_state(state).map_err(err)?;
+    let mut w = load(state)?;
     let addr = Address::decode(to).map_err(err)?;
     if addr == w.address() {
         return Err(err("that is your own address"));
@@ -182,10 +245,12 @@ pub fn build_send(
         .create_payment_at(&addr, darks, DEFAULT_FEE, memo, height(tip), MATURITY)
         .map_err(err)?;
     w.record_send(&tx, darks, memo.to_string()).map_err(err)?;
+    let tx_val = serde_json::to_value(&tx).map_err(err)?;
     let out = json!({
-        "state": w.export_state().map_err(err)?,
-        "tx": tx,
+        "state": dump(&w)?,
+        "tx": tx_val,
         "txid": tx.txid().to_hex(),
+        "fee": Amount(DEFAULT_FEE).decimal_string(),
     });
     JsValue::from_str(&out.to_string()).pipe_ok()
 }

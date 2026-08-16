@@ -740,6 +740,18 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -777,18 +789,30 @@ internal interface UniffiLib : Library {
     ): Long
     fun uniffi_nightfall_mobile_fn_method_mobilewallet_history(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    fun uniffi_nightfall_mobile_fn_method_mobilewallet_info(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     fun uniffi_nightfall_mobile_fn_method_mobilewallet_recovery_phrase(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    fun uniffi_nightfall_mobile_fn_method_mobilewallet_reset_scan(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_nightfall_mobile_fn_method_mobilewallet_send(`ptr`: Pointer,`node`: RustBuffer.ByValue,`to`: RustBuffer.ByValue,`amount`: RustBuffer.ByValue,`memo`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_nightfall_mobile_fn_method_mobilewallet_sync(`ptr`: Pointer,`node`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Int
+    fun uniffi_nightfall_mobile_fn_method_mobilewallet_view_key(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_nightfall_mobile_fn_func_default_fee(uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     fun uniffi_nightfall_mobile_fn_func_default_node(uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    fun uniffi_nightfall_mobile_fn_func_node_tip(`node`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Long
     fun uniffi_nightfall_mobile_fn_func_privacy_warning(uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_nightfall_mobile_fn_func_wallet_exists(`datadir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
+    fun uniffi_nightfall_mobile_fn_func_wipe_wallet(`datadir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun ffi_nightfall_mobile_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun ffi_nightfall_mobile_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -901,11 +925,17 @@ internal interface UniffiLib : Library {
     ): Unit
     fun ffi_nightfall_mobile_rust_future_complete_void(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    fun uniffi_nightfall_mobile_checksum_func_default_fee(
+    ): Short
     fun uniffi_nightfall_mobile_checksum_func_default_node(
+    ): Short
+    fun uniffi_nightfall_mobile_checksum_func_node_tip(
     ): Short
     fun uniffi_nightfall_mobile_checksum_func_privacy_warning(
     ): Short
     fun uniffi_nightfall_mobile_checksum_func_wallet_exists(
+    ): Short
+    fun uniffi_nightfall_mobile_checksum_func_wipe_wallet(
     ): Short
     fun uniffi_nightfall_mobile_checksum_method_mobilewallet_address(
     ): Short
@@ -915,11 +945,17 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_nightfall_mobile_checksum_method_mobilewallet_history(
     ): Short
+    fun uniffi_nightfall_mobile_checksum_method_mobilewallet_info(
+    ): Short
     fun uniffi_nightfall_mobile_checksum_method_mobilewallet_recovery_phrase(
+    ): Short
+    fun uniffi_nightfall_mobile_checksum_method_mobilewallet_reset_scan(
     ): Short
     fun uniffi_nightfall_mobile_checksum_method_mobilewallet_send(
     ): Short
     fun uniffi_nightfall_mobile_checksum_method_mobilewallet_sync(
+    ): Short
+    fun uniffi_nightfall_mobile_checksum_method_mobilewallet_view_key(
     ): Short
     fun uniffi_nightfall_mobile_checksum_constructor_mobilewallet_create(
     ): Short
@@ -944,13 +980,22 @@ private fun uniffiCheckContractApiVersion(lib: UniffiLib) {
 
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: UniffiLib) {
+    if (lib.uniffi_nightfall_mobile_checksum_func_default_fee() != 60578.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_nightfall_mobile_checksum_func_default_node() != 35671.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_nightfall_mobile_checksum_func_node_tip() != 24409.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_nightfall_mobile_checksum_func_privacy_warning() != 55729.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_nightfall_mobile_checksum_func_wallet_exists() != 51802.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_nightfall_mobile_checksum_func_wipe_wallet() != 31223.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_nightfall_mobile_checksum_method_mobilewallet_address() != 25360.toShort()) {
@@ -965,13 +1010,22 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_nightfall_mobile_checksum_method_mobilewallet_history() != 3194.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_nightfall_mobile_checksum_method_mobilewallet_info() != 38866.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_nightfall_mobile_checksum_method_mobilewallet_recovery_phrase() != 36561.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_nightfall_mobile_checksum_method_mobilewallet_reset_scan() != 17562.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_nightfall_mobile_checksum_method_mobilewallet_send() != 1384.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_nightfall_mobile_checksum_method_mobilewallet_sync() != 21731.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_nightfall_mobile_checksum_method_mobilewallet_view_key() != 8398.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_nightfall_mobile_checksum_constructor_mobilewallet_create() != 8821.toShort()) {
@@ -1328,11 +1382,17 @@ public interface MobileWalletInterface {
     
     fun `history`(): List<HistoryView>
     
+    fun `info`(): WalletInfo
+    
     fun `recoveryPhrase`(): kotlin.String
+    
+    fun `resetScan`()
     
     fun `send`(`node`: kotlin.String, `to`: kotlin.String, `amount`: kotlin.String, `memo`: kotlin.String): kotlin.String
     
     fun `sync`(`node`: kotlin.String): kotlin.UInt
+    
+    fun `viewKey`(): kotlin.String
     
     companion object
 }
@@ -1471,6 +1531,19 @@ open class MobileWallet: Disposable, AutoCloseable, MobileWalletInterface {
     
 
     
+    @Throws(MobileException::class)override fun `info`(): WalletInfo {
+            return FfiConverterTypeWalletInfo.lift(
+    callWithPointer {
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.INSTANCE.uniffi_nightfall_mobile_fn_method_mobilewallet_info(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
     @Throws(MobileException::class)override fun `recoveryPhrase`(): kotlin.String {
             return FfiConverterString.lift(
     callWithPointer {
@@ -1481,6 +1554,18 @@ open class MobileWallet: Disposable, AutoCloseable, MobileWalletInterface {
     }
     )
     }
+    
+
+    
+    @Throws(MobileException::class)override fun `resetScan`()
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.INSTANCE.uniffi_nightfall_mobile_fn_method_mobilewallet_reset_scan(
+        it, _status)
+}
+    }
+    
     
 
     
@@ -1503,6 +1588,19 @@ open class MobileWallet: Disposable, AutoCloseable, MobileWalletInterface {
     uniffiRustCallWithError(MobileException) { _status ->
     UniffiLib.INSTANCE.uniffi_nightfall_mobile_fn_method_mobilewallet_sync(
         it, FfiConverterString.lower(`node`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(MobileException::class)override fun `viewKey`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.INSTANCE.uniffi_nightfall_mobile_fn_method_mobilewallet_view_key(
+        it, _status)
 }
     }
     )
@@ -1664,9 +1762,12 @@ public object FfiConverterTypeCreatedWallet: FfiConverterRustBuffer<CreatedWalle
 data class HistoryView (
     var `direction`: kotlin.String, 
     var `amount`: kotlin.String, 
+    var `fee`: kotlin.String, 
     var `memo`: kotlin.String, 
     var `height`: kotlin.ULong?, 
-    var `pending`: kotlin.Boolean
+    var `pending`: kotlin.Boolean, 
+    var `timestamp`: kotlin.ULong, 
+    var `txid`: kotlin.String
 ) {
     
     companion object
@@ -1681,25 +1782,74 @@ public object FfiConverterTypeHistoryView: FfiConverterRustBuffer<HistoryView> {
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
             FfiConverterOptionalULong.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterString.read(buf),
         )
     }
 
     override fun allocationSize(value: HistoryView) = (
             FfiConverterString.allocationSize(value.`direction`) +
             FfiConverterString.allocationSize(value.`amount`) +
+            FfiConverterString.allocationSize(value.`fee`) +
             FfiConverterString.allocationSize(value.`memo`) +
             FfiConverterOptionalULong.allocationSize(value.`height`) +
-            FfiConverterBoolean.allocationSize(value.`pending`)
+            FfiConverterBoolean.allocationSize(value.`pending`) +
+            FfiConverterULong.allocationSize(value.`timestamp`) +
+            FfiConverterString.allocationSize(value.`txid`)
     )
 
     override fun write(value: HistoryView, buf: ByteBuffer) {
             FfiConverterString.write(value.`direction`, buf)
             FfiConverterString.write(value.`amount`, buf)
+            FfiConverterString.write(value.`fee`, buf)
             FfiConverterString.write(value.`memo`, buf)
             FfiConverterOptionalULong.write(value.`height`, buf)
             FfiConverterBoolean.write(value.`pending`, buf)
+            FfiConverterULong.write(value.`timestamp`, buf)
+            FfiConverterString.write(value.`txid`, buf)
+    }
+}
+
+
+
+data class WalletInfo (
+    var `address`: kotlin.String, 
+    var `birthHeight`: kotlin.ULong, 
+    var `scannedTo`: kotlin.ULong, 
+    var `outputs`: kotlin.UInt
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeWalletInfo: FfiConverterRustBuffer<WalletInfo> {
+    override fun read(buf: ByteBuffer): WalletInfo {
+        return WalletInfo(
+            FfiConverterString.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: WalletInfo) = (
+            FfiConverterString.allocationSize(value.`address`) +
+            FfiConverterULong.allocationSize(value.`birthHeight`) +
+            FfiConverterULong.allocationSize(value.`scannedTo`) +
+            FfiConverterUInt.allocationSize(value.`outputs`)
+    )
+
+    override fun write(value: WalletInfo, buf: ByteBuffer) {
+            FfiConverterString.write(value.`address`, buf)
+            FfiConverterULong.write(value.`birthHeight`, buf)
+            FfiConverterULong.write(value.`scannedTo`, buf)
+            FfiConverterUInt.write(value.`outputs`, buf)
     }
 }
 
@@ -1820,11 +1970,30 @@ public object FfiConverterSequenceTypeHistoryView: FfiConverterRustBuffer<List<H
             FfiConverterTypeHistoryView.write(it, buf)
         }
     }
-} fun `defaultNode`(): kotlin.String {
+} fun `defaultFee`(): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_nightfall_mobile_fn_func_default_fee(
+        _status)
+}
+    )
+    }
+    
+ fun `defaultNode`(): kotlin.String {
             return FfiConverterString.lift(
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_nightfall_mobile_fn_func_default_node(
         _status)
+}
+    )
+    }
+    
+
+    @Throws(MobileException::class) fun `nodeTip`(`node`: kotlin.String): kotlin.ULong {
+            return FfiConverterULong.lift(
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.INSTANCE.uniffi_nightfall_mobile_fn_func_node_tip(
+        FfiConverterString.lower(`node`),_status)
 }
     )
     }
@@ -1846,6 +2015,15 @@ public object FfiConverterSequenceTypeHistoryView: FfiConverterRustBuffer<List<H
 }
     )
     }
+    
+
+    @Throws(MobileException::class) fun `wipeWallet`(`datadir`: kotlin.String)
+        = 
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.INSTANCE.uniffi_nightfall_mobile_fn_func_wipe_wallet(
+        FfiConverterString.lower(`datadir`),_status)
+}
+    
     
 
 

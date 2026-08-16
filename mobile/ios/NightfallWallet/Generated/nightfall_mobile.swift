@@ -506,11 +506,17 @@ public protocol MobileWalletProtocol : AnyObject {
     
     func history() throws  -> [HistoryView]
     
+    func info() throws  -> WalletInfo
+    
     func recoveryPhrase() throws  -> String
+    
+    func resetScan() throws 
     
     func send(node: String, to: String, amount: String, memo: String) throws  -> String
     
     func sync(node: String) throws  -> UInt32
+    
+    func viewKey() throws  -> String
     
 }
 
@@ -624,11 +630,24 @@ open func history()throws  -> [HistoryView] {
 })
 }
     
+open func info()throws  -> WalletInfo {
+    return try  FfiConverterTypeWalletInfo.lift(try rustCallWithError(FfiConverterTypeMobileError.lift) {
+    uniffi_nightfall_mobile_fn_method_mobilewallet_info(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func recoveryPhrase()throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeMobileError.lift) {
     uniffi_nightfall_mobile_fn_method_mobilewallet_recovery_phrase(self.uniffiClonePointer(),$0
     )
 })
+}
+    
+open func resetScan()throws  {try rustCallWithError(FfiConverterTypeMobileError.lift) {
+    uniffi_nightfall_mobile_fn_method_mobilewallet_reset_scan(self.uniffiClonePointer(),$0
+    )
+}
 }
     
 open func send(node: String, to: String, amount: String, memo: String)throws  -> String {
@@ -646,6 +665,13 @@ open func sync(node: String)throws  -> UInt32 {
     return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeMobileError.lift) {
     uniffi_nightfall_mobile_fn_method_mobilewallet_sync(self.uniffiClonePointer(),
         FfiConverterString.lower(node),$0
+    )
+})
+}
+    
+open func viewKey()throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeMobileError.lift) {
+    uniffi_nightfall_mobile_fn_method_mobilewallet_view_key(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -872,18 +898,24 @@ public func FfiConverterTypeCreatedWallet_lower(_ value: CreatedWallet) -> RustB
 public struct HistoryView {
     public var direction: String
     public var amount: String
+    public var fee: String
     public var memo: String
     public var height: UInt64?
     public var pending: Bool
+    public var timestamp: UInt64
+    public var txid: String
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(direction: String, amount: String, memo: String, height: UInt64?, pending: Bool) {
+    public init(direction: String, amount: String, fee: String, memo: String, height: UInt64?, pending: Bool, timestamp: UInt64, txid: String) {
         self.direction = direction
         self.amount = amount
+        self.fee = fee
         self.memo = memo
         self.height = height
         self.pending = pending
+        self.timestamp = timestamp
+        self.txid = txid
     }
 }
 
@@ -897,6 +929,9 @@ extension HistoryView: Equatable, Hashable {
         if lhs.amount != rhs.amount {
             return false
         }
+        if lhs.fee != rhs.fee {
+            return false
+        }
         if lhs.memo != rhs.memo {
             return false
         }
@@ -906,15 +941,24 @@ extension HistoryView: Equatable, Hashable {
         if lhs.pending != rhs.pending {
             return false
         }
+        if lhs.timestamp != rhs.timestamp {
+            return false
+        }
+        if lhs.txid != rhs.txid {
+            return false
+        }
         return true
     }
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(direction)
         hasher.combine(amount)
+        hasher.combine(fee)
         hasher.combine(memo)
         hasher.combine(height)
         hasher.combine(pending)
+        hasher.combine(timestamp)
+        hasher.combine(txid)
     }
 }
 
@@ -928,18 +972,24 @@ public struct FfiConverterTypeHistoryView: FfiConverterRustBuffer {
             try HistoryView(
                 direction: FfiConverterString.read(from: &buf), 
                 amount: FfiConverterString.read(from: &buf), 
+                fee: FfiConverterString.read(from: &buf), 
                 memo: FfiConverterString.read(from: &buf), 
                 height: FfiConverterOptionUInt64.read(from: &buf), 
-                pending: FfiConverterBool.read(from: &buf)
+                pending: FfiConverterBool.read(from: &buf), 
+                timestamp: FfiConverterUInt64.read(from: &buf), 
+                txid: FfiConverterString.read(from: &buf)
         )
     }
 
     public static func write(_ value: HistoryView, into buf: inout [UInt8]) {
         FfiConverterString.write(value.direction, into: &buf)
         FfiConverterString.write(value.amount, into: &buf)
+        FfiConverterString.write(value.fee, into: &buf)
         FfiConverterString.write(value.memo, into: &buf)
         FfiConverterOptionUInt64.write(value.height, into: &buf)
         FfiConverterBool.write(value.pending, into: &buf)
+        FfiConverterUInt64.write(value.timestamp, into: &buf)
+        FfiConverterString.write(value.txid, into: &buf)
     }
 }
 
@@ -956,6 +1006,88 @@ public func FfiConverterTypeHistoryView_lift(_ buf: RustBuffer) throws -> Histor
 #endif
 public func FfiConverterTypeHistoryView_lower(_ value: HistoryView) -> RustBuffer {
     return FfiConverterTypeHistoryView.lower(value)
+}
+
+
+public struct WalletInfo {
+    public var address: String
+    public var birthHeight: UInt64
+    public var scannedTo: UInt64
+    public var outputs: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(address: String, birthHeight: UInt64, scannedTo: UInt64, outputs: UInt32) {
+        self.address = address
+        self.birthHeight = birthHeight
+        self.scannedTo = scannedTo
+        self.outputs = outputs
+    }
+}
+
+
+
+extension WalletInfo: Equatable, Hashable {
+    public static func ==(lhs: WalletInfo, rhs: WalletInfo) -> Bool {
+        if lhs.address != rhs.address {
+            return false
+        }
+        if lhs.birthHeight != rhs.birthHeight {
+            return false
+        }
+        if lhs.scannedTo != rhs.scannedTo {
+            return false
+        }
+        if lhs.outputs != rhs.outputs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(address)
+        hasher.combine(birthHeight)
+        hasher.combine(scannedTo)
+        hasher.combine(outputs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWalletInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WalletInfo {
+        return
+            try WalletInfo(
+                address: FfiConverterString.read(from: &buf), 
+                birthHeight: FfiConverterUInt64.read(from: &buf), 
+                scannedTo: FfiConverterUInt64.read(from: &buf), 
+                outputs: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: WalletInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.address, into: &buf)
+        FfiConverterUInt64.write(value.birthHeight, into: &buf)
+        FfiConverterUInt64.write(value.scannedTo, into: &buf)
+        FfiConverterUInt32.write(value.outputs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWalletInfo_lift(_ buf: RustBuffer) throws -> WalletInfo {
+    return try FfiConverterTypeWalletInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWalletInfo_lower(_ value: WalletInfo) -> RustBuffer {
+    return FfiConverterTypeWalletInfo.lower(value)
 }
 
 
@@ -1061,9 +1193,22 @@ fileprivate struct FfiConverterSequenceTypeHistoryView: FfiConverterRustBuffer {
         return seq
     }
 }
+public func defaultFee() -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_nightfall_mobile_fn_func_default_fee($0
+    )
+})
+}
 public func defaultNode() -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_nightfall_mobile_fn_func_default_node($0
+    )
+})
+}
+public func nodeTip(node: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMobileError.lift) {
+    uniffi_nightfall_mobile_fn_func_node_tip(
+        FfiConverterString.lower(node),$0
     )
 })
 }
@@ -1079,6 +1224,12 @@ public func walletExists(datadir: String) -> Bool {
         FfiConverterString.lower(datadir),$0
     )
 })
+}
+public func wipeWallet(datadir: String)throws  {try rustCallWithError(FfiConverterTypeMobileError.lift) {
+    uniffi_nightfall_mobile_fn_func_wipe_wallet(
+        FfiConverterString.lower(datadir),$0
+    )
+}
 }
 
 private enum InitializationResult {
@@ -1096,13 +1247,22 @@ private var initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_nightfall_mobile_checksum_func_default_fee() != 60578) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_nightfall_mobile_checksum_func_default_node() != 35671) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nightfall_mobile_checksum_func_node_tip() != 24409) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nightfall_mobile_checksum_func_privacy_warning() != 55729) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nightfall_mobile_checksum_func_wallet_exists() != 51802) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nightfall_mobile_checksum_func_wipe_wallet() != 31223) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nightfall_mobile_checksum_method_mobilewallet_address() != 25360) {
@@ -1117,13 +1277,22 @@ private var initializationResult: InitializationResult = {
     if (uniffi_nightfall_mobile_checksum_method_mobilewallet_history() != 3194) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_nightfall_mobile_checksum_method_mobilewallet_info() != 38866) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_nightfall_mobile_checksum_method_mobilewallet_recovery_phrase() != 36561) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nightfall_mobile_checksum_method_mobilewallet_reset_scan() != 17562) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nightfall_mobile_checksum_method_mobilewallet_send() != 1384) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nightfall_mobile_checksum_method_mobilewallet_sync() != 21731) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_nightfall_mobile_checksum_method_mobilewallet_view_key() != 8398) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_nightfall_mobile_checksum_constructor_mobilewallet_create() != 8821) {

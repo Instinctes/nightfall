@@ -13,7 +13,11 @@ android {
         targetSdk = 35
         versionCode = 70
         versionName = "0.7.0"
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
     }
+    ndkVersion = "29.0.14206865"
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -37,4 +41,5 @@ dependencies {
     implementation("androidx.compose.material3:material3:1.3.1")
     implementation("androidx.compose.material:material-icons-extended:1.7.5")
     implementation("net.java.dev.jna:jna:5.14.0@aar")
+    implementation("com.google.zxing:core:3.5.3")
 }
