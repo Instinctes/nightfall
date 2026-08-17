@@ -24,16 +24,22 @@ use std::collections::HashMap;
 /// chain and revalidate an alternate history from genesis.
 pub const MAX_REORG_DEPTH: usize = 500;
 
+/// How many leading blocks of `candidate` we already hold (same hash).
+pub fn reorg_common_prefix(our_hashes: &[Hash256], candidate: &[Block]) -> usize {
+    candidate
+        .iter()
+        .zip(our_hashes.iter())
+        .take_while(|(b, h)| b.hash() == **h)
+        .count()
+}
+
 /// How many of our own blocks a candidate would force us to abandon.
 ///
 /// Walks the shared prefix. Anything after that on our side is the rewind.
 pub fn reorg_rewind(our_hashes: &[Hash256], candidate: &[Block]) -> usize {
-    let common = candidate
-        .iter()
-        .zip(our_hashes.iter())
-        .take_while(|(b, h)| b.hash() == **h)
-        .count();
-    our_hashes.len().saturating_sub(common)
+    our_hashes
+        .len()
+        .saturating_sub(reorg_common_prefix(our_hashes, candidate))
 }
 
 /// Cap on transactions per block.
@@ -497,9 +503,29 @@ impl Chain {
         blocks: Vec<Block>,
         now_unix: u64,
     ) -> Result<Self, ConsensusError> {
+        Self::rebuild_from_blocks_trusted_prefix(network, blocks, 0, now_unix)
+    }
+
+    /// Replay `blocks`, skipping proof-of-work on the first `trusted_prefix`.
+    ///
+    /// Those leading blocks are ones this node already validated (same hash as
+    /// our own history). Re-hashing them on every one-block fork is what made
+    /// a 6 000-block laptop appear to stop syncing: Argon2id at 11 ms each is
+    /// a minute of work to throw away a single stale tip. Everything after
+    /// the shared prefix is checked in full, including proof of work.
+    pub fn rebuild_from_blocks_trusted_prefix(
+        network: NetworkId,
+        blocks: Vec<Block>,
+        trusted_prefix: usize,
+        now_unix: u64,
+    ) -> Result<Self, ConsensusError> {
         let mut chain = Self::new_fair(network)?;
-        for b in blocks {
-            chain.apply_block(b, now_unix)?;
+        for (i, b) in blocks.into_iter().enumerate() {
+            if i < trusted_prefix {
+                chain.apply_block_locally_trusted(b, now_unix)?;
+            } else {
+                chain.apply_block(b, now_unix)?;
+            }
         }
         Ok(chain)
     }
@@ -601,11 +627,14 @@ impl Chain {
         // to rejoin. A peer that actually forks at genesis, abandoning more
         // than MAX_REORG_DEPTH of our history, is still refused — that is the
         // denial-of-service limit, and it stays.
-        if reorg_rewind(our_hashes, &blocks) > MAX_REORG_DEPTH {
+        let common = reorg_common_prefix(our_hashes, &blocks);
+        if our_hashes.len().saturating_sub(common) > MAX_REORG_DEPTH {
             return Err(ConsensusError::ReorgTooDeep);
         }
 
-        let candidate = Self::rebuild_from_blocks(network, blocks, now_unix)?;
+        // Shared history is ours. Only the suffix is untrusted work.
+        let candidate =
+            Self::rebuild_from_blocks_trusted_prefix(network, blocks, common, now_unix)?;
         if candidate.total_work > our_work {
             return Ok(Some(candidate));
         }

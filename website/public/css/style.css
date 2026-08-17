@@ -448,11 +448,19 @@ header.hero {
 }
 
 .wallet-card .amount {
-    font-size: 2.1rem;
+    font-size: clamp(1.28rem, 2.6vw, 1.85rem);
     font-weight: 700;
     color: #fff;
     margin: 8px 0 4px;
     letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+}
+
+.wallet-card .amt-tick {
+    font-size: 0.52em;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    opacity: 0.88;
 }
 
 .wallet-chips {
@@ -489,6 +497,65 @@ header.hero {
 
 .wallet-rows div + div {
     margin-top: 2px;
+}
+
+.wallet-rows .burned {
+    color: #ffc85c;
+}
+
+.supply-sub {
+    font-size: 0.84rem;
+    color: rgba(255, 255, 255, 0.72);
+    margin-top: 2px;
+}
+
+.supply-bar {
+    height: 4px;
+    border-radius: 99px;
+    background: rgba(0, 0, 0, 0.35);
+    margin: 14px 0 4px;
+    overflow: hidden;
+}
+
+.supply-bar i {
+    display: block;
+    height: 100%;
+    width: 0;
+    border-radius: inherit;
+    background: #fff;
+    transition: width 0.6s ease;
+}
+
+.supply-proof {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 16px;
+    font-size: 0.88rem;
+    color: #4ae0a8;
+}
+
+.supply-proof .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: currentColor;
+    flex-shrink: 0;
+}
+
+.supply-proof.is-bad {
+    color: #ff6b7a;
+}
+
+.supply-proof.is-wait {
+    color: rgba(255, 255, 255, 0.7);
+}
+
+.supply-note {
+    margin: 8px 0 0;
+    font-size: 0.76rem;
+    line-height: 1.45;
+    color: rgba(255, 255, 255, 0.55);
 }
 
 /* --------------------------------------------------------------- section -- */

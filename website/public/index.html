@@ -16,7 +16,7 @@
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
-<link rel="stylesheet" href="css/style.css?v=v8-1">
+<link rel="stylesheet" href="css/style.css?v=supply-1">
 </head>
 <body>
 
@@ -62,18 +62,20 @@
       </div>
 
       <div class="reveal" data-delay="2">
-        <div class="wallet-card">
-          <div class="label">TOTAL BALANCE</div>
-          <div class="amount"><span id="ticker">0.00000000</span> NIGHT</div>
-          <div class="wallet-chips">
-            <span>132.00000000 unlocking</span>
-            <span>22 outputs</span>
-          </div>
+        <div class="wallet-card supply-card" id="supply-card">
+          <div class="label">NETWORK SUPPLY</div>
+          <div class="amount"><span id="supply-circ">—</span> <span class="amt-tick">NIGHT</span></div>
+          <div class="supply-sub" id="supply-sub">of 90,000,000 max</div>
+          <div class="supply-bar" aria-hidden="true"><i id="supply-bar"></i></div>
           <div class="wallet-rows">
-            <div><span>Mined · block 318</span><span>+6.00000000</span></div>
-            <div><span>Received · "invoice 42"</span><span>+5.00000000</span></div>
-            <div><span>Sent</span><span>−1.00100000</span></div>
+            <div><span>Mined</span><span id="supply-mined">—</span></div>
+            <div><span>Burned in fees</span><span class="burned" id="supply-burned">—</span></div>
           </div>
+          <div class="supply-proof" id="supply-proof">
+            <span class="dot"></span>
+            <span id="supply-proof-text">Checking the chain…</span>
+          </div>
+          <p class="supply-note">Every node re-checks that no coin exists which was never mined.</p>
         </div>
       </div>
     </div>
@@ -300,17 +302,17 @@
       <div class="dl reveal">
         <div class="os">macOS · Apple Silicon</div>
         <div class="req">M1 – M4 · macOS 11+</div>
-        <a class="btn btn-primary" href="downloads/NIGHTFALLCOIN-Core-0.7.1-macOS-arm64.dmg">Download 0.7.1</a>
+        <a class="btn btn-primary" href="downloads/NIGHTFALLCOIN-Core-0.7.2-macOS-arm64.dmg">Download 0.7.2</a>
       </div>
       <div class="dl reveal" data-delay="1">
         <div class="os">macOS · Intel</div>
         <div class="req">macOS 10.15 Catalina+</div>
-        <a class="btn btn-primary" href="downloads/NIGHTFALLCOIN-Core-0.7.1-macOS-intel.dmg">Download 0.7.1</a>
+        <a class="btn btn-primary" href="downloads/NIGHTFALLCOIN-Core-0.7.2-macOS-intel.dmg">Download 0.7.2</a>
       </div>
       <div class="dl reveal" data-delay="2">
         <div class="os">Windows</div>
         <div class="req">64-bit · Windows 10+</div>
-        <a class="btn btn-primary" href="downloads/nightfall-core-0.7.1-windows-x64.exe">Download 0.7.1</a>
+        <a class="btn btn-primary" href="downloads/nightfall-core-0.7.2-windows-x64.exe">Download 0.7.2</a>
       </div>
       <div class="dl reveal">
         <div class="os">Android · arm64</div>
@@ -337,8 +339,8 @@
       is Apple, not us. The web wallet needs no install.
       <br>
       Verify what you downloaded against
-      <a href="downloads/SHA256SUMS-0.7.1.txt">SHA256SUMS-0.7.1.txt</a>,
-      <a href="downloads/SHA256SUMS-0.7.1-windows.txt">SHA256SUMS-0.7.1-windows.txt</a>,
+      <a href="downloads/SHA256SUMS-0.7.2.txt">SHA256SUMS-0.7.2.txt</a>,
+      <a href="downloads/SHA256SUMS-0.7.2-windows.txt">SHA256SUMS-0.7.2-windows.txt</a>,
       <a href="downloads/SHA256SUMS-0.7.0-android.txt">SHA256SUMS-0.7.0-android.txt</a>
       and
       <a href="downloads/SHA256SUMS-0.7.0-ios.txt">SHA256SUMS-0.7.0-ios.txt</a>,
@@ -411,6 +413,6 @@
   </div>
 </footer>
 
-<script src="js/main.js?v=v8-1"></script>
+<script src="js/main.js?v=supply-1"></script>
 </body>
 </html>

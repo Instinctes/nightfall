@@ -133,6 +133,15 @@ pub struct NodeInner {
     /// Keyed by txid. The embargo is a few tens of seconds so a stem that
     /// dies mid-path still reaches the network.
     pub stem_embargo: HashMap<String, u64>,
+    /// Addresses that completed a handshake this process. Gossip from
+    /// `GetPeers` is not enough — that is how a `peers.json` filled with
+    /// Tor exits and produced 51 hung SYN_SENT while the seed sat one
+    /// socket away.
+    pub confirmed_peers: HashSet<String>,
+    /// Set when a peer is ahead and their blocks do not connect to our tip.
+    /// Mining on that tip deepens a fork; this does not expire with the
+    /// catch-up window.
+    pub stalled_on_fork: AtomicBool,
 }
 
 /// Upper bound on buffered branch blocks. A fork deeper than this is past
@@ -173,7 +182,13 @@ impl NodeInner {
 
     /// Write known peers out, so the next start is not back to zero.
     pub fn persist_peers(&self, datadir: &std::path::Path) {
-        let mut all: Vec<String> = self.dialable_peers();
+        let seeds = self
+            .network
+            .seed_nodes()
+            .iter()
+            .map(|s| s.to_string())
+            .chain(self.bootstrap.iter().cloned());
+        let mut all = peers_to_remember(seeds, self.confirmed_peers.iter().cloned());
         all.sort();
         if let Ok(json) = serde_json::to_string_pretty(&all) {
             let path = peers_file(datadir);
@@ -186,6 +201,7 @@ impl NodeInner {
 
     fn bump_tip(&mut self) {
         self.tip_epoch.fetch_add(1, Ordering::SeqCst);
+        self.stalled_on_fork.store(false, Ordering::SeqCst);
         // Our chain moved, so whatever gap remains is being closed. Anything
         // that stops moving while a peer claims more is a fork, and the mining
         // hold-off gives up on it — see MAX_CATCHUP_WAIT_SECS.
@@ -233,11 +249,17 @@ impl NodeInner {
     /// on the same LAN while every log line looked healthy.
     fn forget_incompatible(&mut self, addr: &str) {
         self.peer_addrs.remove(addr);
+        self.confirmed_peers.remove(addr);
         self.bootstrap.retain(|a| a != addr);
         self.sessions.remove(addr);
         self.sessions.remove(&outbound_key(addr));
         self.sessions.remove(&inbound_key(addr));
         tracing::info!("dropped {addr}: incompatible genesis");
+    }
+
+    fn mark_confirmed(&mut self, addr: String) {
+        self.confirmed_peers.insert(addr.clone());
+        self.peer_addrs.insert(addr);
     }
 
     /// Announce a block on every live socket.
@@ -476,6 +498,8 @@ impl NodeHandle {
             reorg_in_flight: Arc::new(AtomicBool::new(false)),
             last_reorg_fetch: AtomicU64::new(0),
             last_wall_tick: AtomicU64::new(now_unix()),
+            confirmed_peers: HashSet::new(),
+            stalled_on_fork: AtomicBool::new(false),
             sessions: Arc::clone(&sessions),
             tip_notify: Arc::clone(&tip_notify),
             proxy: parse_proxy_cfg(cfg.proxy.as_deref())?,
@@ -681,18 +705,33 @@ impl NodeHandle {
 
 // -------------------------------------------------------- live sessions ---
 
+/// How many non-seed addresses we will dial at once. A `peers.json` stuffed
+/// with Tor exits used to launch one thread per line and leave 50+ sockets
+/// in SYN_SENT — the seed, one hop away, starved.
+pub const MAX_OUTBOUND_EXTRA: usize = 6;
+const DIAL_GIVE_UP: u32 = 5;
+
 fn spawn_outbound_supervisor(state: SharedState) {
     thread::spawn(move || {
-        let mut launched: HashSet<String> = HashSet::new();
+        let launched: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         loop {
             let targets = outbound_targets(&state);
             for addr in targets {
-                if launched.contains(&addr) {
-                    continue;
+                {
+                    let mut live = launched.lock().unwrap();
+                    if live.contains(&addr) {
+                        continue;
+                    }
+                    live.insert(addr.clone());
                 }
-                launched.insert(addr.clone());
                 let st = Arc::clone(&state);
-                thread::spawn(move || stay_connected(st, addr));
+                let slot = Arc::clone(&launched);
+                thread::spawn(move || {
+                    stay_connected(st, addr.clone());
+                    if let Ok(mut live) = slot.lock() {
+                        live.remove(&addr);
+                    }
+                });
             }
             thread::sleep(Duration::from_secs(2));
         }
@@ -703,24 +742,77 @@ fn outbound_targets(state: &SharedState) -> Vec<String> {
     let Ok(g) = state.lock() else {
         return Vec::new();
     };
-    let mut out = Vec::new();
-    for s in g.network.seed_nodes() {
-        out.push((*s).to_string());
-    }
-    for a in g.dialable_peers() {
-        if !out.contains(&a) {
-            out.push(a);
+    let seeds: Vec<String> = g
+        .network
+        .seed_nodes()
+        .iter()
+        .map(|s| s.to_string())
+        .chain(g.bootstrap.iter().cloned())
+        .collect();
+    let confirmed: Vec<String> = g.confirmed_peers.iter().cloned().collect();
+    let gossip: Vec<String> = g.peer_addrs.iter().cloned().collect();
+    outbound_dial_list(&seeds, &confirmed, &gossip, MAX_OUTBOUND_EXTRA)
+}
+
+/// Seeds first, then peers that already shook hands, then a short gossip
+/// tail. Unbounded gossip is how a laptop spent its sockets on relays that
+/// will never speak Nightfall.
+pub fn outbound_dial_list(
+    seeds: &[String],
+    confirmed: &[String],
+    gossip: &[String],
+    max_extra: usize,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in seeds {
+        if !out.contains(s) {
+            out.push(s.clone());
         }
+    }
+    let mut extra = 0usize;
+    for a in confirmed.iter().chain(gossip.iter()) {
+        if extra >= max_extra {
+            break;
+        }
+        if out.contains(a) {
+            continue;
+        }
+        out.push(a.clone());
+        extra += 1;
     }
     out
 }
 
+/// Addresses worth writing to disk: compiled-in seeds and peers that
+/// actually completed a handshake. Gossip is kept in memory for this
+/// session only.
+pub fn peers_to_remember(
+    seeds: impl IntoIterator<Item = String>,
+    confirmed: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    seeds
+        .into_iter()
+        .chain(confirmed)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .take(MAX_PEERS)
+        .collect()
+}
+
 fn stay_connected(state: SharedState, addr: String) {
     let mut backoff = Duration::from_millis(250);
+    let mut fails = 0u32;
+    let is_seed = {
+        let Ok(g) = state.lock() else {
+            return;
+        };
+        g.network.seed_nodes().iter().any(|s| *s == addr) || g.bootstrap.iter().any(|s| s == &addr)
+    };
     loop {
         match open_outbound_session(&state, &addr) {
             Ok(()) => {
                 backoff = Duration::from_millis(250);
+                fails = 0;
             }
             Err(e) => {
                 let msg = e.to_string();
@@ -734,6 +826,14 @@ fn stay_connected(state: SharedState, addr: String) {
                         }
                     }
                     tracing::info!("outbound {addr} abandoned: {msg}");
+                    return;
+                }
+                fails = fails.saturating_add(1);
+                if !is_seed && fails >= DIAL_GIVE_UP {
+                    if let Ok(mut g) = state.lock() {
+                        g.peer_addrs.remove(&addr);
+                    }
+                    tracing::debug!("outbound {addr}: giving up after {fails} failures");
                     return;
                 }
                 tracing::debug!("outbound {addr}: {e}");
@@ -777,7 +877,7 @@ fn open_outbound_session(state: &SharedState, addr: &str) -> anyhow::Result<()> 
 
     let (peer_h, peer_tip) = handshake(&mut stream, network, genesis, our_h, tip, port)?;
     note_peer_height(state, peer_h);
-    state.lock().unwrap().peer_addrs.insert(addr.to_string());
+    state.lock().unwrap().mark_confirmed(addr.to_string());
 
     let write_clone = stream.try_clone()?;
     let sess = {
@@ -991,7 +1091,7 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
             if let Some(addr) = dialable_addr(&peer_label, listen_port) {
                 let mut g = state.lock().unwrap();
                 if g.peer_addrs.len() < MAX_PEERS {
-                    g.peer_addrs.insert(addr.clone());
+                    g.mark_confirmed(addr.clone());
                     tracing::info!("learned peer address {addr} running {agent}");
                 }
                 if g.peer_agents.len() < MAX_PEERS * 2 {
@@ -1212,6 +1312,7 @@ fn peer_io_loop(
                     match g.chain.try_ingest_blocks(blocks, now_unix()) {
                         Ok(n) => {
                             if n > 0 {
+                                g.stalled_on_fork.store(false, Ordering::SeqCst);
                                 g.bump_tip();
                                 let _ = g.persist();
                                 tracing::info!("extended +{n} from {peer_label}");
@@ -1239,7 +1340,11 @@ fn peer_io_loop(
                     // The page did not connect. Either we already have those
                     // heights (a competing block at our tip) or we are on a
                     // lighter fork. GetBlocks cannot fix that — pull and
-                    // weigh their chain.
+                    // weigh their chain. Stop mining on the stale tip so we
+                    // do not deepen the fork while the rebuild runs.
+                    if let Ok(g) = state.lock() {
+                        g.stalled_on_fork.store(true, Ordering::SeqCst);
+                    }
                     kick_reorg_fetch(state, sess);
                 }
             }
@@ -1571,7 +1676,7 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
             return Err(e.into());
         }
     };
-    state.lock().unwrap().peer_addrs.insert(addr.to_string());
+    state.lock().unwrap().mark_confirmed(addr.to_string());
     note_peer_height(state, peer_h);
 
     // Learn about the rest of the network from this peer.
@@ -1829,6 +1934,13 @@ pub const SLEEP_GAP_SECS: u64 = 60;
 
 /// How far behind the best peer we are, or `None` if we should mine anyway.
 fn catchup_behind(inner: &NodeInner) -> Option<u64> {
+    // A competing tip must not be extended. This is not the catch-up
+    // timeout: waiting that out and mining again is how a one-block fork
+    // became a stranded chain.
+    if inner.stalled_on_fork.load(Ordering::SeqCst) || inner.reorg_in_flight.load(Ordering::SeqCst)
+    {
+        return Some(1);
+    }
     mining_should_wait(
         inner.chain.block_count(),
         inner.chain.tip_height().map(|h| h.0).unwrap_or(0),

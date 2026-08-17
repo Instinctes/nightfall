@@ -219,6 +219,51 @@ fn a_long_extension_of_a_shallow_fork_is_not_too_deep() {
 }
 
 #[test]
+fn a_one_block_fork_adopts_the_heavier_valid_branch() {
+    // The MacBook case: we share everything up to the last block, then mine
+    // one competing tip while the network keeps going. Rewind is 1. The
+    // rebuild must trust the shared prefix (no re-PoW) and still accept the
+    // heavier suffix.
+    let miner = WalletKeys::generate().address();
+    let mut shared = devnet();
+    for i in 0..4u64 {
+        shared
+            .mine_block(&miner, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+
+    let mut ours = Chain::new_fair(NetworkId::Devnet).unwrap();
+    ours.try_ingest_blocks(shared.blocks.clone(), NOW + 1_000)
+        .unwrap();
+    ours.mine_block(&miner, vec![], NOW + 4 * TARGET_BLOCK_TIME_SECS)
+        .unwrap();
+
+    let mut theirs = Chain::new_fair(NetworkId::Devnet).unwrap();
+    theirs
+        .try_ingest_blocks(shared.blocks.clone(), NOW + 1_000)
+        .unwrap();
+    for i in 0..3u64 {
+        theirs
+            .mine_block(&miner, vec![], NOW + (4 + i) * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+    assert!(theirs.total_work > ours.total_work);
+    assert_eq!(
+        reorg_rewind(
+            &ours.blocks.iter().map(|b| b.hash()).collect::<Vec<_>>(),
+            &theirs.blocks
+        ),
+        1
+    );
+
+    assert!(ours
+        .maybe_reorg_to(theirs.blocks.clone(), NOW + 10_000)
+        .unwrap());
+    assert_eq!(ours.tip_hash(), theirs.tip_hash());
+    ours.verify_supply().unwrap();
+}
+
+#[test]
 fn tampered_pow_is_rejected() {
     let mut chain = devnet();
     let miner = WalletKeys::generate().address();

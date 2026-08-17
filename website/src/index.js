@@ -183,6 +183,42 @@ async function proxyWalletApi(request) {
     }
 }
 
+async function proxySupply() {
+    try {
+        const upstream = await fetch(MOBILE_UPSTREAM, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ method: "status", params: {}, id: 1 }),
+        });
+        const payload = await upstream.json();
+        const r = payload && payload.result;
+        if (!r) {
+            return jsonResponse(502, { error: "seed returned no status" });
+        }
+        const body = JSON.stringify({
+            circulating: r.circulating,
+            minted: r.minted,
+            burned_fees: r.burned_fees,
+            max_supply: r.max_supply,
+            supply_invariant_ok: r.supply_invariant_ok,
+            tip_height: r.tip_height,
+            difficulty: r.difficulty,
+        });
+        return new Response(body, {
+            status: 200,
+            headers: {
+                "Content-Type": "application/json; charset=utf-8",
+                "Cache-Control": "public, max-age=15, must-revalidate",
+                ...securityHeaders("/supply"),
+            },
+        });
+    } catch (e) {
+        return jsonResponse(502, {
+            error: `node unreachable: ${e.message || e}`,
+        });
+    }
+}
+
 export default {
     async fetch(request, env) {
         const url = new URL(request.url);
@@ -198,6 +234,16 @@ export default {
         // Browser wallet → seed light API. Must run before the GET-only gate.
         if (url.pathname === "/wallet-api" || url.pathname === "/wallet-api/") {
             return proxyWalletApi(request);
+        }
+
+        // Homepage supply card. Same seed, a short cache so every visitor
+        // does not open a new upstream socket. Numbers are public chain
+        // facts — minted, burned, circulating — not a price.
+        if (url.pathname === "/supply" || url.pathname === "/supply/") {
+            if (request.method !== "GET" && request.method !== "HEAD") {
+                return jsonResponse(405, { error: "GET" }, { Allow: "GET, HEAD" });
+            }
+            return proxySupply();
         }
 
         // Everything else is static. No forms, no other API.

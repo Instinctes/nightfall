@@ -2,8 +2,8 @@
 
 use nightfall_consensus::MAX_REORG_DEPTH;
 use nightfall_node::runtime::{
-    mining_should_wait, reorg_fetch_cap, MAX_CATCHUP_WAIT_SECS, MAX_REORG_FETCH,
-    PEER_HEIGHT_TTL_SECS,
+    mining_should_wait, outbound_dial_list, peers_to_remember, reorg_fetch_cap,
+    MAX_CATCHUP_WAIT_SECS, MAX_OUTBOUND_EXTRA, MAX_REORG_FETCH, PEER_HEIGHT_TTL_SECS,
 };
 
 #[test]
@@ -103,4 +103,33 @@ fn a_fresh_ahead_peer_holds_mining() {
         mining_should_wait(1_900, 1_899, 2_500, now, now, now),
         Some(601)
     );
+}
+
+#[test]
+fn gossip_does_not_fill_the_dial_list() {
+    // A peers.json of 60 Tor exits used to launch 60 stay_connected threads.
+    let seeds = vec!["seed.nightfallcoin.org:17891".into()];
+    let confirmed = vec!["82.66.214.220:17891".into()];
+    let gossip: Vec<String> = (0..60).map(|i| format!("192.42.116.{i}:17891")).collect();
+    let list = outbound_dial_list(&seeds, &confirmed, &gossip, MAX_OUTBOUND_EXTRA);
+    assert!(list.contains(&seeds[0]));
+    assert!(list.contains(&confirmed[0]));
+    assert_eq!(list.len(), 1 + MAX_OUTBOUND_EXTRA);
+    assert!(
+        !list.iter().any(|a| a.starts_with("192.42.116.50")),
+        "must not dial the whole gossip dump"
+    );
+}
+
+#[test]
+fn we_only_remember_seeds_and_confirmed_peers() {
+    let remembered = peers_to_remember(
+        ["seed.nightfallcoin.org:17891".into()],
+        ["82.66.214.220:17891".into()],
+    );
+    assert_eq!(remembered.len(), 2);
+    assert!(remembered
+        .iter()
+        .any(|a| a.contains("seed.nightfallcoin.org")));
+    assert!(remembered.iter().any(|a| a.contains("82.66.214.220")));
 }

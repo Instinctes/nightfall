@@ -71,24 +71,83 @@
         counters.forEach(runCounter);
     }
 
-    /* ------------------------------------------------- hero balance ticker -- */
-    const ticker = document.getElementById("ticker");
-    if (ticker && !reduced) {
-        let value = 0;
-        const target = 1872;
-        const tick = () => {
-            value += (target - value) * 0.06;
-            const shown = value < target - 0.5 ? value : target;
-            ticker.textContent = shown.toLocaleString("en-US", {
-                minimumFractionDigits: 8,
-                maximumFractionDigits: 8,
+    /* ------------------------------------------- live network supply card -- */
+    const DARKS = 100000000;
+    const supplyCirc = document.getElementById("supply-circ");
+    const supplySub = document.getElementById("supply-sub");
+    const supplyBar = document.getElementById("supply-bar");
+    const supplyMined = document.getElementById("supply-mined");
+    const supplyBurned = document.getElementById("supply-burned");
+    const supplyProof = document.getElementById("supply-proof");
+    const supplyProofText = document.getElementById("supply-proof-text");
+
+    const formatNight = (darks) => {
+        const n = Number(darks);
+        if (!Number.isFinite(n) || n < 0) return "—";
+        const whole = Math.floor(n / DARKS);
+        const frac = Math.floor(n % DARKS);
+        return (
+            whole.toLocaleString("en-US") +
+            "." +
+            String(frac).padStart(8, "0")
+        );
+    };
+
+    const paintSupply = (s) => {
+        const minted = Number(s.minted);
+        const burned = Number(s.burned_fees);
+        const circ = Number(s.circulating);
+        const maxNight = Number(s.max_supply) || 90000000;
+        const maxDarks = maxNight * DARKS;
+        const pct = maxDarks > 0 && Number.isFinite(circ) ? (circ / maxDarks) * 100 : 0;
+
+        if (supplyCirc) supplyCirc.textContent = formatNight(circ);
+        if (supplyMined) supplyMined.textContent = formatNight(minted);
+        if (supplyBurned) supplyBurned.textContent = formatNight(burned);
+        if (supplySub) {
+            supplySub.textContent =
+                "of " +
+                maxNight.toLocaleString("en-US") +
+                " max · " +
+                pct.toFixed(4) +
+                "% issued";
+        }
+        if (supplyBar) {
+            // A 0.03% bar is invisible. Show the real fraction, but never
+            // less than a sliver once anything has been mined.
+            const width = minted > 0 ? Math.max(pct, 0.6) : 0;
+            supplyBar.style.width = Math.min(width, 100) + "%";
+        }
+        if (supplyProof && supplyProofText) {
+            const ok = s.supply_invariant_ok === true;
+            supplyProof.classList.remove("is-bad", "is-wait");
+            if (ok) {
+                supplyProofText.textContent = "Supply proof verified";
+            } else {
+                supplyProof.classList.add("is-bad");
+                supplyProofText.textContent = "Supply proof FAILED";
+            }
+        }
+    };
+
+    const loadSupply = () => {
+        if (!supplyCirc) return Promise.resolve();
+        return fetch("/supply", { cache: "no-store" })
+            .then((res) => {
+                if (!res.ok) throw new Error("supply " + res.status);
+                return res.json();
+            })
+            .then(paintSupply)
+            .catch(() => {
+                if (supplyProof && supplyProofText && supplyCirc.textContent === "—") {
+                    supplyProof.classList.add("is-wait");
+                    supplyProofText.textContent = "Seed did not answer";
+                }
             });
-            if (shown < target) requestAnimationFrame(tick);
-        };
-        setTimeout(() => requestAnimationFrame(tick), 700);
-    } else if (ticker) {
-        ticker.textContent = "1,872.00000000";
-    }
+    };
+
+    loadSupply();
+    setInterval(loadSupply, 15000);
 
     /* ------------------------------------------------ equation spotlight --- */
     const eq = document.getElementById("eq");
