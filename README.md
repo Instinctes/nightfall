@@ -351,6 +351,17 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). In short: consensus changes need a test
 that fails without them, and anything touching the supply invariant needs a
 very good reason.
 
+## Support
+
+If you want to help keep the work going, Bitcoin donations are welcome:
+
+```
+1HuXWCLpdpJZvfy4GKu39RMtVg6pgUCPHA
+```
+
+No expectation, no perk, no official price. Mine or receive NIGHT on the
+network itself.
+
 ## License
 
 MIT **or** Apache-2.0, at your option — see [LICENSE-MIT](LICENSE-MIT) and
