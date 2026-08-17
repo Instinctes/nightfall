@@ -16,9 +16,25 @@ use nightfall_types::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Reorgs deeper than this are refused outright. Without a bound, a peer can
-/// force unbounded revalidation work by offering a chain forking at genesis.
+/// Reorgs deeper than this are refused outright. Depth is how many of *our*
+/// blocks we would abandon — the rewind to the common ancestor — not how much
+/// longer the other chain is. A laptop that slept for a few hours is hundreds
+/// of blocks *behind* on a one-block fork; that is catch-up, not a deep reorg.
+/// Without a rewind bound, a peer can still force us to throw away the whole
+/// chain and revalidate an alternate history from genesis.
 pub const MAX_REORG_DEPTH: usize = 500;
+
+/// How many of our own blocks a candidate would force us to abandon.
+///
+/// Walks the shared prefix. Anything after that on our side is the rewind.
+pub fn reorg_rewind(our_hashes: &[Hash256], candidate: &[Block]) -> usize {
+    let common = candidate
+        .iter()
+        .zip(our_hashes.iter())
+        .take_while(|(b, h)| b.hash() == **h)
+        .count();
+    our_hashes.len().saturating_sub(common)
+}
 
 /// Cap on transactions per block.
 pub const MAX_TXS_PER_BLOCK: usize = 512;
@@ -523,13 +539,8 @@ impl Chain {
         blocks: Vec<Block>,
         now_unix: u64,
     ) -> Result<bool, ConsensusError> {
-        match Self::evaluate_reorg(
-            self.network,
-            self.total_work,
-            self.blocks.len(),
-            blocks,
-            now_unix,
-        )? {
+        let hashes: Vec<Hash256> = self.blocks.iter().map(|b| b.hash()).collect();
+        match Self::evaluate_reorg(self.network, self.total_work, &hashes, blocks, now_unix)? {
             Some(candidate) => Ok(self.adopt_reorg(candidate)),
             None => Ok(false),
         }
@@ -541,7 +552,7 @@ impl Chain {
     /// candidate from genesis and re-verifies every block, proof of work
     /// included — and it is deliberately a free function over borrowed facts
     /// rather than a method. A caller holding a lock around its chain can copy
-    /// the three numbers this needs, release the lock, run the rebuild, and
+    /// the work and the tip hashes, release the lock, run the rebuild, and
     /// only then come back for [`Self::adopt_reorg`].
     ///
     /// That separation is not a micro-optimisation. Measured on a live 1737
@@ -553,10 +564,14 @@ impl Chain {
     /// while slightly behind produced exactly that condition on every round,
     /// which is what made the wallet appear to hang and the chain appear to
     /// stop.
+    ///
+    /// `our_hashes` is the identity of the chain being replaced, cheapest
+    /// first: 32 bytes per block, no bodies. The caller copies it under the
+    /// lock and drops the lock before calling this.
     pub fn evaluate_reorg(
         network: NetworkId,
         our_work: u128,
-        our_len: usize,
+        our_hashes: &[Hash256],
         blocks: Vec<Block>,
         now_unix: u64,
     ) -> Result<Option<Self>, ConsensusError> {
@@ -577,20 +592,16 @@ impl Chain {
             return Ok(None);
         }
 
-        // Only now the depth bound, and only against something that claims to
-        // be heavier. The guard exists so a peer cannot make us validate an
-        // arbitrarily long chain on demand; it is a denial-of-service limit,
-        // not a rule about which chain is correct.
+        // Depth is the rewind, not the length gap.
         //
-        // It does mean two chains that drift more than MAX_REORG_DEPTH apart
-        // can never reconcile, whichever carries more work. That is a real
-        // limitation and it has already happened once: two miners on separate
-        // networks diverged by roughly two thousand blocks and had to be
-        // resolved by throwing both away. The bound stays, because the
-        // alternative is letting a stranger dictate unbounded validation work,
-        // but nodes should meet long before it matters — which is what seed
-        // nodes are for.
-        if blocks.len() > our_len + MAX_REORG_DEPTH {
+        // The old check (`blocks.len() > our_len + MAX_REORG_DEPTH`) treated a
+        // node that fell a few hours behind on a one-block fork as "too deep"
+        // the moment the seed pulled 500 blocks ahead. Those two chains share
+        // almost everything; the laptop would have to delete `blocks.jsonl`
+        // to rejoin. A peer that actually forks at genesis, abandoning more
+        // than MAX_REORG_DEPTH of our history, is still refused — that is the
+        // denial-of-service limit, and it stays.
+        if reorg_rewind(our_hashes, &blocks) > MAX_REORG_DEPTH {
             return Err(ConsensusError::ReorgTooDeep);
         }
 

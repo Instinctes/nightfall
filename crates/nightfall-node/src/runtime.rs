@@ -112,6 +112,10 @@ pub struct NodeInner {
     /// socket. Without a throttle, every 4-second Status tick would
     /// start the same download.
     pub last_reorg_fetch: AtomicU64,
+    /// Last time a 1-second ticker stored the wall clock. A jump larger than
+    /// [`SLEEP_GAP_SECS`] means the process was frozen (lid closed). Mining
+    /// must not resume on the stale tip.
+    pub last_wall_tick: AtomicU64,
     /// Sockets that are open right now. Announce writes here. A wallet behind
     /// NAT stays in real time because its outbound to a seed lives in this
     /// pool, not because anyone can dial it back.
@@ -471,6 +475,7 @@ impl NodeHandle {
             peer_agents: HashMap::new(),
             reorg_in_flight: Arc::new(AtomicBool::new(false)),
             last_reorg_fetch: AtomicU64::new(0),
+            last_wall_tick: AtomicU64::new(now_unix()),
             sessions: Arc::clone(&sessions),
             tip_notify: Arc::clone(&tip_notify),
             proxy: parse_proxy_cfg(cfg.proxy.as_deref())?,
@@ -509,6 +514,25 @@ impl NodeHandle {
                         tracing::warn!("persist: {e}");
                     }
                     g.persist_peers(&datadir);
+                }
+            });
+        }
+
+        {
+            // Heartbeat for lid-close detection. Frozen with the rest of the
+            // process during sleep; the first iteration after wake sees the
+            // jump and clears the stale peer height before mining resumes.
+            let st = Arc::clone(&state);
+            thread::spawn(move || loop {
+                thread::sleep(Duration::from_secs(1));
+                let now = now_unix();
+                if let Ok(mut g) = st.lock() {
+                    let last = g.last_wall_tick.load(Ordering::Relaxed);
+                    if now.saturating_sub(last) > SLEEP_GAP_SECS {
+                        apply_clock_jump(&mut g);
+                    } else {
+                        g.last_wall_tick.store(now, Ordering::Relaxed);
+                    }
                 }
             });
         }
@@ -1257,7 +1281,7 @@ fn note_peer_height(state: &SharedState, height: u64) {
 }
 
 /// How long a peer's claimed height stays believed without confirmation.
-const PEER_HEIGHT_TTL_SECS: u64 = 120;
+pub const PEER_HEIGHT_TTL_SECS: u64 = 120;
 
 /// Weigh a block that forks from a chain we already hold.
 ///
@@ -1324,7 +1348,7 @@ fn consider_branch(state: &SharedState, block: Block, peer_label: &str) {
     let before = g.chain.block_count();
     let network = g.chain.network;
     let our_work = g.chain.total_work;
-    let our_len = g.chain.blocks.len();
+    let our_hashes: Vec<_> = g.chain.blocks.iter().map(|b| b.hash()).collect();
     let guard = Arc::clone(&g.reorg_in_flight);
     drop(g);
 
@@ -1334,7 +1358,7 @@ fn consider_branch(state: &SharedState, block: Block, peer_label: &str) {
     };
 
     // Verified with the lock released. See `Chain::evaluate_reorg`.
-    let verdict = Chain::evaluate_reorg(network, our_work, our_len, candidate, now_unix());
+    let verdict = Chain::evaluate_reorg(network, our_work, &our_hashes, candidate, now_unix());
 
     let Ok(g) = state.lock() else { return };
     let mut g = g;
@@ -1515,6 +1539,10 @@ fn push_blocks_via_session(
 fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
     let proxy = state.lock().ok().and_then(|g| g.proxy.clone());
     let (mut stream, used_tor) = connect_peer_via(addr, 15_000, proxy.as_ref())?;
+    // Connect is 15s. Pages of 128 blocks over Tor need the live-session
+    // budget or a mid-chain fetch dies and looks like "sync is stuck".
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(120)));
     if let Ok(g) = state.lock() {
         g.last_tor_ok.store(used_tor, Ordering::Relaxed);
     }
@@ -1595,9 +1623,18 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Fetch forward from just below our tip rather than replaying from genesis.
-    // v4 downloaded the whole chain from every peer every 20 seconds.
-    let mut from = our_h.saturating_sub(1);
+    // Fetch forward from the next height we can attach, not from tip − 1.
+    // Starting at tip − 1 includes a block we already hold; apply_block
+    // then returns BadHeight, applied stays 0, and every catch-up is
+    // misread as a fork — which is how a node that was merely late ended
+    // up in the reorg path after the lid opened.
+    //
+    // `our_h + 1` is wrong on an empty node: tip_height is then 0 by
+    // default, and we would skip genesis.
+    let mut from = {
+        let g = state.lock().unwrap();
+        next_needed_height(&g)
+    };
     let mut total_applied = 0usize;
 
     for _ in 0..64 {
@@ -1621,41 +1658,61 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
         }
         drop(g);
 
-        // Nothing connected. Either we are already ahead, or we are on a
-        // different fork. Only the second case is worth work.
-        if peer_h <= our_h {
+        // Nothing connected. Either we already have those heights (a competing
+        // block at our tip) or we are on a lighter fork. Find where we last
+        // agreed and pull only the suffix — not the peer's chain from genesis,
+        // which used to hit `our_len + MAX_REORG_DEPTH` and refuse a laptop
+        // that had slept for a few hours.
+        if peer_tip == {
+            let g = state.lock().unwrap();
+            g.chain.tip_hash().to_hex()
+        } {
             break;
         }
 
-        // Only one thread verifies a reorg at a time, and the claim is staked
-        // before the download rather than after it: eleven peers that all
-        // noticed the same divergence would otherwise each pull an entire
-        // chain over the wire to prove the same point.
-        let (network, our_work, our_len, guard) = {
+        let ancestor = common_ancestor(state, &mut stream, peer_h, &peer_tip);
+        let (network, our_work, our_hashes, prefix, rewind, guard) = {
             let g = state.lock().unwrap();
+            let our_tip = g.chain.tip_height().map(|h| h.0).unwrap_or(0);
+            let rewind = our_tip.saturating_sub(ancestor) as usize;
+            let prefix_end = (ancestor as usize)
+                .saturating_add(1)
+                .min(g.chain.blocks.len());
             (
                 g.chain.network,
                 g.chain.total_work,
-                g.chain.blocks.len(),
+                g.chain.blocks.iter().map(|b| b.hash()).collect::<Vec<_>>(),
+                g.chain.blocks[..prefix_end].to_vec(),
+                rewind,
                 Arc::clone(&g.reorg_in_flight),
             )
         };
+
+        if rewind > nightfall_consensus::MAX_REORG_DEPTH {
+            tracing::warn!(
+                "peer {addr} diverges {rewind} blocks back — past MAX_REORG_DEPTH, not adopting"
+            );
+            break;
+        }
+
         let Some(_flight) = ReorgFlight::begin(&guard) else {
             tracing::debug!("peer {addr} diverges, but a reorg is already being verified");
             break;
         };
 
-        // Pull the peer's chain in full before judging it. Comparing against a
-        // single 128-block page can never outweigh a longer local chain, so a
-        // node stuck on a lighter fork would never recover.
-        let candidate = fetch_full_chain(&mut stream, peer_h, our_len)?;
+        let suffix = fetch_blocks_from(&mut stream, ancestor.saturating_add(1), peer_h)?;
+        if suffix.is_empty() && rewind == 0 {
+            break;
+        }
+        let mut candidate = prefix;
+        candidate.extend(suffix);
         if candidate.is_empty() {
             break;
         }
 
         // Rebuilt and re-verified with the lock released — tens of seconds of
         // work that used to freeze the whole node. See `Chain::evaluate_reorg`.
-        let verdict = Chain::evaluate_reorg(network, our_work, our_len, candidate, now_unix());
+        let verdict = Chain::evaluate_reorg(network, our_work, &our_hashes, candidate, now_unix());
 
         let mut g = state.lock().unwrap();
         match verdict {
@@ -1684,45 +1741,36 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// How many blocks it is worth pulling to judge a peer's chain.
+/// Hard ceiling on a single reorg pull. A peer advertising `u64::MAX` must
+/// not make us allocate forever. ~100k blocks is more than two weeks at the
+/// 15-second target — long enough for a closed laptop, short enough that a
+/// liar is cut off.
+pub const MAX_REORG_FETCH: usize = 100_000;
+
+/// How many blocks to pull in `[from_height, peer_height]`, inclusive.
 ///
-/// Enough to hold all of theirs, never more than we would accept anyway.
-pub fn reorg_fetch_cap(peer_height: u64, our_len: usize) -> usize {
-    let theirs = peer_height.saturating_add(1) as usize;
-    theirs.min(our_len.saturating_add(nightfall_consensus::MAX_REORG_DEPTH))
+/// This used to be `min(peer_height + 1, our_len + MAX_REORG_DEPTH)` and was
+/// fetched from genesis. A node 700 blocks behind on a one-block fork then
+/// asked for a chain the acceptance rule would refuse as "too deep". The
+/// caller now supplies the first height *after* the common ancestor, so the
+/// cap is the suffix, not the whole history.
+pub fn reorg_fetch_cap(peer_height: u64, from_height: u64) -> usize {
+    if from_height > peer_height {
+        return 0;
+    }
+    let want = (peer_height - from_height) as usize + 1;
+    want.min(MAX_REORG_FETCH)
 }
 
-/// Download a peer's entire chain, paging until we reach their tip.
-///
-/// The bound is "as much as could possibly be accepted", and it has to be
-/// exactly that. It used to be `MAX_REORG_DEPTH * 4` — a flat 2,000 blocks,
-/// chosen when the chain was short enough that the difference never showed.
-///
-/// The day the chain passed 2,000 blocks, that number became a wall. A node
-/// that had diverged asked a peer for its chain, received a truncated 2,000
-/// block *prefix* of it, weighed that prefix against its own longer chain,
-/// correctly concluded it was lighter, and refused it. Then it did the same
-/// thing on the next round, and the next. The peer was not offering a worse
-/// chain; we were only ever looking at part of a better one. Two nodes, one
-/// plainly heavier, permanently unable to reconcile — and every block mined on
-/// the losing side lost with it.
-///
-/// Found at block 2,057, with a laptop stuck on 2,048 while the seed node it
-/// was talking to carried more work and neither would budge.
-///
-/// `our_len + MAX_REORG_DEPTH` is the right ceiling because it is precisely
-/// what [`Chain::evaluate_reorg`] will entertain: anything longer is rejected
-/// as too deep, so fetching it would be wasted bandwidth. Anything shorter,
-/// including any fixed constant, eventually truncates a legitimate chain.
-fn fetch_full_chain(
+/// Download blocks `[from_height ..= peer_height]` in pages.
+fn fetch_blocks_from(
     stream: &mut TcpStream,
+    from_height: u64,
     peer_height: u64,
-    our_len: usize,
 ) -> anyhow::Result<Vec<nightfall_consensus::Block>> {
-    let cap = reorg_fetch_cap(peer_height, our_len);
-
+    let cap = reorg_fetch_cap(peer_height, from_height);
     let mut all = Vec::with_capacity(cap.min(4096));
-    let mut from = 0u64;
+    let mut from = from_height;
 
     while all.len() < cap {
         let batch = nightfall_p2p::request_blocks(stream, from, MAX_BLOCKS_PER_REQUEST)?;
@@ -1735,9 +1783,12 @@ fn fetch_full_chain(
             .map(|b| b.header.height.0 + 1)
             .unwrap_or(from + 1);
         all.extend(batch);
-        if n < MAX_BLOCKS_PER_REQUEST {
+        if n < MAX_BLOCKS_PER_REQUEST || from > peer_height {
             break;
         }
+    }
+    if all.len() > cap {
+        all.truncate(cap);
     }
     Ok(all)
 }
@@ -1767,28 +1818,79 @@ fn fetch_full_chain(
 /// The clock measures *time without progress*, not time spent behind:
 /// `bump_tip` resets it whenever our chain moves at all. A node that is
 /// catching up, however far behind it is, never reaches this.
-const MAX_CATCHUP_WAIT_SECS: u64 = 600;
+pub const MAX_CATCHUP_WAIT_SECS: u64 = 600;
+
+/// Wall-clock gap that means the process was frozen (laptop lid).
+///
+/// A healthy ticker writes once a second. Sixty seconds of silence is not a
+/// slow hash, it is sleep. Shorter than [`PEER_HEIGHT_TTL_SECS`] so we notice
+/// the lid before we trust a stale peer height and mine on it.
+pub const SLEEP_GAP_SECS: u64 = 60;
 
 /// How far behind the best peer we are, or `None` if we should mine anyway.
-///
-/// `None` covers three cases, and the third is the important one:
-///
-/// - we are level with, or ahead of, every peer;
-/// - we have no peers at all — nothing to be behind, and a network has to
-///   start somewhere;
-/// - we have been waiting too long, which means the gap is a fork rather than
-///   lag, and waiting cannot close it.
 fn catchup_behind(inner: &NodeInner) -> Option<u64> {
-    let ours = inner.chain.tip_height().map(|h| h.0).unwrap_or(0);
-    if inner.best_peer_height <= ours {
+    mining_should_wait(
+        inner.chain.block_count(),
+        inner.chain.tip_height().map(|h| h.0).unwrap_or(0),
+        inner.best_peer_height,
+        inner.best_peer_seen,
+        inner.behind_since,
+        now_unix(),
+    )
+}
+
+/// Whether mining must wait, and by how many blocks if a peer is actually
+/// ahead. Pure so the sleep/startup cases can be tested without a node.
+///
+/// A chain we already have, with no fresh peer, must not be extended. That is
+/// the lid-close fork: the process wakes, `best_peer_height` still equals our
+/// tip, sockets are dead, and the first block we mine is a branch the seed
+/// will never take. Genesis (empty chain) may mine — a network of one has to
+/// start. After [`MAX_CATCHUP_WAIT_SECS`] we mine anyway so an isolated node
+/// is not bricked.
+pub fn mining_should_wait(
+    block_count: u64,
+    our_height: u64,
+    best_peer_height: u64,
+    best_peer_seen: u64,
+    behind_since: u64,
+    now: u64,
+) -> Option<u64> {
+    let peer_fresh =
+        best_peer_seen > 0 && now.saturating_sub(best_peer_seen) <= PEER_HEIGHT_TTL_SECS;
+
+    if !peer_fresh {
+        if block_count == 0 {
+            return None;
+        }
+        if now.saturating_sub(behind_since) > MAX_CATCHUP_WAIT_SECS {
+            return None;
+        }
+        return Some(1);
+    }
+
+    if best_peer_height <= our_height {
         return None;
     }
-    // Sync is either working, in which case our height keeps moving and this
-    // stays fresh, or it is not, in which case waiting achieves nothing.
-    if now_unix().saturating_sub(inner.behind_since) > MAX_CATCHUP_WAIT_SECS {
+    if now.saturating_sub(behind_since) > MAX_CATCHUP_WAIT_SECS {
         return None;
     }
-    Some(inner.best_peer_height - ours)
+    Some(best_peer_height - our_height)
+}
+
+/// Drop cached peer height and abort the current template. Called when the
+/// wall clock jumps — the process was frozen and every socket is suspect.
+fn apply_clock_jump(inner: &mut NodeInner) {
+    if inner.chain.block_count() == 0 {
+        inner.last_wall_tick.store(now_unix(), Ordering::Relaxed);
+        return;
+    }
+    tracing::info!("wall clock jumped — holding mining until a peer confirms the tip");
+    inner.tip_epoch.fetch_add(1, Ordering::SeqCst);
+    inner.best_peer_height = 0;
+    inner.best_peer_seen = 0;
+    inner.behind_since = now_unix();
+    inner.last_wall_tick.store(now_unix(), Ordering::Relaxed);
 }
 
 pub fn blocks_behind(state: &SharedState) -> Option<u64> {
@@ -1816,12 +1918,18 @@ fn mining_loop(state: SharedState) {
     }
 
     loop {
-        let (enabled, tip_epoch, epoch_now) = {
-            let g = state.lock().unwrap();
+        let (enabled, tip_epoch, epoch_now, last_tick) = {
+            let mut g = state.lock().unwrap();
+            let now = now_unix();
+            let last = g.last_wall_tick.load(Ordering::Relaxed);
+            if now.saturating_sub(last) > SLEEP_GAP_SECS {
+                apply_clock_jump(&mut g);
+            }
             (
                 g.mining_enabled.load(Ordering::SeqCst),
                 Arc::clone(&g.tip_epoch),
                 g.tip_epoch.load(Ordering::SeqCst),
+                g.last_wall_tick.load(Ordering::Relaxed),
             )
         };
 
@@ -1838,9 +1946,10 @@ fn mining_loop(state: SharedState) {
         // fork — and it happens exactly when someone is most likely to press
         // Start: right after opening the wallet, before the first sync lands.
         //
-        // Mining with *no* peers stays allowed: a network of one has nothing to
-        // be behind, and refusing would make a first node impossible. The
-        // wallet warns about that case separately, and loudly.
+        // An existing chain with no *fresh* peer is the same trap: after the
+        // lid opens, sockets are dead and the cached height still matches, so
+        // "no one is ahead" is a lie. Genesis may mine (a network of one has
+        // to start). After MAX_CATCHUP_WAIT_SECS an isolated node mines too.
         if let Some(behind) = blocks_behind(&state) {
             tracing::debug!("holding off mining — {behind} block(s) behind a peer");
             thread::sleep(Duration::from_secs(1));
@@ -1888,8 +1997,12 @@ fn mining_loop(state: SharedState) {
             )
         };
 
-        let should_stop =
-            || tip_epoch.load(Ordering::SeqCst) != epoch_now || !mining_flag.load(Ordering::SeqCst);
+        let should_stop = || {
+            if now_unix().saturating_sub(last_tick) > SLEEP_GAP_SECS {
+                return true;
+            }
+            tip_epoch.load(Ordering::SeqCst) != epoch_now || !mining_flag.load(Ordering::SeqCst)
+        };
 
         let start_nonce: u64 = rand::random();
         let Some((nonce, _hash)) = mine_parallel(
@@ -1909,6 +2022,16 @@ fn mining_loop(state: SharedState) {
 
         // --- submit under the lock (cheap) ---
         let mut g = state.lock().unwrap();
+        let now = now_unix();
+        if now.saturating_sub(g.last_wall_tick.load(Ordering::Relaxed)) > SLEEP_GAP_SECS {
+            apply_clock_jump(&mut g);
+            tracing::debug!("discarding block found after a clock jump");
+            continue;
+        }
+        if catchup_behind(&g).is_some() {
+            tracing::debug!("discarding block found while we should not have been mining");
+            continue;
+        }
         if g.chain.tip_hash() != template.built_on {
             tracing::debug!("template went stale before submission, discarding");
             continue;

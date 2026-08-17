@@ -2,7 +2,7 @@
 
 use nightfall_consensus::*;
 use nightfall_crypto::WalletKeys;
-use nightfall_types::{Height, NetworkId, TARGET_BLOCK_TIME_SECS};
+use nightfall_types::{Hash256, Height, NetworkId, TARGET_BLOCK_TIME_SECS};
 
 const NOW: u64 = 1_800_000_000;
 
@@ -144,21 +144,78 @@ fn a_lighter_chain_is_declined_not_accused() {
 }
 
 #[test]
-fn reorg_depth_is_bounded() {
-    let mut chain = devnet();
+fn reorg_depth_is_the_rewind_not_the_length() {
+    // Depth is how many of *our* blocks we would drop. A peer that shares
+    // nothing with a 501-block history is too deep even if it only sends a
+    // handful of blocks. A peer that shares almost everything and is 510
+    // blocks longer is catch-up, not a deep reorg — that used to return
+    // ReorgTooDeep and permanently stranded a laptop that had slept.
     let miner = WalletKeys::generate().address();
-    chain.mine_block(&miner, vec![], NOW).unwrap();
+    let mut mined = devnet();
+    let template = mined.mine_block(&miner, vec![], NOW).unwrap();
 
-    // Pretend a peer offers an absurdly deep fork.
-    let mut fake = Vec::new();
-    let template = chain.blocks[0].clone();
-    for _ in 0..(MAX_REORG_DEPTH + 10) {
-        fake.push(template.clone());
+    let our_hashes: Vec<Hash256> = (0..=MAX_REORG_DEPTH)
+        .map(|i| {
+            let mut h = [0u8; 32];
+            h[0] = 0xA1;
+            h[1] = (i / 256) as u8;
+            h[2] = (i % 256) as u8;
+            Hash256(h)
+        })
+        .collect();
+    assert_eq!(our_hashes.len(), MAX_REORG_DEPTH + 1);
+
+    let fake = vec![template.clone(); 8];
+    assert!(
+        matches!(
+            Chain::evaluate_reorg(NetworkId::Devnet, 1, &our_hashes, fake, NOW),
+            Err(ConsensusError::ReorgTooDeep)
+        ),
+        "abandoning more than MAX_REORG_DEPTH of our history must be refused"
+    );
+}
+
+#[test]
+fn a_long_extension_of_a_shallow_fork_is_not_too_deep() {
+    // The laptop-sleep case: we share the first three blocks, we have one
+    // extra of our own, the seed kept going for well past the old
+    // `our_len + 500` wall. Old rule: ReorgTooDeep. New rule: rewind is 1.
+    let miner = WalletKeys::generate().address();
+    let mut shared = devnet();
+    for i in 0..3u64 {
+        shared
+            .mine_block(&miner, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
     }
-    assert!(matches!(
-        chain.maybe_reorg_to(fake, NOW),
-        Err(ConsensusError::ReorgTooDeep)
-    ));
+    let mut ours = Chain::new_fair(NetworkId::Devnet).unwrap();
+    ours.try_ingest_blocks(shared.blocks.clone(), NOW + 1_000)
+        .unwrap();
+    ours.mine_block(&miner, vec![], NOW + 3 * TARGET_BLOCK_TIME_SECS)
+        .unwrap();
+
+    let our_hashes: Vec<Hash256> = ours.blocks.iter().map(|b| b.hash()).collect();
+    let mut candidate = shared.blocks.clone();
+    let pad = shared.blocks[0].clone();
+    for _ in 0..(MAX_REORG_DEPTH + 10) {
+        candidate.push(pad.clone());
+    }
+    assert!(
+        candidate.len() > ours.blocks.len() + MAX_REORG_DEPTH,
+        "setup: this is past the old length-delta wall"
+    );
+    assert_eq!(reorg_rewind(&our_hashes, &candidate), 1);
+
+    let verdict = Chain::evaluate_reorg(
+        NetworkId::Devnet,
+        ours.total_work,
+        &our_hashes,
+        candidate,
+        NOW + 10_000,
+    );
+    assert!(
+        !matches!(verdict, Err(ConsensusError::ReorgTooDeep)),
+        "a one-block rewind must not be reported as too deep, got {verdict:?}"
+    );
 }
 
 #[test]
@@ -357,8 +414,7 @@ fn evaluating_a_reorg_needs_no_chain_to_mutate() {
     // The point of `evaluate_reorg` is that a node can run it with its state
     // lock released. That is only true if deciding a reorg needs nothing but
     // borrowed facts, so this test exists to keep it that way: it never
-    // constructs the chain being replaced at all, only the three numbers
-    // describing it.
+    // mutates the chain being replaced, only its work and its hashes.
     let miner = WalletKeys::generate().address();
     let mut long = devnet();
     for i in 0..6u64 {
@@ -368,10 +424,11 @@ fn evaluating_a_reorg_needs_no_chain_to_mutate() {
     let mut short = devnet();
     short.mine_block(&miner, vec![], NOW).unwrap();
 
+    let short_hashes: Vec<Hash256> = short.blocks.iter().map(|b| b.hash()).collect();
     let verdict = Chain::evaluate_reorg(
         NetworkId::Devnet,
         short.total_work,
-        short.blocks.len(),
+        &short_hashes,
         long.blocks.clone(),
         NOW + 10_000,
     )
@@ -407,10 +464,11 @@ fn a_candidate_that_lost_the_race_is_not_adopted() {
     ours.mine_block(&miner, vec![], NOW).unwrap();
 
     // Judged while we were short: the candidate wins.
+    let ours_hashes: Vec<Hash256> = ours.blocks.iter().map(|b| b.hash()).collect();
     let candidate = Chain::evaluate_reorg(
         NetworkId::Devnet,
         ours.total_work,
-        ours.blocks.len(),
+        &ours_hashes,
         candidate_src.blocks.clone(),
         NOW + 10_000,
     )
@@ -462,10 +520,11 @@ fn splitting_the_reorg_did_not_change_the_verdict() {
         .maybe_reorg_to(long.blocks.clone(), NOW + 10_000)
         .unwrap();
 
+    let halves_hashes: Vec<Hash256> = via_halves.blocks.iter().map(|b| b.hash()).collect();
     let b = match Chain::evaluate_reorg(
         NetworkId::Devnet,
         via_halves.total_work,
-        via_halves.blocks.len(),
+        &halves_hashes,
         long.blocks.clone(),
         NOW + 10_000,
     )
