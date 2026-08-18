@@ -119,7 +119,7 @@ jobs:
           cp target/release/nightfalld "dist/nightfalld-${VERSION}-linux-x64"
           cp target/release/nightfall-wallet "dist/nightfall-wallet-${VERSION}-linux-x64"
           chmod +x dist/*
-          (cd dist && sha256sum nightfall-*-linux-x64 > "SHA256SUMS-${VERSION}-linux.txt")
+          (cd dist && sha256sum nightfall*-linux-x64 > "SHA256SUMS-${VERSION}-linux.txt")
           cat "dist/SHA256SUMS-${VERSION}-linux.txt"
         env:
           INPUT_TAG: ${{ github.event.inputs.tag }}
