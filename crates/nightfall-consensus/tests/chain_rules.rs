@@ -287,9 +287,14 @@ fn a_one_block_fork_adopts_the_heavier_valid_branch() {
 fn tampered_pow_is_rejected() {
     let mut chain = devnet();
     let miner = WalletKeys::generate().address();
-    let mut block = chain.build_template(&miner, vec![], NOW).unwrap().seal(0); // nonce 0 almost certainly fails the difficulty check
-
+    let mut block = chain.build_template(&miner, vec![], NOW).unwrap().seal(0);
+    // Devnet's floor is low enough that nonce 0 sometimes hashes. Keep
+    // walking until the header is actually invalid.
     block.header.nonce = 0;
+    while block.pow_is_valid(chain.pow_params()) {
+        block.header.nonce = block.header.nonce.wrapping_add(1);
+        assert_ne!(block.header.nonce, 0, "every nonce met the target");
+    }
     let res = chain.apply_block(block, NOW);
     assert!(matches!(res, Err(ConsensusError::BadPow)), "got {res:?}");
 }
