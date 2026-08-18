@@ -2,8 +2,9 @@
 
 use nightfall_consensus::MAX_REORG_DEPTH;
 use nightfall_node::runtime::{
-    mining_should_wait, outbound_dial_list, peers_to_remember, reorg_fetch_cap,
-    MAX_CATCHUP_WAIT_SECS, MAX_OUTBOUND_EXTRA, MAX_REORG_FETCH, PEER_HEIGHT_TTL_SECS,
+    merge_directory_peers, mining_should_wait, outbound_dial_list, peers_to_remember,
+    pick_eviction_victim, reorg_fetch_cap, EvictionCandidate, IBD_BEHIND, MAX_CATCHUP_WAIT_SECS,
+    MAX_OUTBOUND_EXTRA, MAX_REORG_FETCH, PEER_HEIGHT_TTL_SECS,
 };
 
 #[test]
@@ -132,4 +133,81 @@ fn we_only_remember_seeds_and_confirmed_peers() {
         .iter()
         .any(|a| a.contains("seed.nightfallcoin.org")));
     assert!(remembered.iter().any(|a| a.contains("82.66.214.220")));
+}
+
+fn cand(key: &str, height: Option<u64>, outbound: bool) -> EvictionCandidate {
+    EvictionCandidate {
+        key: key.into(),
+        height,
+        outbound,
+    }
+}
+
+#[test]
+fn a_synced_inbound_gives_up_its_seat() {
+    let tip = 8_000;
+    let victim = pick_eviction_victim(
+        &[
+            cand("in:new", Some(0), false),
+            cand("in:caught", Some(tip), false),
+            cand("out:seed", Some(tip), true),
+        ],
+        tip,
+        "in:new",
+    );
+    assert_eq!(victim.as_deref(), Some("in:caught"));
+}
+
+#[test]
+fn a_newcomer_is_never_the_victim() {
+    let tip = 8_000;
+    let victim = pick_eviction_victim(
+        &[
+            cand("in:new", Some(0), false),
+            cand("in:old", Some(tip), false),
+        ],
+        tip,
+        "in:new",
+    );
+    assert_eq!(victim.as_deref(), Some("in:old"));
+}
+
+#[test]
+fn catching_up_inbounds_are_not_evicted() {
+    let tip: u64 = 8_000;
+    let victim = pick_eviction_victim(
+        &[
+            cand("in:a", Some(10), false),
+            cand("in:b", Some(tip.saturating_sub(IBD_BEHIND + 1)), false),
+        ],
+        tip,
+        "in:new",
+    );
+    assert_eq!(victim, None);
+}
+
+#[test]
+fn outbound_sessions_are_not_evicted() {
+    let tip = 100;
+    let victim = pick_eviction_victim(&[cand("out:seed", Some(tip), true)], tip, "in:new");
+    assert_eq!(victim, None);
+}
+
+#[test]
+fn the_directory_names_seeds_and_reachable_listeners_only() {
+    let list = merge_directory_peers(
+        ["seed.nightfallcoin.org:17891".into()],
+        [
+            "8.8.8.8:17891".into(),
+            "10.0.0.1:17891".into(),
+            "127.0.0.1:17891".into(),
+            "abcd.onion:17891".into(),
+        ],
+        32,
+    );
+    assert!(list.contains(&"seed.nightfallcoin.org:17891".into()));
+    assert!(list.contains(&"8.8.8.8:17891".into()));
+    assert!(!list
+        .iter()
+        .any(|a| a.starts_with("10.") || a.contains("onion") || a.starts_with("127.")));
 }

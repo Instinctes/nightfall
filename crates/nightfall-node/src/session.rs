@@ -12,7 +12,7 @@ use nightfall_consensus::Block;
 use nightfall_ledger::Transaction;
 use nightfall_p2p::{broadcast_block, broadcast_tx, write_msg, PeerMsg};
 use std::collections::HashMap;
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::sync::{Arc, Mutex};
 
 /// How many outbound sockets we try to keep up. Seeds are filled first, so a
@@ -50,6 +50,15 @@ impl SessionHandle {
         })?;
         broadcast_tx(&mut s, tx)
     }
+
+    /// Unblock the peer's read loop so the slot frees. Used when a new
+    /// inbound needs the chain and every seat is taken by a node that
+    /// already has it.
+    pub fn disconnect(&self) {
+        if let Ok(s) = self.writer.lock() {
+            let _ = s.shutdown(Shutdown::Both);
+        }
+    }
 }
 
 pub struct SessionPool {
@@ -86,6 +95,10 @@ impl SessionPool {
             .lock()
             .map(|g| g.contains_key(key))
             .unwrap_or(false)
+    }
+
+    pub fn get(&self, key: &str) -> Option<SessionHandle> {
+        self.inner.lock().ok().and_then(|g| g.get(key).cloned())
     }
 
     pub fn len(&self) -> usize {

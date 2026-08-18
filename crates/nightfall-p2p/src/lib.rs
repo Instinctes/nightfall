@@ -35,6 +35,75 @@ pub fn dialable_addr(observed: &str, advertised_port: u16) -> Option<String> {
     })
 }
 
+/// An address we are willing to hand to a stranger as a place to dial.
+///
+/// Hostnames (compiled-in seeds) pass. Literal IPs must be globally routable
+/// and not a documented reserved block. `.onion` stays off this list — a
+/// browser or a clearnet wallet cannot use it, and publishing one leaks that
+/// the node is reachable only through Tor.
+pub fn is_directory_addr(addr: &str) -> bool {
+    let addr = addr.trim();
+    if addr.is_empty() || !looks_like_dial_target(addr) {
+        return false;
+    }
+    if addr.contains(".onion") {
+        return false;
+    }
+    // Hostname: seed.example:17891 — not an IP, so the directory may name it.
+    if let Ok(sock) = addr.parse::<std::net::SocketAddr>() {
+        return ip_is_globally_reachable(sock.ip()) && sock.port() != 0;
+    }
+    if let Some(rest) = addr.strip_prefix('[') {
+        if let Some((host, _)) = rest.split_once("]:") {
+            if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
+                return ip_is_globally_reachable(std::net::IpAddr::V6(ip));
+            }
+        }
+        return false;
+    }
+    let Some((host, _)) = addr.rsplit_once(':') else {
+        return false;
+    };
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return host
+            .parse::<std::net::Ipv4Addr>()
+            .map(|ip| ip_is_globally_reachable(std::net::IpAddr::V4(ip)))
+            .unwrap_or(false);
+    }
+    // DNS name. Refuse empty labels and raw IPs that failed above.
+    !host.is_empty()
+        && host.contains('.')
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
+fn ip_is_globally_reachable(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            !v4.is_unspecified()
+                && !v4.is_loopback()
+                && !v4.is_private()
+                && !v4.is_link_local()
+                && !v4.is_broadcast()
+                && !v4.is_multicast()
+                && !v4.is_documentation()
+                && (v4.octets()[0] != 100 || v4.octets()[1] & 0xc0 != 0x40) // 100.64/10
+        }
+        std::net::IpAddr::V6(v6) => {
+            !v6.is_unspecified()
+                && !v6.is_loopback()
+                && !v6.is_multicast()
+                && !is_unique_local_v6(v6)
+        }
+    }
+}
+
+fn is_unique_local_v6(ip: std::net::Ipv6Addr) -> bool {
+    // fc00::/7
+    ip.octets()[0] & 0xfe == 0xfc
+}
+
 pub fn network_magic(network: NetworkId) -> [u8; 4] {
     match network {
         NetworkId::Mainnet => *b"NFL2",
@@ -329,4 +398,27 @@ pub fn broadcast_block(stream: &mut TcpStream, block: &Block) -> std::io::Result
 
 pub fn broadcast_tx(stream: &mut TcpStream, tx: &Transaction) -> std::io::Result<()> {
     write_msg(stream, &PeerMsg::Tx { tx: tx.clone() })
+}
+
+#[cfg(test)]
+mod directory_tests {
+    use super::is_directory_addr;
+
+    #[test]
+    fn seeds_and_public_ips_are_publishable() {
+        assert!(is_directory_addr("seed.nightfallcoin.org:17891"));
+        assert!(is_directory_addr("8.8.8.8:17891"));
+        assert!(is_directory_addr("[2001:4860:4860::8888]:17891"));
+    }
+
+    #[test]
+    fn private_onion_and_garbage_are_not() {
+        assert!(!is_directory_addr("127.0.0.1:17891"));
+        assert!(!is_directory_addr("10.0.0.1:17891"));
+        assert!(!is_directory_addr("192.168.1.9:17891"));
+        assert!(!is_directory_addr("100.64.1.1:17891"));
+        assert!(!is_directory_addr("abcd.onion:17891"));
+        assert!(!is_directory_addr("no-port"));
+        assert!(!is_directory_addr(""));
+    }
 }

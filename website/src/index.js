@@ -18,6 +18,7 @@ const MOBILE_ALLOWED = new Set([
     "submit_tx",
     "get_utxo_root",
     "banner",
+    "peers",
 ]);
 const MOBILE_MAX_BODY = 512 * 1024;
 
@@ -183,6 +184,37 @@ async function proxyWalletApi(request) {
     }
 }
 
+async function proxyPeers() {
+    try {
+        const upstream = await fetch(MOBILE_UPSTREAM, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ method: "peers", params: {}, id: 1 }),
+        });
+        const payload = await upstream.json();
+        const r = payload && payload.result;
+        if (!r || !Array.isArray(r.peers)) {
+            return jsonResponse(502, { error: "seed returned no peer list" });
+        }
+        const body = JSON.stringify({
+            peers: r.peers,
+            genesis: r.genesis || "",
+        });
+        return new Response(body, {
+            status: 200,
+            headers: {
+                "Content-Type": "application/json; charset=utf-8",
+                "Cache-Control": "public, max-age=30, must-revalidate",
+                ...securityHeaders("/peers"),
+            },
+        });
+    } catch (e) {
+        return jsonResponse(502, {
+            error: `node unreachable: ${e.message || e}`,
+        });
+    }
+}
+
 async function proxySupply() {
     try {
         const upstream = await fetch(MOBILE_UPSTREAM, {
@@ -202,6 +234,7 @@ async function proxySupply() {
             max_supply: r.max_supply,
             supply_invariant_ok: r.supply_invariant_ok,
             tip_height: r.tip_height,
+            blocks: r.blocks,
             difficulty: r.difficulty,
         });
         return new Response(body, {
@@ -244,6 +277,16 @@ export default {
                 return jsonResponse(405, { error: "GET" }, { Allow: "GET, HEAD" });
             }
             return proxySupply();
+        }
+
+        // Listening nodes a fresh wallet can dial when the compiled-in
+        // seed is full. Public facts: addresses that completed a handshake
+        // and accepted an outbound from the seed. Not a census of miners.
+        if (url.pathname === "/peers" || url.pathname === "/peers/") {
+            if (request.method !== "GET" && request.method !== "HEAD") {
+                return jsonResponse(405, { error: "GET" }, { Allow: "GET, HEAD" });
+            }
+            return proxyPeers();
         }
 
         // Everything else is static. No forms, no other API.

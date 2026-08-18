@@ -80,6 +80,9 @@
     const supplyBurned = document.getElementById("supply-burned");
     const supplyProof = document.getElementById("supply-proof");
     const supplyProofText = document.getElementById("supply-proof-text");
+    const liveBlocks = document.getElementById("live-blocks");
+    const liveBlocksSub = document.getElementById("live-blocks-sub");
+    const liveDiff = document.getElementById("live-diff");
 
     const formatNight = (darks) => {
         const n = Number(darks);
@@ -127,6 +130,25 @@
                 supplyProof.classList.add("is-bad");
                 supplyProofText.textContent = "Supply proof FAILED";
             }
+        }
+
+        const blocks = Number(s.blocks);
+        const height = Number(s.tip_height);
+        if (liveBlocks) {
+            liveBlocks.textContent = Number.isFinite(blocks)
+                ? blocks.toLocaleString("en-US")
+                : "—";
+        }
+        if (liveBlocksSub) {
+            liveBlocksSub.textContent = Number.isFinite(height)
+                ? "height " + height.toLocaleString("en-US")
+                : "from the seed";
+        }
+        const diff = Number(s.difficulty);
+        if (liveDiff) {
+            liveDiff.textContent = Number.isFinite(diff)
+                ? Math.round(diff).toLocaleString("en-US")
+                : "—";
         }
     };
 

@@ -8,8 +8,9 @@ use nightfall_consensus::{Block, BlockTemplate, Chain, Mempool};
 use nightfall_crypto::{default_threads, mine_parallel, Address};
 use nightfall_ledger::Transaction;
 use nightfall_p2p::{
-    broadcast_block, connect_peer_via, dialable_addr, handshake, looks_like_dial_target, read_msg,
-    write_msg, PeerMsg, SocksProxy, DEFAULT_TOR_PROXY, MAX_BLOCKS_PER_REQUEST, MAX_PEERS_PER_MSG,
+    broadcast_block, connect_peer_via, dialable_addr, handshake, is_directory_addr,
+    looks_like_dial_target, read_msg, write_msg, PeerMsg, SocksProxy, DEFAULT_TOR_PROXY,
+    MAX_BLOCKS_PER_REQUEST, MAX_PEERS_PER_MSG,
 };
 use nightfall_storage::{now_unix, ChainStore};
 use nightfall_types::NetworkId;
@@ -25,8 +26,18 @@ use std::time::Duration;
 
 pub type SharedState = Arc<Mutex<NodeInner>>;
 
-/// Maximum simultaneous peer connections (live sessions + address book).
-const MAX_PEERS: usize = 64;
+/// Soft cap on live sessions. A seed that sits at this number and then
+/// refuses Hello is how new wallets freeze on genesis: they never learn
+/// another address. 128 still fits a 1 GiB VPS; overflow is handled by
+/// evicting a caught-up inbound, not by dropping the newcomer.
+const MAX_PEERS: usize = 128;
+/// Extra inbound Hellos accepted while at `MAX_PEERS` so a genesis node
+/// can introduce itself. After Hello we evict a synced session. Without
+/// this burst the next TCP is discarded before we know they need the chain.
+const IBD_ACCEPT_BURST: usize = 32;
+/// A peer this many blocks from our tip is treated as caught up and can
+/// give up its seat for someone who is not.
+pub const IBD_BEHIND: u64 = 8;
 /// How often live sessions are asked for their tip. Push is the main path;
 /// this is the safety net for a missed `InvBlock`.
 const STATUS_TICK: Duration = Duration::from_secs(4);
@@ -43,7 +54,18 @@ pub struct NodeConfig {
     pub proxy: Option<String>,
     /// Public light-client HTTP API. Empty / None = off.
     pub mobile_listen: Option<String>,
+    /// HTTPS directory of listening nodes. `None` uses the compiled mainnet
+    /// default. `Some("off")` disables the fetch.
+    pub peers_url: Option<String>,
 }
+
+/// Where a new install finds listening nodes when the compiled-in seeds
+/// are full or filtered. Served by the website Worker over 443.
+pub const DEFAULT_PEERS_DIRECTORY: &str = "https://nightfallcoin.org/peers";
+/// After an inbound peer is at our tip, wait this long (they get a peer
+/// list and a last page of blocks) and then hang up. The seed is a
+/// doorbell, not a living room.
+pub const INTRO_GRACE_SECS: u64 = 30;
 
 pub struct NodeInner {
     pub chain: Chain,
@@ -97,6 +119,11 @@ pub struct NodeInner {
     /// a very different situation from one where everybody upgraded, and until
     /// now the two were indistinguishable from the inside.
     pub peer_agents: HashMap<String, String>,
+    /// Last advertised tip height per live session key (`in:…` / `out:…`).
+    session_height: HashMap<String, u64>,
+    /// Listen addresses we ourselves completed an outbound handshake to.
+    /// Those are the only IPs we publish: we know they answer.
+    reachable_listen: HashSet<String>,
     /// Set while a reorg candidate is being rebuilt and verified.
     ///
     /// Rebuilding is measured in tens of seconds on a chain of any size, and
@@ -222,6 +249,18 @@ impl NodeInner {
         // broadcast that paints this node as the sender.
         propagate_from_inner(self, &tx, None, true);
         Ok(id)
+    }
+
+    /// Addresses a stranger may be told to dial. Seeds plus nodes that
+    /// completed an outbound handshake with us and whose address is
+    /// globally routable. This is the protocol directory — not "everyone
+    /// who ever connected".
+    pub fn publishable_peers(&self) -> Vec<String> {
+        merge_directory_peers(
+            self.network.seed_nodes().iter().map(|s| s.to_string()),
+            self.reachable_listen.iter().cloned(),
+            MAX_PEERS_PER_MSG,
+        )
     }
 
     pub fn dialable_peers(&self) -> Vec<String> {
@@ -444,6 +483,7 @@ impl NodeHandle {
         let store = ChainStore::new(&cfg.datadir);
         let chain = store.load_or_new(cfg.network)?;
         store.save(&chain)?;
+        let genesis_hex = chain.genesis_hash.to_hex();
 
         let mining_enabled = Arc::new(AtomicBool::new(cfg.mine));
         let tip_epoch = Arc::new(AtomicU64::new(0));
@@ -495,6 +535,8 @@ impl NodeHandle {
             // someone pressed Start — the exact case this field exists to stop.
             behind_since: now_unix(),
             peer_agents: HashMap::new(),
+            session_height: HashMap::new(),
+            reachable_listen: HashSet::new(),
             reorg_in_flight: Arc::new(AtomicBool::new(false)),
             last_reorg_fetch: AtomicU64::new(0),
             last_wall_tick: AtomicU64::new(now_unix()),
@@ -522,6 +564,12 @@ impl NodeHandle {
         spawn_outbound_supervisor(Arc::clone(&state));
         spawn_status_ticker(Arc::clone(&state));
         spawn_dandelion_fluff(Arc::clone(&state));
+        spawn_directory_bootstrap(
+            Arc::clone(&state),
+            cfg.network,
+            cfg.peers_url.clone(),
+            genesis_hex,
+        );
 
         if cfg.miner.is_some() {
             let st = Arc::clone(&state);
@@ -877,12 +925,20 @@ fn open_outbound_session(state: &SharedState, addr: &str) -> anyhow::Result<()> 
 
     let (peer_h, peer_tip) = handshake(&mut stream, network, genesis, our_h, tip, port)?;
     note_peer_height(state, peer_h);
-    state.lock().unwrap().mark_confirmed(addr.to_string());
+    {
+        let mut g = state.lock().unwrap();
+        g.mark_confirmed(addr.to_string());
+        if is_directory_addr(addr) {
+            g.reachable_listen.insert(addr.to_string());
+        }
+    }
 
     let write_clone = stream.try_clone()?;
     let sess = {
-        let g = state.lock().unwrap();
-        g.sessions.insert(outbound_key(addr), write_clone, true)
+        let mut g = state.lock().unwrap();
+        let key = outbound_key(addr);
+        g.session_height.insert(key.clone(), peer_h);
+        g.sessions.insert(key, write_clone, true)
     };
     tracing::info!("outbound session {addr} height={peer_h}");
 
@@ -904,8 +960,10 @@ fn open_outbound_session(state: &SharedState, addr: &str) -> anyhow::Result<()> 
 
     let mut reader = BufReader::new(stream);
     let result = peer_io_loop(&mut reader, &sess, state, addr, peer_h);
-    if let Ok(g) = state.lock() {
-        g.sessions.remove(&outbound_key(addr));
+    if let Ok(mut g) = state.lock() {
+        let key = outbound_key(addr);
+        g.sessions.remove(&key);
+        g.session_height.remove(&key);
     }
     result
 }
@@ -974,6 +1032,178 @@ fn spawn_status_ticker(state: SharedState) {
     });
 }
 
+/// Seeds plus reachable listeners, filtered for the public directory.
+pub fn merge_directory_peers(
+    seeds: impl IntoIterator<Item = String>,
+    reachable: impl IntoIterator<Item = String>,
+    cap: usize,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for addr in seeds.into_iter().chain(reachable) {
+        if !is_directory_addr(&addr) {
+            continue;
+        }
+        if !seen.insert(addr.clone()) {
+            continue;
+        }
+        out.push(addr);
+        if out.len() >= cap {
+            break;
+        }
+    }
+    out
+}
+
+fn spawn_directory_bootstrap(
+    state: SharedState,
+    network: NetworkId,
+    configured: Option<String>,
+    genesis_hex: String,
+) {
+    let url = match configured.as_deref().map(str::trim) {
+        Some("off") | Some("none") | Some("false") => return,
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ if network == NetworkId::Mainnet => DEFAULT_PEERS_DIRECTORY.to_string(),
+        _ => return,
+    };
+    thread::spawn(move || match fetch_directory_peers(&url, &genesis_hex) {
+        Ok(peers) if !peers.is_empty() => {
+            if let Ok(mut g) = state.lock() {
+                let mut added = 0usize;
+                for addr in peers {
+                    if !looks_like_dial_target(&addr) || !is_directory_addr(&addr) {
+                        continue;
+                    }
+                    if g.peer_addrs.insert(addr.clone()) {
+                        g.bootstrap.push(addr);
+                        added += 1;
+                    }
+                }
+                if added > 0 {
+                    tracing::info!("directory {url}: {added} listening node(s) to dial");
+                }
+            }
+        }
+        Ok(_) => tracing::debug!("directory {url}: empty"),
+        Err(e) => tracing::info!("directory {url}: {e}"),
+    });
+}
+
+fn fetch_directory_peers(url: &str, genesis_hex: &str) -> anyhow::Result<Vec<String>> {
+    let body: serde_json::Value = ureq::get(url)
+        .timeout(Duration::from_secs(8))
+        .call()
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .into_json()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Some(got) = body.get("genesis").and_then(|v| v.as_str()) {
+        if !got.is_empty() && !genesis_hex.is_empty() && !genesis_hex.eq_ignore_ascii_case(got) {
+            anyhow::bail!("directory genesis {got} does not match ours");
+        }
+    }
+    let list = body
+        .get("peers")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    Ok(list
+        .into_iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .filter(|a| is_directory_addr(a))
+        .take(MAX_PEERS_PER_MSG)
+        .collect())
+}
+
+fn finish_introduction(
+    state: &SharedState,
+    sess: &SessionHandle,
+    peer_height: u64,
+    started: std::time::Instant,
+    label: &str,
+) -> bool {
+    let our = state
+        .lock()
+        .ok()
+        .and_then(|g| g.chain.tip_height().map(|h| h.0))
+        .unwrap_or(0);
+    if peer_height.saturating_add(IBD_BEHIND) < our {
+        return false;
+    }
+    if started.elapsed() < Duration::from_secs(INTRO_GRACE_SECS) {
+        return false;
+    }
+    if let Ok(g) = state.lock() {
+        let _ = sess.send(&PeerMsg::Peers {
+            addrs: g.publishable_peers(),
+        });
+    }
+    tracing::info!("introduced {label} — hanging up, they have the tip");
+    true
+}
+
+/// One live session we might disconnect to free a seat.
+#[derive(Debug, Clone)]
+pub struct EvictionCandidate {
+    pub key: String,
+    pub height: Option<u64>,
+    pub outbound: bool,
+}
+
+/// Pick a session that already has the chain. A seed's job is to introduce
+/// newcomers, not to hold 128 miners who finished IBD an hour ago.
+///
+/// Returns `None` when every inbound is still catching up — stealing their
+/// seat would recreate the "stuck at genesis" bug for someone else.
+pub fn pick_eviction_victim(
+    candidates: &[EvictionCandidate],
+    our_tip: u64,
+    protect: &str,
+) -> Option<String> {
+    let mut synced: Vec<&EvictionCandidate> = candidates
+        .iter()
+        .filter(|c| !c.outbound && c.key != protect)
+        .filter(|c| match c.height {
+            Some(h) => h.saturating_add(IBD_BEHIND) >= our_tip,
+            None => true,
+        })
+        .collect();
+    if synced.is_empty() {
+        return None;
+    }
+    synced.sort_by_key(|c| std::cmp::Reverse(c.height.unwrap_or(u64::MAX)));
+    Some(synced[0].key.clone())
+}
+
+fn evict_synced_inbound(state: &SharedState, protect: &str) -> bool {
+    let (our_tip, candidates) = {
+        let Ok(g) = state.lock() else {
+            return false;
+        };
+        let tip = g.chain.tip_height().map(|h| h.0).unwrap_or(0);
+        let list: Vec<EvictionCandidate> = g
+            .sessions
+            .all()
+            .into_iter()
+            .map(|s| EvictionCandidate {
+                height: g.session_height.get(&s.key).copied(),
+                key: s.key,
+                outbound: s.outbound,
+            })
+            .collect();
+        (tip, list)
+    };
+    let Some(key) = pick_eviction_victim(&candidates, our_tip, protect) else {
+        return false;
+    };
+    let Some(sess) = state.lock().ok().and_then(|g| g.sessions.get(&key)) else {
+        return false;
+    };
+    tracing::info!("evicted {key} (caught up) to make room for a new inbound");
+    sess.disconnect();
+    true
+}
+
 // -------------------------------------------------------------------- p2p ---
 
 fn p2p_listen_loop(addr: String, state: SharedState) {
@@ -990,8 +1220,10 @@ fn p2p_listen_loop(addr: String, state: SharedState) {
         match conn {
             Ok(stream) => {
                 let live = state.lock().map(|g| g.sessions.len()).unwrap_or(MAX_PEERS);
-                if live >= MAX_PEERS {
-                    tracing::debug!("session limit reached, dropping connection");
+                // Hard cap only. Soft cap is MAX_PEERS; overflow seats exist
+                // so Hello can run and a synced miner can be asked to leave.
+                if live >= MAX_PEERS.saturating_add(IBD_ACCEPT_BURST) {
+                    tracing::debug!("session burst full, dropping connection");
                     continue;
                 }
                 let st = Arc::clone(&state);
@@ -1102,6 +1334,9 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
             // by the advertised listen address. See `outbound_key`.
             let session_key = inbound_key(&peer_label);
             note_peer_height(&state, peer_height);
+            if let Ok(mut g) = state.lock() {
+                g.session_height.insert(session_key.clone(), peer_height);
+            }
 
             let (height, tip, our_port) = {
                 let g = state.lock().unwrap();
@@ -1135,13 +1370,28 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
         }
     };
 
+    if state
+        .lock()
+        .map(|g| g.sessions.len() >= MAX_PEERS)
+        .unwrap_or(false)
+    {
+        evict_synced_inbound(&state, &session_key);
+    }
     let sess = {
         let g = state.lock().unwrap();
         g.sessions.insert(session_key.clone(), hello_writer, false)
     };
+    // First gift: who else answers. A new install that only knows the
+    // seed must leave this socket with somewhere else to dial.
+    let intro = {
+        let g = state.lock().unwrap();
+        g.publishable_peers()
+    };
+    let _ = sess.send(&PeerMsg::Peers { addrs: intro });
     let result = peer_io_loop(&mut reader, &sess, &state, &peer_label, peer_height);
-    if let Ok(g) = state.lock() {
+    if let Ok(mut g) = state.lock() {
         g.sessions.remove(&session_key);
+        g.session_height.remove(&session_key);
     }
     result
 }
@@ -1162,7 +1412,13 @@ fn peer_io_loop(
     peer_label: &str,
     mut last_peer_height: u64,
 ) -> anyhow::Result<()> {
+    let introduced_at = std::time::Instant::now();
     loop {
+        if !sess.outbound
+            && finish_introduction(state, sess, last_peer_height, introduced_at, peer_label)
+        {
+            return Ok(());
+        }
         let msg = match read_msg(reader) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
@@ -1181,10 +1437,7 @@ fn peer_io_loop(
             PeerMsg::GetPeers => {
                 let addrs: Vec<String> = {
                     let g = state.lock().unwrap();
-                    g.dialable_peers()
-                        .into_iter()
-                        .take(MAX_PEERS_PER_MSG)
-                        .collect()
+                    g.publishable_peers()
                 };
                 sess.send(&PeerMsg::Peers { addrs })?;
             }
@@ -1223,6 +1476,9 @@ fn peer_io_loop(
             PeerMsg::Status { height, tip, .. } => {
                 last_peer_height = height;
                 note_peer_height(state, height);
+                if let Ok(mut g) = state.lock() {
+                    g.session_height.insert(sess.key.clone(), height);
+                }
                 let (next, our_tip) = {
                     let g = state.lock().unwrap();
                     (next_needed_height(&g), g.chain.tip_hash().to_hex())

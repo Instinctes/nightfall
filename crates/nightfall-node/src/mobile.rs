@@ -2,7 +2,7 @@
 //!
 //! The full RPC is unauthenticated and includes `mine_one`. A phone must never
 //! reach that. This listener answers only `status`, `scan_feed`, `submit_tx`,
-//! `get_utxo_root` and `banner`.
+//! `get_utxo_root`, `banner` and `peers`.
 //!
 //! Plain HTTP. TLS belongs on a reverse proxy (Caddy / nginx) in front.
 
@@ -22,6 +22,7 @@ const ALLOWED: &[&str] = &[
     "submit_tx",
     "get_utxo_root",
     "banner",
+    "peers",
 ];
 const MAX_BODY: usize = 512 * 1024;
 const PER_IP_PER_MIN: u32 = 120;
@@ -88,6 +89,15 @@ fn handle(
 
     if method == "OPTIONS" {
         return write_http(&mut stream, 204, "");
+    }
+    if method == "GET" && (path == "/peers" || path == "/peers/") {
+        let req = RpcReq {
+            method: "peers".into(),
+            params: json!({}),
+            id: json!(1),
+        };
+        let res = rpc::dispatch(&req, &state);
+        return write_http(&mut stream, 200, &serde_json::to_string(&res)?);
     }
     if method == "GET" && (path == "/status" || path == "/") {
         let req = RpcReq {

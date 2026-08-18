@@ -392,6 +392,52 @@ header.hero {
 
 /* ------------------------------------------------------- floating wallet -- */
 
+.live-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    animation: float 7s ease-in-out infinite;
+}
+
+.live-tiles {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+}
+
+.live-tile {
+    background: var(--grad);
+    border-radius: var(--r-lg);
+    padding: 18px 18px 16px;
+    box-shadow: 0 18px 40px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
+.live-tile .label {
+    font-size: 0.72rem;
+    letter-spacing: 0.12em;
+    color: rgba(255, 255, 255, 0.82);
+    font-weight: 600;
+}
+
+.live-tile .amount {
+    font-size: clamp(1.2rem, 2.4vw, 1.55rem);
+    font-weight: 700;
+    color: #fff;
+    margin: 8px 0 2px;
+    letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+}
+
+.live-tile .supply-sub {
+    margin-top: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .live-stack {
+        animation: none;
+    }
+}
+
 .wallet-card {
     background: var(--grad);
     border-radius: var(--r-lg);
@@ -400,6 +446,10 @@ header.hero {
     animation: float 7s ease-in-out infinite;
     position: relative;
     overflow: hidden;
+}
+
+.live-stack .wallet-card {
+    animation: none;
 }
 
 .wallet-card::after {

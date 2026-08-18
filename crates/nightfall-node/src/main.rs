@@ -190,6 +190,7 @@ fn main() -> anyhow::Result<()> {
                 miner,
                 proxy,
                 mobile_listen: mobile_listen.clone(),
+                peers_url: std::env::var("NIGHTFALL_PEERS_URL").ok(),
             };
 
             println!("{COIN_NAME} node starting");

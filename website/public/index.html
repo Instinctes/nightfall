@@ -16,7 +16,7 @@
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
-<link rel="stylesheet" href="css/style.css?v=supply-1">
+<link rel="stylesheet" href="css/style.css?v=live-2">
 </head>
 <body>
 
@@ -61,7 +61,19 @@
         </div>
       </div>
 
-      <div class="reveal" data-delay="2">
+      <div class="reveal live-stack" data-delay="2">
+        <div class="live-tiles">
+          <div class="live-tile" id="live-blocks-card">
+            <div class="label">BLOCKS</div>
+            <div class="amount"><span id="live-blocks">—</span></div>
+            <div class="supply-sub" id="live-blocks-sub">from the seed</div>
+          </div>
+          <div class="live-tile" id="live-diff-card">
+            <div class="label">DIFFICULTY</div>
+            <div class="amount"><span id="live-diff">—</span></div>
+            <div class="supply-sub">LWMA · ~15s</div>
+          </div>
+        </div>
         <div class="wallet-card supply-card" id="supply-card">
           <div class="label">NETWORK SUPPLY</div>
           <div class="amount"><span id="supply-circ">—</span> <span class="amt-tick">NIGHT</span></div>
@@ -302,17 +314,17 @@
       <div class="dl reveal">
         <div class="os">macOS · Apple Silicon</div>
         <div class="req">M1 – M4 · macOS 11+</div>
-        <a class="btn btn-primary" href="downloads/NIGHTFALLCOIN-Core-0.7.2-macOS-arm64.dmg">Download 0.7.2</a>
+        <a class="btn btn-primary" href="downloads/NIGHTFALLCOIN-Core-0.7.3-macOS-arm64.dmg">Download 0.7.3</a>
       </div>
       <div class="dl reveal" data-delay="1">
         <div class="os">macOS · Intel</div>
         <div class="req">macOS 10.15 Catalina+</div>
-        <a class="btn btn-primary" href="downloads/NIGHTFALLCOIN-Core-0.7.2-macOS-intel.dmg">Download 0.7.2</a>
+        <a class="btn btn-primary" href="downloads/NIGHTFALLCOIN-Core-0.7.3-macOS-intel.dmg">Download 0.7.3</a>
       </div>
       <div class="dl reveal" data-delay="2">
         <div class="os">Windows</div>
         <div class="req">64-bit · Windows 10+</div>
-        <a class="btn btn-primary" href="downloads/nightfall-core-0.7.2-windows-x64.exe">Download 0.7.2</a>
+        <a class="btn btn-primary" href="downloads/nightfall-core-0.7.3-windows-x64.exe">Download 0.7.3</a>
       </div>
       <div class="dl reveal">
         <div class="os">Android · arm64</div>
@@ -339,8 +351,8 @@
       is Apple, not us. The web wallet needs no install.
       <br>
       Verify what you downloaded against
-      <a href="downloads/SHA256SUMS-0.7.2.txt">SHA256SUMS-0.7.2.txt</a>,
-      <a href="downloads/SHA256SUMS-0.7.2-windows.txt">SHA256SUMS-0.7.2-windows.txt</a>,
+      <a href="downloads/SHA256SUMS-0.7.3.txt">SHA256SUMS-0.7.3.txt</a>,
+      <a href="downloads/SHA256SUMS-0.7.3-windows.txt">SHA256SUMS-0.7.3-windows.txt</a>,
       <a href="downloads/SHA256SUMS-0.7.0-android.txt">SHA256SUMS-0.7.0-android.txt</a>
       and
       <a href="downloads/SHA256SUMS-0.7.0-ios.txt">SHA256SUMS-0.7.0-ios.txt</a>,
@@ -413,6 +425,6 @@
   </div>
 </footer>
 
-<script src="js/main.js?v=supply-1"></script>
+<script src="js/main.js?v=live-2"></script>
 </body>
 </html>

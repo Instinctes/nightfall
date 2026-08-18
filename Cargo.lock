@@ -2499,7 +2499,7 @@ dependencies = [
 
 [[package]]
 name = "nightfall-consensus"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "hex",
  "nightfall-crypto",
@@ -2512,7 +2512,7 @@ dependencies = [
 
 [[package]]
 name = "nightfall-core"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2538,7 +2538,7 @@ dependencies = [
 
 [[package]]
 name = "nightfall-crypto"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "argon2",
  "bip39",
@@ -2562,7 +2562,7 @@ dependencies = [
 
 [[package]]
 name = "nightfall-ledger"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "curve25519-dalek",
  "hex",
@@ -2576,7 +2576,7 @@ dependencies = [
 
 [[package]]
 name = "nightfall-mobile"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "hex",
@@ -2593,7 +2593,7 @@ dependencies = [
 
 [[package]]
 name = "nightfall-node"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2609,11 +2609,12 @@ dependencies = [
  "serde_json",
  "tracing",
  "tracing-subscriber",
+ "ureq",
 ]
 
 [[package]]
 name = "nightfall-p2p"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "hex",
  "nightfall-consensus",
@@ -2626,7 +2627,7 @@ dependencies = [
 
 [[package]]
 name = "nightfall-storage"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "dirs",
@@ -2642,7 +2643,7 @@ dependencies = [
 
 [[package]]
 name = "nightfall-types"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "hex",
  "serde",
@@ -2651,7 +2652,7 @@ dependencies = [
 
 [[package]]
 name = "nightfall-wallet"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2669,7 +2670,7 @@ dependencies = [
 
 [[package]]
 name = "nightfall-web"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "clear_on_drop",
  "console_error_panic_hook",

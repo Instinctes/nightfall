@@ -184,6 +184,17 @@ pub(crate) fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
             )
         }
 
+        "peers" => {
+            let g = state.lock().unwrap();
+            ok(
+                json!({
+                    "peers": g.publishable_peers(),
+                    "genesis": g.chain.genesis_hash.to_hex(),
+                }),
+                id,
+            )
+        }
+
         "verify_supply" => {
             let g = state.lock().unwrap();
             match g.chain.verify_supply() {
