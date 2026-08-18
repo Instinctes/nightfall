@@ -43,6 +43,40 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
         .unwrap_or((0, 0, 0, 0, false, 0, 0));
 
     let behind = app.status.as_ref().map(|s| s.blocks_behind).unwrap_or(0);
+    let loading = app.status.as_ref().map(|s| s.loading).unwrap_or(false);
+
+    if loading {
+        egui::Frame::none()
+            .fill(ACCENT.gamma_multiply(0.12))
+            .stroke(Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.55)))
+            .rounding(Rounding::same(ROUND))
+            .inner_margin(egui::Margin::same(16.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width() - 32.0);
+                ui.horizontal(|ui| {
+                    dot(ui, ACCENT, true);
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Loading the chain from disk")
+                            .size(14.0)
+                            .color(ACCENT)
+                            .strong(),
+                    );
+                });
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Last saved tip is block {}. RPC and phones already answer. \
+                         P2P waits until the file is in memory so this node does not \
+                         advertise genesis.",
+                        format_int(blocks)
+                    ))
+                    .size(12.5)
+                    .color(TEXT_DIM),
+                );
+            });
+        ui.add_space(14.0);
+    }
 
     // Mining is held back while the chain is behind, because a block built on a
     // tip the network has already left cannot win — it only deepens a fork.
@@ -187,7 +221,14 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
         let connected = peers > 0;
         let scanned = app.wallet.lock().map(|w| w.scanned_to()).unwrap_or(0);
 
-        let (colour, pulse, text) = if syncing {
+        let loading = app.status.as_ref().map(|s| s.loading).unwrap_or(false);
+        let (colour, pulse, text) = if loading {
+            (
+                WARN,
+                true,
+                format!("Loading chain · local block {}", format_int(blocks)),
+            )
+        } else if syncing {
             (WARN, true, "Scanning…".to_string())
         } else if connected {
             (
@@ -207,6 +248,25 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(2.0);
         ui.label(RichText::new(text).size(11.5).color(TEXT_FAINT));
     });
+
+    if let Some(reason) = peers_zero_reason(app, peers, blocks) {
+        ui.add_space(8.0);
+        ui.label(RichText::new(reason).size(11.5).color(TEXT_DIM));
+    }
+
+    if app.is_mining() && app.hashrate.current > 0.0 && difficulty > 0 {
+        let secs = difficulty as f64 / app.hashrate.current.max(1.0);
+        let eta = if secs < 90_000.0 {
+            format!(
+                "Your hashrate × this difficulty ≈ one block every {}",
+                human_duration(secs)
+            )
+        } else {
+            "A block at this hashrate is more than a day away.".to_string()
+        };
+        ui.add_space(6.0);
+        ui.label(RichText::new(eta).size(11.5).color(ACCENT_HI));
+    }
 
     if balances.immature > 0 {
         ui.add_space(8.0);
@@ -1035,6 +1095,39 @@ fn reward_at(height: u64) -> u64 {
     (nightfall_types::INITIAL_BLOCK_REWARD_NIGHT * DARKS_PER_NIGHT) >> halvings
 }
 
+fn peers_zero_reason(app: &App, peers: usize, blocks: u64) -> Option<String> {
+    if peers > 0 {
+        return None;
+    }
+    let s = app.status.as_ref()?;
+    if s.loading {
+        return Some(format!(
+            "P2P is closed until the chain file is loaded. Last tip on disk: block {}.",
+            format_int(s.blocks)
+        ));
+    }
+    let port = app.network.default_p2p_port();
+    let mut msg = String::new();
+    if let Some(err) = &s.last_dial_error {
+        msg.push_str(&format!("Last dial failed: {err}. "));
+    }
+    if blocks <= 1 {
+        msg.push_str(&format!(
+            "This node is still at genesis. Allow outbound TCP {port} \
+             (Windows Defender often blocks it). 0.7.3+ also fetches listeners \
+             from nightfallcoin.org/peers."
+        ));
+    } else {
+        msg.push_str(&format!(
+            "No live socket. Outbound to a seed on port {port} is enough — \
+             you do not have to be reachable. If this stays at zero, {port} is \
+             blocked or the compiled seed is full; 0.7.3+ asks \
+             https://nightfallcoin.org/peers for other listeners."
+        ));
+    }
+    Some(msg)
+}
+
 fn human_duration(secs: f64) -> String {
     if secs < 60.0 {
         format!("{secs:.0} s")
@@ -1092,6 +1185,8 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             ui.label(
                 RichText::new(if peers > 0 {
                     format!("Connected to {peers} peer(s)")
+                } else if s.map(|s| s.loading).unwrap_or(false) {
+                    "No peers — chain still loading".to_string()
                 } else {
                     "No peers — mining solo".to_string()
                 })
@@ -1099,6 +1194,10 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 .strong(),
             );
         });
+        if let Some(reason) = peers_zero_reason(app, peers, s.map(|s| s.blocks).unwrap_or(0)) {
+            ui.add_space(8.0);
+            ui.label(RichText::new(reason).size(12.0).color(TEXT_DIM));
+        }
         ui.add_space(10.0);
         ui.label(RichText::new("Add a peer").size(12.0).color(TEXT_DIM));
         ui.add_space(5.0);

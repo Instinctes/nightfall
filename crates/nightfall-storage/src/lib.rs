@@ -30,6 +30,16 @@ struct ChainMeta {
     validated_bytes: u64,
 }
 
+/// Sidecar written next to an exported `blocks.jsonl`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SnapshotManifest {
+    pub v: u32,
+    pub network: NetworkId,
+    pub genesis: String,
+    pub tip: String,
+    pub blocks: u64,
+}
+
 pub struct ChainStore {
     pub dir: PathBuf,
 }
@@ -82,6 +92,106 @@ impl ChainStore {
         fs::write(&tmp, serde_json::to_vec_pretty(&meta)?)?;
         fs::rename(tmp, self.meta_path())?;
         Ok(())
+    }
+
+    /// Last validated tip without replaying the chain. Used so RPC and the
+    /// light API can answer while a long reload is still running.
+    pub fn peek_meta(&self) -> Option<(u64, String, String)> {
+        let raw = fs::read_to_string(self.meta_path()).ok()?;
+        let m: ChainMeta = serde_json::from_str(&raw).ok()?;
+        if m.validated_tip.is_empty() {
+            return None;
+        }
+        Some((m.block_count, m.validated_tip, m.genesis_hash))
+    }
+
+    fn read_meta(&self) -> Option<ChainMeta> {
+        fs::read_to_string(self.meta_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+    }
+
+    /// Copy `blocks.jsonl` plus a small manifest. The importer still verifies
+    /// every block — this is a faster start, not a trust shortcut.
+    pub fn export_snapshot(&self, out: &Path) -> anyhow::Result<SnapshotManifest> {
+        let src = self.blocks_path();
+        if !src.exists() {
+            anyhow::bail!("no blocks.jsonl in {}", self.dir.display());
+        }
+        fs::create_dir_all(out)?;
+        fs::copy(&src, out.join("blocks.jsonl"))?;
+        let meta = self
+            .read_meta()
+            .ok_or_else(|| anyhow::anyhow!("no chain-meta.json — run the node once"))?;
+        let snap = SnapshotManifest {
+            v: 1,
+            network: meta.network,
+            genesis: meta.genesis_hash,
+            tip: meta.validated_tip,
+            blocks: meta.block_count,
+        };
+        fs::write(out.join("snapshot.json"), serde_json::to_vec_pretty(&snap)?)?;
+        Ok(snap)
+    }
+
+    /// Install a snapshot directory and replay it with full PoW + supply
+    /// checks. `validated_bytes` is forced to 0 so a copied file is never
+    /// trusted as if this node had already verified it.
+    pub fn import_snapshot(&self, from: &Path, network: NetworkId) -> anyhow::Result<Chain> {
+        let src = if from.is_file() {
+            from.to_path_buf()
+        } else {
+            from.join("blocks.jsonl")
+        };
+        if !src.exists() {
+            anyhow::bail!("no blocks.jsonl at {}", src.display());
+        }
+        let manifest: Option<SnapshotManifest> = fs::read_to_string(from.join("snapshot.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok());
+        if let Some(m) = &manifest {
+            if m.network != network {
+                anyhow::bail!(
+                    "snapshot is {:?} but {:?} was requested",
+                    m.network,
+                    network
+                );
+            }
+        }
+        self.ensure_dir()?;
+        fs::copy(&src, self.blocks_path())?;
+        let meta = ChainMeta {
+            network,
+            genesis_hash: manifest
+                .as_ref()
+                .map(|m| m.genesis.clone())
+                .unwrap_or_default(),
+            block_count: manifest.as_ref().map(|m| m.blocks).unwrap_or(0),
+            protocol_version: nightfall_types::PROTOCOL_VERSION,
+            validated_tip: String::new(),
+            validated_bytes: 0,
+        };
+        fs::write(self.meta_path(), serde_json::to_vec_pretty(&meta)?)?;
+        let chain = self.load_or_new(network)?;
+        chain.verify_supply()?;
+        if let Some(m) = &manifest {
+            if !m.tip.is_empty() && chain.tip_hash().to_hex() != m.tip {
+                anyhow::bail!(
+                    "imported tip {} != snapshot tip {}",
+                    chain.tip_hash().to_hex(),
+                    m.tip
+                );
+            }
+            if !m.genesis.is_empty() && chain.genesis_hash.to_hex() != m.genesis {
+                anyhow::bail!(
+                    "imported genesis {} != snapshot genesis {}",
+                    chain.genesis_hash.to_hex(),
+                    m.genesis
+                );
+            }
+        }
+        self.save(&chain)?;
+        Ok(chain)
     }
 
     /// Tip hash recorded alongside the stored blocks, if any.
@@ -340,5 +450,29 @@ mod tests {
             "must refuse a v4 datadir loudly: {err}"
         );
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn snapshot_roundtrip_rechecks_supply() {
+        let dir = std::env::temp_dir().join(format!("nf-snap-src-{}", now_unix()));
+        let out = std::env::temp_dir().join(format!("nf-snap-out-{}", now_unix()));
+        let dest = std::env::temp_dir().join(format!("nf-snap-dst-{}", now_unix()));
+        fs::create_dir_all(&dir).unwrap();
+        let store = ChainStore::new(&dir);
+        let chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+        store.save(&chain).unwrap();
+        let snap = store.export_snapshot(&out).unwrap();
+        assert_eq!(snap.blocks, chain.block_count());
+        assert!(out.join("blocks.jsonl").exists());
+        assert!(out.join("snapshot.json").exists());
+
+        let imported = ChainStore::new(&dest)
+            .import_snapshot(&out, NetworkId::Devnet)
+            .unwrap();
+        assert_eq!(imported.tip_hash(), chain.tip_hash());
+        imported.verify_supply().unwrap();
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&out).ok();
+        fs::remove_dir_all(&dest).ok();
     }
 }

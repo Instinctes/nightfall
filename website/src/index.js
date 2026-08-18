@@ -215,6 +215,64 @@ async function proxyPeers() {
     }
 }
 
+async function proxyNetwork() {
+    try {
+        const [statusRes, peersRes] = await Promise.all([
+            fetch(MOBILE_UPSTREAM, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ method: "status", params: {}, id: 1 }),
+            }),
+            fetch(MOBILE_UPSTREAM, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ method: "peers", params: {}, id: 1 }),
+            }),
+        ]);
+        const statusPayload = await statusRes.json();
+        const r = statusPayload && statusPayload.result;
+        if (!r) {
+            return jsonResponse(502, { error: "seed returned no status" });
+        }
+        let peerCount = 0;
+        try {
+            const peersPayload = await peersRes.json();
+            const pr = peersPayload && peersPayload.result;
+            if (pr && Array.isArray(pr.peers)) {
+                peerCount = pr.peers.length;
+            }
+        } catch {
+            peerCount = Number(r.live_peers || r.peers || 0);
+        }
+        const body = JSON.stringify({
+            blocks: r.blocks,
+            tip_height: r.tip_height,
+            difficulty: r.difficulty,
+            circulating: r.circulating,
+            minted: r.minted,
+            burned_fees: r.burned_fees,
+            max_supply: r.max_supply,
+            supply_invariant_ok: r.supply_invariant_ok,
+            peers: peerCount,
+            loading: !!r.loading,
+            genesis: r.genesis || "",
+            protocol_version: r.protocol_version,
+        });
+        return new Response(body, {
+            status: 200,
+            headers: {
+                "Content-Type": "application/json; charset=utf-8",
+                "Cache-Control": "public, max-age=15, must-revalidate",
+                ...securityHeaders("/network.json"),
+            },
+        });
+    } catch (e) {
+        return jsonResponse(502, {
+            error: `node unreachable: ${e.message || e}`,
+        });
+    }
+}
+
 async function proxySupply() {
     try {
         const upstream = await fetch(MOBILE_UPSTREAM, {
@@ -236,6 +294,7 @@ async function proxySupply() {
             tip_height: r.tip_height,
             blocks: r.blocks,
             difficulty: r.difficulty,
+            loading: !!r.loading,
         });
         return new Response(body, {
             status: 200,
@@ -287,6 +346,14 @@ export default {
                 return jsonResponse(405, { error: "GET" }, { Allow: "GET, HEAD" });
             }
             return proxyPeers();
+        }
+
+        // Public numbers only. No addresses, no graph.
+        if (url.pathname === "/network.json") {
+            if (request.method !== "GET" && request.method !== "HEAD") {
+                return jsonResponse(405, { error: "GET" }, { Allow: "GET, HEAD" });
+            }
+            return proxyNetwork();
         }
 
         // Everything else is static. No forms, no other API.

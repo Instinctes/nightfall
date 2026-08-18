@@ -14,7 +14,7 @@ use nightfall_p2p::{
 };
 use nightfall_storage::{now_unix, ChainStore};
 use nightfall_types::NetworkId;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::BufReader;
 use std::net::{TcpListener, TcpStream};
@@ -124,6 +124,15 @@ pub struct NodeInner {
     /// Listen addresses we ourselves completed an outbound handshake to.
     /// Those are the only IPs we publish: we know they answer.
     reachable_listen: HashSet<String>,
+    /// Replay from disk is still running. P2P waits; RPC/light already answer.
+    pub(crate) loading: bool,
+    pub(crate) preview_blocks: u64,
+    pub(crate) preview_tip: String,
+    pub(crate) last_dial_error: Option<String>,
+    /// Next height a catch-up page should request, so two peers do not
+    /// fetch the same 128-block slice.
+    ibd_from: u64,
+    ibd_buffer: BTreeMap<u64, Vec<Block>>,
     /// Set while a reorg candidate is being rebuilt and verified.
     ///
     /// Rebuilding is measured in tens of seconds on a chain of any size, and
@@ -470,6 +479,10 @@ pub struct StatusSnap {
     pub tor_proxy: bool,
     /// Transaction relay uses Dandelion-class stem/fluff.
     pub dandelion: bool,
+    /// Why the last outbound dial failed, if we have no live peers.
+    pub last_dial_error: Option<String>,
+    /// True while the chain is still being replayed from disk.
+    pub loading: bool,
 }
 
 pub struct NodeHandle {
@@ -481,9 +494,24 @@ pub struct NodeHandle {
 impl NodeHandle {
     pub fn start(cfg: NodeConfig) -> anyhow::Result<Self> {
         let store = ChainStore::new(&cfg.datadir);
-        let chain = store.load_or_new(cfg.network)?;
-        store.save(&chain)?;
-        let genesis_hex = chain.genesis_hash.to_hex();
+        // Bind RPC/light first. Replaying 10k+ trusted blocks takes minutes;
+        // phones and the website used to get Cloudflare 520 the whole time
+        // because nothing was listening. P2P stays down until the real chain
+        // is in memory — advertising genesis during that window would send
+        // every newcomer down a fork.
+        let stored = store.blocks_path().exists();
+        let preview = store.peek_meta();
+        let chain = Chain::new_fair(cfg.network)?;
+        let genesis_hex = preview
+            .as_ref()
+            .map(|(_, _, g)| g.clone())
+            .unwrap_or_else(|| chain.genesis_hash.to_hex());
+        if !stored {
+            store.save(&chain)?;
+        }
+        let (preview_blocks, preview_tip) = preview
+            .map(|(n, t, _)| (n, t))
+            .unwrap_or_else(|| (chain.block_count(), chain.tip_hash().to_hex()));
 
         let mining_enabled = Arc::new(AtomicBool::new(cfg.mine));
         let tip_epoch = Arc::new(AtomicU64::new(0));
@@ -537,6 +565,12 @@ impl NodeHandle {
             peer_agents: HashMap::new(),
             session_height: HashMap::new(),
             reachable_listen: HashSet::new(),
+            loading: stored,
+            preview_blocks,
+            preview_tip,
+            last_dial_error: None,
+            ibd_from: 0,
+            ibd_buffer: BTreeMap::new(),
             reorg_in_flight: Arc::new(AtomicBool::new(false)),
             last_reorg_fetch: AtomicU64::new(0),
             last_wall_tick: AtomicU64::new(now_unix()),
@@ -550,20 +584,13 @@ impl NodeHandle {
         };
         let state: SharedState = Arc::new(Mutex::new(inner));
 
-        {
-            let st = Arc::clone(&state);
-            let listen = cfg.p2p_listen.clone();
-            thread::spawn(move || p2p_listen_loop(listen, st));
-        }
-
         rpc::spawn_rpc(cfg.rpc_listen.clone(), Arc::clone(&state));
         if let Some(addr) = cfg.mobile_listen.clone().filter(|s| !s.is_empty()) {
             crate::mobile::spawn_mobile(addr, Arc::clone(&state));
         }
 
-        spawn_outbound_supervisor(Arc::clone(&state));
-        spawn_status_ticker(Arc::clone(&state));
-        spawn_dandelion_fluff(Arc::clone(&state));
+        // HTTP directory only — fills the address book. Must not open P2P
+        // sockets until the real chain is loaded, or we handshake at genesis.
         spawn_directory_bootstrap(
             Arc::clone(&state),
             cfg.network,
@@ -571,19 +598,16 @@ impl NodeHandle {
             genesis_hex,
         );
 
-        if cfg.miner.is_some() {
-            let st = Arc::clone(&state);
-            thread::spawn(move || mining_loop(st));
-        }
-
         {
             let st = Arc::clone(&state);
             let datadir = cfg.datadir.clone();
             thread::spawn(move || loop {
                 thread::sleep(Duration::from_secs(30));
                 if let Ok(g) = st.lock() {
-                    if let Err(e) = g.persist() {
-                        tracing::warn!("persist: {e}");
+                    if !g.loading {
+                        if let Err(e) = g.persist() {
+                            tracing::warn!("persist: {e}");
+                        }
                     }
                     g.persist_peers(&datadir);
                 }
@@ -607,6 +631,45 @@ impl NodeHandle {
                     }
                 }
             });
+        }
+
+        if stored {
+            let st = Arc::clone(&state);
+            let listen = cfg.p2p_listen.clone();
+            let mine = cfg.miner.is_some();
+            let network = cfg.network;
+            let datadir = cfg.datadir.clone();
+            thread::spawn(move || {
+                tracing::info!("loading chain from disk — RPC and the light API are already up");
+                match ChainStore::new(&datadir).load_or_new(network) {
+                    Ok(loaded) => {
+                        let blocks = loaded.block_count();
+                        let tip = loaded.tip_hash().to_hex();
+                        if let Ok(mut g) = st.lock() {
+                            g.chain = loaded;
+                            g.loading = false;
+                            g.preview_blocks = blocks;
+                            g.preview_tip = tip.clone();
+                            g.ibd_from = next_needed_height(&g);
+                            let _ = g.persist();
+                        }
+                        tracing::info!("chain ready ({blocks} blocks, tip {tip}) — opening P2P");
+                        spawn_p2p_plane(st, listen, mine);
+                    }
+                    Err(e) => {
+                        tracing::error!("chain load failed: {e}");
+                        if let Ok(mut g) = st.lock() {
+                            g.last_dial_error = Some(format!("chain load: {e}"));
+                        }
+                    }
+                }
+            });
+        } else {
+            spawn_p2p_plane(
+                Arc::clone(&state),
+                cfg.p2p_listen.clone(),
+                cfg.miner.is_some(),
+            );
         }
 
         Ok(Self {
@@ -685,9 +748,25 @@ impl NodeHandle {
 
     pub fn status_snapshot(&self) -> anyhow::Result<StatusSnap> {
         let g = self.state.lock().unwrap();
+        let loading = g.loading;
+        let blocks = if loading {
+            g.preview_blocks
+        } else {
+            g.chain.block_count()
+        };
+        let tip = if loading && !g.preview_tip.is_empty() {
+            g.preview_tip.clone()
+        } else {
+            g.chain.tip_hash().to_hex()
+        };
+        let tip_height = if loading {
+            g.preview_blocks.saturating_sub(1)
+        } else {
+            g.chain.tip_height().map(|h| h.0).unwrap_or(0)
+        };
         Ok(StatusSnap {
-            blocks: g.chain.block_count(),
-            tip: g.chain.tip_hash().to_hex(),
+            blocks,
+            tip,
             peers: g.peer_addrs.len(),
             mempool: g.mempool.len(),
             mining: g.mining_enabled.load(Ordering::SeqCst),
@@ -697,17 +776,23 @@ impl NodeHandle {
             total_work: g.chain.total_work,
             utxos: g.chain.ledger.utxos.len(),
             utxo_root: g.chain.ledger.utxo_root().to_hex(),
-            supply_ok: g.chain.verify_supply().is_ok(),
+            supply_ok: !loading && g.chain.verify_supply().is_ok(),
             hashes_total: g.hashes_total.load(Ordering::Relaxed),
             blocks_found: g.blocks_found.load(Ordering::Relaxed),
-            tip_height: g.chain.tip_height().map(|h| h.0).unwrap_or(0),
+            tip_height,
             coinbase_maturity: g.chain.ledger.coinbase_maturity,
             kernels: g.chain.ledger.kernels.count,
             started_at: g.started_at,
-            blocks_behind: catchup_behind(&g).unwrap_or(0),
+            blocks_behind: if loading {
+                0
+            } else {
+                catchup_behind(&g).unwrap_or(0)
+            },
             live_peers: g.sessions.len(),
             tor_proxy: g.proxy.is_some() && g.last_tor_ok.load(Ordering::Relaxed),
             dandelion: true,
+            last_dial_error: g.last_dial_error.clone(),
+            loading,
         })
     }
 
@@ -861,9 +946,17 @@ fn stay_connected(state: SharedState, addr: String) {
             Ok(()) => {
                 backoff = Duration::from_millis(250);
                 fails = 0;
+                if let Ok(mut g) = state.lock() {
+                    g.last_dial_error = None;
+                }
             }
             Err(e) => {
                 let msg = e.to_string();
+                if !msg.contains("self-dial") {
+                    if let Ok(mut g) = state.lock() {
+                        g.last_dial_error = Some(format!("{addr}: {msg}"));
+                    }
+                }
                 if msg.contains("genesis mismatch")
                     || msg.contains("network mismatch")
                     || msg.contains("self-dial")
@@ -944,10 +1037,15 @@ fn open_outbound_session(state: &SharedState, addr: &str) -> anyhow::Result<()> 
 
     // Catch up on this socket before we sit in the read loop. A NAT wallet
     // that just opened Core is often tens of blocks behind; one GetBlocks
-    // here, then the loop chains pages if the peer is still ahead.
+    // here, then the loop chains pages if the peer is still ahead. Claim a
+    // unique slice so two new outbound peers do not fetch the same page.
     if peer_h + 1 > next || peer_tip != tip.to_hex() {
+        let from_height = {
+            let mut g = state.lock().unwrap();
+            claim_ibd_from(&mut g)
+        };
         let _ = sess.send(&PeerMsg::GetBlocks {
-            from_height: next,
+            from_height,
             limit: MAX_BLOCKS_PER_REQUEST,
         });
     } else if peer_h < our_h {
@@ -975,6 +1073,85 @@ fn next_needed_height(inner: &NodeInner) -> u64 {
         .tip_height()
         .map(|h| h.0.saturating_add(1))
         .unwrap_or(0)
+}
+
+const IBD_PAGE: u64 = MAX_BLOCKS_PER_REQUEST as u64;
+/// Do not run more than this many heights ahead of our tip. Lost pages
+/// rewind the claim pointer by re-requesting `next`.
+const IBD_MAX_AHEAD: u64 = IBD_PAGE * 4;
+
+/// Next GetBlocks start height. Two live peers therefore fetch different
+/// 128-block slices instead of the same one twice.
+fn next_ibd_claim(next_needed: u64, ibd_from: &mut u64) -> u64 {
+    if *ibd_from < next_needed {
+        *ibd_from = next_needed;
+    }
+    if *ibd_from >= next_needed.saturating_add(IBD_MAX_AHEAD) {
+        return next_needed;
+    }
+    let from = *ibd_from;
+    *ibd_from = from.saturating_add(IBD_PAGE);
+    from
+}
+
+fn claim_ibd_from(inner: &mut NodeInner) -> u64 {
+    let next = next_needed_height(inner);
+    next_ibd_claim(next, &mut inner.ibd_from)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IbdPage {
+    Applied(usize),
+    Buffered,
+    Duplicate,
+    Rejected,
+}
+
+fn apply_ibd_page(inner: &mut NodeInner, blocks: Vec<Block>, now: u64) -> IbdPage {
+    let Some(start) = blocks.first().map(|b| b.header.height.0) else {
+        return IbdPage::Duplicate;
+    };
+    let next = next_needed_height(inner);
+    if start > next {
+        inner.ibd_buffer.insert(start, blocks);
+        while inner.ibd_buffer.len() > 8 {
+            if let Some(k) = inner.ibd_buffer.keys().next_back().copied() {
+                inner.ibd_buffer.remove(&k);
+            }
+        }
+        return IbdPage::Buffered;
+    }
+    let last_h = blocks.last().map(|b| b.header.height.0).unwrap_or(start);
+    if last_h < next {
+        return IbdPage::Duplicate;
+    }
+    let mut applied = match inner.chain.try_ingest_blocks(blocks, now) {
+        Ok(n) => n,
+        Err(_) => 0,
+    };
+    loop {
+        let n = next_needed_height(inner);
+        let Some(page) = inner.ibd_buffer.remove(&n) else {
+            break;
+        };
+        match inner.chain.try_ingest_blocks(page, now) {
+            Ok(k) if k > 0 => applied += k,
+            _ => break,
+        }
+    }
+    let now_next = next_needed_height(inner);
+    if now_next > inner.ibd_from {
+        inner.ibd_from = now_next;
+    }
+    if applied > 0 {
+        IbdPage::Applied(applied)
+    } else if now_next > next {
+        IbdPage::Duplicate
+    } else if start == next {
+        IbdPage::Rejected
+    } else {
+        IbdPage::Duplicate
+    }
 }
 
 const REORG_FETCH_COOLDOWN_SECS: u64 = 15;
@@ -1053,6 +1230,20 @@ pub fn merge_directory_peers(
         }
     }
     out
+}
+
+fn spawn_p2p_plane(state: SharedState, listen: String, mine: bool) {
+    {
+        let st = Arc::clone(&state);
+        thread::spawn(move || p2p_listen_loop(listen, st));
+    }
+    spawn_outbound_supervisor(Arc::clone(&state));
+    spawn_status_ticker(Arc::clone(&state));
+    spawn_dandelion_fluff(Arc::clone(&state));
+    if mine {
+        let st = Arc::clone(&state);
+        thread::spawn(move || mining_loop(st));
+    }
 }
 
 fn spawn_directory_bootstrap(
@@ -1476,21 +1667,25 @@ fn peer_io_loop(
             PeerMsg::Status { height, tip, .. } => {
                 last_peer_height = height;
                 note_peer_height(state, height);
-                if let Ok(mut g) = state.lock() {
+                let (want, our_tip) = {
+                    let mut g = state.lock().unwrap();
                     g.session_height.insert(sess.key.clone(), height);
-                }
-                let (next, our_tip) = {
-                    let g = state.lock().unwrap();
-                    (next_needed_height(&g), g.chain.tip_hash().to_hex())
+                    let next = next_needed_height(&g);
+                    let our_tip = g.chain.tip_hash().to_hex();
+                    let want = if height + 1 > next {
+                        Some(claim_ibd_from(&mut g))
+                    } else {
+                        None
+                    };
+                    (want, our_tip)
                 };
-                if height + 1 > next {
-                    // Ask for blocks we do not yet have. Starting at
-                    // `tip − 1` used to include a block we already hold;
-                    // apply_block then returned BadHeight and the rest of
-                    // the page was thrown away — a node 120 blocks behind
-                    // on a one-block fork sat there forever.
+                if let Some(from_height) = want {
+                    // Distinct pages per peer. Starting at `tip − 1` used
+                    // to include a block we already hold; apply_block then
+                    // returned BadHeight and the rest of the page was
+                    // thrown away.
                     sess.send(&PeerMsg::GetBlocks {
-                        from_height: next,
+                        from_height,
                         limit: MAX_BLOCKS_PER_REQUEST,
                     })?;
                 } else if tip != our_tip && sess.outbound {
@@ -1547,13 +1742,17 @@ fn peer_io_loop(
             PeerMsg::InvBlock { height, .. } => {
                 last_peer_height = last_peer_height.max(height);
                 note_peer_height(state, height);
-                let next = {
-                    let g = state.lock().unwrap();
-                    next_needed_height(&g)
+                let want = {
+                    let mut g = state.lock().unwrap();
+                    if height + 1 > next_needed_height(&g) {
+                        Some(claim_ibd_from(&mut g))
+                    } else {
+                        None
+                    }
                 };
-                if height + 1 > next {
+                if let Some(from_height) = want {
                     sess.send(&PeerMsg::GetBlocks {
-                        from_height: next,
+                        from_height,
                         limit: MAX_BLOCKS_PER_REQUEST,
                     })?;
                 }
@@ -1563,41 +1762,37 @@ fn peer_io_loop(
                 if blocks.len() > MAX_BLOCKS_PER_REQUEST {
                     return Err(anyhow::anyhow!("peer sent an oversized block batch"));
                 }
-                let n = {
+                let outcome = {
                     let mut g = state.lock().unwrap();
-                    match g.chain.try_ingest_blocks(blocks, now_unix()) {
-                        Ok(n) => {
-                            if n > 0 {
-                                g.stalled_on_fork.store(false, Ordering::SeqCst);
-                                g.bump_tip();
-                                let _ = g.persist();
-                                tracing::info!("extended +{n} from {peer_label}");
-                            }
-                            n
+                    let outcome = apply_ibd_page(&mut g, blocks, now_unix());
+                    if let IbdPage::Applied(n) = outcome {
+                        g.stalled_on_fork.store(false, Ordering::SeqCst);
+                        g.bump_tip();
+                        let _ = g.persist();
+                        tracing::info!("extended +{n} from {peer_label}");
+                    }
+                    outcome
+                };
+                // Keep pulling. Parallel peers fetch different pages;
+                // out-of-order ones sit in ibd_buffer until the hole fills.
+                let (want, reject) = {
+                    let mut g = state.lock().unwrap();
+                    let next = next_needed_height(&g);
+                    let behind = last_peer_height + 1 > next;
+                    match outcome {
+                        IbdPage::Applied(_) | IbdPage::Buffered if behind => {
+                            (Some(claim_ibd_from(&mut g)), false)
                         }
-                        Err(_) => 0,
+                        IbdPage::Rejected if behind => (None, true),
+                        _ => (None, false),
                     }
                 };
-                // Keep pulling on this live socket until we catch the peer.
-                // One 128-block page per Status tick would take a minute to
-                // close a 2,000-block gap; chaining pages closes it now.
-                let next = {
-                    let g = state.lock().unwrap();
-                    next_needed_height(&g)
-                };
-                if n > 0 {
-                    if last_peer_height + 1 > next {
-                        sess.send(&PeerMsg::GetBlocks {
-                            from_height: next,
-                            limit: MAX_BLOCKS_PER_REQUEST,
-                        })?;
-                    }
-                } else if last_peer_height + 1 > next {
-                    // The page did not connect. Either we already have those
-                    // heights (a competing block at our tip) or we are on a
-                    // lighter fork. GetBlocks cannot fix that — pull and
-                    // weigh their chain. Stop mining on the stale tip so we
-                    // do not deepen the fork while the rebuild runs.
+                if let Some(from_height) = want {
+                    sess.send(&PeerMsg::GetBlocks {
+                        from_height,
+                        limit: MAX_BLOCKS_PER_REQUEST,
+                    })?;
+                } else if reject {
                     if let Ok(g) = state.lock() {
                         g.stalled_on_fork.store(true, Ordering::SeqCst);
                     }
@@ -2421,5 +2616,36 @@ fn mining_loop(state: SharedState) {
             }
             Err(e) => tracing::warn!("our own block was rejected: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod ibd_claim_tests {
+    use super::{next_ibd_claim, IBD_MAX_AHEAD, IBD_PAGE};
+
+    #[test]
+    fn distinct_pages_then_rewind_at_the_cap() {
+        let mut ibd_from = 0u64;
+        let next = 100u64;
+        let a = next_ibd_claim(next, &mut ibd_from);
+        let b = next_ibd_claim(next, &mut ibd_from);
+        let c = next_ibd_claim(next, &mut ibd_from);
+        assert_eq!(a, 100);
+        assert_eq!(b, 100 + IBD_PAGE);
+        assert_eq!(c, 100 + IBD_PAGE * 2);
+        assert_eq!(b - a, IBD_PAGE);
+
+        // Past the ahead-cap we re-request the hole instead of running away.
+        ibd_from = next + IBD_MAX_AHEAD;
+        let rewind = next_ibd_claim(next, &mut ibd_from);
+        assert_eq!(rewind, next);
+    }
+
+    #[test]
+    fn claim_pointer_catches_up_after_ingest() {
+        let mut ibd_from = 50;
+        let advanced = next_ibd_claim(200, &mut ibd_from);
+        assert_eq!(advanced, 200);
+        assert_eq!(ibd_from, 200 + IBD_PAGE);
     }
 }

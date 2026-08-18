@@ -83,6 +83,27 @@ less install.sh          # read it; never pipe an installer into a shell
 sudo bash install.sh
 ```
 
+A headless node that is not a seed (can mine, holds keys if you ask it to):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Instinctes/nightfall/main/scripts/install-node-linux.sh -o install-node.sh
+less install-node.sh
+sudo bash install-node.sh          # relay only
+sudo bash install-node.sh --mine   # also mines
+```
+
+Both scripts refuse to enable the service unless genesis is
+`061a052d49607ff8f4b306c75d622ebd230cff4ec3a45a6dffc2f7738d4b20de`
+(protocol v8). The previous v7 hash is a different chain.
+
+To move a long chain without waiting on P2P (the node still verifies
+every block’s PoW and the supply invariant):
+
+```bash
+nightfalld --network mainnet export-snapshot --out /tmp/nf-snap
+nightfalld --network mainnet --datadir /new/datadir import-snapshot --from /tmp/nf-snap
+```
+
 **On macOS:**
 
 ```bash

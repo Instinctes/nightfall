@@ -58,6 +58,22 @@ Under your data folder (macOS mainnet example):
 4. Open **firewall port 17891** (mainnet) so others can connect.  
 5. Share only **Payment ID**, never `core.seed`.
 
+## View key and receipts
+
+A view key is `nfview1…`. It finds every payment and opens amounts and
+memos. It cannot spend. Settings → **Show view key**. CLI:
+`nightfall-wallet --network mainnet export-view-key`.
+
+To prove **one** payment without handing over the view key, copy a
+**Receipt** from the Activity list, or:
+
+```bash
+nightfall-wallet --network mainnet export-receipt --txid <prefix> > payment.json
+nightfall-wallet verify-receipt --file payment.json
+```
+
+Longer write-up: <https://nightfallcoin.org/view-key/>.
+
 ## CLI still available
 
 Advanced users: `nightfalld` + `nightfall-wallet` (see MAINNET.md).

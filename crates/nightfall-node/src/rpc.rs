@@ -140,8 +140,24 @@ pub(crate) fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
     match req.method.as_str() {
         "status" => {
             let g = state.lock().unwrap();
+            let loading = g.loading;
             let chain = &g.chain;
-            let supply_ok = chain.verify_supply().is_ok();
+            let supply_ok = !loading && chain.verify_supply().is_ok();
+            let blocks = if loading {
+                g.preview_blocks
+            } else {
+                chain.block_count()
+            };
+            let tip = if loading && !g.preview_tip.is_empty() {
+                g.preview_tip.clone()
+            } else {
+                chain.tip_hash().to_hex()
+            };
+            let tip_height = if loading {
+                g.preview_blocks.saturating_sub(1)
+            } else {
+                chain.tip_height().map(|h| h.0).unwrap_or(0)
+            };
             // What the rest of the network is running, counted by version.
             // During an incident this is the first thing worth knowing, and it
             // used to be unanswerable from anywhere: the handshake carried an
@@ -155,9 +171,9 @@ pub(crate) fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
                 json!({
                     "network": chain.network.as_str(),
                     "protocol_version": nightfall_types::PROTOCOL_VERSION,
-                    "blocks": chain.block_count(),
-                    "tip_height": chain.tip_height().map(|h| h.0),
-                    "tip": chain.tip_hash().to_hex(),
+                    "blocks": blocks,
+                    "tip_height": tip_height,
+                    "tip": tip,
                     "genesis": chain.genesis_hash.to_hex(),
                     "difficulty": chain.next_difficulty(),
                     "total_work": chain.total_work.to_string(),
@@ -179,6 +195,8 @@ pub(crate) fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
                     "tor_proxy": g.proxy.is_some()
                         && g.last_tor_ok.load(std::sync::atomic::Ordering::Relaxed),
                     "dandelion": true,
+                    "loading": loading,
+                    "last_dial_error": g.last_dial_error,
                 }),
                 id,
             )
@@ -223,6 +241,9 @@ pub(crate) fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
         }
 
         "submit_tx" => {
+            if state.lock().map(|g| g.loading).unwrap_or(false) {
+                return err("chain is still loading from disk", id);
+            }
             let raw = req.params.get("tx").cloned().unwrap_or(json!(null));
             let tx: Transaction = match serde_json::from_value(raw) {
                 Ok(t) => t,
@@ -254,6 +275,9 @@ pub(crate) fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
         // does not exist. It cannot spend anything, because the seed never
         // leaves the device. Point the wallet at your own node.
         "scan_feed" => {
+            if state.lock().map(|g| g.loading).unwrap_or(false) {
+                return err("chain is still loading from disk", id);
+            }
             let from = req.params.get("from").and_then(|v| v.as_u64()).unwrap_or(0);
             let limit = req
                 .params

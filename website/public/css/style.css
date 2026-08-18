@@ -1118,6 +1118,20 @@ section {
     font-size: 0.86em;
 }
 
+.doc pre {
+    overflow-x: auto;
+    padding: 14px 16px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.03);
+    margin: 12px 0 22px;
+}
+
+.doc pre code {
+    font-size: 0.84rem;
+    line-height: 1.55;
+}
+
 .doc .sev-high { color: var(--warn); }
 .doc .sev-med { color: var(--teal); }
 .doc .sev-info { color: var(--text-faint); }

@@ -66,6 +66,16 @@ enum Commands {
         #[arg(long)]
         mobile_listen: Option<String>,
     },
+    /// Write `blocks.jsonl` + `snapshot.json`. The importer still verifies PoW.
+    ExportSnapshot {
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Load a snapshot directory. Every block is re-checked; this is not a trust shortcut.
+    ImportSnapshot {
+        #[arg(long)]
+        from: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -151,6 +161,21 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::Path => {
             println!("{}", store.blocks_path().display());
+        }
+        Commands::ExportSnapshot { out } => {
+            let snap = store.export_snapshot(&out)?;
+            println!("wrote.......... {}", out.display());
+            println!("blocks......... {}", snap.blocks);
+            println!("tip............ {}", snap.tip);
+            println!("genesis........ {}", snap.genesis);
+            println!("network........ {:?}", snap.network);
+            println!("verify......... importer re-checks PoW and supply");
+        }
+        Commands::ImportSnapshot { from } => {
+            println!("importing...... {}", from.display());
+            println!("verify......... full PoW + supply (not trusted)");
+            let chain = store.import_snapshot(&from, network)?;
+            print_status(&chain, &datadir, network, 0, 0);
         }
         Commands::Run {
             listen,

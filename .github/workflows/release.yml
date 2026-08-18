@@ -1,7 +1,7 @@
 name: Release
 
-# Builds the Windows binaries on a real Windows runner and attaches them to the
-# release for the tag that triggered this.
+# Builds the Windows and Linux binaries on GitHub runners and attaches
+# them to the release for the tag that triggered this.
 #
 # Why not cross-compile from macOS: it needs a mingw toolchain that has to be
 # kept working on one person's laptop, and the result is a binary nobody else
@@ -82,6 +82,51 @@ jobs:
         run: |
           TAG="${INPUT_TAG:-${GITHUB_REF_NAME}}"
           # --clobber so re-running for a tag replaces rather than fails.
+          gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+
+  linux:
+    name: linux-x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+
+      - name: Tests
+        run: cargo test --workspace
+
+      - name: Build
+        run: cargo build --release -p nightfall-core -p nightfall-node -p nightfall-wallet
+
+      - name: Collect and checksum
+        run: |
+          TAG="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+          VERSION="${TAG#v}"
+          mkdir -p dist
+          cp target/release/nightfall-core "dist/nightfall-core-${VERSION}-linux-x64"
+          cp target/release/nightfalld "dist/nightfalld-${VERSION}-linux-x64"
+          cp target/release/nightfall-wallet "dist/nightfall-wallet-${VERSION}-linux-x64"
+          chmod +x dist/*
+          (cd dist && sha256sum nightfall-*-linux-x64 > "SHA256SUMS-${VERSION}-linux.txt")
+          cat "dist/SHA256SUMS-${VERSION}-linux.txt"
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+
+      - name: Attach to release
+        run: |
+          TAG="${INPUT_TAG:-${GITHUB_REF_NAME}}"
           gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

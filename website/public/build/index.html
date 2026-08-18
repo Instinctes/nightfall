@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build it yourself — NIGHTFALLCOIN</title>
+<meta name="description" content="How to build NIGHTFALLCOIN Core from source and check the published SHA-256. Binaries stay unsigned.">
+<meta name="theme-color" content="#0e0b18">
+<link rel="icon" href="/assets/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="stylesheet" href="/css/style.css?v=build-1">
+</head>
+<body>
+<nav id="nav">
+  <div class="wrap">
+    <a class="brand" href="/"><img class="mark" src="/assets/logo-256.png" alt="" width="34" height="34"> NIGHTFALL</a>
+    <div class="nav-links">
+      <a href="/network/">Network</a>
+      <a href="/build/">Build</a>
+      <a href="/wallet/">Web wallet</a>
+      <a class="btn btn-primary" href="/#download">Download</a>
+    </div>
+  </div>
+</nav>
+
+<article class="doc">
+  <div class="wrap">
+    <p class="kicker" style="color:var(--teal);letter-spacing:.08em;text-transform:uppercase;font-size:.78rem;font-weight:700;margin:0 0 14px">Reproducible as far as we can go</p>
+    <h1>Build it yourself</h1>
+    <p class="lede">
+      The published wallets are <em>not</em> signed by Apple or Microsoft.
+      A checksum is the whole story. If you do not want to trust a download,
+      compile the same crate the release was built from and compare the hash.
+    </p>
+
+    <div class="notice" style="margin:28px 0">
+      GitHub Actions builds the Windows binaries from this repository. macOS
+      DMGs are built on the maintainer’s machines and checksummed here. Nobody
+      notarizes them. That is a limitation, not a temporary skip.
+    </div>
+
+    <h2>1. Get the source</h2>
+    <pre><code>git clone https://github.com/Instinctes/nightfall
+cd nightfall
+git checkout v0.7.4   # or the tag printed next to the download
+rustc --version</code></pre>
+    <p>
+      Use a current stable Rust. The lockfile pins crates; it does not pin
+      the compiler. Two people with different <code>rustc</code> versions can
+      get different bytes and the same behaviour. Compare behaviour and the
+      published checksum of the <em>released</em> file — do not expect your
+      local binary to match the DMG byte-for-byte unless you use the same
+      OS, the same rustc, and the same build script.
+    </p>
+
+    <h2>2. Build Core, the CLI wallet, the node</h2>
+    <pre><code>cargo build --release -p nightfall-core
+cargo build --release -p nightfall-wallet
+cargo build --release -p nightfall-node</code></pre>
+    <p>
+      Binaries land in <code>target/release/</code> as
+      <code>nightfall-core</code>, <code>nightfall-wallet</code>,
+      <code>nightfalld</code>. On Windows the names end in <code>.exe</code>.
+    </p>
+
+    <h2>3. Check a downloaded file</h2>
+    <p>macOS / Linux:</p>
+    <pre><code>shasum -a 256 NIGHTFALLCOIN-Core-0.7.4-macOS-arm64.dmg
+grep NIGHTFALLCOIN-Core-0.7.4-macOS-arm64.dmg SHA256SUMS-0.7.4.txt</code></pre>
+    <p>Windows (PowerShell):</p>
+    <pre><code>Get-FileHash .\\nightfall-core-0.7.4-windows-x64.exe -Algorithm SHA256
+Get-Content .\\SHA256SUMS-0.7.4-windows.txt</code></pre>
+    <p>
+      The two lines must match. Checksums for the current desktop release:
+      <a href="/downloads/SHA256SUMS-0.7.4.txt">SHA256SUMS-0.7.4.txt</a>,
+      <a href="/downloads/SHA256SUMS-0.7.4-windows.txt">SHA256SUMS-0.7.4-windows.txt</a>,
+      <a href="/downloads/SHA256SUMS-0.7.4-linux.txt">SHA256SUMS-0.7.4-linux.txt</a>.
+      Phone builds are still 0.7.0 and have their own lists.
+    </p>
+
+    <h2>4. What this does not prove</h2>
+    <ul>
+      <li>It does not prove the source is free of bugs. It proves the file you have is the file we published.</li>
+      <li>It does not replace an outside audit. See <a href="/audit/">the internal review</a>.</li>
+      <li>It does not make the binary trusted by the OS. Gatekeeper and SmartScreen will keep warning. That is expected.</li>
+    </ul>
+
+    <h2 id="linux">Linux node without the wallet</h2>
+    <p>
+      Read the installer, then run it. Do not pipe curl into bash.
+      The same file is on this site and on GitHub.
+    </p>
+    <pre><code>curl -fsSL https://nightfallcoin.org/scripts/install-node-linux.sh -o install-node.sh
+less install-node.sh
+sudo bash install-node.sh          # relay only
+sudo bash install-node.sh --mine   # also mines; holds a key</code></pre>
+    <p>
+      Prebuilt binaries, if you would rather not compile:
+      <a href="/downloads/nightfalld-0.7.4-linux-x64"><code>nightfalld-0.7.4-linux-x64</code></a>,
+      <a href="/downloads/nightfall-wallet-0.7.4-linux-x64"><code>nightfall-wallet-0.7.4-linux-x64</code></a>,
+      <a href="/downloads/nightfall-core-0.7.4-linux-x64"><code>nightfall-core-0.7.4-linux-x64</code></a>
+      (Core needs GTK). Check
+      <a href="/downloads/SHA256SUMS-0.7.4-linux.txt">SHA256SUMS-0.7.4-linux.txt</a>.
+    </p>
+    <p>
+      A public seed (always-on, no keys, TCP 17891 open) uses
+      <a href="https://github.com/Instinctes/nightfall/blob/main/scripts/install-seed-node-linux.sh"><code>install-seed-node-linux.sh</code></a>
+      instead. Both check genesis
+      <code>061a052d49607ff8f4b306c75d622ebd230cff4ec3a45a6dffc2f7738d4b20de</code>
+      before they enable the service.
+    </p>
+  </div>
+</article>
+</body>
+</html>

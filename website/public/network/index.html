@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Network — NIGHTFALLCOIN</title>
+<meta name="description" content="Live chain numbers only: height, difficulty, supply, listener count. No addresses.">
+<meta name="theme-color" content="#0e0b18">
+<link rel="icon" href="/assets/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="stylesheet" href="/css/style.css?v=network-1">
+</head>
+<body>
+<nav id="nav">
+  <div class="wrap">
+    <a class="brand" href="/"><img class="mark" src="/assets/logo-256.png" alt="" width="34" height="34"> NIGHTFALL</a>
+    <div class="nav-links">
+      <a href="/network/">Network</a>
+      <a href="/build/">Build</a>
+      <a href="/wallet/">Web wallet</a>
+      <a class="btn btn-primary" href="/#download">Download</a>
+    </div>
+  </div>
+</nav>
+
+<article class="doc">
+  <div class="wrap">
+    <p class="kicker" style="color:var(--teal);letter-spacing:.08em;text-transform:uppercase;font-size:.78rem;font-weight:700;margin:0 0 14px">Public numbers · no addresses</p>
+    <h1>Network</h1>
+    <p class="lede">
+      Height, difficulty, supply, and how many listening nodes the seed will
+      name. Not a miner census. Not a peer graph. Addresses live on
+      <code>/peers</code> for nodes that need to dial; this page does not print them.
+    </p>
+
+    <div class="live-tiles" style="margin:28px 0 10px">
+      <div class="live-tile">
+        <div class="label">HEIGHT</div>
+        <div class="amount"><span id="n-height">—</span></div>
+        <div class="supply-sub" id="n-height-sub">tip</div>
+      </div>
+      <div class="live-tile">
+        <div class="label">DIFFICULTY</div>
+        <div class="amount"><span id="n-diff">—</span></div>
+        <div class="supply-sub">LWMA · ~15s</div>
+      </div>
+      <div class="live-tile">
+        <div class="label">LISTENERS</div>
+        <div class="amount"><span id="n-peers">—</span></div>
+        <div class="supply-sub">count only</div>
+      </div>
+    </div>
+
+    <div class="wallet-card supply-card" style="margin:0 0 28px">
+      <div class="label">CIRCULATING</div>
+      <div class="amount"><span id="n-circ">—</span> <span class="amt-tick">NIGHT</span></div>
+      <div class="supply-sub" id="n-supply-sub">of 90,000,000 max</div>
+    </div>
+
+    <table>
+      <tbody>
+        <tr><th>Blocks</th><td id="n-blocks">—</td></tr>
+        <tr><th>Minted</th><td id="n-minted">—</td></tr>
+        <tr><th>Burned fees</th><td id="n-burned">—</td></tr>
+        <tr><th>Supply invariant</th><td id="n-ok">—</td></tr>
+        <tr><th>Genesis</th><td><code id="n-genesis">—</code></td></tr>
+        <tr><th>Protocol</th><td id="n-proto">—</td></tr>
+      </tbody>
+    </table>
+
+    <p class="muted" id="n-note" style="margin-top:22px">
+      Numbers come from the seed. A loading seed reports the last tip it
+      saved, not a live handshake. Machine-readable:
+      <a href="/network.json"><code>/network.json</code></a>.
+    </p>
+  </div>
+</article>
+
+<script>
+function fmt(n) {
+  if (n == null || n === "") return "—";
+  var x = Number(n);
+  if (!isFinite(x)) return String(n);
+  return x.toLocaleString("en-US");
+}
+function night(darks) {
+  var n = Number(darks);
+  if (!isFinite(n)) return "—";
+  return (n / 1e8).toLocaleString("en-US", { maximumFractionDigits: 8 });
+}
+function paint(d) {
+  document.getElementById("n-height").textContent = fmt(d.tip_height);
+  document.getElementById("n-height-sub").textContent = d.loading
+    ? "loading from disk"
+    : "tip";
+  document.getElementById("n-diff").textContent = fmt(d.difficulty);
+  document.getElementById("n-peers").textContent = fmt(d.peers);
+  document.getElementById("n-circ").textContent = night(d.circulating);
+  document.getElementById("n-supply-sub").textContent =
+    "of " + fmt(d.max_supply) + " max";
+  document.getElementById("n-blocks").textContent = fmt(d.blocks);
+  document.getElementById("n-minted").textContent = night(d.minted) + " NIGHT";
+  document.getElementById("n-burned").textContent = night(d.burned_fees) + " NIGHT";
+  document.getElementById("n-ok").textContent = d.supply_invariant_ok ? "ok" : "not yet";
+  document.getElementById("n-genesis").textContent = d.genesis || "—";
+  document.getElementById("n-proto").textContent = d.protocol_version != null
+    ? "v" + d.protocol_version
+    : "—";
+}
+fetch("/network.json", { cache: "no-store" })
+  .then(function (r) { return r.json(); })
+  .then(paint)
+  .catch(function () {
+    document.getElementById("n-note").textContent =
+      "Seed unreachable. Try again in a minute.";
+  });
+</script>
+</body>
+</html>

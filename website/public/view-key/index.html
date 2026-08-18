@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>View key and receipts — NIGHTFALLCOIN</title>
+<meta name="description" content="nfview1 sees amounts and memos. It cannot spend. A receipt proves one payment without handing over the view key.">
+<meta name="theme-color" content="#0e0b18">
+<link rel="icon" href="/assets/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="stylesheet" href="/css/style.css?v=viewkey-1">
+</head>
+<body>
+<nav id="nav">
+  <div class="wrap">
+    <a class="brand" href="/"><img class="mark" src="/assets/logo-256.png" alt="" width="34" height="34"> NIGHTFALL</a>
+    <div class="nav-links">
+      <a href="/network/">Network</a>
+      <a href="/view-key/">View key</a>
+      <a href="/wallet/">Web wallet</a>
+      <a class="btn btn-primary" href="/#download">Download</a>
+    </div>
+  </div>
+</nav>
+
+<article class="doc">
+  <div class="wrap">
+    <p class="kicker" style="color:var(--teal);letter-spacing:.08em;text-transform:uppercase;font-size:.78rem;font-weight:700;margin:0 0 14px">See, do not spend</p>
+    <h1>View key and receipts</h1>
+    <p class="lede">
+      A Nightfall address is <code>nf1…</code>. The matching view key is
+      <code>nfview1…</code>. Anyone who holds the view key can find every
+      payment you send or receive and open the amounts and memos. They
+      cannot move a coin. The spend secret never sits in that string.
+    </p>
+
+    <div class="notice" style="margin:28px 0">
+      A view key is not a watch-only toy you paste into a group chat. It is
+      the entire history of the wallet, forever, including payments that
+      have not happened yet. Give it to an accountant. Do not give it to a
+      stranger who asked for “proof you got paid.”
+    </div>
+
+    <h2>What <code>nfview1</code> can and cannot do</h2>
+    <table>
+      <thead>
+        <tr><th></th><th>View key</th><th>Spend seed / 24 words</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Find your outputs on the chain</td><td>yes</td><td>yes</td></tr>
+        <tr><td>Read amounts and memos</td><td>yes</td><td>yes</td></tr>
+        <tr><td>Build a spend</td><td>no — the type has no spend secret</td><td>yes</td></tr>
+        <tr><td>Recover the wallet on a new device</td><td>no</td><td>yes</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Show it in Core</h2>
+    <ol>
+      <li>Open NIGHTFALLCOIN Core → Settings.</li>
+      <li>Under <b>View key</b>, click <b>Show view key</b>.</li>
+      <li>Copy <code>nfview1…</code>. Hide it again when you are done.</li>
+    </ol>
+    <p>CLI:</p>
+    <pre><code>nightfall-wallet --network mainnet export-view-key</code></pre>
+
+    <h2>Prove one payment instead</h2>
+    <p>
+      A receipt opens a single output (amount + blinding) and is signed by
+      the address that owns it. The other side can check the signature
+      belongs to <code>nf1…</code> without ever seeing the view key. That
+      is the right tool for “I paid you” / “I received this.”
+    </p>
+    <p>In Core: Activity → the row → <b>Receipt</b>. It copies JSON.</p>
+    <p>CLI:</p>
+    <pre><code># export (txid prefix is enough)
+nightfall-wallet --network mainnet export-receipt --txid 8f3a &gt; payment.json
+
+# anyone can check it
+nightfall-wallet verify-receipt --file payment.json</code></pre>
+    <p>
+      A valid receipt says: this address, this amount, this height, this
+      memo. It does not say the output is still unspent. It does not
+      reveal any other payment.
+    </p>
+
+    <h2>What this is not</h2>
+    <ul>
+      <li>Not a viewing key that an exchange can use to credit a deposit unless they also understand Nightfall outputs. There is no official listing.</li>
+      <li>Not a way to make the chain “100% anonymous.” The graph is mixed inside a block, not erased. See <a href="/#honest">the honest list</a>.</li>
+      <li>Not a substitute for writing down the 24 words. Lose the seed and the view key cannot spend the coins back to you.</li>
+    </ul>
+  </div>
+</article>
+</body>
+</html>

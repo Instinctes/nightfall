@@ -29,6 +29,7 @@
       <a href="#mining">Mining</a>
       <a href="#specs">Specs</a>
       <a href="#honest">Limitations</a>
+      <a href="/network/">Network</a>
       <a href="/audit/">Audit</a>
       <a href="/wallet/">Web wallet</a>
       <a class="btn btn-primary" href="#download">Download</a>
@@ -87,7 +88,7 @@
             <span class="dot"></span>
             <span id="supply-proof-text">Checking the chain…</span>
           </div>
-          <p class="supply-note">Every node re-checks that no coin exists which was never mined.</p>
+          <p class="supply-note">Every node re-checks that no coin exists which was never mined. <a href="/network/">Full numbers</a> — height, difficulty, listener count. No addresses.</p>
         </div>
       </div>
     </div>
@@ -314,17 +315,22 @@
       <div class="dl reveal">
         <div class="os">macOS · Apple Silicon</div>
         <div class="req">M1 – M4 · macOS 11+</div>
-        <a class="btn btn-primary" href="downloads/NIGHTFALLCOIN-Core-0.7.3-macOS-arm64.dmg">Download 0.7.3</a>
+        <a class="btn btn-primary" href="downloads/NIGHTFALLCOIN-Core-0.7.4-macOS-arm64.dmg">Download 0.7.4</a>
       </div>
       <div class="dl reveal" data-delay="1">
         <div class="os">macOS · Intel</div>
         <div class="req">macOS 10.15 Catalina+</div>
-        <a class="btn btn-primary" href="downloads/NIGHTFALLCOIN-Core-0.7.3-macOS-intel.dmg">Download 0.7.3</a>
+        <a class="btn btn-primary" href="downloads/NIGHTFALLCOIN-Core-0.7.4-macOS-intel.dmg">Download 0.7.4</a>
       </div>
       <div class="dl reveal" data-delay="2">
         <div class="os">Windows</div>
         <div class="req">64-bit · Windows 10+</div>
-        <a class="btn btn-primary" href="downloads/nightfall-core-0.7.3-windows-x64.exe">Download 0.7.3</a>
+        <a class="btn btn-primary" href="downloads/nightfall-core-0.7.4-windows-x64.exe">Download 0.7.4</a>
+      </div>
+      <div class="dl reveal">
+        <div class="os">Linux · x64</div>
+        <div class="req">Debian / Ubuntu · or any systemd box</div>
+        <a class="btn btn-primary" href="downloads/nightfalld-0.7.4-linux-x64">Download nightfalld</a>
       </div>
       <div class="dl reveal">
         <div class="os">Android · arm64</div>
@@ -351,13 +357,16 @@
       is Apple, not us. The web wallet needs no install.
       <br>
       Verify what you downloaded against
-      <a href="downloads/SHA256SUMS-0.7.3.txt">SHA256SUMS-0.7.3.txt</a>,
-      <a href="downloads/SHA256SUMS-0.7.3-windows.txt">SHA256SUMS-0.7.3-windows.txt</a>,
+      <a href="downloads/SHA256SUMS-0.7.4.txt">SHA256SUMS-0.7.4.txt</a>,
+      <a href="downloads/SHA256SUMS-0.7.4-windows.txt">SHA256SUMS-0.7.4-windows.txt</a>,
+      <a href="downloads/SHA256SUMS-0.7.4-linux.txt">SHA256SUMS-0.7.4-linux.txt</a>,
       <a href="downloads/SHA256SUMS-0.7.0-android.txt">SHA256SUMS-0.7.0-android.txt</a>
       and
       <a href="downloads/SHA256SUMS-0.7.0-ios.txt">SHA256SUMS-0.7.0-ios.txt</a>,
-      or <a href="https://github.com/Instinctes/nightfall">build it yourself from source</a> —
+      or <a href="/build/">build it yourself from source</a> —
       that is the point.
+      Linux Core and the CLI wallet are on the same checksum list;
+      a one-command node install is on <a href="/build/#linux">the build page</a>.
     </p>
   </div>
 </section>
@@ -406,13 +415,15 @@
         <a href="https://github.com/Instinctes/nightfall">Source code</a>
         <a href="https://github.com/Instinctes/nightfall/blob/main/docs/SPEC.md">Protocol spec</a>
         <a href="/audit/">Security review (v8)</a>
-        <a href="https://github.com/Instinctes/nightfall/blob/main/docs/AUDIT-2026-08-12.md">v4 audit</a>
+        <a href="/build/">Build it yourself</a>
+        <a href="/view-key/">View key &amp; receipts</a>
         <a href="https://github.com/Instinctes/nightfall/blob/main/docs/DECISIONS.md">Design decisions</a>
       </div>
       <div class="foot-col">
         <h4>Run it</h4>
         <a href="#download">Download wallet</a>
         <a href="/wallet/">Web wallet</a>
+        <a href="/network/">Network numbers</a>
         <a href="https://github.com/Instinctes/nightfall/blob/main/docs/MAINNET.md">Run a node</a>
         <a href="https://github.com/Instinctes/nightfall/blob/main/FAIR_LAUNCH.md">Fair launch rules</a>
         <a href="https://github.com/Instinctes/nightfall/blob/main/MANIFESTO.md">Manifesto</a>
