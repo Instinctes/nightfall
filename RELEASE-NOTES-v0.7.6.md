@@ -21,6 +21,10 @@ fork against a seed a hundred blocks ahead is seconds.
 The sidebar shows the wallet build under the network badge, so a
 screenshot tells you whether the miner is on this fix.
 
+`status` now includes `mining`, `hashes_total` and `blocks_found`.
+Headless `nightfalld` miners were scraping nothing official; the GUI
+already had those numbers.
+
 Phone and browser wallets are unchanged. They talk to the seed over
 the light API and never ran this path.
 

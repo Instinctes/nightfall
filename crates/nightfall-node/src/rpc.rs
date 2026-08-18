@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -197,6 +198,13 @@ pub(crate) fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
                     "dandelion": true,
                     "loading": loading,
                     "last_dial_error": g.last_dial_error,
+                    // Headless miners poll this. The GUI already had the
+                    // same three numbers via StatusSnap; leaving them off
+                    // the RPC meant a nightfalld box had no official way
+                    // to see whether it was hashing.
+                    "mining": g.mining_enabled.load(Ordering::SeqCst),
+                    "hashes_total": g.hashes_total.load(Ordering::Relaxed),
+                    "blocks_found": g.blocks_found.load(Ordering::Relaxed),
                 }),
                 id,
             )
