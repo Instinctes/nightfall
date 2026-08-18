@@ -29,6 +29,26 @@ fn mines_and_accumulates_work() {
 }
 
 #[test]
+fn own_disk_replay_matches_full_apply() {
+    let mut full = devnet();
+    let miner = WalletKeys::generate().address();
+    for i in 0..6u64 {
+        full.mine_block(&miner, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+
+    let mut fast = devnet();
+    for b in full.blocks.clone() {
+        fast.apply_block_from_own_disk(b).unwrap();
+    }
+    assert_eq!(fast.tip_hash(), full.tip_hash());
+    assert_eq!(fast.total_work, full.total_work);
+    assert_eq!(fast.ledger.utxo_root(), full.ledger.utxo_root());
+    assert_eq!(fast.ledger.kernel_sum(), full.ledger.kernel_sum());
+    fast.verify_supply().unwrap();
+}
+
+#[test]
 fn peer_can_replay_our_chain() {
     let mut a = devnet();
     let miner = WalletKeys::generate().address();

@@ -66,9 +66,10 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new(format!(
-                        "Last saved tip is block {}. RPC and phones already answer. \
-                         P2P waits until the file is in memory so this node does not \
-                         advertise genesis.",
+                        "Reading the chain file from this computer (last tip {}). \
+                         This is not a network sync. Peers stay closed so this node \
+                         does not advertise genesis. Several minutes at this height \
+                         is normal — your coins are already on disk.",
                         format_int(blocks)
                     ))
                     .size(12.5)
@@ -120,7 +121,7 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
 
     // Mining with no peers is how you end up on a private fork without
     // noticing. Say so loudly, before hours of work get discarded.
-    if app.is_mining() && peers == 0 {
+    if app.is_mining() && peers == 0 && !loading {
         egui::Frame::none()
             .fill(WARN.gamma_multiply(0.12))
             .stroke(Stroke::new(1.0_f32, WARN.gamma_multiply(0.55)))
@@ -333,6 +334,16 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
 
         // --- supply panel ---
         titled_card(&mut cols[1], "Network supply", |ui| {
+            if loading {
+                ui.label(RichText::new("—").size(20.0).monospace().strong());
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Hidden until the chain file is in memory. Not zero.")
+                        .size(11.5)
+                        .color(TEXT_DIM),
+                );
+                return;
+            }
             let circulating = minted.saturating_sub(burned);
             let pct = circulating as f64 / (MAX_SUPPLY_NIGHT as f64 * DARKS_PER_NIGHT as f64);
 
@@ -372,7 +383,9 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
                 dot(ui, status_color(supply_ok), false);
                 ui.add_space(4.0);
                 ui.label(
-                    RichText::new(if supply_ok {
+                    RichText::new(if loading {
+                        "Supply proof waits until the file is loaded"
+                    } else if supply_ok {
                         "Supply proof verified"
                     } else {
                         "Supply proof FAILED"

@@ -274,6 +274,75 @@ impl LedgerState {
         Ok(())
     }
 
+    /// Replay a block this node already wrote to its own disk.
+    ///
+    /// No range proofs, no signatures, no balance equation, no per-block
+    /// supply check. Those ran when the block was accepted. Restart used
+    /// to redo them for every stored block and froze wallets for minutes.
+    /// The caller must still run [`verify_supply`] once the file is done.
+    pub fn apply_block_state_only(
+        &mut self,
+        body: &BlockBody,
+        height: Height,
+        expected_reward: u64,
+    ) -> Result<(), LedgerError> {
+        if body.outputs.is_empty() || body.kernels.is_empty() {
+            return Err(LedgerError::EmptyBlock);
+        }
+        if body.coinbase_kernels() != 1 {
+            return Err(LedgerError::MissingCoinbase);
+        }
+        let fees = body.total_fee();
+        if self.supply.would_exceed_cap(expected_reward) {
+            return Err(LedgerError::SupplyCapExceeded);
+        }
+
+        let mut spent: BTreeSet<[u8; 32]> = BTreeSet::new();
+        for input in &body.inputs {
+            if !spent.insert(input.commit.0) {
+                return Err(LedgerError::DoubleSpendWithinBlock);
+            }
+            if !self.utxos.contains(&input.commit) {
+                return Err(LedgerError::UnknownInput {
+                    commit: input.commit.to_hex(),
+                });
+            }
+        }
+        for c in &spent {
+            self.utxos.remove(&Commitment(*c));
+        }
+        for out in &body.outputs {
+            self.utxos.insert(
+                out.commit,
+                UtxoEntry {
+                    output_pk: out.output_pk,
+                    height: height.0,
+                    is_coinbase: out.features.is_coinbase(),
+                },
+            );
+        }
+        for k in &body.kernels {
+            self.kernels
+                .add(&k.excess)
+                .ok_or(LedgerError::MalformedKernelExcess)?;
+        }
+        if expected_reward > 0 {
+            self.supply.total_minted_darks = self
+                .supply
+                .total_minted_darks
+                .checked_add(expected_reward)
+                .ok_or(LedgerError::ArithmeticOverflow)?;
+            self.supply.total_burned_darks = self
+                .supply
+                .total_burned_darks
+                .checked_add(fees)
+                .ok_or(LedgerError::ArithmeticOverflow)?;
+        }
+        self.tx_count += body.kernels.len() as u64;
+        self.height = height;
+        Ok(())
+    }
+
     /// Mempool admission check: is this transaction valid against current state?
     pub fn check_tx_acceptable(
         &self,

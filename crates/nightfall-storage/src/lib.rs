@@ -105,6 +105,20 @@ impl ChainStore {
         Some((m.block_count, m.validated_tip, m.genesis_hash))
     }
 
+    /// True when `blocks.jsonl` is byte-for-byte what this node last validated.
+    pub fn is_own_file_trusted(&self) -> bool {
+        let Some(m) = self.read_meta() else {
+            return false;
+        };
+        if m.validated_tip.is_empty() {
+            return false;
+        }
+        let bytes = fs::metadata(self.blocks_path())
+            .map(|x| x.len())
+            .unwrap_or(0);
+        m.validated_bytes == bytes && bytes > 0
+    }
+
     fn read_meta(&self) -> Option<ChainMeta> {
         fs::read_to_string(self.meta_path())
             .ok()
@@ -272,6 +286,16 @@ impl ChainStore {
 
     /// Load a chain, replaying and revalidating every stored block.
     pub fn load_or_new(&self, network: NetworkId) -> anyhow::Result<Chain> {
+        self.load_or_new_with_progress(network, |_, _| {})
+    }
+
+    /// Same as [`load_or_new`], reporting `(applied, expected)` so a UI can
+    /// count while the file is still being read.
+    pub fn load_or_new_with_progress(
+        &self,
+        network: NetworkId,
+        mut on_progress: impl FnMut(u64, u64),
+    ) -> anyhow::Result<Chain> {
         self.ensure_dir()?;
 
         if self.legacy_path().exists() && !self.blocks_path().exists() {
@@ -322,6 +346,7 @@ impl ChainStore {
         }
 
         let now = now_unix();
+        let expected = meta.as_ref().map(|m| m.block_count).unwrap_or(0);
         let mut chain = Chain::new_fair(network)?;
         let file = BufReader::new(File::open(self.blocks_path())?);
 
@@ -334,11 +359,14 @@ impl ChainStore {
                 .map_err(|e| anyhow::anyhow!("block {i} is corrupt: {e}"))?;
 
             let outcome = if trusted {
-                chain.apply_block_locally_trusted(block, now)
+                chain.apply_block_from_own_disk(block)
             } else {
                 chain.apply_block(block, now)
             };
             outcome.map_err(|e| anyhow::anyhow!("stored block {i} failed revalidation: {e}"))?;
+            if i == 0 || i % 128 == 0 {
+                on_progress(chain.block_count(), expected);
+            }
         }
 
         // The validation record must describe the chain we actually rebuilt.
@@ -351,6 +379,14 @@ impl ChainStore {
                         m.validated_tip,
                         chain.tip_hash()
                     );
+                }
+            }
+            if let Some(tip) = chain.blocks.last() {
+                if chain.ledger.utxo_root() != tip.header.utxo_root {
+                    anyhow::bail!("replayed UTXO root does not match the stored tip");
+                }
+                if chain.ledger.kernel_sum() != tip.header.kernel_sum {
+                    anyhow::bail!("replayed kernel sum does not match the stored tip");
                 }
             }
         }

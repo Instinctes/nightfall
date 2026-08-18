@@ -445,6 +445,7 @@ impl App {
 
                 // Bottom block: network + supply proof.
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                    let loading = self.status.as_ref().map(|s| s.loading).unwrap_or(false);
                     let supply_ok = self.status.as_ref().map(|s| s.supply_ok).unwrap_or(false);
                     egui::Frame::none()
                         .fill(SURFACE_HI)
@@ -452,17 +453,16 @@ impl App {
                         .inner_margin(egui::Margin::same(11.0))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                dot(ui, status_color(supply_ok), false);
+                                let (label, ok) = if loading {
+                                    ("Supply — loading", true)
+                                } else if supply_ok {
+                                    ("Supply verified", true)
+                                } else {
+                                    ("Supply UNVERIFIED", false)
+                                };
+                                dot(ui, status_color(ok), loading);
                                 ui.add_space(4.0);
-                                ui.label(
-                                    RichText::new(if supply_ok {
-                                        "Supply verified"
-                                    } else {
-                                        "Supply UNVERIFIED"
-                                    })
-                                    .size(11.5)
-                                    .color(status_color(supply_ok)),
-                                );
+                                ui.label(RichText::new(label).size(11.5).color(status_color(ok)));
                             });
                             ui.add_space(3.0);
                             ui.label(
@@ -509,9 +509,12 @@ impl App {
                     ui.label(RichText::new(title).size(20.0).strong());
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let loading = self.status.as_ref().map(|s| s.loading).unwrap_or(false);
                         let mining = self.is_mining();
                         let btn = egui::Button::new(
-                            RichText::new(if mining {
+                            RichText::new(if loading {
+                                "Loading chain…"
+                            } else if mining {
                                 "Stop mining"
                             } else {
                                 "Start mining"
@@ -531,7 +534,7 @@ impl App {
                         })
                         .rounding(Rounding::same(ROUND_SM))
                         .min_size(Vec2::new(126.0, 34.0));
-                        if ui.add(btn).clicked() {
+                        if ui.add_enabled(!loading, btn).clicked() && !loading {
                             self.set_mining(!mining);
                             if mining {
                                 self.hashrate.current = 0.0;

@@ -494,14 +494,18 @@ pub struct NodeHandle {
 impl NodeHandle {
     pub fn start(cfg: NodeConfig) -> anyhow::Result<Self> {
         let store = ChainStore::new(&cfg.datadir);
-        // Bind RPC/light first. Replaying 10k+ trusted blocks takes minutes;
-        // phones and the website used to get Cloudflare 520 the whole time
-        // because nothing was listening. P2P stays down until the real chain
-        // is in memory — advertising genesis during that window would send
-        // every newcomer down a fork.
+        // Own file, already validated: replay without proofs (seconds).
+        // File changed or no record: full verify in the background, RPC/light
+        // up immediately so a seed restart is not five minutes of 520s.
         let stored = store.blocks_path().exists();
+        let trusted = store.is_own_file_trusted();
+        let need_slow_replay = stored && !trusted;
         let preview = store.peek_meta();
-        let chain = Chain::new_fair(cfg.network)?;
+        let chain = if need_slow_replay {
+            Chain::new_fair(cfg.network)?
+        } else {
+            store.load_or_new(cfg.network)?
+        };
         let genesis_hex = preview
             .as_ref()
             .map(|(_, _, g)| g.clone())
@@ -565,7 +569,7 @@ impl NodeHandle {
             peer_agents: HashMap::new(),
             session_height: HashMap::new(),
             reachable_listen: HashSet::new(),
-            loading: stored,
+            loading: need_slow_replay,
             preview_blocks,
             preview_tip,
             last_dial_error: None,
@@ -633,7 +637,7 @@ impl NodeHandle {
             });
         }
 
-        if stored {
+        if need_slow_replay {
             let st = Arc::clone(&state);
             let listen = cfg.p2p_listen.clone();
             let mine = cfg.miner.is_some();
@@ -641,7 +645,17 @@ impl NodeHandle {
             let datadir = cfg.datadir.clone();
             thread::spawn(move || {
                 tracing::info!("loading chain from disk — RPC and the light API are already up");
-                match ChainStore::new(&datadir).load_or_new(network) {
+                let progress = {
+                    let st = Arc::clone(&st);
+                    move |done: u64, _total: u64| {
+                        if let Ok(mut g) = st.lock() {
+                            if g.loading {
+                                g.preview_blocks = done.max(1);
+                            }
+                        }
+                    }
+                };
+                match ChainStore::new(&datadir).load_or_new_with_progress(network, progress) {
                     Ok(loaded) => {
                         let blocks = loaded.block_count();
                         let tip = loaded.tip_hash().to_hex();
@@ -651,6 +665,7 @@ impl NodeHandle {
                             g.preview_blocks = blocks;
                             g.preview_tip = tip.clone();
                             g.ibd_from = next_needed_height(&g);
+                            g.bump_tip();
                             let _ = g.persist();
                         }
                         tracing::info!("chain ready ({blocks} blocks, tip {tip}) — opening P2P");

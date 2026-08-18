@@ -411,6 +411,36 @@ impl Chain {
         self.apply_block_inner(block, now_unix, false)
     }
 
+    /// Replay a block from this node's own `blocks.jsonl`.
+    ///
+    /// Linkage only (height, parent). Proofs, signatures and the supply
+    /// equation already ran when we accepted the block. Used on restart so
+    /// a miner is not stuck for minutes on their own file.
+    pub fn apply_block_from_own_disk(&mut self, block: Block) -> Result<(), ConsensusError> {
+        if block.header.version != PROTOCOL_VERSION {
+            return Err(ConsensusError::BadVersion {
+                got: block.header.version,
+                expected: PROTOCOL_VERSION,
+            });
+        }
+        if block.header.height != self.next_height() {
+            return Err(ConsensusError::BadHeight);
+        }
+        if block.header.prev_hash != self.tip_hash() {
+            return Err(ConsensusError::BadPrev);
+        }
+        let subsidy = self
+            .emission
+            .reward_at(block.header.height, self.ledger.supply.total_minted_darks)
+            .darks();
+        self.ledger
+            .apply_block_state_only(&block.body, block.header.height, subsidy)
+            .map_err(|e| ConsensusError::Ledger(e.to_string()))?;
+        self.total_work = self.total_work.saturating_add(block.work());
+        self.blocks.push(block);
+        Ok(())
+    }
+
     fn apply_block_inner(
         &mut self,
         block: Block,
