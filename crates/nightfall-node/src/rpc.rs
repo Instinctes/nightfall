@@ -205,6 +205,15 @@ pub(crate) fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
                     "mining": g.mining_enabled.load(Ordering::SeqCst),
                     "hashes_total": g.hashes_total.load(Ordering::Relaxed),
                     "blocks_found": g.blocks_found.load(Ordering::Relaxed),
+                    "tip_time": if loading {
+                        0
+                    } else {
+                        chain
+                            .blocks
+                            .last()
+                            .map(|b| b.header.timestamp_unix)
+                            .unwrap_or(0)
+                    },
                 }),
                 id,
             )

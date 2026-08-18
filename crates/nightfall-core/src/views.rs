@@ -6,13 +6,22 @@ use crate::widgets::*;
 use eframe::egui::{self, Color32, RichText, Rounding, Stroke, Vec2};
 use nightfall_crypto::Address;
 use nightfall_storage::now_unix;
-use nightfall_types::{Amount, DARKS_PER_NIGHT, MAX_SUPPLY_NIGHT};
+use nightfall_types::{Amount, DARKS_PER_NIGHT, MAX_SUPPLY_NIGHT, TARGET_BLOCK_TIME_SECS};
 use nightfall_wallet::Direction;
 
 fn night(darks: u64) -> String {
     let whole = darks / DARKS_PER_NIGHT;
     let frac = darks % DARKS_PER_NIGHT;
     format!("{}.{:08}", format_int(whole), frac)
+}
+
+fn night_compact(darks: u64) -> String {
+    if darks % DARKS_PER_NIGHT == 0 {
+        return format_int(darks / DARKS_PER_NIGHT);
+    }
+    let whole = darks / DARKS_PER_NIGHT;
+    let frac = format!("{:08}", darks % DARKS_PER_NIGHT);
+    format!("{}.{}", format_int(whole), frac.trim_end_matches('0'))
 }
 
 // ------------------------------------------------------------- dashboard ---
@@ -255,6 +264,26 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
         ui.label(RichText::new(reason).size(11.5).color(TEXT_DIM));
     }
 
+    let scanned = app.wallet.lock().map(|w| w.scanned_to()).unwrap_or(0);
+    if !loading && tip > scanned {
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(format!(
+                "Wallet scan {} / {} — coins in the last {} block{} are still being looked for.",
+                format_int(scanned),
+                format_int(tip),
+                format_int(tip.saturating_sub(scanned)),
+                if tip.saturating_sub(scanned) == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ))
+            .size(11.5)
+            .color(ACCENT_HI),
+        );
+    }
+
     if app.is_mining() && app.hashrate.current > 0.0 && difficulty > 0 {
         let secs = difficulty as f64 / app.hashrate.current.max(1.0);
         let eta = if secs < 90_000.0 {
@@ -302,6 +331,78 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
             });
         }
     });
+
+    ui.add_space(14.0);
+
+    let now = now_unix();
+    let tip_time = app.status.as_ref().map(|s| s.tip_time).unwrap_or(0);
+    let last_age = now.saturating_sub(tip_time);
+    let last_block = if loading || tip_time == 0 {
+        "—".to_string()
+    } else {
+        ago(tip_time, now)
+    };
+    let last_color = if loading || tip_time == 0 {
+        TEXT_DIM
+    } else if last_age > 60 {
+        WARN
+    } else {
+        TEXT
+    };
+
+    let net_hs = if loading || difficulty == 0 {
+        0.0
+    } else {
+        difficulty as f64 / TARGET_BLOCK_TIME_SECS as f64
+    };
+    let net_label = if net_hs <= 0.0 {
+        "—".to_string()
+    } else {
+        format_hashrate(net_hs)
+    };
+
+    let local_hs = app.hashrate.current;
+    let (share_label, share_color) = if app.is_mining() && local_hs > 0.0 && net_hs > 0.0 {
+        (format!("{:.2}%", 100.0 * local_hs / net_hs), ACCENT_HI)
+    } else {
+        ("—".to_string(), TEXT_DIM)
+    };
+
+    let next = next_unlock(app);
+    let (unlock_label, unlock_color) = match next {
+        Some((value, left)) => {
+            let secs = left as f64 * TARGET_BLOCK_TIME_SECS as f64;
+            (
+                format!("{} · {}", night_compact(value), human_duration(secs)),
+                WARN,
+            )
+        }
+        None => ("—".to_string(), TEXT_DIM),
+    };
+
+    ui.columns(4, |cols| {
+        let cells = [
+            ("LAST BLOCK", last_block, last_color),
+            ("NETWORK HASH", net_label, TEXT),
+            ("YOUR SHARE", share_label, share_color),
+            ("NEXT UNLOCK", unlock_label, unlock_color),
+        ];
+        for (i, (label, value, color)) in cells.into_iter().enumerate() {
+            card(&mut cols[i], |ui| {
+                stat(ui, label, &value, color);
+            });
+        }
+    });
+
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new(
+            "Network hash is difficulty ÷ 15 s — an estimate, not a miner count. \
+             Your share is this machine against that estimate.",
+        )
+        .size(11.0)
+        .color(TEXT_FAINT),
+    );
 
     ui.add_space(14.0);
 
@@ -957,14 +1058,16 @@ pub fn mining(app: &mut App, ui: &mut egui::Ui) {
         });
 
         ui.add_space(16.0);
-        ui.columns(3, |cols| {
+        let lifetime = lifetime_mined(app);
+        ui.columns(4, |cols| {
             let cells = [
                 (
                     "HASHRATE",
                     format_hashrate(app.hashrate.current),
                     if mining { ACCENT_HI } else { TEXT_DIM },
                 ),
-                ("BLOCKS FOUND", format_int(blocks_found), SUCCESS),
+                ("THIS SESSION", format_int(blocks_found), SUCCESS),
+                ("LIFETIME MINED", night_compact(lifetime), TEXT),
                 ("TOTAL HASHES", format_int(hashes_total), TEXT),
             ];
             for (i, (label, value, color)) in cells.into_iter().enumerate() {
@@ -1098,6 +1201,53 @@ pub fn mining(app: &mut App, ui: &mut egui::Ui) {
             }
         });
     }
+}
+
+fn next_unlock(app: &App) -> Option<(u64, u64)> {
+    let tip = app.tip_height();
+    let maturity = app.maturity();
+    app.wallet.lock().ok().and_then(|w| {
+        let mut soonest: Option<(u64, u64)> = None;
+        for o in w.outputs().iter().filter(|o| !o.spent) {
+            if let Some(left) = w.blocks_until_mature(o, tip, maturity) {
+                match soonest {
+                    Some((_, best)) if left >= best => {}
+                    _ => soonest = Some((o.value, left)),
+                }
+            }
+        }
+        soonest
+    })
+}
+
+fn lifetime_mined(app: &App) -> u64 {
+    app.wallet
+        .lock()
+        .ok()
+        .map(|w| {
+            w.history()
+                .iter()
+                .filter(|e| e.direction == Direction::Mined && e.height.is_some())
+                .map(|e| e.amount)
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+fn format_peer_versions(map: &std::collections::BTreeMap<String, usize>) -> String {
+    if map.is_empty() {
+        return "No handshake versions yet".into();
+    }
+    let mut merged: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for (agent, n) in map {
+        let label = agent.rsplit('/').next().unwrap_or(agent).to_string();
+        *merged.entry(label).or_insert(0) += *n;
+    }
+    merged
+        .into_iter()
+        .map(|(v, n)| format!("{n}× {v}"))
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 fn reward_at(height: u64) -> u64 {
@@ -1266,6 +1416,18 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 ui.label(RichText::new(p).monospace().size(11.5).color(TEXT_FAINT));
             }
         }
+
+        ui.add_space(12.0);
+        ui.label(RichText::new("Peer versions").size(12.0).color(TEXT_DIM));
+        ui.add_space(4.0);
+        let empty_versions = std::collections::BTreeMap::new();
+        ui.label(
+            RichText::new(format_peer_versions(
+                s.map(|st| &st.peer_versions).unwrap_or(&empty_versions),
+            ))
+            .size(12.0)
+            .color(if peers > 0 { TEXT } else { TEXT_FAINT }),
+        );
     });
 
     ui.add_space(14.0);

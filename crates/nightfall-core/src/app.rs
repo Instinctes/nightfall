@@ -396,7 +396,11 @@ impl App {
                     ui.vertical(|ui| {
                         ui.add_space(2.0);
                         ui.label(RichText::new("NIGHTFALL").size(17.0).color(TEXT).strong());
-                        ui.label(RichText::new("CORE WALLET").size(9.5).color(ACCENT_HI));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.label(RichText::new("CORE WALLET").size(9.5).color(ACCENT_HI));
+                            ui.label(RichText::new(WALLET_VERSION).size(9.5).color(TEXT_DIM));
+                        });
                     });
                 });
 
@@ -490,7 +494,6 @@ impl App {
                                 .color(TEXT_FAINT),
                         );
                     });
-                    ui.label(RichText::new(WALLET_VERSION).size(10.0).color(TEXT_FAINT));
                 });
             });
     }

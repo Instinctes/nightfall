@@ -483,6 +483,10 @@ pub struct StatusSnap {
     pub last_dial_error: Option<String>,
     /// True while the chain is still being replayed from disk.
     pub loading: bool,
+    /// Unix time of the tip block. 0 while loading or on an empty chain.
+    pub tip_time: u64,
+    /// Handshake agent strings, counted. Empty until a peer completes Hello.
+    pub peer_versions: BTreeMap<String, usize>,
 }
 
 pub struct NodeHandle {
@@ -779,6 +783,19 @@ impl NodeHandle {
         } else {
             g.chain.tip_height().map(|h| h.0).unwrap_or(0)
         };
+        let tip_time = if loading {
+            0
+        } else {
+            g.chain
+                .blocks
+                .last()
+                .map(|b| b.header.timestamp_unix)
+                .unwrap_or(0)
+        };
+        let mut peer_versions = BTreeMap::new();
+        for agent in g.peer_agents.values() {
+            *peer_versions.entry(agent.clone()).or_insert(0) += 1;
+        }
         Ok(StatusSnap {
             blocks,
             tip,
@@ -808,6 +825,8 @@ impl NodeHandle {
             dandelion: true,
             last_dial_error: g.last_dial_error.clone(),
             loading,
+            tip_time,
+            peer_versions,
         })
     }
 
@@ -1140,10 +1159,10 @@ fn apply_ibd_page(inner: &mut NodeInner, blocks: Vec<Block>, now: u64) -> IbdPag
     if last_h < next {
         return IbdPage::Duplicate;
     }
-    let mut applied = match inner.chain.try_ingest_blocks(blocks, now) {
-        Ok(n) => n,
-        Err(_) => 0,
-    };
+    let mut applied = inner
+        .chain
+        .try_ingest_blocks(blocks, now)
+        .unwrap_or_default();
     loop {
         let n = next_needed_height(inner);
         let Some(page) = inner.ibd_buffer.remove(&n) else {
