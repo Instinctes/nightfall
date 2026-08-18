@@ -1345,6 +1345,11 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         );
         kv(
             ui,
+            "Wallet version",
+            RichText::new(crate::app::WALLET_VERSION).monospace(),
+        );
+        kv(
+            ui,
             "Blocks",
             RichText::new(format_int(s.map(|s| s.blocks).unwrap_or(0))).monospace(),
         );

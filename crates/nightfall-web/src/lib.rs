@@ -232,7 +232,8 @@ pub fn wallet_history(state: &str) -> Result<JsValue, JsError> {
 #[wasm_bindgen]
 pub fn probe_crypto() -> Result<String, JsError> {
     let keys = WalletKeys::from_seed([7u8; 32]);
-    let (out, _) = nightfall_crypto::create_output(&keys.address(), 1, "", b"probe").map_err(err)?;
+    let (out, _) =
+        nightfall_crypto::create_output(&keys.address(), 1, "", b"probe").map_err(err)?;
     Ok(format!("ok {}", out.range_proof.len()))
 }
 

@@ -1860,9 +1860,9 @@ pub const PEER_HEIGHT_TTL_SECS: u64 = 120;
 /// time, arriving in order. So each rejected block whose parent we know is kept
 /// by parent hash, the branch is walked forward as far as it goes, and the
 /// result is offered to `maybe_reorg_to` — which applies the ordinary rule,
-/// cumulative work, and rebuilds from genesis with full validation. Nothing
-/// here shortcuts a check; it only gives the existing check something to look
-/// at.
+/// cumulative work, and verifies only the untrusted suffix. Nothing here
+/// shortcuts a check on new blocks; it only gives the existing check
+/// something to look at.
 fn consider_branch(state: &SharedState, block: Block, peer_label: &str) {
     let mut g = match state.lock() {
         Ok(g) => g,
@@ -2281,8 +2281,8 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
             break;
         }
 
-        // Rebuilt and re-verified with the lock released — tens of seconds of
-        // work that used to freeze the whole node. See `Chain::evaluate_reorg`.
+        // Shared prefix is our own file; only the suffix is verified.
+        // See `Chain::evaluate_reorg`.
         let verdict = Chain::evaluate_reorg(network, our_work, &our_hashes, candidate, now_unix());
 
         let mut g = state.lock().unwrap();

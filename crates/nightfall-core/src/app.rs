@@ -16,6 +16,9 @@ use std::time::{Duration, Instant};
 /// Default fee: 0.001 NIGHT. Burned in full.
 pub const DEFAULT_FEE_DARKS: u64 = DARKS_PER_NIGHT / 1_000;
 
+/// Desktop build. Not the protocol — that is `PROTOCOL_VERSION`.
+pub const WALLET_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Dashboard,
@@ -487,6 +490,7 @@ impl App {
                                 .color(TEXT_FAINT),
                         );
                     });
+                    ui.label(RichText::new(WALLET_VERSION).size(10.0).color(TEXT_FAINT));
                 });
             });
     }

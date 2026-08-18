@@ -242,8 +242,8 @@ fn a_long_extension_of_a_shallow_fork_is_not_too_deep() {
 fn a_one_block_fork_adopts_the_heavier_valid_branch() {
     // The MacBook case: we share everything up to the last block, then mine
     // one competing tip while the network keeps going. Rewind is 1. The
-    // rebuild must trust the shared prefix (no re-PoW) and still accept the
-    // heavier suffix.
+    // rebuild must trust the shared prefix (no proofs, no re-PoW) and still
+    // accept the heavier suffix.
     let miner = WalletKeys::generate().address();
     let mut shared = devnet();
     for i in 0..4u64 {
@@ -281,6 +281,128 @@ fn a_one_block_fork_adopts_the_heavier_valid_branch() {
         .unwrap());
     assert_eq!(ours.tip_hash(), theirs.tip_hash());
     ours.verify_supply().unwrap();
+}
+
+#[test]
+fn trusted_prefix_rebuild_matches_full_rebuild() {
+    // The fast reorg path must land on the same ledger as checking every
+    // prefix block again. If the roots drift, a valid suffix would fail
+    // (or worse, a bad one would attach).
+    let miner = WalletKeys::generate().address();
+    let mut full = devnet();
+    for i in 0..8u64 {
+        full.mine_block(&miner, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+
+    let fast = Chain::rebuild_from_blocks_trusted_prefix(
+        NetworkId::Devnet,
+        full.blocks.clone(),
+        5,
+        NOW + 10_000,
+    )
+    .unwrap();
+    assert_eq!(fast.tip_hash(), full.tip_hash());
+    assert_eq!(fast.total_work, full.total_work);
+    assert_eq!(fast.ledger.utxo_root(), full.ledger.utxo_root());
+    assert_eq!(fast.ledger.kernel_sum(), full.ledger.kernel_sum());
+    fast.verify_supply().unwrap();
+}
+
+#[test]
+fn a_four_block_fork_adopts_the_heavier_branch() {
+    // Live case: we extended a stale tip four times while the seed kept
+    // going. Rewind is 4, not "too deep", and the shared prefix is ours.
+    let miner = WalletKeys::generate().address();
+    let mut shared = devnet();
+    for i in 0..4u64 {
+        shared
+            .mine_block(&miner, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+
+    let mut ours = Chain::new_fair(NetworkId::Devnet).unwrap();
+    ours.try_ingest_blocks(shared.blocks.clone(), NOW + 1_000)
+        .unwrap();
+    for i in 0..4u64 {
+        ours.mine_block(&miner, vec![], NOW + (4 + i) * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+
+    let mut theirs = Chain::new_fair(NetworkId::Devnet).unwrap();
+    theirs
+        .try_ingest_blocks(shared.blocks.clone(), NOW + 1_000)
+        .unwrap();
+    for i in 0..8u64 {
+        theirs
+            .mine_block(&miner, vec![], NOW + (4 + i) * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+    assert!(theirs.total_work > ours.total_work);
+    assert_eq!(
+        reorg_rewind(
+            &ours.blocks.iter().map(|b| b.hash()).collect::<Vec<_>>(),
+            &theirs.blocks
+        ),
+        4
+    );
+
+    assert!(ours
+        .maybe_reorg_to(theirs.blocks.clone(), NOW + 10_000)
+        .unwrap());
+    assert_eq!(ours.tip_hash(), theirs.tip_hash());
+    assert_eq!(ours.total_work, theirs.total_work);
+    ours.verify_supply().unwrap();
+}
+
+#[test]
+fn reorg_still_validates_the_untrusted_suffix() {
+    // Trusting the prefix must not skip PoW on the first block we do not hold.
+    let miner = WalletKeys::generate().address();
+    let mut shared = devnet();
+    for i in 0..3u64 {
+        shared
+            .mine_block(&miner, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+
+    let mut ours = Chain::new_fair(NetworkId::Devnet).unwrap();
+    ours.try_ingest_blocks(shared.blocks.clone(), NOW + 1_000)
+        .unwrap();
+    ours.mine_block(&miner, vec![], NOW + 3 * TARGET_BLOCK_TIME_SECS)
+        .unwrap();
+
+    let mut theirs = Chain::new_fair(NetworkId::Devnet).unwrap();
+    theirs
+        .try_ingest_blocks(shared.blocks.clone(), NOW + 1_000)
+        .unwrap();
+    theirs
+        .mine_block(&miner, vec![], NOW + 3 * TARGET_BLOCK_TIME_SECS)
+        .unwrap();
+    theirs
+        .mine_block(&miner, vec![], NOW + 4 * TARGET_BLOCK_TIME_SECS)
+        .unwrap();
+    assert!(theirs.total_work > ours.total_work);
+
+    let mut tampered = theirs.blocks.clone();
+    let last = tampered.last_mut().unwrap();
+    last.header.nonce = last.header.nonce.wrapping_add(1);
+    while last.pow_is_valid(NetworkId::Devnet.pow_params()) {
+        last.header.nonce = last.header.nonce.wrapping_add(1);
+    }
+
+    let hashes: Vec<Hash256> = ours.blocks.iter().map(|b| b.hash()).collect();
+    let verdict = Chain::evaluate_reorg(
+        NetworkId::Devnet,
+        ours.total_work,
+        &hashes,
+        tampered,
+        NOW + 10_000,
+    );
+    assert!(
+        matches!(verdict, Err(ConsensusError::BadPow)),
+        "an invalid suffix must still fail, got {verdict:?}"
+    );
 }
 
 #[test]

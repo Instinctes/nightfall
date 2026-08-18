@@ -536,13 +536,17 @@ impl Chain {
         Self::rebuild_from_blocks_trusted_prefix(network, blocks, 0, now_unix)
     }
 
-    /// Replay `blocks`, skipping proof-of-work on the first `trusted_prefix`.
+    /// Replay `blocks`, treating the first `trusted_prefix` as our own file.
     ///
     /// Those leading blocks are ones this node already validated (same hash as
-    /// our own history). Re-hashing them on every one-block fork is what made
-    /// a 6 000-block laptop appear to stop syncing: Argon2id at 11 ms each is
-    /// a minute of work to throw away a single stale tip. Everything after
-    /// the shared prefix is checked in full, including proof of work.
+    /// our own history). Re-checking range proofs, signatures and a ledger
+    /// clone per height on every one-block fork is what made a 13 000-block
+    /// laptop sit on "1 block behind" for ten minutes: that is the untrusted
+    /// path, and the prefix is not untrusted. Linkage and UTXO replay only,
+    /// same as startup. Everything after the shared prefix is checked in full,
+    /// including proof of work. After the prefix we require the rebuilt
+    /// roots to match the last trusted header, so a drifted state cannot
+    /// launder a suffix.
     pub fn rebuild_from_blocks_trusted_prefix(
         network: NetworkId,
         blocks: Vec<Block>,
@@ -552,12 +556,32 @@ impl Chain {
         let mut chain = Self::new_fair(network)?;
         for (i, b) in blocks.into_iter().enumerate() {
             if i < trusted_prefix {
-                chain.apply_block_locally_trusted(b, now_unix)?;
-            } else {
-                chain.apply_block(b, now_unix)?;
+                chain.apply_block_from_own_disk(b)?;
+                continue;
             }
+            if i == trusted_prefix && trusted_prefix > 0 {
+                chain.check_tip_roots()?;
+            }
+            chain.apply_block(b, now_unix)?;
+        }
+        if trusted_prefix > 0 && trusted_prefix >= chain.block_count() as usize {
+            chain.check_tip_roots()?;
         }
         Ok(chain)
+    }
+
+    /// Last applied header must still describe the ledger we just rebuilt.
+    fn check_tip_roots(&self) -> Result<(), ConsensusError> {
+        let Some(tip) = self.blocks.last() else {
+            return Ok(());
+        };
+        if self.ledger.utxo_root() != tip.header.utxo_root {
+            return Err(ConsensusError::BadUtxoRoot);
+        }
+        if self.ledger.kernel_sum() != tip.header.kernel_sum {
+            return Err(ConsensusError::BadKernelSum);
+        }
+        Ok(())
     }
 
     /// Extend the tip with sequential blocks, stopping at the first that does
@@ -605,21 +629,17 @@ impl Chain {
     /// Decide a reorg without touching an existing chain.
     ///
     /// This is the expensive half of [`Self::maybe_reorg_to`] — it rebuilds the
-    /// candidate from genesis and re-verifies every block, proof of work
-    /// included — and it is deliberately a free function over borrowed facts
-    /// rather than a method. A caller holding a lock around its chain can copy
-    /// the work and the tip hashes, release the lock, run the rebuild, and
-    /// only then come back for [`Self::adopt_reorg`].
+    /// candidate and verifies only the untrusted suffix — and it is
+    /// deliberately a free function over borrowed facts rather than a method.
+    /// A caller holding a lock around its chain can copy the work and the tip
+    /// hashes, release the lock, run the rebuild, and only then come back for
+    /// [`Self::adopt_reorg`].
     ///
-    /// That separation is not a micro-optimisation. Measured on a live 1737
-    /// block chain, the rebuild takes 26.7 seconds at 15.4 ms per block, and it
-    /// grows linearly with the chain. Running it inside the node's state mutex
-    /// froze everything else for that entire time: no RPC answer, no interface
-    /// frame, no other peer, no block submission — and every peer thread whose
-    /// blocks failed to connect started its own copy of it. A node that mined
-    /// while slightly behind produced exactly that condition on every round,
-    /// which is what made the wallet appear to hang and the chain appear to
-    /// stop.
+    /// Shared history is identified by hash against `our_hashes` and replayed
+    /// as our own file. The suffix still pays full validation, proof of work
+    /// included. Running the untrusted path on the prefix froze a live node
+    /// for about ten minutes at 13 000 blocks: range proofs and a ledger clone
+    /// per height, to throw away a four-block fork.
     ///
     /// `our_hashes` is the identity of the chain being replaced, cheapest
     /// first: 32 bytes per block, no bodies. The caller copies it under the
@@ -665,6 +685,7 @@ impl Chain {
         // Shared history is ours. Only the suffix is untrusted work.
         let candidate =
             Self::rebuild_from_blocks_trusted_prefix(network, blocks, common, now_unix)?;
+        candidate.verify_supply()?;
         if candidate.total_work > our_work {
             return Ok(Some(candidate));
         }
