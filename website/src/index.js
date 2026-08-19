@@ -247,6 +247,7 @@ async function proxyNetwork() {
         const body = JSON.stringify({
             blocks: r.blocks,
             tip_height: r.tip_height,
+            tip: r.tip || "",
             difficulty: r.difficulty,
             circulating: r.circulating,
             minted: r.minted,

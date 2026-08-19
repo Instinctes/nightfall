@@ -30,3 +30,7 @@ egui = "0.29"
 arboard = "3"
 qrcode = { version = "0.14.1", default-features = false }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+ureq = { workspace = true }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+tray-icon = "0.19"

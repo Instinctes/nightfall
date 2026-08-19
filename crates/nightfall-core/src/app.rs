@@ -1,10 +1,13 @@
 //! Application shell: state, background sync, navigation.
 
+use crate::address_book::AddressBook;
 use crate::theme::*;
+use crate::tray::{Tray, TrayAction};
 use crate::views;
 use crate::wallet_state::WalletState;
 use crate::widgets::*;
-use eframe::egui::{self, Color32, RichText, Rounding, Stroke, Vec2};
+use eframe::egui::{self, Color32, RichText, Rounding, Stroke, Vec2, ViewportCommand};
+use nightfall_crypto::WalletKeys;
 use nightfall_node::{NodeConfig, NodeHandle, StatusSnap};
 use nightfall_storage::now_unix;
 use nightfall_types::{NetworkId, DARKS_PER_NIGHT};
@@ -108,7 +111,14 @@ pub struct App {
 
     // Settings
     pub reveal_seed: bool,
+    pub reveal_mnemonic: bool,
     pub reveal_view_key: bool,
+    pub backup_acked: bool,
+    pub resync_confirm: bool,
+    pub close_to_tray: bool,
+    pub mining_threads: usize,
+    pub want_quit: bool,
+    pub window_hidden: bool,
 
     // Activity filter
     pub activity_filter: String,
@@ -116,22 +126,63 @@ pub struct App {
     // Network
     pub peer_input: String,
     pub proxy_input: String,
+    pub chain_check: Option<ChainCheck>,
+    pub chain_check_busy: Arc<AtomicBool>,
+
+    // Address book
+    pub address_book: AddressBook,
+    pub book_name: String,
+    pub book_addr: String,
+
+    pub onboarding: Option<Onboarding>,
+    tray: Option<Tray>,
+    pending_chain_check: Option<Arc<Mutex<Option<ChainCheck>>>>,
+}
+
+/// First-run screens. Existing wallets skip this.
+pub enum Onboarding {
+    Choice,
+    Create {
+        phrase: String,
+        written: bool,
+    },
+    Restore {
+        phrase: String,
+        error: Option<String>,
+    },
+}
+
+#[derive(Clone)]
+pub struct ChainCheck {
+    pub our_tip: String,
+    pub our_height: u64,
+    pub public_tip: String,
+    pub public_height: u64,
+    pub genesis: String,
+    pub same: bool,
+    pub error: Option<String>,
 }
 
 impl App {
     pub fn new(network: NetworkId, datadir: PathBuf) -> Self {
-        let wallet = match WalletState::load_or_create(&datadir, network) {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::error!("wallet: {e}");
-                WalletState::empty()
+        let has_seed = WalletState::seed_exists(&datadir);
+        let wallet = if has_seed {
+            match WalletState::load_or_create(&datadir, network) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::error!("wallet: {e}");
+                    WalletState::empty()
+                }
             }
+        } else {
+            WalletState::empty()
         };
 
         let proxy_input = load_proxy(&datadir);
+        let mining_threads = load_mining_threads(&datadir);
         let mut app = Self {
             network,
-            datadir,
+            datadir: datadir.clone(),
             node: None,
             wallet: Arc::new(Mutex::new(wallet)),
             view: View::Dashboard,
@@ -150,12 +201,33 @@ impl App {
             send_confirm: false,
             send_busy: false,
             reveal_seed: false,
+            reveal_mnemonic: false,
             reveal_view_key: false,
+            backup_acked: load_backup_acked(&datadir),
+            resync_confirm: false,
+            close_to_tray: load_close_to_tray(&datadir),
+            mining_threads,
+            want_quit: false,
+            window_hidden: false,
             activity_filter: String::new(),
             peer_input: String::new(),
             proxy_input,
+            chain_check: None,
+            chain_check_busy: Arc::new(AtomicBool::new(false)),
+            address_book: AddressBook::load(&datadir),
+            book_name: String::new(),
+            book_addr: String::new(),
+            onboarding: if has_seed {
+                None
+            } else {
+                Some(Onboarding::Choice)
+            },
+            tray: None,
+            pending_chain_check: None,
         };
-        app.start_node();
+        if has_seed {
+            app.start_node();
+        }
         app
     }
 
@@ -195,6 +267,7 @@ impl App {
 
         match NodeHandle::start(cfg) {
             Ok(h) => {
+                h.set_mining_threads(self.mining_threads);
                 let handle = Arc::new(h);
                 self.node = Some(Arc::clone(&handle));
                 self.spawn_sync_worker(handle);
@@ -203,6 +276,135 @@ impl App {
                 self.status_error = Some(format!("{e}"));
                 tracing::error!("node failed to start: {e}");
             }
+        }
+    }
+
+    pub fn begin_create_wallet(&mut self) {
+        let keys = WalletKeys::generate();
+        self.onboarding = Some(Onboarding::Create {
+            phrase: keys.to_mnemonic(),
+            written: false,
+        });
+    }
+
+    pub fn finish_create_wallet(&mut self, phrase: &str) -> anyhow::Result<()> {
+        let w = WalletState::restore_from_phrase(&self.datadir, self.network, phrase)?;
+        if let Ok(mut slot) = self.wallet.lock() {
+            *slot = w;
+        }
+        self.ack_backup();
+        self.onboarding = None;
+        self.start_node();
+        Ok(())
+    }
+
+    pub fn finish_restore_wallet(&mut self, phrase: &str) -> anyhow::Result<()> {
+        let w = WalletState::restore_from_phrase(&self.datadir, self.network, phrase)?;
+        if let Ok(mut slot) = self.wallet.lock() {
+            *slot = w;
+        }
+        self.ack_backup();
+        self.onboarding = None;
+        self.start_node();
+        Ok(())
+    }
+
+    pub fn ack_backup(&mut self) {
+        self.backup_acked = true;
+        save_flag(&self.datadir, "backup_acked", true);
+    }
+
+    pub fn set_close_to_tray(&mut self, on: bool) {
+        self.close_to_tray = on;
+        save_flag(&self.datadir, "close_to_tray", on);
+    }
+
+    pub fn set_mining_threads(&mut self, n: usize) {
+        let n = n.clamp(1, 64);
+        self.mining_threads = n;
+        save_mining_threads(&self.datadir, n);
+        if let Some(node) = &self.node {
+            node.set_mining_threads(n);
+        }
+    }
+
+    pub fn resync_chain(&mut self, ctx: &egui::Context) {
+        let Some(node) = self.node.clone() else {
+            self.toasts.error(ctx, "Node is not running");
+            return;
+        };
+        match node.resync_chain() {
+            Ok(backup) => {
+                if let Ok(mut w) = self.wallet.lock() {
+                    let _ = w.rescan(&node);
+                }
+                self.resync_confirm = false;
+                self.toasts.success(
+                    ctx,
+                    format!(
+                        "Chain file set aside at {}. Downloading the live chain.",
+                        backup.display()
+                    ),
+                );
+            }
+            Err(e) => self.toasts.error(ctx, e.to_string()),
+        }
+    }
+
+    pub fn start_chain_check(&mut self) {
+        if self.chain_check_busy.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let our_tip = self
+            .status
+            .as_ref()
+            .map(|s| s.tip.clone())
+            .unwrap_or_default();
+        let our_height = self.tip_height();
+        let busy = Arc::clone(&self.chain_check_busy);
+        let slot: Arc<Mutex<Option<ChainCheck>>> = Arc::new(Mutex::new(None));
+        let out = Arc::clone(&slot);
+        std::thread::spawn(move || {
+            let result = fetch_public_tip();
+            let check = match result {
+                Ok((public_tip, public_height, genesis)) => {
+                    let same = !our_tip.is_empty() && our_tip.eq_ignore_ascii_case(&public_tip);
+                    ChainCheck {
+                        our_tip,
+                        our_height,
+                        public_tip,
+                        public_height,
+                        genesis,
+                        same,
+                        error: None,
+                    }
+                }
+                Err(e) => ChainCheck {
+                    our_tip,
+                    our_height,
+                    public_tip: String::new(),
+                    public_height: 0,
+                    genesis: String::new(),
+                    same: false,
+                    error: Some(e),
+                },
+            };
+            if let Ok(mut g) = out.lock() {
+                *g = Some(check);
+            }
+            busy.store(false, Ordering::SeqCst);
+        });
+        self.pending_chain_check = Some(slot);
+    }
+
+    fn take_chain_check(&mut self) {
+        let Some(slot) = &self.pending_chain_check else {
+            return;
+        };
+        let taken = slot.lock().ok().and_then(|mut g| g.take());
+        if let Some(check) = taken {
+            self.chain_check = Some(check);
+            self.pending_chain_check = None;
         }
     }
 
@@ -298,6 +500,7 @@ impl App {
             return;
         }
         self.last_status_poll = Some(Instant::now());
+        self.take_chain_check();
 
         if let Some(node) = &self.node {
             match node.status_snapshot() {
@@ -592,9 +795,24 @@ impl eframe::App for App {
         apply(ctx);
         self.poll_status();
         self.drain_sync_signal(ctx);
+        self.handle_tray(ctx);
 
-        // Keep the UI live for hashrate and sync animation.
+        // Keep the UI live for hashrate, tray clicks, and sync animation.
         ctx.request_repaint_after(Duration::from_millis(500));
+
+        if self.onboarding.is_some() {
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::none()
+                        .fill(BG)
+                        .inner_margin(egui::Margin::same(28.0)),
+                )
+                .show(ctx, |ui| {
+                    views::onboarding(self, ui, ctx);
+                });
+            self.toasts.show(ctx);
+            return;
+        }
 
         self.sidebar(ctx);
         self.topbar(ctx);
@@ -650,6 +868,39 @@ impl eframe::App for App {
     }
 }
 
+impl App {
+    fn handle_tray(&mut self, ctx: &egui::Context) {
+        if self.tray.is_none() {
+            self.tray = Tray::new();
+        }
+        if let Some(tray) = &self.tray {
+            match tray.poll() {
+                Some(TrayAction::Show) => {
+                    self.window_hidden = false;
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                }
+                Some(TrayAction::Quit) => {
+                    self.want_quit = true;
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
+                None => {}
+            }
+        }
+        if self.want_quit {
+            return;
+        }
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.close_to_tray
+            && self.tray.is_some()
+        {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            self.window_hidden = true;
+        }
+    }
+}
+
 fn proxy_file(datadir: &std::path::Path) -> PathBuf {
     datadir.join("socks_proxy")
 }
@@ -665,6 +916,74 @@ fn load_proxy(datadir: &std::path::Path) -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| nightfall_p2p::DEFAULT_TOR_PROXY.to_string())
+}
+
+fn save_flag(datadir: &std::path::Path, name: &str, on: bool) {
+    let path = datadir.join(name);
+    let _ = if on {
+        std::fs::write(path, "1")
+    } else {
+        std::fs::write(path, "0")
+    };
+}
+
+fn load_flag(datadir: &std::path::Path, name: &str, default: bool) -> bool {
+    std::fs::read_to_string(datadir.join(name))
+        .ok()
+        .map(|s| matches!(s.trim(), "1" | "true" | "yes"))
+        .unwrap_or(default)
+}
+
+fn load_backup_acked(datadir: &std::path::Path) -> bool {
+    load_flag(datadir, "backup_acked", false)
+}
+
+fn load_close_to_tray(datadir: &std::path::Path) -> bool {
+    load_flag(datadir, "close_to_tray", true)
+}
+
+fn load_mining_threads(datadir: &std::path::Path) -> usize {
+    if let Ok(s) = std::env::var("NF_MINING_THREADS") {
+        if let Ok(n) = s.parse::<usize>() {
+            if n > 0 {
+                return n.clamp(1, 64);
+            }
+        }
+    }
+    std::fs::read_to_string(datadir.join("mining_threads"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or_else(nightfall_crypto::default_threads)
+        .clamp(1, 64)
+}
+
+fn save_mining_threads(datadir: &std::path::Path, n: usize) {
+    let _ = std::fs::write(datadir.join("mining_threads"), n.to_string());
+}
+
+fn fetch_public_tip() -> Result<(String, u64, String), String> {
+    let body: serde_json::Value = ureq::get("https://nightfallcoin.org/network.json")
+        .timeout(Duration::from_secs(8))
+        .call()
+        .map_err(|e| e.to_string())?
+        .into_json()
+        .map_err(|e| e.to_string())?;
+    let tip = body
+        .get("tip")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let height = body.get("tip_height").and_then(|v| v.as_u64()).unwrap_or(0);
+    let genesis = body
+        .get("genesis")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if tip.is_empty() && genesis.is_empty() {
+        return Err("nightfallcoin.org returned no tip".into());
+    }
+    Ok((tip, height, genesis))
 }
 
 fn save_proxy(datadir: &std::path::Path, value: &str) {

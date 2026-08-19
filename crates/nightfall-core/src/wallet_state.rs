@@ -24,6 +24,10 @@ impl WalletState {
         }
     }
 
+    pub fn seed_exists(datadir: &Path) -> bool {
+        datadir.join("core.seed").exists()
+    }
+
     pub fn load_or_create(datadir: &Path, network: NetworkId) -> anyhow::Result<Self> {
         let wallet = Wallet::open(datadir, network, "core.seed")?;
         let seed_path = wallet.seed_path.clone();
@@ -31,6 +35,25 @@ impl WalletState {
             inner: Some(wallet),
             seed_path,
         })
+    }
+
+    pub fn restore_from_phrase(
+        datadir: &Path,
+        network: NetworkId,
+        phrase: &str,
+    ) -> anyhow::Result<Self> {
+        let wallet = Wallet::restore_from_phrase(datadir, network, "core.seed", phrase, 0)?;
+        let seed_path = wallet.seed_path.clone();
+        Ok(Self {
+            inner: Some(wallet),
+            seed_path,
+        })
+    }
+
+    pub fn recovery_phrase(&self) -> String {
+        self.wallet()
+            .map(|w| w.recovery_phrase())
+            .unwrap_or_default()
     }
 
     fn wallet(&self) -> Option<&Wallet> {

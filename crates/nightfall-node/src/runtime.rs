@@ -19,7 +19,7 @@ use std::fs;
 use std::io::BufReader;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -178,6 +178,16 @@ pub struct NodeInner {
     /// Mining on that tip deepens a fork; this does not expire with the
     /// catch-up window.
     pub stalled_on_fork: AtomicBool,
+    /// How many of our blocks the last reorg probe would rewind. 0 if unknown.
+    /// Past [`nightfall_consensus::MAX_REORG_DEPTH`] the node cannot adopt
+    /// the heavier chain; the UI must say so instead of "1 block behind".
+    pub fork_rewind: AtomicU64,
+    /// Worker count for the miner. Read each template so a GUI slider lands
+    /// without restarting the process. Capped at 64 (32 MiB each).
+    pub mining_threads: Arc<AtomicUsize>,
+    pub hashrate_prev_total: AtomicU64,
+    /// Hashes in the last one-second heartbeat. Integer H/s for RPC.
+    pub hashrate_hps: AtomicU64,
 }
 
 /// Upper bound on buffered branch blocks. A fork deeper than this is past
@@ -238,6 +248,7 @@ impl NodeInner {
     fn bump_tip(&mut self) {
         self.tip_epoch.fetch_add(1, Ordering::SeqCst);
         self.stalled_on_fork.store(false, Ordering::SeqCst);
+        self.fork_rewind.store(0, Ordering::SeqCst);
         // Our chain moved, so whatever gap remains is being closed. Anything
         // that stops moving while a peer claims more is a fork, and the mining
         // hold-off gives up on it — see MAX_CATCHUP_WAIT_SECS.
@@ -487,6 +498,48 @@ pub struct StatusSnap {
     pub tip_time: u64,
     /// Handshake agent strings, counted. Empty until a peer completes Hello.
     pub peer_versions: BTreeMap<String, usize>,
+    pub stalled_on_fork: bool,
+    pub reorg_in_flight: bool,
+    pub best_peer_height: u64,
+    pub fork_rewind: u64,
+    /// Hashes per second over the last heartbeat. 0 when not mining.
+    pub hashrate: u64,
+    pub mining_threads: usize,
+    pub sync_hold: SyncHold,
+}
+
+/// Why mining is held, for the UI. Distinct from the mining-hold number
+/// `blocks_behind`, which is forced to 1 on a fork and used to look like lag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncHold {
+    Synced,
+    CatchingUp(u64),
+    CompetingTip { reorging: bool },
+    DeadBranch { gap: u64 },
+}
+
+/// Pure so the GUI labels can be tested without a node.
+pub fn classify_sync_hold(
+    stalled_on_fork: bool,
+    reorg_in_flight: bool,
+    fork_rewind: u64,
+    our_height: u64,
+    best_peer_height: u64,
+    catchup: Option<u64>,
+) -> SyncHold {
+    if stalled_on_fork || reorg_in_flight {
+        let gap = best_peer_height.saturating_sub(our_height).max(fork_rewind);
+        if gap > nightfall_consensus::MAX_REORG_DEPTH as u64 {
+            return SyncHold::DeadBranch { gap };
+        }
+        return SyncHold::CompetingTip {
+            reorging: reorg_in_flight,
+        };
+    }
+    match catchup {
+        Some(n) if n > 0 => SyncHold::CatchingUp(n),
+        _ => SyncHold::Synced,
+    }
 }
 
 pub struct NodeHandle {
@@ -527,6 +580,7 @@ impl NodeHandle {
         let blocks_found = Arc::new(AtomicU64::new(0));
         let sessions = Arc::new(SessionPool::new());
         let tip_notify = Arc::new((Mutex::new(0u64), Condvar::new()));
+        let mining_threads = Arc::new(AtomicUsize::new(initial_mining_threads()));
 
         let inner = NodeInner {
             chain,
@@ -584,6 +638,10 @@ impl NodeHandle {
             last_wall_tick: AtomicU64::new(now_unix()),
             confirmed_peers: HashSet::new(),
             stalled_on_fork: AtomicBool::new(false),
+            fork_rewind: AtomicU64::new(0),
+            mining_threads: Arc::clone(&mining_threads),
+            hashrate_prev_total: AtomicU64::new(0),
+            hashrate_hps: AtomicU64::new(0),
             sessions: Arc::clone(&sessions),
             tip_notify: Arc::clone(&tip_notify),
             proxy: parse_proxy_cfg(cfg.proxy.as_deref())?,
@@ -637,6 +695,10 @@ impl NodeHandle {
                     } else {
                         g.last_wall_tick.store(now, Ordering::Relaxed);
                     }
+                    let total = g.hashes_total.load(Ordering::Relaxed);
+                    let prev = g.hashrate_prev_total.swap(total, Ordering::Relaxed);
+                    g.hashrate_hps
+                        .store(total.saturating_sub(prev), Ordering::Relaxed);
                 }
             });
         }
@@ -708,6 +770,77 @@ impl NodeHandle {
 
     pub fn is_mining(&self) -> bool {
         self.mining_enabled.load(Ordering::SeqCst)
+    }
+
+    pub fn set_mining_threads(&self, n: usize) {
+        let n = n.clamp(1, MAX_MINING_THREADS);
+        if let Ok(g) = self.state.lock() {
+            g.mining_threads.store(n, Ordering::SeqCst);
+            tracing::info!("mining threads set to {n}");
+        }
+    }
+
+    pub fn mining_threads(&self) -> usize {
+        self.state
+            .lock()
+            .ok()
+            .map(|g| g.mining_threads.load(Ordering::Relaxed).max(1))
+            .unwrap_or(1)
+    }
+
+    /// Drop the local chain file and start IBD again. Wallet keys stay.
+    ///
+    /// Used when a fork is deeper than [`nightfall_consensus::MAX_REORG_DEPTH`]:
+    /// the node cannot adopt the heavier branch, so the only way onto the
+    /// live tip is to throw away `blocks.jsonl` and download it. Coinbase on
+    /// the abandoned branch is gone either way.
+    pub fn resync_chain(&self) -> anyhow::Result<PathBuf> {
+        self.mining_enabled.store(false, Ordering::SeqCst);
+        let (sessions, backup) = {
+            let mut g = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("node state lock poisoned"))?;
+            if g.loading {
+                anyhow::bail!("chain is still loading from disk");
+            }
+            let stamp = now_unix();
+            let dir = g.store.dir.clone();
+            let blocks = g.store.blocks_path();
+            let meta = g.store.meta_path();
+            let backup = dir.join(format!("chain-backup-{stamp}"));
+            fs::create_dir_all(&backup)?;
+            if blocks.exists() {
+                fs::rename(&blocks, backup.join("blocks.jsonl"))?;
+            }
+            if meta.exists() {
+                fs::rename(&meta, backup.join("chain-meta.json"))?;
+            }
+            g.chain = Chain::new_fair(g.network)?;
+            g.store.save(&g.chain)?;
+            g.branch.clear();
+            g.ibd_buffer.clear();
+            g.ibd_from = 0;
+            g.stalled_on_fork.store(false, Ordering::SeqCst);
+            g.fork_rewind.store(0, Ordering::SeqCst);
+            g.best_peer_height = 0;
+            g.best_peer_seen = 0;
+            g.behind_since = now_unix();
+            g.mempool = Mempool::default();
+            g.bump_tip();
+            (g.sessions.all(), backup)
+        };
+        for sess in sessions {
+            let _ = sess.send(&nightfall_p2p::PeerMsg::GetBlocks {
+                from_height: 0,
+                limit: nightfall_p2p::MAX_BLOCKS_PER_REQUEST,
+            });
+        }
+        tracing::info!(
+            "chain file moved aside — IBD from genesis, backup {}",
+            backup.display()
+        );
+        Ok(backup)
     }
 
     pub fn shared(&self) -> SharedState {
@@ -796,12 +929,18 @@ impl NodeHandle {
         for agent in g.peer_agents.values() {
             *peer_versions.entry(agent.clone()).or_insert(0) += 1;
         }
+        let stalled = g.stalled_on_fork.load(Ordering::SeqCst);
+        let reorging = g.reorg_in_flight.load(Ordering::SeqCst);
+        let fork_rewind = g.fork_rewind.load(Ordering::Relaxed);
+        let best_peer_height = g.best_peer_height;
+        let catchup = if loading { None } else { catchup_behind(&g) };
+        let mining_on = g.mining_enabled.load(Ordering::SeqCst);
         Ok(StatusSnap {
             blocks,
             tip,
             peers: g.peer_addrs.len(),
             mempool: g.mempool.len(),
-            mining: g.mining_enabled.load(Ordering::SeqCst),
+            mining: mining_on,
             minted: g.chain.ledger.supply.total_minted_darks,
             burned_fees: g.chain.ledger.supply.total_burned_darks,
             difficulty: g.chain.next_difficulty(),
@@ -815,11 +954,7 @@ impl NodeHandle {
             coinbase_maturity: g.chain.ledger.coinbase_maturity,
             kernels: g.chain.ledger.kernels.count,
             started_at: g.started_at,
-            blocks_behind: if loading {
-                0
-            } else {
-                catchup_behind(&g).unwrap_or(0)
-            },
+            blocks_behind: catchup.unwrap_or(0),
             live_peers: g.sessions.len(),
             tor_proxy: g.proxy.is_some() && g.last_tor_ok.load(Ordering::Relaxed),
             dandelion: true,
@@ -827,6 +962,28 @@ impl NodeHandle {
             loading,
             tip_time,
             peer_versions,
+            stalled_on_fork: stalled,
+            reorg_in_flight: reorging,
+            best_peer_height,
+            fork_rewind,
+            hashrate: if mining_on {
+                g.hashrate_hps.load(Ordering::Relaxed)
+            } else {
+                0
+            },
+            mining_threads: g.mining_threads.load(Ordering::Relaxed),
+            sync_hold: if loading {
+                SyncHold::Synced
+            } else {
+                classify_sync_hold(
+                    stalled,
+                    reorging,
+                    fork_rewind,
+                    tip_height,
+                    best_peer_height,
+                    catchup,
+                )
+            },
         })
     }
 
@@ -2278,10 +2435,18 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
             )
         };
 
+        if rewind > 0 {
+            if let Ok(g) = state.lock() {
+                g.fork_rewind.store(rewind as u64, Ordering::SeqCst);
+            }
+        }
         if rewind > nightfall_consensus::MAX_REORG_DEPTH {
             tracing::warn!(
                 "peer {addr} diverges {rewind} blocks back — past MAX_REORG_DEPTH, not adopting"
             );
+            if let Ok(g) = state.lock() {
+                g.stalled_on_fork.store(true, Ordering::SeqCst);
+            }
             break;
         }
 
@@ -2495,11 +2660,22 @@ pub fn blocks_behind(state: &SharedState) -> Option<u64> {
     catchup_behind(&g)
 }
 
-fn mining_loop(state: SharedState) {
-    let threads = std::env::var("NF_MINING_THREADS")
+const MAX_MINING_THREADS: usize = 64;
+
+fn initial_mining_threads() -> usize {
+    std::env::var("NF_MINING_THREADS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0)
+        .unwrap_or_else(default_threads)
+        .clamp(1, MAX_MINING_THREADS)
+}
+
+fn mining_loop(state: SharedState) {
+    let threads = state
+        .lock()
+        .ok()
+        .map(|g| g.mining_threads.load(Ordering::Relaxed).max(1))
         .unwrap_or_else(default_threads);
 
     {
@@ -2601,6 +2777,12 @@ fn mining_loop(state: SharedState) {
             tip_epoch.load(Ordering::SeqCst) != epoch_now || !mining_flag.load(Ordering::SeqCst)
         };
 
+        let threads = state
+            .lock()
+            .ok()
+            .map(|g| g.mining_threads.load(Ordering::Relaxed).max(1))
+            .unwrap_or(1)
+            .clamp(1, MAX_MINING_THREADS);
         let start_nonce: u64 = rand::random();
         let Some((nonce, _hash)) = mine_parallel(
             &preimage,
@@ -2681,5 +2863,42 @@ mod ibd_claim_tests {
         let advanced = next_ibd_claim(200, &mut ibd_from);
         assert_eq!(advanced, 200);
         assert_eq!(ibd_from, 200 + IBD_PAGE);
+    }
+}
+
+#[cfg(test)]
+mod sync_hold_tests {
+    use super::{classify_sync_hold, SyncHold};
+
+    #[test]
+    fn lag_is_a_distance() {
+        assert_eq!(
+            classify_sync_hold(false, false, 0, 100, 847, Some(747)),
+            SyncHold::CatchingUp(747)
+        );
+        assert_eq!(
+            classify_sync_hold(false, false, 0, 100, 100, None),
+            SyncHold::Synced
+        );
+    }
+
+    #[test]
+    fn a_fork_is_not_one_block_behind() {
+        assert_eq!(
+            classify_sync_hold(true, false, 0, 17975, 17975, Some(1)),
+            SyncHold::CompetingTip { reorging: false }
+        );
+        assert_eq!(
+            classify_sync_hold(true, true, 4, 13000, 13004, Some(1)),
+            SyncHold::CompetingTip { reorging: true }
+        );
+    }
+
+    #[test]
+    fn a_deep_fork_is_a_dead_branch() {
+        let hold = classify_sync_hold(true, false, 0, 12_000, 17_976, Some(1));
+        assert_eq!(hold, SyncHold::DeadBranch { gap: 5_976 });
+        let hold = classify_sync_hold(true, false, 800, 17_000, 17_100, Some(1));
+        assert_eq!(hold, SyncHold::DeadBranch { gap: 800 });
     }
 }

@@ -6,8 +6,10 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod address_book;
 mod app;
 mod theme;
+mod tray;
 mod views;
 mod wallet_state;
 mod widgets;

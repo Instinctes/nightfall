@@ -1,10 +1,11 @@
 //! The seven views.
 
-use crate::app::{parse_amount, App, View, DEFAULT_FEE_DARKS};
+use crate::app::{parse_amount, App, Onboarding, View, DEFAULT_FEE_DARKS};
 use crate::theme::*;
 use crate::widgets::*;
 use eframe::egui::{self, Color32, RichText, Rounding, Stroke, Vec2};
 use nightfall_crypto::Address;
+use nightfall_node::SyncHold;
 use nightfall_storage::now_unix;
 use nightfall_types::{Amount, DARKS_PER_NIGHT, MAX_SUPPLY_NIGHT, TARGET_BLOCK_TIME_SECS};
 use nightfall_wallet::Direction;
@@ -51,8 +52,12 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
         })
         .unwrap_or((0, 0, 0, 0, false, 0, 0));
 
-    let behind = app.status.as_ref().map(|s| s.blocks_behind).unwrap_or(0);
     let loading = app.status.as_ref().map(|s| s.loading).unwrap_or(false);
+    let sync_hold = app
+        .status
+        .as_ref()
+        .map(|s| s.sync_hold)
+        .unwrap_or(SyncHold::Synced);
 
     if loading {
         egui::Frame::none()
@@ -88,42 +93,98 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(14.0);
     }
 
-    // Mining is held back while the chain is behind, because a block built on a
-    // tip the network has already left cannot win — it only deepens a fork.
-    // Say that plainly, or the wallet looks broken: the button says "Stop
-    // mining" and the hashrate reads zero.
-    if app.is_mining() && behind > 0 {
+    // Mining is held back while the chain is behind or on a fork. The old
+    // label always said "1 block behind" on a fork, which is why a node
+    // stranded for days looked one block late.
+    let hold_banner = match sync_hold {
+        SyncHold::CatchingUp(n) if n > 0 => Some((
+            ACCENT,
+            format!(
+                "Catching up — {} block{} behind",
+                format_int(n),
+                if n == 1 { "" } else { "s" }
+            ),
+            "Mining starts by itself once this reaches zero. A block built on an outdated tip cannot be accepted by anyone — it would only split the chain.".to_string(),
+            false,
+        )),
+        SyncHold::CompetingTip { reorging } => Some((
+            WARN,
+            if reorging {
+                "On a competing tip — reorg in progress".to_string()
+            } else {
+                "On a competing tip — waiting to reorg".to_string()
+            },
+            "BLOCKS is frozen because the next network block does not connect here. The \"1 behind\" figure was a hold, not a distance.".to_string(),
+            false,
+        )),
+        SyncHold::DeadBranch { gap } => Some((
+            DANGER,
+            "Stuck on a dead branch".to_string(),
+            format!(
+                "This tip diverged {} blocks back — past the 500-block reorg limit. Resync the chain file in Settings. The seed and wallet stay. Coinbase mined on this branch is gone.",
+                format_int(gap)
+            ),
+            true,
+        )),
+        _ => None,
+    };
+    if let Some((color, title, body, offer_resync)) = hold_banner {
         egui::Frame::none()
-            .fill(ACCENT.gamma_multiply(0.12))
-            .stroke(Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.55)))
+            .fill(color.gamma_multiply(0.12))
+            .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.55)))
             .rounding(Rounding::same(ROUND))
             .inner_margin(egui::Margin::same(16.0))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width() - 32.0);
                 ui.horizontal(|ui| {
-                    dot(ui, ACCENT, true);
+                    dot(ui, color, true);
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(title).size(14.0).color(color).strong());
+                });
+                ui.add_space(6.0);
+                ui.label(RichText::new(body).size(12.5).color(TEXT_DIM));
+                if offer_resync {
+                    ui.add_space(10.0);
+                    if ghost_button(ui, "  Open Settings to resync  ").clicked() {
+                        app.view = View::Settings;
+                        app.resync_confirm = true;
+                    }
+                }
+            });
+        ui.add_space(14.0);
+    }
+
+    if !app.backup_acked {
+        egui::Frame::none()
+            .fill(WARN.gamma_multiply(0.12))
+            .stroke(Stroke::new(1.0_f32, WARN.gamma_multiply(0.55)))
+            .rounding(Rounding::same(ROUND))
+            .inner_margin(egui::Margin::same(16.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width() - 32.0);
+                ui.horizontal(|ui| {
+                    dot(ui, WARN, false);
                     ui.add_space(6.0);
                     ui.label(
-                        RichText::new(format!(
-                            "Catching up — {} block{} behind",
-                            format_int(behind),
-                            if behind == 1 { "" } else { "s" }
-                        ))
-                        .size(14.0)
-                        .color(ACCENT)
-                        .strong(),
+                        RichText::new("Write down the 24 words")
+                            .size(14.0)
+                            .color(WARN)
+                            .strong(),
                     );
                 });
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new(
-                        "Mining starts by itself once this reaches zero. A block built on \
-                         an outdated tip cannot be accepted by anyone — it would only \
-                         split the chain.",
+                        "The hex seed is no longer the backup. Settings → Backup shows the same 24 words the phone and browser wallets use. Anyone who sees them can spend.",
                     )
                     .size(12.5)
                     .color(TEXT_DIM),
                 );
+                ui.add_space(10.0);
+                if ghost_button(ui, "  Open Backup  ").clicked() {
+                    app.view = View::Settings;
+                    app.reveal_mnemonic = true;
+                }
             });
         ui.add_space(14.0);
     }
@@ -654,6 +715,25 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             }
         }
 
+        if !app.address_book.entries.is_empty() {
+            ui.add_space(10.0);
+            ui.label(RichText::new("Address book").size(11.0).color(TEXT_DIM));
+            ui.add_space(4.0);
+            let picks: Vec<(String, String)> = app
+                .address_book
+                .entries
+                .iter()
+                .map(|e| (e.name.clone(), e.address.clone()))
+                .collect();
+            ui.horizontal_wrapped(|ui| {
+                for (name, addr) in picks {
+                    if ghost_button(ui, &format!("  {name}  ")).clicked() {
+                        app.send_to = addr;
+                    }
+                }
+            });
+        }
+
         ui.add_space(18.0);
 
         // Amount
@@ -1080,6 +1160,34 @@ pub fn mining(app: &mut App, ui: &mut egui::Ui) {
             ui.add_space(16.0);
             sparkline(ui, &app.hashrate.history, 54.0);
         }
+
+        ui.add_space(16.0);
+        let max_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8)
+            .clamp(1, 64) as i32;
+        ui.label(RichText::new("CPU threads").size(12.0).color(TEXT_DIM));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let mut n = app.mining_threads as i32;
+            let resp = ui.add(egui::Slider::new(&mut n, 1..=max_threads).integer());
+            if resp.changed() {
+                app.set_mining_threads(n as usize);
+            }
+            ui.label(
+                RichText::new(format!("{} × 32 MiB RAM", app.mining_threads))
+                    .size(11.0)
+                    .color(TEXT_FAINT),
+            );
+        });
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "Each thread holds its own Argon2 workspace. Leave one core for the wallet. Change lands on the next template — no restart.",
+            )
+            .size(11.0)
+            .color(TEXT_FAINT),
+        );
     });
 
     ui.add_space(14.0);
@@ -1520,6 +1628,65 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             "Tip",
             RichText::new(short_hex(&s.map(|s| s.tip.clone()).unwrap_or_default())).monospace(),
         );
+        let tip_full = s.map(|st| st.tip.clone()).unwrap_or_default();
+        if !tip_full.is_empty() && copyable(ui, &tip_full, true) {
+            app.toasts.success(ctx, "Tip hash copied");
+        }
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            let busy = app
+                .chain_check_busy
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if ghost_button(
+                ui,
+                if busy {
+                    "  Checking…  "
+                } else {
+                    "  Same chain as the seed?  "
+                },
+            )
+            .clicked()
+                && !busy
+            {
+                app.start_chain_check();
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "Asks nightfallcoin.org/network.json. The site sees that you checked — not a private probe.",
+            )
+            .size(10.5)
+            .color(TEXT_FAINT),
+        );
+        if let Some(check) = &app.chain_check {
+            ui.add_space(8.0);
+            if let Some(err) = &check.error {
+                ui.label(RichText::new(err).size(12.0).color(DANGER));
+            } else if check.same {
+                ui.label(
+                    RichText::new(format!(
+                        "Same tip as the public seed (height {}). Genesis {}.",
+                        format_int(check.public_height),
+                        short_hex(&check.genesis)
+                    ))
+                    .size(12.0)
+                    .color(SUCCESS),
+                );
+            } else {
+                ui.label(
+                    RichText::new(format!(
+                        "Different tip. Yours {} @ {}. Seed {} @ {}.",
+                        short_hex(&check.our_tip),
+                        format_int(check.our_height),
+                        short_hex(&check.public_tip),
+                        format_int(check.public_height)
+                    ))
+                    .size(12.0)
+                    .color(WARN),
+                );
+            }
+        }
         kv(
             ui,
             "Total work",
@@ -1580,8 +1747,9 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.set_width(ui.available_width());
         ui.label(
             RichText::new(
-                "Your seed is the only thing that can recover this wallet. Anyone who reads it \
-                 owns your coins. Write it down offline — never in a screenshot, chat or cloud note.",
+                "The 24 words are the wallet — the same phrase the phone and browser use. \
+                 Anyone who reads them owns the coins. Write them on paper. Never a screenshot, \
+                 chat or cloud note. These words are not a Bitcoin seed.",
             )
             .size(12.0)
             .color(TEXT_DIM),
@@ -1605,16 +1773,46 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         );
 
         ui.add_space(12.0);
+        if app.reveal_mnemonic {
+            let phrase = app
+                .wallet
+                .lock()
+                .map(|w| w.recovery_phrase())
+                .unwrap_or_default();
+            if copyable(ui, &phrase, true) {
+                app.toasts.info(ctx, "Phrase copied — handle with care");
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ghost_button(ui, "Hide words").clicked() {
+                    app.reveal_mnemonic = false;
+                }
+                if !app.backup_acked && ghost_button(ui, "I wrote these words down").clicked() {
+                    app.ack_backup();
+                    app.toasts.success(ctx, "Backup acknowledged");
+                }
+            });
+        } else if ghost_button(ui, "Reveal 24 words").clicked() {
+            app.reveal_mnemonic = true;
+        }
+
+        ui.add_space(10.0);
         if app.reveal_seed {
             let seed = app.wallet.lock().map(|w| w.seed_hex()).unwrap_or_default();
+            ui.label(
+                RichText::new("Hex seed (same 32 bytes as the words)")
+                    .size(11.0)
+                    .color(TEXT_FAINT),
+            );
+            ui.add_space(4.0);
             if copyable(ui, &seed, true) {
-                app.toasts.info(ctx, "Seed copied — handle with care");
+                app.toasts.info(ctx, "Hex seed copied — handle with care");
             }
             ui.add_space(6.0);
-            if ghost_button(ui, "Hide seed").clicked() {
+            if ghost_button(ui, "Hide hex").clicked() {
                 app.reveal_seed = false;
             }
-        } else if ghost_button(ui, "Reveal recovery seed").clicked() {
+        } else if ghost_button(ui, "Show hex seed").clicked() {
             app.reveal_seed = true;
         }
     });
@@ -1704,6 +1902,117 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 .size(10.5)
                 .color(TEXT_FAINT),
         );
+
+        ui.add_space(16.0);
+        ui.label(
+            RichText::new(
+                "Resync the chain file if BLOCKS is frozen on a dead branch. \
+                 Wallet keys stay. Coinbase mined on the abandoned tip does not come back.",
+            )
+            .size(12.0)
+            .color(TEXT_DIM),
+        );
+        ui.add_space(8.0);
+        if app.resync_confirm {
+            ui.label(
+                RichText::new(
+                    "This moves blocks.jsonl aside and downloads the live chain. Minutes to hours.",
+                )
+                .size(11.5)
+                .color(WARN),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if primary_button(ui, "  Resync now  ", true).clicked() {
+                    app.resync_chain(ctx);
+                }
+                if ghost_button(ui, "Cancel").clicked() {
+                    app.resync_confirm = false;
+                }
+            });
+        } else if ghost_button(ui, "Resync chain, keep wallet").clicked() {
+            app.resync_confirm = true;
+        }
+    });
+
+    ui.add_space(14.0);
+
+    titled_card(ui, "Address book", |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(
+            RichText::new("Local labels for nf1 addresses you send to. Never published.")
+                .size(12.0)
+                .color(TEXT_DIM),
+        );
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut app.book_name)
+                    .desired_width(140.0)
+                    .hint_text("Name"),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut app.book_addr)
+                    .desired_width(280.0)
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text("nf1…"),
+            );
+            if ghost_button(ui, "Add").clicked() {
+                match app
+                    .address_book
+                    .add(app.book_name.clone(), app.book_addr.clone())
+                {
+                    Ok(()) => {
+                        let _ = app.address_book.save(&app.datadir);
+                        app.book_name.clear();
+                        app.book_addr.clear();
+                        app.toasts.success(ctx, "Contact saved");
+                    }
+                    Err(e) => app.toasts.error(ctx, e),
+                }
+            }
+        });
+        ui.add_space(8.0);
+        let entries = app.address_book.entries.clone();
+        for e in entries {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&e.name).size(12.5));
+                ui.label(
+                    RichText::new(short_hex(&e.address))
+                        .monospace()
+                        .size(11.0)
+                        .color(TEXT_FAINT),
+                );
+                if ghost_button(ui, "Remove").clicked() {
+                    app.address_book.remove(&e.address);
+                    let _ = app.address_book.save(&app.datadir);
+                }
+            });
+        }
+    });
+
+    ui.add_space(14.0);
+
+    titled_card(ui, "Window", |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            let mut tray = app.close_to_tray;
+            if ui
+                .checkbox(&mut tray, "Close to tray — mining keeps running")
+                .changed()
+            {
+                app.set_close_to_tray(tray);
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "On Windows the process looks gone if the window closes. Tray Show / Quit. \
+                 macOS keeps the dock icon either way.",
+            )
+            .size(11.0)
+            .color(TEXT_FAINT),
+        );
     });
 
     ui.add_space(14.0);
@@ -1734,7 +2043,12 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         kv(
             ui,
             "Graph privacy",
-            RichText::new("not yet — kernel aggregation pending").color(WARN),
+            RichText::new("obscured by aggregation, not erased").color(WARN),
+        );
+        kv(
+            ui,
+            "Proof of work",
+            RichText::new("Nighthash-v2 · Argon2id 32 MiB").color(SUCCESS),
         );
 
         ui.add_space(12.0);
@@ -1744,7 +2058,7 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             .inner_margin(egui::Margin::same(12.0))
             .show(ui, |ui| {
                 ui.label(
-                    RichText::new("Pre-launch software, not independently audited.")
+                    RichText::new("Not independently audited.")
                         .size(12.0)
                         .color(WARN)
                         .strong(),
@@ -1752,8 +2066,8 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 ui.add_space(3.0);
                 ui.label(
                     RichText::new(
-                        "The transaction graph is still linkable and proof of work is not yet \
-                         memory-hard. Do not treat NIGHT as money you can afford to lose.",
+                        "Amounts and addresses are hidden. The transaction graph is still \
+                         linkable. Do not treat NIGHT as money you can afford to lose.",
                     )
                     .size(11.0)
                     .color(TEXT_DIM),
@@ -1763,4 +2077,125 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 
     ui.add_space(20.0);
     let _ = Amount::ZERO;
+}
+
+// ----------------------------------------------------------- onboarding ---
+
+pub fn onboarding(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
+    ui.set_max_width(560.0);
+    ui.vertical_centered(|ui| {
+        logo(ui, 56.0);
+        ui.add_space(12.0);
+        ui.label(RichText::new("NIGHTFALL").size(22.0).color(TEXT).strong());
+        ui.label(RichText::new("Core wallet").size(13.0).color(ACCENT_HI));
+    });
+    ui.add_space(22.0);
+
+    match &app.onboarding {
+        Some(Onboarding::Choice) => {
+            titled_card(ui, "This computer has no wallet yet", |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new(
+                        "Create a new wallet, or restore the same 24 words you wrote down \
+                         on a phone or in the browser. The words are BIP-39; Nightfall \
+                         derives keys differently, so they do not open a Bitcoin wallet.",
+                    )
+                    .size(13.0)
+                    .color(TEXT_DIM),
+                );
+                ui.add_space(16.0);
+                if primary_button(ui, "  Create a new wallet  ", true).clicked() {
+                    app.begin_create_wallet();
+                }
+                ui.add_space(8.0);
+                if ghost_button(ui, "  I already have 24 words  ").clicked() {
+                    app.onboarding = Some(Onboarding::Restore {
+                        phrase: String::new(),
+                        error: None,
+                    });
+                }
+            });
+        }
+        Some(Onboarding::Create { phrase, written }) => {
+            let phrase = phrase.clone();
+            let written = *written;
+            titled_card(ui, "Write these 24 words down", |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new(
+                        "This is the only backup. Anyone who sees them can spend. \
+                         Paper, offline. Not a screenshot.",
+                    )
+                    .size(13.0)
+                    .color(TEXT_DIM),
+                );
+                ui.add_space(12.0);
+                if copyable(ui, &phrase, true) {
+                    app.toasts.info(ctx, "Copied — still write them on paper");
+                }
+                ui.add_space(12.0);
+                let mut ack = written;
+                if ui
+                    .checkbox(&mut ack, "I wrote these 24 words down")
+                    .changed()
+                {
+                    if let Some(Onboarding::Create { written, .. }) = &mut app.onboarding {
+                        *written = ack;
+                    }
+                }
+                ui.add_space(12.0);
+                if primary_button(ui, "  Open the wallet  ", written).clicked() && written {
+                    if let Err(e) = app.finish_create_wallet(&phrase) {
+                        app.toasts.error(ctx, e.to_string());
+                    }
+                }
+            });
+        }
+        Some(Onboarding::Restore { phrase: _, error }) => {
+            let err = error.clone();
+            titled_card(ui, "Restore from 24 words", |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new(
+                        "Paste the phrase. Whitespace and case do not matter. \
+                         A bad checksum is caught before anything is written.",
+                    )
+                    .size(13.0)
+                    .color(TEXT_DIM),
+                );
+                ui.add_space(10.0);
+                if let Some(Onboarding::Restore { phrase, .. }) = &mut app.onboarding {
+                    ui.add(
+                        egui::TextEdit::multiline(phrase)
+                            .desired_rows(4)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("word1 word2 … word24"),
+                    );
+                }
+                if let Some(e) = err {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(e).size(12.0).color(DANGER));
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if primary_button(ui, "  Restore  ", true).clicked() {
+                        let phrase = match &app.onboarding {
+                            Some(Onboarding::Restore { phrase, .. }) => phrase.clone(),
+                            _ => String::new(),
+                        };
+                        if let Err(e) = app.finish_restore_wallet(&phrase) {
+                            if let Some(Onboarding::Restore { error, .. }) = &mut app.onboarding {
+                                *error = Some(e.to_string());
+                            }
+                        }
+                    }
+                    if ghost_button(ui, "Back").clicked() {
+                        app.onboarding = Some(Onboarding::Choice);
+                    }
+                });
+            });
+        }
+        None => {}
+    }
 }

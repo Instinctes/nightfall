@@ -59,6 +59,7 @@
     <table>
       <tbody>
         <tr><th>Blocks</th><td id="n-blocks">—</td></tr>
+        <tr><th>Tip</th><td><code id="n-tip">—</code></td></tr>
         <tr><th>Minted</th><td id="n-minted">—</td></tr>
         <tr><th>Burned fees</th><td id="n-burned">—</td></tr>
         <tr><th>Supply invariant</th><td id="n-ok">—</td></tr>
@@ -98,6 +99,7 @@ function paint(d) {
   document.getElementById("n-supply-sub").textContent =
     "of " + fmt(d.max_supply) + " max";
   document.getElementById("n-blocks").textContent = fmt(d.blocks);
+  document.getElementById("n-tip").textContent = d.tip || "—";
   document.getElementById("n-minted").textContent = night(d.minted) + " NIGHT";
   document.getElementById("n-burned").textContent = night(d.burned_fees) + " NIGHT";
   document.getElementById("n-ok").textContent = d.supply_invariant_ok ? "ok" : "not yet";

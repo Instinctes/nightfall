@@ -5,4 +5,6 @@ pub mod rpc;
 pub mod runtime;
 pub mod session;
 
-pub use runtime::{NodeConfig, NodeHandle, NodeInner, SharedState, StatusSnap};
+pub use runtime::{
+    classify_sync_hold, NodeConfig, NodeHandle, NodeInner, SharedState, StatusSnap, SyncHold,
+};

@@ -214,6 +214,16 @@ pub(crate) fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
                             .map(|b| b.header.timestamp_unix)
                             .unwrap_or(0)
                     },
+                    "stalled_on_fork": g.stalled_on_fork.load(Ordering::SeqCst),
+                    "reorg_in_flight": g.reorg_in_flight.load(Ordering::SeqCst),
+                    "best_peer_height": g.best_peer_height,
+                    "fork_rewind": g.fork_rewind.load(Ordering::Relaxed),
+                    "hashrate": if g.mining_enabled.load(Ordering::SeqCst) {
+                        g.hashrate_hps.load(Ordering::Relaxed)
+                    } else {
+                        0
+                    },
+                    "mining_threads": g.mining_threads.load(Ordering::Relaxed),
                 }),
                 id,
             )
