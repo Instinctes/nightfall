@@ -81,6 +81,7 @@ mod imp {
 pub use imp::{Tray, TrayAction};
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[allow(dead_code)]
 pub enum TrayAction {
     Show,
     Quit,

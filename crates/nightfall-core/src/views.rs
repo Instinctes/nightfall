@@ -16,6 +16,7 @@ fn night(darks: u64) -> String {
     format!("{}.{:08}", format_int(whole), frac)
 }
 
+#[allow(clippy::manual_is_multiple_of)]
 fn night_compact(darks: u64) -> String {
     if darks % DARKS_PER_NIGHT == 0 {
         return format_int(darks / DARKS_PER_NIGHT);
