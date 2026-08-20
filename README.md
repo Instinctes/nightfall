@@ -26,6 +26,16 @@ never touch the chain, and hidden inflation isn't something you take on trust �
 [Security review (v8)](docs/AUDIT-2026-08-16.md) ·
 [v4 audit](docs/AUDIT-2026-08-12.md)
 
+<br>
+
+<img src="assets/wallet.png" alt="The Core Wallet: a full node, a miner and a wallet in one window" width="820">
+
+<sub>The balance and the mining figures are blanked on purpose. What one
+operator holds is nobody's business — which is the entire point. Everything
+still visible is a public chain fact: height, peers, difficulty, network
+hashrate, total supply, and the proof that no coin exists which was never
+mined.</sub>
+
 </div>
 
 ---
