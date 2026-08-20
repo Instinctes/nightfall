@@ -72,8 +72,37 @@ jobs:
           $lines = Get-ChildItem dist -Filter *.exe | ForEach-Object {
             "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
           }
-          $lines | Set-Content "dist/SHA256SUMS-$version-windows.txt" -Encoding ascii
+          # LF, not CRLF. This is the second time.
+          #
+          # `Set-Content` writes Windows line endings, which puts a carriage
+          # return on the end of every filename in the list. `shasum -a 256 -c`
+          # on macOS or Linux then looks for a file whose name ends in \r,
+          # reports "No such file or directory" for every entry, and tells the
+          # one user who actually verified their download that it failed. The
+          # binaries are fine; the list is not.
+          #
+          # Fixed once in v0.5.4 and lost again somewhere in 0.7.x, so the step
+          # below now fails the build rather than trusting anyone to remember.
+          $text = ($lines -join "`n") + "`n"
+          [System.IO.File]::WriteAllText(
+            (Join-Path $PWD "dist/SHA256SUMS-$version-windows.txt"),
+            $text,
+            (New-Object System.Text.UTF8Encoding $false)
+          )
           Get-Content "dist/SHA256SUMS-$version-windows.txt"
+
+      - name: The checksum list must be readable off Windows
+        shell: pwsh
+        run: |
+          $tag = if ($env:INPUT_TAG) { $env:INPUT_TAG } else { "${{ github.ref_name }}" }
+          $version = $tag -replace '^v', ''
+          $path = "dist/SHA256SUMS-$version-windows.txt"
+          $bytes = [System.IO.File]::ReadAllBytes($path)
+          if ($bytes -contains 13) {
+            Write-Error "$path contains a carriage return — shasum -c will fail on macOS and Linux"
+            exit 1
+          }
+          Write-Host "$path is LF-only"
         env:
           INPUT_TAG: ${{ github.event.inputs.tag }}
 

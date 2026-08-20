@@ -1,0 +1,3 @@
+2c11b73424be8ac71b28c7ce0d2a89cbec8d7912b2b06791c549dfb88b2e60cc  nightfall-core-0.7.2-windows-x64.exe
+d81520861bde5b3b2752f662f8f2811d2e48b11f331ab1c0d16ce477592f4a74  nightfall-wallet-0.7.2-windows-x64.exe
+e9d8be84164dbd8a5905b6fecc8454c8973662c2ea8860733e009b807c6a0308  nightfalld-0.7.2-windows-x64.exe
