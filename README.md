@@ -15,10 +15,13 @@ never touch the chain, and hidden inflation isn't something you take on trust �
 [![Protocol](https://img.shields.io/badge/protocol-v8%20n8-8b5cf6)](docs/SPEC.md)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-4ae0a8)](#license)
 [![Status](https://img.shields.io/badge/status-new%20genesis-ffc85c)](#honest-status)
+[![Discord](https://img.shields.io/badge/discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/Wj6pTNmVEr)
 
 **[Download](https://nightfallcoin.org)** ·
 [Web wallet](https://nightfallcoin.org/wallet/) ·
 [Start mining](#start-mining) ·
+[Discord](https://discord.gg/Wj6pTNmVEr) ·
+[Live network](https://nightfallcoin.org/network/) ·
 [Protocol spec](docs/SPEC.md) ·
 [Security review (v8)](docs/AUDIT-2026-08-16.md) ·
 [v4 audit](docs/AUDIT-2026-08-12.md)
@@ -182,11 +185,12 @@ Four pieces make that sound:
 
 | | |
 |--|--|
-| Max supply | **90,000,000 NIGHT** — curve terminates at 89,999,999.7075 through integer truncation at each halving |
+| Max supply | **90,000,000 NIGHT** — the curve terminates 0.75 short, at 89,999,999.25, because each halving truncates to whole darks |
 | Premine | **0** |
 | Team / VC allocation | **0** |
 | Block reward | 6 NIGHT, halving every 7,500,000 blocks (~3.56 years) |
-| 89 M minted | ~23.5 years |
+| 89 M minted | ~23.4 years |
+| Subsidy reaches zero | after 30 halvings — 225,000,000 blocks, ~107 years |
 | Tail emission | **none** |
 | Fees | burned during the subsidy; **to the miner after** |
 | Coinbase maturity | 1,440 blocks |
@@ -301,17 +305,23 @@ primitives.
 cargo test --workspace
 ```
 
-136 tests. The ones that matter most:
+185 tests. The ones that matter most:
 
 | Suite | What it locks down |
 |-------|--------------------|
 | `nightfall-ledger/tests/exploit_regression.rs` | the six attacks that worked against protocol v4, each of which must now fail |
 | `nightfall-ledger/tests/ledger_flow.rs` | coinbase, transfer, fee burn, double spend, maturity, atomicity, supply invariant |
-| `nightfall-consensus/tests/chain_rules.rs` | work-based fork choice, time-warp resistance, reorg bounds, emission curve |
+| `nightfall-consensus/tests/chain_rules.rs` | work-based fork choice, time-warp resistance, reorg bounds, emission curve, and that raising the wire version never moves the genesis |
+| `nightfall-node/tests/reorg_fetch.rs` | how much of a peer's chain is pulled before judging it — a fixed cap once split the network at exactly 2,000 blocks |
 | `nightfall-storage/tests/reorg_persistence.rs` | a chain saved after a reorg must reload — found by running two miners against each other |
 
 **Do not weaken `exploit_regression.rs`.** Every test in it is the inverse of a
 proof-of-concept that once worked against a real build.
+
+Worth saying plainly: **no test starts two nodes.** Every networking fault this
+project has had — a freeze, a fork, the 2,000-block wall, a handshake checked in
+only one direction — was found by real nodes disagreeing, while the suite
+passed. A multi-node harness is the most valuable thing anyone could contribute.
 
 ---
 
@@ -366,11 +376,31 @@ vulnerability reporting is enabled on this repository.
 | [MANIFESTO.md](MANIFESTO.md) | Why this exists |
 | [FAIR_LAUNCH.md](FAIR_LAUNCH.md) | Fair launch rules |
 
+## Community
+
+**[Discord](https://discord.gg/Wj6pTNmVEr)** — mining and node help, releases,
+and the place where problems get reported first. English is the working
+language; there is a German channel.
+
+Two things you will not find there: a price, and anyone claiming to be
+support who sends you a link. **Nobody from this project will ever DM you
+first, ask for your 24 words, or ask you to "validate" a wallet.** Every
+official download is on [nightfallcoin.org](https://nightfallcoin.org) or the
+[releases page](https://github.com/Instinctes/nightfall/releases/latest), and
+every binary has a published checksum.
+
+Live chain numbers, no addresses, no tracking:
+**[nightfallcoin.org/network](https://nightfallcoin.org/network/)**.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). In short: consensus changes need a test
 that fails without them, and anything touching the supply invariant needs a
 very good reason.
+
+Where help is worth the most, in order: an independent audit, a multi-node
+integration harness, and someone running a seed node in a part of the world
+that currently has none.
 
 ## Support
 

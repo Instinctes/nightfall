@@ -36,6 +36,12 @@ launch will. Leave blocks for other CPUs.
 
 ## After the last reward
 
-Fees are burned. Miners are not paid by the protocol once the subsidy
-hits zero (~33 years, 89,999,999.7075 NIGHT). Security then depends on
+Fees stop being burned and go to the miner once the subsidy runs out.
+That takes 30 halvings — 225,000,000 blocks, roughly 107 years — and the
+curve terminates at 89,999,999.25 NIGHT, three quarters of a coin short
+of the cap, because every halving truncates to whole darks.
+
+The practical horizon is much nearer: 89 million are minted in about
+23.4 years, so the block reward is a rounding error long before it
+formally reaches zero. Security then depends on fees, and therefore on
 people who want the chain to exist. See `docs/MAINNET.md`.
