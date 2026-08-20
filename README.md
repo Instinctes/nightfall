@@ -15,7 +15,7 @@ never touch the chain, and hidden inflation isn't something you take on trust �
 [![Protocol](https://img.shields.io/badge/protocol-v8%20n8-8b5cf6)](docs/SPEC.md)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-4ae0a8)](#license)
 [![Status](https://img.shields.io/badge/status-new%20genesis-ffc85c)](#honest-status)
-[![Discord](https://img.shields.io/badge/discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/Wj6pTNmVEr)
+[![Discord](https://img.shields.io/endpoint?url=https%3A%2F%2Fnightfallcoin.org%2Fdiscord.json&logo=discord&logoColor=white)](https://discord.gg/Wj6pTNmVEr)
 
 **[Download](https://nightfallcoin.org)** ·
 [Web wallet](https://nightfallcoin.org/wallet/) ·
