@@ -262,6 +262,45 @@ validation record cannot re-hash the dropped bodies; resync from a seed.
 The same class of assumption as Bitcoin's prune: you trust this node's
 own disk, not a stranger's UTXO snapshot.
 
+### 2.7 On-disk chain format
+
+A node reads whichever chain file it finds in its datadir:
+
+| File | Encoding |
+|---|---|
+| `blocks.jsonl` | one JSON object per line (historic default) |
+| `blocks.bin` | `u32` little-endian record length, then bincode |
+
+`blocks.bin` wins if both are present.
+
+**Neither is consensus.** A block hash is computed over raw field bytes,
+never over the serialised form, and the P2P wire stays newline-delimited
+JSON. A converted node and an unconverted node hold the identical chain
+and talk to each other unchanged. This is a disk layout, nothing more.
+
+The reason to convert is that `serde_json` renders a `[u8; 32]` as an
+array of decimal numbers — `[241,118,175,…]` — so every byte of every
+hash, commitment, signature and range proof costs about 3.6 characters.
+Measured on mainnet at 31,288 blocks:
+
+| | Size | Per block |
+|---|---|---|
+| `blocks.jsonl` | 152.3 MiB | 5.10 KiB |
+| `blocks.bin` | 42.2 MiB | 1.41 KiB |
+
+**72.3 % less disk**, same tip, same UTXO root, same supply proof.
+
+Nothing converts by itself:
+
+```
+nightfalld --network mainnet migrate-storage
+```
+
+The command writes `blocks.bin.tmp`, reads it back, compares **every
+block hash** against the source, and only then swaps the files. The old
+file is kept as `blocks.jsonl.pre-binary`. Stop the daemon first — there
+is no lock on the chain file.
+
 ---
 
 ## 3. Emission

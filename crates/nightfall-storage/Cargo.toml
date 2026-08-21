@@ -12,6 +12,7 @@ nightfall-ledger = { workspace = true }
 nightfall-crypto = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+bincode = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 dirs = { workspace = true }

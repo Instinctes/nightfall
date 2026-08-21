@@ -3052,6 +3052,7 @@ name = "nightfall-storage"
 version = "0.7.8"
 dependencies = [
  "anyhow",
+ "bincode",
  "dirs 5.0.1",
  "nightfall-consensus",
  "nightfall-crypto",

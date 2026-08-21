@@ -7,7 +7,7 @@
 //! and again after every accepted block. At 84 blocks that was already a 1.5 MB
 //! rewrite; the cost grows linearly with height forever (audit finding N-05).
 
-use nightfall_consensus::{Block, Chain, CompactHeader};
+use nightfall_consensus::{Chain, CompactHeader};
 use nightfall_crypto::Commitment;
 use nightfall_ledger::{LedgerState, UtxoEntry, UtxoSet};
 use nightfall_types::{Hash256, Height, NetworkId};
@@ -16,6 +16,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub mod codec;
+pub use codec::Format;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ChainMeta {
@@ -63,8 +66,18 @@ impl ChainStore {
         Self { dir: dir.into() }
     }
 
+    /// The chain file this datadir actually has.
+    ///
+    /// Binary when `blocks.bin` exists, JSON otherwise. A node therefore reads
+    /// whichever it finds and nothing changes for anyone who has not run
+    /// `nightfalld migrate-storage`.
     pub fn blocks_path(&self) -> PathBuf {
-        self.dir.join("blocks.jsonl")
+        self.dir.join(self.format().file_name())
+    }
+
+    /// Storage encoding in use here. See `codec`.
+    pub fn format(&self) -> Format {
+        codec::detect(&self.dir)
     }
 
     pub fn headers_path(&self) -> PathBuf {
@@ -168,6 +181,78 @@ impl ChainStore {
         fs::read_to_string(self.meta_path())
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
+    }
+
+    /// Rewrite the chain file in the binary encoding.
+    ///
+    /// Opt-in and reversible. The old `blocks.jsonl` is kept as
+    /// `blocks.jsonl.pre-binary`; deleting `blocks.bin` puts the node back on
+    /// JSON with nothing lost.
+    ///
+    /// Verified before anything is swapped: the binary file is written to a
+    /// temporary name, read back, and every block hash compared against the
+    /// source. A storage migration that trusts its own output is how a node
+    /// ends up unable to start with no way back.
+    ///
+    /// Returns the old and new sizes in bytes.
+    pub fn migrate_to_binary(&self) -> anyhow::Result<(u64, u64)> {
+        if self.format() == Format::Binary {
+            anyhow::bail!("this datadir is already binary");
+        }
+        let src = self.dir.join(codec::BLOCKS_JSONL);
+        if !src.exists() {
+            anyhow::bail!("no {} in {}", codec::BLOCKS_JSONL, self.dir.display());
+        }
+        let before = fs::metadata(&src)?.len();
+
+        let blocks = codec::read_blocks(File::open(&src)?, Format::Json)?;
+        if blocks.is_empty() {
+            anyhow::bail!("the chain file is empty — nothing to convert");
+        }
+
+        let tmp = self.dir.join("blocks.bin.tmp");
+        {
+            let mut w = BufWriter::new(File::create(&tmp)?);
+            for b in &blocks {
+                codec::write_block(&mut w, b, Format::Binary)?;
+            }
+            w.flush()?;
+        }
+
+        // Read the new file back and compare. Hashes, not lengths: a file that
+        // is the right size and the wrong content is the failure worth
+        // catching.
+        let back = codec::read_blocks(File::open(&tmp)?, Format::Binary)?;
+        if back.len() != blocks.len() {
+            let _ = fs::remove_file(&tmp);
+            anyhow::bail!(
+                "converted file has {} blocks, source had {} — not swapping",
+                back.len(),
+                blocks.len()
+            );
+        }
+        for (i, (a, b)) in blocks.iter().zip(&back).enumerate() {
+            if a.hash() != b.hash() {
+                let _ = fs::remove_file(&tmp);
+                anyhow::bail!("block {i} differs after conversion — not swapping");
+            }
+        }
+
+        let after = fs::metadata(&tmp)?.len();
+        fs::rename(&tmp, self.dir.join(codec::BLOCKS_BIN))?;
+        fs::rename(&src, self.dir.join("blocks.jsonl.pre-binary"))?;
+
+        // The size recorded in the meta belongs to the file that no longer
+        // exists. Leaving it would make `is_own_file_trusted` compare the new
+        // file against the old length, fail, and force a full re-verification
+        // on the next start — correct, but hours of it for no reason.
+        if let Some(mut m) = self.read_meta() {
+            m.validated_bytes = after;
+            let tmp_meta = self.dir.join("chain-meta.json.tmp");
+            fs::write(&tmp_meta, serde_json::to_vec_pretty(&m)?)?;
+            fs::rename(tmp_meta, self.meta_path())?;
+        }
+        Ok((before, after))
     }
 
     /// Copy `blocks.jsonl` plus a small manifest. The importer still verifies
@@ -322,9 +407,9 @@ impl ChainStore {
                 .append(true)
                 .open(self.blocks_path())?,
         );
+        let fmt = self.format();
         for block in &chain.blocks[on_disk as usize..] {
-            serde_json::to_writer(&mut file, block)?;
-            file.write_all(b"\n")?;
+            codec::write_block(&mut file, block, fmt)?;
         }
         file.flush()?;
         self.write_meta(chain)?;
@@ -363,9 +448,9 @@ impl ChainStore {
                     .append(true)
                     .open(self.blocks_path())?,
             );
+            let fmt = self.format();
             for block in chain.blocks.iter().skip(already) {
-                serde_json::to_writer(&mut file, block)?;
-                file.write_all(b"\n")?;
+                codec::write_block(&mut file, block, fmt)?;
             }
             file.flush()?;
         }
@@ -529,16 +614,9 @@ impl ChainStore {
             }
         }
 
-        let file = BufReader::new(File::open(self.blocks_path())?);
+        let stored_blocks = codec::read_blocks(File::open(self.blocks_path())?, self.format())?;
 
-        for (i, line) in file.lines().enumerate() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let block: Block = serde_json::from_str(&line)
-                .map_err(|e| anyhow::anyhow!("block {i} is corrupt: {e}"))?;
-
+        for (i, block) in stored_blocks.into_iter().enumerate() {
             let outcome = if trusted {
                 chain.apply_block_from_own_disk(block)
             } else {
@@ -828,6 +906,104 @@ mod tests {
         loaded.verify_supply().unwrap();
         assert!(loaded.block_by_height(0).is_none());
         assert!(loaded.block_by_height(8).is_some());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The whole point of the conversion: a node that ran on JSON and a node
+    /// that converted must hold the same chain. Tip, height, and UTXO root —
+    /// if any of the three moved, the format changed meaning, and the format
+    /// is not allowed to mean anything.
+    #[test]
+    fn migration_keeps_the_identical_chain() {
+        use nightfall_crypto::WalletKeys;
+        let dir = std::env::temp_dir().join(format!("nf-mig-{}", now_unix()));
+        fs::create_dir_all(&dir).unwrap();
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+        for i in 0..8u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+        store.save(&chain).unwrap();
+        assert_eq!(store.format(), Format::Json, "fresh datadir starts as json");
+
+        let (before, after) = store.migrate_to_binary().unwrap();
+        assert!(after < before, "{after} B is not smaller than {before} B");
+        assert_eq!(store.format(), Format::Binary);
+        assert!(
+            dir.join("blocks.jsonl.pre-binary").exists(),
+            "the old file must survive so the operator can go back"
+        );
+        assert!(!dir.join(codec::BLOCKS_JSONL).exists());
+
+        let loaded = store.load_or_new(NetworkId::Devnet).unwrap();
+        assert_eq!(loaded.tip_hash(), chain.tip_hash());
+        assert_eq!(loaded.block_count(), chain.block_count());
+        assert_eq!(loaded.ledger.utxo_root(), chain.ledger.utxo_root());
+        loaded.verify_supply().unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// After converting, the node keeps mining into the file it now has.
+    /// Appending to the abandoned .jsonl would silently split the chain in
+    /// two, with the newer half in the file nothing reads.
+    #[test]
+    fn blocks_mined_after_migration_land_in_the_binary_file() {
+        use nightfall_crypto::WalletKeys;
+        let dir = std::env::temp_dir().join(format!("nf-mig-app-{}", now_unix()));
+        fs::create_dir_all(&dir).unwrap();
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+        for i in 0..4u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+        store.save(&chain).unwrap();
+        store.migrate_to_binary().unwrap();
+
+        let mut chain = store.load_or_new(NetworkId::Devnet).unwrap();
+        for i in 4..9u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+            // save() appends only what is not on disk yet, so this exercises
+            // the incremental write path, not a rewrite.
+            store.save(&chain).unwrap();
+        }
+        let tip = chain.tip_hash();
+
+        let reloaded = store.load_or_new(NetworkId::Devnet).unwrap();
+        assert_eq!(reloaded.block_count(), chain.block_count());
+        assert_eq!(reloaded.tip_hash(), tip);
+        reloaded.verify_supply().unwrap();
+        // The stale file must not have grown a single byte.
+        let stale = fs::read_to_string(dir.join("blocks.jsonl.pre-binary")).unwrap();
+        assert_eq!(
+            stale.lines().count(),
+            4,
+            "the abandoned file was written to after the swap"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrating_an_already_binary_datadir_is_refused() {
+        use nightfall_crypto::WalletKeys;
+        let dir = std::env::temp_dir().join(format!("nf-mig-twice-{}", now_unix()));
+        fs::create_dir_all(&dir).unwrap();
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+        chain.mine_block(&miner, vec![], now_unix()).unwrap();
+        store.save(&chain).unwrap();
+        store.migrate_to_binary().unwrap();
+
+        let err = store.migrate_to_binary().unwrap_err().to_string();
+        assert!(err.contains("already binary"), "got: {err}");
         fs::remove_dir_all(&dir).ok();
     }
 }
