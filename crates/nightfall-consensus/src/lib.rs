@@ -429,6 +429,23 @@ impl Chain {
         if block.header.prev_hash != self.tip_hash() {
             return Err(ConsensusError::BadPrev);
         }
+        // The pin is checked here too, and it has to be.
+        //
+        // This path skips proof of work, and since checkpoints were added it
+        // is also the path that *replays a peer's blocks* below a pinned
+        // height — not only our own file. A pin enforced solely in
+        // `apply_block_inner` would therefore be enforced on every path except
+        // the fast one it created. That is a check that only looks like a
+        // check.
+        if let Some(pinned) = nightfall_types::checkpoint_at(block.header.height.0) {
+            if block.hash().to_hex() != pinned {
+                return Err(ConsensusError::CheckpointMismatch {
+                    height: block.header.height.0,
+                    expected: pinned.to_string(),
+                    got: block.hash().to_hex(),
+                });
+            }
+        }
         let subsidy = self
             .emission
             .reward_at(block.header.height, self.ledger.supply.total_minted_darks)
@@ -462,6 +479,22 @@ impl Chain {
         }
         if block.header.prev_hash != self.tip_hash() {
             return Err(ConsensusError::BadPrev);
+        }
+
+        // --- checkpoint: this build has an opinion about this height ---
+        //
+        // Cheap, and checked before anything expensive. A peer offering a
+        // different history at a pinned height is not a peer with a heavier
+        // chain, it is a peer on another chain, and no amount of work makes
+        // that one ours.
+        if let Some(pinned) = nightfall_types::checkpoint_at(block.header.height.0) {
+            if block.hash().to_hex() != pinned {
+                return Err(ConsensusError::CheckpointMismatch {
+                    height: block.header.height.0,
+                    expected: pinned.to_string(),
+                    got: block.hash().to_hex(),
+                });
+            }
         }
 
         // --- timestamp: bounded ahead, strictly after median-time-past ---
@@ -553,6 +586,45 @@ impl Chain {
         trusted_prefix: usize,
         now_unix: u64,
     ) -> Result<Self, ConsensusError> {
+        // A pinned height widens the trusted prefix for everyone, not just for
+        // a node replaying its own disk.
+        //
+        // The saving is the whole reason checkpoints exist: ~11 ms of Argon2id
+        // per block, six hours for a one-year-old chain. Skipping it below a
+        // pin is sound because the blocks still have to *link* — each one's
+        // prev_hash must be the last one's hash — and the block at the pinned
+        // height still has to equal the pin. A forged history that satisfies
+        // both is the real history.
+        //
+        // Two conditions, and the first draft had neither. Written out because
+        // getting this wrong disables proof of work rather than merely being
+        // slow, which is the same shape of fault as the v4 balance proof:
+        //
+        //  * **Mainnet only.** The pins are mainnet heights. A devnet chain of
+        //    five blocks is *shorter* than the pin, and a naive
+        //    `min(blocks.len())` therefore marked every block trusted and
+        //    skipped proof of work on every network. Caught by
+        //    `reorg_still_validates_the_untrusted_suffix`.
+        //
+        //  * **The chain must actually reach the pin.** A prefix is only
+        //    anchored if the pinned block is in it; a candidate that stops
+        //    short of the pinned height has nothing vouching for it and gets
+        //    the full check. Trusting the first 25,000 blocks of a chain that
+        //    never arrives at block 25,000 trusts nothing at all.
+        let pin_height = nightfall_types::highest_checkpoint_height();
+        let assume_valid_to = if network == NetworkId::Mainnet
+            && pin_height > 0
+            && (blocks.len() as u64) > pin_height
+            && std::env::var("NIGHTFALL_NO_ASSUME_VALID").is_err()
+        {
+            // Heights are indices here: `blocks` starts at genesis, so the
+            // pinned block sits at `pin_height` and the prefix is inclusive.
+            (pin_height + 1) as usize
+        } else {
+            0
+        };
+        let trusted_prefix = trusted_prefix.max(assume_valid_to);
+
         let mut chain = Self::new_fair(network)?;
         for (i, b) in blocks.into_iter().enumerate() {
             if i < trusted_prefix {
@@ -817,6 +889,15 @@ pub enum ConsensusError {
     BadTxCount,
     #[error("insufficient proof of work")]
     BadPow,
+    #[error(
+        "block {height} is {got} but this build is pinned to {expected} — \
+         that is a different chain, not a longer one"
+    )]
+    CheckpointMismatch {
+        height: u64,
+        expected: String,
+        got: String,
+    },
     #[error("difficulty {got}, expected {expected}")]
     BadDifficulty { got: u64, expected: u64 },
     #[error("previous hash does not link to our tip")]

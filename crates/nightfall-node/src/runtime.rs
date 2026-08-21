@@ -57,6 +57,22 @@ pub struct NodeConfig {
     /// HTTPS directory of listening nodes. `None` uses the compiled mainnet
     /// default. `Some("off")` disables the fetch.
     pub peers_url: Option<String>,
+    /// Answer the handshake, hand over the address book, hang up.
+    ///
+    /// A seed does two unrelated jobs, and only one of them needs a socket
+    /// held open. Relaying blocks needs a live session. *Introducing* — the
+    /// job a fresh install actually needs — is one round trip: hello, here is
+    /// who else answers, goodbye.
+    ///
+    /// Keeping those introductions as live sessions is what caps a seed at
+    /// `MAX_PEERS`. Two seeds at 128 seats are 256 concurrent slots for the
+    /// whole network; a thousand new installs in the same minute simply fail
+    /// to find anyone. Hanging up turns the same machine from 128 seats into
+    /// thousands of introductions per second, because nothing is retained.
+    ///
+    /// The node still syncs and still dials out — it just refuses to be
+    /// anybody's long-term peer.
+    pub introducer: bool,
 }
 
 /// Where a new install finds listening nodes when the compiled-in seeds
@@ -78,6 +94,8 @@ pub struct NodeInner {
     pub bootstrap: Vec<String>,
     /// Port we accept connections on, advertised in every handshake.
     pub listen_port: u16,
+    /// Hand over the address book and hang up. See `NodeConfig::introducer`.
+    pub introducer: bool,
     pub mining_enabled: Arc<AtomicBool>,
     /// Bumped whenever the tip changes. The miner watches this to abandon a
     /// stale template instantly.
@@ -612,6 +630,7 @@ impl NodeHandle {
                 .next()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or_else(|| cfg.network.default_p2p_port()),
+            introducer: cfg.introducer,
             mining_enabled: Arc::clone(&mining_enabled),
             tip_epoch: Arc::clone(&tip_epoch),
             hashes_total: Arc::clone(&hashes_total),
@@ -1751,6 +1770,23 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
             return Ok(());
         }
     };
+
+    // Introducer: the whole point of this connection was the address book.
+    //
+    // Handled before the session pool is touched, so an introduction costs no
+    // seat, no eviction and no entry in `session_height` — it costs one write
+    // and a close. That is the difference between a machine that can point
+    // 128 installs at the network and one that can point at thousands.
+    if state.lock().map(|g| g.introducer).unwrap_or(false) {
+        let intro = {
+            let g = state.lock().unwrap();
+            g.publishable_peers()
+        };
+        let n = intro.len();
+        let _ = write_msg(&mut hello_writer, &PeerMsg::Peers { addrs: intro });
+        tracing::debug!("introduced {peer_label} to {n} peer(s), closing");
+        return Ok(());
+    }
 
     if state
         .lock()

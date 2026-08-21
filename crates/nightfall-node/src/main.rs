@@ -65,6 +65,12 @@ enum Commands {
         /// Example: 0.0.0.0:17888
         #[arg(long)]
         mobile_listen: Option<String>,
+        /// Run as a pure introducer: answer the handshake, hand over the
+        /// address book, hang up. Holds no inbound session, so one machine
+        /// can point thousands of new installs at the network instead of
+        /// the 128 a normal node has seats for. Still syncs and dials out.
+        #[arg(long, default_value_t = false)]
+        introducer: bool,
     },
     /// Write `blocks.jsonl` + `snapshot.json`. The importer still verifies PoW.
     ExportSnapshot {
@@ -185,6 +191,7 @@ fn main() -> anyhow::Result<()> {
             miner_seed,
             proxy,
             mobile_listen,
+            introducer,
         } => {
             let listen =
                 listen.unwrap_or_else(|| format!("0.0.0.0:{}", network.default_p2p_port()));
@@ -216,6 +223,7 @@ fn main() -> anyhow::Result<()> {
                 proxy,
                 mobile_listen: mobile_listen.clone(),
                 peers_url: std::env::var("NIGHTFALL_PEERS_URL").ok(),
+                introducer,
             };
 
             println!("{COIN_NAME} node starting");

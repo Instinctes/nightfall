@@ -44,6 +44,56 @@ pub const DIFFICULTY_WINDOW: u64 = 90;
 /// single-core work per block even if all other miners vanish.
 pub const MIN_DIFFICULTY: u64 = 2_000;
 
+/// Block hashes this build refuses to disagree with, newest last.
+///
+/// Two jobs, and the first is the one that matters.
+///
+/// **Safety.** A checkpoint makes a deep rewrite impossible rather than merely
+/// expensive. `MAX_REORG_DEPTH` already bounds how far back a peer may drag us,
+/// but the bound is relative — a node that was offline for a month has no
+/// opinion about which month it missed. A pinned hash gives it one, and it
+/// costs a comparison.
+///
+/// **Speed.** Nighthash-v2 verification is symmetric with mining: ~11 ms per
+/// block. At 2.1 million blocks a year that is six hours of pure CPU to sync a
+/// one-year-old chain and a week once blocks carry real transactions. Below a
+/// pinned height the proof of work is not re-hashed, because a chain that
+/// links correctly *and* arrives at the pinned hash cannot be a different
+/// chain — only the same one, replayed.
+///
+/// Honest about what it is: a trust assumption. You are trusting whoever built
+/// the binary not to have pinned a hash from a chain of their own. That is
+/// weaker than verifying every hash yourself, which is why
+/// `--no-assume-valid` exists and why every entry here must be reproducible:
+///
+/// ```text
+/// cargo run --release -p nightfall-node --example checkpoint -- <height>
+/// ```
+///
+/// Each entry below was computed on two independent machines — an operator
+/// laptop and the Frankfurt seed — and the block compared byte for byte before
+/// it was written down. Never add one from a single source.
+pub const CHECKPOINTS: &[(u64, &str)] = &[
+    // Cross-checked 21 Aug 2026 against seed2.nightfallcoin.org.
+    (
+        25_000,
+        "71c8b97b1e8a20f9f29d9e873110e41223b0c96aa9ce773feaee78c97bdd247e",
+    ),
+];
+
+/// The pinned hash for `height`, if this build has an opinion about it.
+pub fn checkpoint_at(height: u64) -> Option<&'static str> {
+    CHECKPOINTS
+        .iter()
+        .find(|(h, _)| *h == height)
+        .map(|(_, hash)| *hash)
+}
+
+/// Highest pinned height, or 0 when a build carries no checkpoints.
+pub fn highest_checkpoint_height() -> u64 {
+    CHECKPOINTS.iter().map(|(h, _)| *h).max().unwrap_or(0)
+}
+
 /// Proof-of-work parameters for Nighthash-v2 (Argon2id).
 ///
 /// Memory-hardness is the point: an attacker must supply `memory_kib` of fast

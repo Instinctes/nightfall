@@ -5,13 +5,14 @@
  *   1. Strict security headers on every response. The page serves wallet
  *      binaries. If someone could inject a script into it, they could swap a
  *      download link and drain everyone who trusted the domain.
- *   2. POST /wallet-api — a same-origin proxy onto the seed's light HTTP
- *      API. The browser wallet is served over HTTPS and cannot speak
+ *   2. POST /wallet-api — a same-origin proxy onto the *light* node's HTTP
+ *      API (Vultr / seed1). P2P doorbell is seed.nightfallcoin.org (Contabo).
+ *      The browser wallet is served over HTTPS and cannot speak
  *      `http://seed:17888` (mixed content). Cloudflare `fetch()` only
- *      reaches ports 80/443, so the seed forwards :80 → :17888.
+ *      reaches ports 80/443, so the light node forwards :80 → :17888.
  */
 
-const MOBILE_UPSTREAM = "http://seed.nightfallcoin.org/";
+const MOBILE_UPSTREAM = "http://seed1.nightfallcoin.org/";
 const MOBILE_ALLOWED = new Set([
     "status",
     "scan_feed",

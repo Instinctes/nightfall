@@ -253,6 +253,8 @@ impl App {
             miner,
             mobile_listen: None,
             peers_url: std::env::var("NIGHTFALL_PEERS_URL").ok(),
+            // A desktop wallet wants peers, not petitioners.
+            introducer: false,
             proxy: {
                 let from_env = std::env::var("NIGHTFALL_PROXY").ok();
                 if from_env.as_ref().map(|s| !s.is_empty()).unwrap_or(false) {

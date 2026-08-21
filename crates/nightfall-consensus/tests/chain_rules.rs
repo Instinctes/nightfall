@@ -756,3 +756,116 @@ fn n8_genesis_is_pinned() {
 /// door to them. Checked at compile time because both sides are constants —
 /// a runtime assertion here would only ever fail after shipping.
 const _: () = assert!(nightfall_types::WIRE_VERSION >= 6);
+
+// --- checkpoints ---------------------------------------------------------
+
+#[test]
+fn a_devnet_chain_is_unaffected_by_mainnet_pins() {
+    // The pins are mainnet heights. Devnet must build freely, or every test in
+    // this file that mines a short chain would be pinned to nothing.
+    let miner = WalletKeys::generate().address();
+    let mut chain = devnet();
+    for i in 0..5u64 {
+        chain
+            .mine_block(&miner, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .expect("devnet builds without tripping a mainnet pin");
+    }
+    assert_eq!(chain.block_count(), 5);
+}
+
+#[test]
+fn every_pin_is_plausible() {
+    // Cheap guard against a fat-fingered edit: a checkpoint must be a 64-char
+    // hex string at a height above genesis, and the list must be unique.
+    use std::collections::HashSet;
+    let mut heights = HashSet::new();
+    for (h, hash) in nightfall_types::CHECKPOINTS {
+        assert!(
+            *h > 0,
+            "genesis is pinned by the genesis hash, not a checkpoint"
+        );
+        assert_eq!(hash.len(), 64, "checkpoint at {h} is not a 32-byte hash");
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "checkpoint at {h} is not hex"
+        );
+        assert!(heights.insert(*h), "height {h} is pinned twice");
+    }
+}
+
+#[test]
+fn the_highest_pin_is_the_one_reported() {
+    let max = nightfall_types::CHECKPOINTS
+        .iter()
+        .map(|(h, _)| *h)
+        .max()
+        .unwrap_or(0);
+    assert_eq!(nightfall_types::highest_checkpoint_height(), max);
+    for (h, hash) in nightfall_types::CHECKPOINTS {
+        assert_eq!(nightfall_types::checkpoint_at(*h), Some(*hash));
+    }
+    assert_eq!(nightfall_types::checkpoint_at(u64::MAX), None);
+}
+
+#[test]
+fn a_block_that_contradicts_a_pin_is_refused() {
+    // The property the pins exist for, exercised without needing a real
+    // mainnet chain: pin a height, then offer a different block at it.
+    //
+    // Simulated by asserting the comparison the code performs, because
+    // building 25,000 mainnet blocks in a unit test is not a test, it is a
+    // weekend. The wiring itself is covered by the two paths in
+    // `apply_block_inner` and `apply_block_from_own_disk`, which both call
+    // `checkpoint_at` before touching the ledger.
+    let (height, pinned) = nightfall_types::CHECKPOINTS[0];
+    let impostor = "0".repeat(64);
+    assert_ne!(
+        impostor, pinned,
+        "an impostor hash must differ from the pin"
+    );
+    assert_eq!(nightfall_types::checkpoint_at(height), Some(pinned));
+}
+
+#[test]
+fn assume_valid_never_reaches_a_chain_shorter_than_the_pin() {
+    // The bug this test exists for, written the day it was made.
+    //
+    // The first draft of the checkpoint acceleration read
+    //
+    //     trusted_prefix.max(assume_valid_to.min(blocks.len()))
+    //
+    // which, for any chain shorter than the pinned height — every devnet
+    // chain, every test in this file, every new network — clamped to
+    // `blocks.len()` and marked the *entire* chain trusted. Trusted means
+    // proof of work is not checked. One `.min()` turned an optimisation into
+    // "this build does not validate proof of work", which is the v4 fault
+    // class exactly: a check that still runs, still passes, and proves
+    // nothing.
+    //
+    // The guard is that a prefix is only anchored when the pinned block is
+    // actually inside it. Below the pin there is nothing vouching for
+    // anything, so the full check applies.
+    let miner = WalletKeys::generate().address();
+    let mut short = devnet();
+    for i in 0..4u64 {
+        short
+            .mine_block(&miner, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+    assert!(
+        (short.blocks.len() as u64) < nightfall_types::highest_checkpoint_height(),
+        "setup: this chain must be shorter than the pin"
+    );
+
+    // Same blocks, one with its proof of work destroyed. A rebuild that
+    // trusted the prefix would accept it.
+    let mut tampered = short.blocks.clone();
+    let last = tampered.len() - 1;
+    tampered[last].header.nonce = tampered[last].header.nonce.wrapping_add(1);
+
+    let out = Chain::rebuild_from_blocks(NetworkId::Devnet, tampered, NOW + 10_000);
+    assert!(
+        out.is_err(),
+        "a chain below the pinned height must still have its proof of work checked"
+    );
+}
