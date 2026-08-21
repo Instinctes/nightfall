@@ -366,7 +366,7 @@ impl NodeInner {
     /// Without this a fresh node, which has spoken to nobody and so knows of
     /// no archives, would sort its only useful contacts last.
     fn is_compiled_seed(&self, addr: &str) -> bool {
-        self.network.seed_nodes().iter().any(|s| *s == addr)
+        self.network.seed_nodes().contains(&addr)
     }
 
     /// Is some peer reporting a height above ours?
