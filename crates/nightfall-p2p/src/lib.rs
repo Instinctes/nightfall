@@ -136,6 +136,23 @@ pub enum PeerMsg {
         /// propagation used to be one-directional.
         #[serde(default)]
         listen_port: u16,
+        /// Lowest block body this node still holds, and whether it pruned.
+        ///
+        /// A pruned node validates every new block and proves the supply
+        /// invariant exactly like an archive — but it cannot answer
+        /// `GetBlocks` below `first_height`. Without saying so in the
+        /// handshake the only way to find that out is to ask and receive an
+        /// empty answer, which the sync loop cannot distinguish from "the
+        /// chain ends here" and treats as a reason to stop. A network of
+        /// pruned nodes would then be unable to bootstrap anyone new.
+        ///
+        /// `serde(default)` on purpose: a node built before these fields
+        /// simply omits them and is read as an archive at height 0, which is
+        /// what it is. No wire version bump, nothing to coordinate.
+        #[serde(default)]
+        pruned: bool,
+        #[serde(default)]
+        first_height: u64,
     },
     HelloOk {
         wire: u32,
@@ -145,6 +162,23 @@ pub enum PeerMsg {
         tip: String,
         #[serde(default)]
         listen_port: u16,
+        /// Lowest block body this node still holds, and whether it pruned.
+        ///
+        /// A pruned node validates every new block and proves the supply
+        /// invariant exactly like an archive — but it cannot answer
+        /// `GetBlocks` below `first_height`. Without saying so in the
+        /// handshake the only way to find that out is to ask and receive an
+        /// empty answer, which the sync loop cannot distinguish from "the
+        /// chain ends here" and treats as a reason to stop. A network of
+        /// pruned nodes would then be unable to bootstrap anyone new.
+        ///
+        /// `serde(default)` on purpose: a node built before these fields
+        /// simply omits them and is read as an archive at height 0, which is
+        /// what it is. No wire version bump, nothing to coordinate.
+        #[serde(default)]
+        pruned: bool,
+        #[serde(default)]
+        first_height: u64,
     },
     /// Ask a peer for the addresses it knows.
     GetPeers,
@@ -301,6 +335,26 @@ pub(crate) fn connect_direct(addr: &str, timeout_ms: u64) -> std::io::Result<Tcp
     }))
 }
 
+/// What the other end told us about itself once the handshake succeeded.
+#[derive(Clone, Debug)]
+pub struct PeerIntro {
+    pub height: u64,
+    pub tip: String,
+    /// True when the peer discarded old block bodies. Such a peer is a fine
+    /// relay and a useless source for initial block download.
+    pub pruned: bool,
+    /// Lowest height whose body the peer can still serve. 0 for an archive.
+    pub first_height: u64,
+}
+
+impl PeerIntro {
+    /// Can this peer answer for the whole chain?
+    pub fn is_archive(&self) -> bool {
+        !self.pruned && self.first_height == 0
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn handshake(
     stream: &mut TcpStream,
     network: NetworkId,
@@ -308,7 +362,9 @@ pub fn handshake(
     height: u64,
     tip: Hash256,
     listen_port: u16,
-) -> std::io::Result<(u64, String)> {
+    pruned: bool,
+    first_height: u64,
+) -> std::io::Result<PeerIntro> {
     write_msg(
         stream,
         &PeerMsg::Hello {
@@ -319,6 +375,8 @@ pub fn handshake(
             tip: tip.to_hex(),
             agent: format!("nightfalld/{}", env!("CARGO_PKG_VERSION")),
             listen_port,
+            pruned,
+            first_height,
         },
     )?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -329,6 +387,8 @@ pub fn handshake(
             genesis: g,
             height: h,
             tip: t,
+            pruned: peer_pruned,
+            first_height: peer_first,
             ..
         } => {
             if wire != WIRE_VERSION {
@@ -353,7 +413,12 @@ pub fn handshake(
                     "genesis mismatch",
                 ));
             }
-            Ok((h, t))
+            Ok(PeerIntro {
+                height: h,
+                tip: t,
+                pruned: peer_pruned,
+                first_height: peer_first,
+            })
         }
         PeerMsg::Error { message } => Err(std::io::Error::other(message)),
         _ => Err(std::io::Error::new(

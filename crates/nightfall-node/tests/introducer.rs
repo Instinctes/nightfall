@@ -190,3 +190,62 @@ fn a_normal_node_keeps_the_session() {
     );
     drop(stream);
 }
+
+// --- pruned status in the handshake --------------------------------------
+
+/// Read the first line the node sends after a hello, as parsed JSON.
+fn hello_ok(port: u16, genesis: &str, extra: serde_json::Value) -> serde_json::Value {
+    let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let mut w = stream.try_clone().expect("clone");
+    let mut hello = serde_json::json!({
+        "type": "hello", "wire": WIRE_VERSION, "network": "devnet",
+        "genesis": genesis, "height": 0, "tip": "00".repeat(32),
+        "agent": "prune-test/1.0", "listen_port": 0,
+    });
+    if let (Some(a), Some(b)) = (hello.as_object_mut(), extra.as_object()) {
+        for (k, v) in b {
+            a.insert(k.clone(), v.clone());
+        }
+    }
+    writeln!(w, "{hello}").expect("write");
+    w.flush().ok();
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).expect("read");
+    serde_json::from_str(&line).expect("parse hello_ok")
+}
+
+#[test]
+fn hello_ok_states_whether_this_node_is_pruned() {
+    // The field has to be on the wire, not merely in the RPC. A syncing peer
+    // speaks P2P; it never sees the RPC, and asking-and-getting-nothing is
+    // indistinguishable from "the chain ends here".
+    let (node, port, _dir) = boot(false);
+    let v = hello_ok(port, &node.genesis_hex(), serde_json::json!({}));
+
+    assert_eq!(v["type"], "hello_ok");
+    assert_eq!(v["pruned"], false, "an archive node must say so: {v}");
+    assert_eq!(v["first_height"], 0, "an archive serves from genesis: {v}");
+}
+
+#[test]
+fn a_hello_without_the_new_fields_is_still_accepted() {
+    // The whole reason these are `serde(default)`: a node built before this
+    // change omits them, and must be read as an archive at height 0 — which
+    // is exactly what it is. If this ever fails, the change needed a wire
+    // version bump and did not get one.
+    let (node, port, _dir) = boot(false);
+    let genesis = node.genesis_hex();
+
+    // `hello_ok` sends no pruned/first_height at all.
+    let v = hello_ok(port, &genesis, serde_json::json!({}));
+    assert_eq!(v["type"], "hello_ok", "old-style hello was refused: {v}");
+
+    // And one that does send them is equally fine.
+    let v2 = hello_ok(
+        port,
+        &genesis,
+        serde_json::json!({ "pruned": true, "first_height": 4242 }),
+    );
+    assert_eq!(v2["type"], "hello_ok", "new-style hello was refused: {v2}");
+}

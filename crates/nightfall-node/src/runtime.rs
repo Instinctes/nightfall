@@ -99,6 +99,17 @@ pub struct NodeInner {
     pub listen_port: u16,
     /// Hand over the address book and hang up. See `NodeConfig::introducer`.
     pub introducer: bool,
+    /// Peers that told us in the handshake they still hold the whole chain.
+    ///
+    /// Pruning is a fine thing for a laptop and a bad thing for everyone if
+    /// nobody notices who did it. A pruned peer relays new blocks perfectly
+    /// and answers `GetBlocks` below its horizon with nothing — which the
+    /// sync loop reads as "the chain ends here" and stops. A node whose peer
+    /// list happened to be all pruned could therefore never finish catching
+    /// up, and nothing in any log would say why.
+    ///
+    /// So the handshake says it, and initial block download asks these first.
+    pub archive_peers: HashSet<String>,
     pub mining_enabled: Arc<AtomicBool>,
     /// Bumped whenever the tip changes. The miner watches this to abandon a
     /// stale template instantly.
@@ -318,16 +329,50 @@ impl NodeInner {
         // removes a learned address; it must not also forget the compiled-in
         // names, because those are the ones that come back on the right chain
         // after an upgrade.
-        self.network
+        let all: HashSet<String> = self
+            .network
             .seed_nodes()
             .iter()
             .map(|s| s.to_string())
             .chain(self.bootstrap.iter().cloned())
             .chain(self.peer_addrs.iter().cloned())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .take(MAX_PEERS)
-            .collect()
+            .collect();
+
+        // Archives first when we are behind.
+        //
+        // A pruned peer answers `GetBlocks` below its horizon with nothing,
+        // and the sync loop reads an empty batch as the end of the chain and
+        // stops. Dialling in arbitrary order therefore means a node catching
+        // up can spend its whole round on peers that structurally cannot help
+        // it, with no error anywhere. Once we are at the tip the distinction
+        // stops mattering — a pruned peer relays new blocks as well as any
+        // other — so the ordering only applies while there is catching up to
+        // do, and nobody is excluded either way.
+        let mut ordered: Vec<String> = Vec::with_capacity(all.len());
+        if self.behind_a_peer() {
+            let (archive, rest): (Vec<String>, Vec<String>) = all
+                .into_iter()
+                .partition(|a| self.archive_peers.contains(a) || self.is_compiled_seed(a));
+            ordered.extend(archive);
+            ordered.extend(rest);
+        } else {
+            ordered.extend(all);
+        }
+        ordered.truncate(MAX_PEERS);
+        ordered
+    }
+
+    /// A compiled-in seed is assumed to be an archive until it says otherwise.
+    /// Without this a fresh node, which has spoken to nobody and so knows of
+    /// no archives, would sort its only useful contacts last.
+    fn is_compiled_seed(&self, addr: &str) -> bool {
+        self.network.seed_nodes().iter().any(|s| *s == addr)
+    }
+
+    /// Is some peer reporting a height above ours?
+    fn behind_a_peer(&self) -> bool {
+        let ours = self.chain.tip_height().map(|h| h.0).unwrap_or(0);
+        self.best_peer_height > ours
     }
 
     /// Stop dialling an address that can never peer with us.
@@ -388,13 +433,15 @@ fn fallback_dial_block(peers: &[String], block: &Block, inner: &NodeInner) {
     let height = inner.chain.tip_height().map(|h| h.0).unwrap_or(0);
     let tip = inner.chain.tip_hash();
     let port = inner.listen_port;
+    let pruned = inner.chain.is_pruned();
+    let first_h = inner.chain.first_height;
     for addr in peers.iter().take(4) {
         let block = block.clone();
         let addr = addr.clone();
         let proxy = inner.proxy.clone();
         thread::spawn(move || {
             if let Ok((mut s, _tor)) = connect_peer_via(&addr, 3000, proxy.as_ref()) {
-                if handshake(&mut s, network, genesis, height, tip, port).is_ok() {
+                if handshake(&mut s, network, genesis, height, tip, port, pruned, first_h).is_ok() {
                     let _ = broadcast_block(&mut s, &block);
                 }
             }
@@ -411,11 +458,13 @@ fn fallback_stem_tx(peers: &[String], tx: &Transaction, inner: &NodeInner) {
     let height = inner.chain.tip_height().map(|h| h.0).unwrap_or(0);
     let tip = inner.chain.tip_hash();
     let port = inner.listen_port;
+    let pruned = inner.chain.is_pruned();
+    let first_h = inner.chain.first_height;
     let proxy = inner.proxy.clone();
     let tx = tx.clone();
     thread::spawn(move || {
         if let Ok((mut s, _tor)) = connect_peer_via(&addr, 3000, proxy.as_ref()) {
-            if handshake(&mut s, network, genesis, height, tip, port).is_ok() {
+            if handshake(&mut s, network, genesis, height, tip, port, pruned, first_h).is_ok() {
                 let _ = nightfall_p2p::broadcast_tx(&mut s, &tx);
             }
         }
@@ -672,6 +721,7 @@ impl NodeHandle {
                 .and_then(|p| p.parse().ok())
                 .unwrap_or_else(|| cfg.network.default_p2p_port()),
             introducer: cfg.introducer,
+            archive_peers: HashSet::new(),
             mining_enabled: Arc::clone(&mining_enabled),
             tip_epoch: Arc::clone(&tip_epoch),
             hashes_total: Arc::clone(&hashes_total),
@@ -1278,7 +1328,7 @@ fn open_outbound_session(state: &SharedState, addr: &str) -> anyhow::Result<()> 
     }
     prepare_live_socket(&stream)?;
 
-    let (network, genesis, our_h, next, tip, port) = {
+    let (network, genesis, our_h, next, tip, port, our_pruned, our_first) = {
         let g = state.lock().unwrap();
         (
             g.network,
@@ -1287,6 +1337,8 @@ fn open_outbound_session(state: &SharedState, addr: &str) -> anyhow::Result<()> 
             next_needed_height(&g),
             g.chain.tip_hash(),
             g.listen_port,
+            g.chain.is_pruned(),
+            g.chain.first_height,
         )
     };
 
@@ -1294,8 +1346,28 @@ fn open_outbound_session(state: &SharedState, addr: &str) -> anyhow::Result<()> 
         anyhow::bail!("self-dial");
     }
 
-    let (peer_h, peer_tip) = handshake(&mut stream, network, genesis, our_h, tip, port)?;
+    let intro = handshake(
+        &mut stream,
+        network,
+        genesis,
+        our_h,
+        tip,
+        port,
+        our_pruned,
+        our_first,
+    )?;
+    let (peer_h, peer_tip) = (intro.height, intro.tip.clone());
     note_peer_height(state, peer_h);
+    // Remember who can answer for the whole chain. A pruned peer relays new
+    // blocks perfectly well and cannot help anybody catch up.
+    {
+        let mut g = state.lock().unwrap();
+        if intro.is_archive() {
+            g.archive_peers.insert(addr.to_string());
+        } else {
+            g.archive_peers.remove(addr);
+        }
+    }
     {
         let mut g = state.lock().unwrap();
         g.mark_confirmed(addr.to_string());
@@ -1807,12 +1879,14 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
                 g.session_height.insert(session_key.clone(), peer_height);
             }
 
-            let (height, tip, our_port) = {
+            let (height, tip, our_port, our_pruned, our_first) = {
                 let g = state.lock().unwrap();
                 (
                     g.chain.tip_height().map(|h| h.0).unwrap_or(0),
                     g.chain.tip_hash().to_hex(),
                     g.listen_port,
+                    g.chain.is_pruned(),
+                    g.chain.first_height,
                 )
             };
             write_msg(
@@ -1824,6 +1898,8 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
                     height,
                     tip,
                     listen_port: our_port,
+                    pruned: our_pruned,
+                    first_height: our_first,
                 },
             )?;
             (session_key, peer_height)
@@ -2408,7 +2484,7 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
     if let Ok(g) = state.lock() {
         g.last_tor_ok.store(used_tor, Ordering::Relaxed);
     }
-    let (network, genesis, our_h, tip, port) = {
+    let (network, genesis, our_h, tip, port, our_pruned, our_first) = {
         let g = state.lock().unwrap();
         (
             g.network,
@@ -2416,10 +2492,21 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
             g.chain.tip_height().map(|h| h.0).unwrap_or(0),
             g.chain.tip_hash(),
             g.listen_port,
+            g.chain.is_pruned(),
+            g.chain.first_height,
         )
     };
 
-    let (peer_h, peer_tip) = match handshake(&mut stream, network, genesis, our_h, tip, port) {
+    let intro = match handshake(
+        &mut stream,
+        network,
+        genesis,
+        our_h,
+        tip,
+        port,
+        our_pruned,
+        our_first,
+    ) {
         Ok(v) => v,
         Err(e) => {
             // Inbound already dropped genesis-mismatch peers. Outbound did
@@ -2433,7 +2520,18 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
             return Err(e.into());
         }
     };
-    state.lock().unwrap().mark_confirmed(addr.to_string());
+    let (peer_h, peer_tip) = (intro.height, intro.tip.clone());
+    {
+        let mut g = state.lock().unwrap();
+        g.mark_confirmed(addr.to_string());
+        // Who can still answer for the whole chain, recorded the moment they
+        // say so rather than discovered by an empty reply later.
+        if intro.is_archive() {
+            g.archive_peers.insert(addr.to_string());
+        } else {
+            g.archive_peers.remove(addr);
+        }
+    }
     note_peer_height(state, peer_h);
 
     // Learn about the rest of the network from this peer.
