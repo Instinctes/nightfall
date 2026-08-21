@@ -267,6 +267,16 @@ fn main() -> anyhow::Result<()> {
 /// whole history: every output past page one was dropped, and a sync that
 /// stopped there lost them for good.
 fn sync(wallet: &mut Wallet, rpc: &str, from: u64) -> anyhow::Result<u32> {
+    let st = rpc_call(rpc, "status", json!({}))?;
+    if st.get("pruned").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let avail = st.get("prune_height").and_then(|v| v.as_u64()).unwrap_or(0);
+        if from < avail {
+            anyhow::bail!(
+                "node is pruned; bodies start at height {avail}. Cannot scan from {from}. \
+                 Point the wallet at an archive node (a seed) or the light API"
+            );
+        }
+    }
     let mut height = from;
     let mut all = Vec::new();
 

@@ -67,6 +67,7 @@ fn boot(introducer: bool) -> (NodeHandle, u16, TempDir) {
         // Never let a test reach for the real network directory.
         peers_url: Some("off".into()),
         introducer,
+        prune: false,
     };
     let node = NodeHandle::start(cfg).expect("node starts");
     // The listener spawns on its own thread; give it a moment to bind.

@@ -220,6 +220,48 @@ blocks are refused.
 | Testnet | 60 |
 | Devnet | 10 |
 
+### 2.5 Checkpoints (`assumevalid`)
+
+A release may pin one or more historical mainnet block hashes in
+`CHECKPOINTS` (`nightfall-types`). Below a pin, proof of work is not
+re-hashed on replay: linkage, UTXO roots and the pin itself still are.
+A chain that never reaches the pinned height is fully checked.
+
+This is a **trust assumption** — you trust the builder not to have
+pinned a hash from a chain of their own — the same class of assumption
+as Bitcoin's `assumevalid`. `NIGHTFALL_NO_ASSUME_VALID=1` turns it off.
+Reproduce a pin with:
+
+```
+cargo run --release -p nightfall-node --example checkpoint -- <height>
+```
+
+Never add a pin from a single machine. Current pin: height **25,000**.
+
+### 2.6 Pruned nodes
+
+A node may drop block **bodies** older than [`MAX_REORG_DEPTH`] (500),
+keeping:
+
+- the UTXO set (and the supply invariant)
+- compact headers from genesis (difficulty, MTP, hash-walks)
+- the last 500 full bodies (the reorg window)
+
+This is a **local storage policy**, not a consensus rule. A pruned node:
+
+- still validates new blocks in full
+- cannot serve `GetBlocks` below the prune height — IBD needs an archive
+- cannot rescan stealth outputs from genesis; use an archive node or the
+  light API (`scan_feed` on a seed)
+- cannot export a full snapshot
+
+`--prune` / Core → Settings → **Prune old blocks**. Seeds that serve IBD
+or `--mobile-listen` stay archives. A pruned datadir that fails its
+validation record cannot re-hash the dropped bodies; resync from a seed.
+
+The same class of assumption as Bitcoin's prune: you trust this node's
+own disk, not a stranger's UTXO snapshot.
+
 ---
 
 ## 3. Emission

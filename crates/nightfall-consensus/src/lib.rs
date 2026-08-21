@@ -45,6 +45,13 @@ pub fn reorg_rewind(our_hashes: &[Hash256], candidate: &[Block]) -> usize {
 /// Cap on transactions per block.
 pub const MAX_TXS_PER_BLOCK: usize = 512;
 
+/// How many full block bodies a pruned node keeps.
+///
+/// Equal to [`MAX_REORG_DEPTH`]: any reorg the node is willing to adopt
+/// still has every body it needs. Older bodies are dropped; headers and
+/// the UTXO set stay. Seeds that serve IBD must not prune.
+pub const PRUNE_KEEP_BLOCKS: usize = MAX_REORG_DEPTH;
+
 // ---------------------------------------------------------------- emission --
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -195,6 +202,43 @@ impl BlockTemplate {
     }
 }
 
+/// Header facts kept after a body is pruned. Difficulty, MTP and reorg
+/// hash-walks need the whole chain; the range proofs do not.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactHeader {
+    pub height: u64,
+    pub hash: Hash256,
+    pub prev_hash: Hash256,
+    pub timestamp_unix: u64,
+    pub difficulty: u64,
+}
+
+impl CompactHeader {
+    pub fn from_block(block: &Block) -> Self {
+        Self {
+            height: block.header.height.0,
+            hash: block.hash(),
+            prev_hash: block.header.prev_hash,
+            timestamp_unix: block.header.timestamp_unix,
+            difficulty: block.header.difficulty,
+        }
+    }
+
+    pub fn work(&self) -> u128 {
+        block_work(self.difficulty)
+    }
+}
+
+/// UTXO + headers below the first kept body. Enough to rebuild a pruned
+/// chain across a reorg that stays inside [`MAX_REORG_DEPTH`].
+#[derive(Clone, Debug)]
+pub struct PrunedBase {
+    pub first_height: u64,
+    pub horizon: LedgerState,
+    pub horizon_work: u128,
+    pub headers: Vec<CompactHeader>,
+}
+
 // ------------------------------------------------------------------- chain --
 
 #[derive(Clone, Debug)]
@@ -204,7 +248,18 @@ pub struct Chain {
     pub genesis_hash: Hash256,
     pub emission: EmissionSchedule,
     pub ledger: LedgerState,
+    /// Full bodies from [`Self::first_height`] onward. Archive: the whole
+    /// chain. Pruned: the reorg window.
     pub blocks: Vec<Block>,
+    /// One compact header per height from genesis, even after prune.
+    pub headers: Vec<CompactHeader>,
+    /// Height of `blocks[0]`. Zero on an archive node.
+    pub first_height: u64,
+    /// Ledger after applying headers `[0, first_height)`. `None` iff
+    /// `first_height == 0`.
+    pub horizon: Option<LedgerState>,
+    /// Cumulative work of the horizon prefix.
+    pub horizon_work: u128,
     /// Exact cumulative proof of work. This, not block count, decides forks.
     pub total_work: u128,
 }
@@ -224,6 +279,10 @@ impl Chain {
             emission: EmissionSchedule::locked_mainnet(),
             ledger: LedgerState::for_network(network),
             blocks: Vec::new(),
+            headers: Vec::new(),
+            first_height: 0,
+            horizon: None,
+            horizon_work: 0,
             total_work: 0,
         })
     }
@@ -237,25 +296,70 @@ impl Chain {
     }
 
     pub fn tip_height(&self) -> Option<Height> {
-        self.blocks.last().map(|b| b.header.height)
+        self.headers
+            .last()
+            .map(|h| Height(h.height))
+            .or_else(|| self.blocks.last().map(|b| b.header.height))
     }
 
     pub fn next_height(&self) -> Height {
         match self.tip_height() {
-            None => Height(0),
             Some(h) => h.next(),
+            None => Height(self.first_height),
         }
     }
 
     pub fn block_count(&self) -> u64 {
-        self.blocks.len() as u64
+        if !self.headers.is_empty() {
+            self.headers.len() as u64
+        } else {
+            self.first_height + self.blocks.len() as u64
+        }
+    }
+
+    pub fn is_pruned(&self) -> bool {
+        self.first_height > 0
     }
 
     pub fn tip_hash(&self) -> Hash256 {
-        self.blocks
+        self.headers
             .last()
-            .map(|b| b.hash())
+            .map(|h| h.hash)
+            .or_else(|| self.blocks.last().map(|b| b.hash()))
             .unwrap_or(self.genesis_hash)
+    }
+
+    pub fn hash_at(&self, height: u64) -> Option<Hash256> {
+        self.headers
+            .get(height as usize)
+            .map(|h| h.hash)
+            .or_else(|| self.block_by_height(height).map(|b| b.hash()))
+    }
+
+    pub fn hash_chain(&self) -> Vec<Hash256> {
+        if !self.headers.is_empty() {
+            self.headers.iter().map(|h| h.hash).collect()
+        } else {
+            self.blocks.iter().map(|b| b.hash()).collect()
+        }
+    }
+
+    /// Snapshot of everything below the first kept body. `None` on archive.
+    pub fn pruned_base(&self) -> Option<PrunedBase> {
+        if self.first_height == 0 {
+            return None;
+        }
+        Some(PrunedBase {
+            first_height: self.first_height,
+            horizon: self.horizon.clone()?,
+            horizon_work: self.horizon_work,
+            headers: self
+                .headers
+                .iter()
+                .take(self.first_height as usize)
+                .cloned()
+                .collect(),
+        })
     }
 
     pub fn total_minted(&self) -> u64 {
@@ -267,23 +371,54 @@ impl Chain {
     }
 
     pub fn block_by_height(&self, height: u64) -> Option<&Block> {
-        self.blocks.get(height as usize)
+        let idx = height.checked_sub(self.first_height)? as usize;
+        self.blocks.get(idx).filter(|b| b.header.height.0 == height)
     }
 
+    /// Bodies we still hold, starting at `start_height`. Heights below
+    /// [`Self::first_height`] are gone — the vec is empty, not a lie.
     pub fn blocks_from(&self, start_height: u64, limit: usize) -> Vec<Block> {
-        self.blocks
-            .iter()
-            .skip(start_height as usize)
-            .take(limit)
-            .cloned()
-            .collect()
+        if start_height < self.first_height {
+            return Vec::new();
+        }
+        let idx = (start_height - self.first_height) as usize;
+        self.blocks.iter().skip(idx).take(limit).cloned().collect()
+    }
+
+    /// Bodies from `first_height` through `height` inclusive.
+    ///
+    /// `None` if that range includes discarded bodies — a reorg that
+    /// deep cannot be rebuilt on a pruned node.
+    pub fn bodies_through(&self, height: u64) -> Option<Vec<Block>> {
+        if self.first_height == 0 {
+            let end = (height as usize).saturating_add(1).min(self.blocks.len());
+            return Some(self.blocks[..end].to_vec());
+        }
+        if height + 1 < self.first_height {
+            return None;
+        }
+        if height + 1 == self.first_height {
+            return Some(Vec::new());
+        }
+        let last = height.checked_sub(self.first_height)? as usize;
+        if last >= self.blocks.len() {
+            return None;
+        }
+        Some(self.blocks[..=last].to_vec())
     }
 
     fn difficulty_history(&self) -> Vec<(u64, u64)> {
-        self.blocks
-            .iter()
-            .map(|b| (b.header.timestamp_unix, b.header.difficulty))
-            .collect()
+        if !self.headers.is_empty() {
+            self.headers
+                .iter()
+                .map(|h| (h.timestamp_unix, h.difficulty))
+                .collect()
+        } else {
+            self.blocks
+                .iter()
+                .map(|b| (b.header.timestamp_unix, b.header.difficulty))
+                .collect()
+        }
     }
 
     /// Difficulty required of the next block.
@@ -296,11 +431,14 @@ impl Chain {
     }
 
     pub fn median_time_past(&self) -> u64 {
-        let ts: Vec<u64> = self
-            .blocks
-            .iter()
-            .map(|b| b.header.timestamp_unix)
-            .collect();
+        let ts: Vec<u64> = if !self.headers.is_empty() {
+            self.headers.iter().map(|h| h.timestamp_unix).collect()
+        } else {
+            self.blocks
+                .iter()
+                .map(|b| b.header.timestamp_unix)
+                .collect()
+        };
         median_time_past(&ts)
     }
 
@@ -454,8 +592,13 @@ impl Chain {
             .apply_block_state_only(&block.body, block.header.height, subsidy)
             .map_err(|e| ConsensusError::Ledger(e.to_string()))?;
         self.total_work = self.total_work.saturating_add(block.work());
-        self.blocks.push(block);
+        self.push_block(block);
         Ok(())
+    }
+
+    fn push_block(&mut self, block: Block) {
+        self.headers.push(CompactHeader::from_block(&block));
+        self.blocks.push(block);
     }
 
     fn apply_block_inner(
@@ -503,7 +646,7 @@ impl Chain {
         {
             return Err(ConsensusError::TimestampTooFarAhead);
         }
-        if !self.blocks.is_empty() && block.header.timestamp_unix <= self.median_time_past() {
+        if self.block_count() > 0 && block.header.timestamp_unix <= self.median_time_past() {
             return Err(ConsensusError::TimestampBeforeMedian);
         }
 
@@ -556,8 +699,42 @@ impl Chain {
         // --- commit ---
         self.total_work = self.total_work.saturating_add(block.work());
         self.ledger = trial;
-        self.blocks.push(block);
+        self.push_block(block);
         Ok(())
+    }
+
+    /// Drop bodies older than `keep`, leaving headers and the UTXO set.
+    ///
+    /// The live ledger stays at the tip. A second copy (`horizon`) is the
+    /// UTXO just before the first kept body, which is what a reorg inside
+    /// the window replays from. Returns how many bodies were discarded.
+    pub fn prune_keep(&mut self, keep: usize) -> Result<usize, ConsensusError> {
+        let keep = keep.max(1);
+        if self.blocks.len() <= keep {
+            return Ok(0);
+        }
+        let drop_n = self.blocks.len() - keep;
+        if self.horizon.is_none() {
+            self.horizon = Some(LedgerState::for_network(self.network));
+            self.horizon_work = 0;
+        }
+        for b in &self.blocks[..drop_n] {
+            let minted = self
+                .horizon
+                .as_ref()
+                .map(|h| h.supply.total_minted_darks)
+                .unwrap_or(0);
+            let subsidy = self.emission.reward_at(b.header.height, minted).darks();
+            self.horizon
+                .as_mut()
+                .unwrap()
+                .apply_block_state_only(&b.body, b.header.height, subsidy)
+                .map_err(|e| ConsensusError::Ledger(e.to_string()))?;
+            self.horizon_work = self.horizon_work.saturating_add(b.work());
+        }
+        self.blocks.drain(..drop_n);
+        self.first_height += drop_n as u64;
+        Ok(drop_n)
     }
 
     /// Replay a full block list into a fresh chain.
@@ -691,8 +868,16 @@ impl Chain {
         blocks: Vec<Block>,
         now_unix: u64,
     ) -> Result<bool, ConsensusError> {
-        let hashes: Vec<Hash256> = self.blocks.iter().map(|b| b.hash()).collect();
-        match Self::evaluate_reorg(self.network, self.total_work, &hashes, blocks, now_unix)? {
+        let hashes = self.hash_chain();
+        let base = self.pruned_base();
+        match Self::evaluate_reorg_at(
+            self.network,
+            self.total_work,
+            &hashes,
+            base,
+            blocks,
+            now_unix,
+        )? {
             Some(candidate) => Ok(self.adopt_reorg(candidate)),
             None => Ok(false),
         }
@@ -723,8 +908,32 @@ impl Chain {
         blocks: Vec<Block>,
         now_unix: u64,
     ) -> Result<Option<Self>, ConsensusError> {
+        Self::evaluate_reorg_at(network, our_work, our_hashes, None, blocks, now_unix)
+    }
+
+    /// Same as [`Self::evaluate_reorg`], but a pruned node passes the UTXO
+    /// sitting at `first_height` and a candidate that *starts there*.
+    ///
+    /// Archive callers leave `base` as `None` and still hand a chain from
+    /// genesis. A fork that would rewind past the prune horizon is
+    /// [`ConsensusError::ReorgTooDeep`] — the bodies are gone.
+    pub fn evaluate_reorg_at(
+        network: NetworkId,
+        our_work: u128,
+        our_hashes: &[Hash256],
+        base: Option<PrunedBase>,
+        blocks: Vec<Block>,
+        now_unix: u64,
+    ) -> Result<Option<Self>, ConsensusError> {
         if blocks.is_empty() {
             return Ok(None);
+        }
+
+        let start = base.as_ref().map(|b| b.first_height).unwrap_or(0);
+        if let Some(first) = blocks.first() {
+            if first.header.height.0 != start {
+                return Err(ConsensusError::BadHeight);
+            }
         }
 
         // Work first, and deliberately so.
@@ -735,7 +944,8 @@ impl Chain {
         // be turned away for a reason unrelated to how it would have been
         // judged — and it reported `ReorgTooDeep` while doing it, which reads
         // as "this chain is suspicious" rather than "we never looked".
-        let claimed_work: u128 = blocks.iter().map(|b| b.work()).sum();
+        let suffix_work: u128 = blocks.iter().map(|b| b.work()).sum();
+        let claimed_work = base.as_ref().map(|b| b.horizon_work).unwrap_or(0) + suffix_work;
         if claimed_work <= our_work {
             return Ok(None);
         }
@@ -749,19 +959,62 @@ impl Chain {
         // to rejoin. A peer that actually forks at genesis, abandoning more
         // than MAX_REORG_DEPTH of our history, is still refused — that is the
         // denial-of-service limit, and it stays.
-        let common = reorg_common_prefix(our_hashes, &blocks);
+        let start_idx = start as usize;
+        if our_hashes.len() < start_idx {
+            return Err(ConsensusError::ReorgTooDeep);
+        }
+        let window_common = blocks
+            .iter()
+            .zip(our_hashes.iter().skip(start_idx))
+            .take_while(|(b, h)| b.hash() == **h)
+            .count();
+        let common = start_idx + window_common;
         if our_hashes.len().saturating_sub(common) > MAX_REORG_DEPTH {
             return Err(ConsensusError::ReorgTooDeep);
         }
 
         // Shared history is ours. Only the suffix is untrusted work.
-        let candidate =
-            Self::rebuild_from_blocks_trusted_prefix(network, blocks, common, now_unix)?;
+        let candidate = match base {
+            Some(base) => {
+                Self::rebuild_from_pruned_base(network, base, blocks, window_common, now_unix)?
+            }
+            None => Self::rebuild_from_blocks_trusted_prefix(network, blocks, common, now_unix)?,
+        };
         candidate.verify_supply()?;
         if candidate.total_work > our_work {
             return Ok(Some(candidate));
         }
         Ok(None)
+    }
+
+    fn rebuild_from_pruned_base(
+        network: NetworkId,
+        base: PrunedBase,
+        blocks: Vec<Block>,
+        trusted_prefix: usize,
+        now_unix: u64,
+    ) -> Result<Self, ConsensusError> {
+        let mut chain = Self::new_fair(network)?;
+        chain.ledger = base.horizon.clone();
+        chain.horizon = Some(base.horizon);
+        chain.horizon_work = base.horizon_work;
+        chain.first_height = base.first_height;
+        chain.headers = base.headers;
+        chain.total_work = base.horizon_work;
+        for (i, b) in blocks.into_iter().enumerate() {
+            if i < trusted_prefix {
+                chain.apply_block_from_own_disk(b)?;
+                continue;
+            }
+            if i == trusted_prefix && trusted_prefix > 0 {
+                chain.check_tip_roots()?;
+            }
+            chain.apply_block(b, now_unix)?;
+        }
+        if trusted_prefix > 0 && trusted_prefix >= chain.blocks.len() {
+            chain.check_tip_roots()?;
+        }
+        Ok(chain)
     }
 
     /// Take a chain produced by [`Self::evaluate_reorg`], if it still wins.

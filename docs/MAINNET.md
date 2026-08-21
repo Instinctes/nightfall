@@ -111,6 +111,10 @@ cargo build --release -p nightfall-node
 ./scripts/install-seed-node.sh
 ```
 
+**Do not pass `--prune` on a seed.** IBD and the light API need every
+block body from genesis. Prune is for laptops; the two public seeds stay
+archives.
+
 Both create a service that restarts on crash, verify the genesis hash before
 starting, keep the RPC on loopback, and hand logging to the system so an
 unattended node cannot fill a disk. Neither mines or holds keys — a seed whose

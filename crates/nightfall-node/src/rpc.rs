@@ -209,9 +209,12 @@ pub(crate) fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
                         0
                     } else {
                         chain
-                            .blocks
+                            .headers
                             .last()
-                            .map(|b| b.header.timestamp_unix)
+                            .map(|h| h.timestamp_unix)
+                            .or_else(|| {
+                                chain.blocks.last().map(|b| b.header.timestamp_unix)
+                            })
                             .unwrap_or(0)
                     },
                     "stalled_on_fork": g.stalled_on_fork.load(Ordering::SeqCst),
@@ -224,6 +227,8 @@ pub(crate) fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
                         0
                     },
                     "mining_threads": g.mining_threads.load(Ordering::Relaxed),
+                    "pruned": chain.is_pruned(),
+                    "prune_height": chain.first_height,
                 }),
                 id,
             )
@@ -324,6 +329,15 @@ pub(crate) fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
                 .unwrap_or(128)
                 .min(nightfall_p2p::MAX_BLOCKS_PER_REQUEST as u64) as usize;
             let g = state.lock().unwrap();
+            if from < g.chain.first_height {
+                return err(
+                    format!(
+                        "this node is pruned; bodies start at height {}",
+                        g.chain.first_height
+                    ),
+                    id,
+                );
+            }
             match serde_json::to_value(g.chain.blocks_from(from, limit)) {
                 Ok(v) => ok(v, id),
                 Err(e) => err(e.to_string(), id),
@@ -438,6 +452,8 @@ fn scan_feed_snapshot(state: &SharedState, from: u64, limit: usize) -> serde_jso
         "outputs": outputs,
         "spent": spent,
         "heartbeat": false,
+        "pruned": g.chain.is_pruned(),
+        "available_from": g.chain.first_height,
     })
 }
 

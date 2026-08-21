@@ -197,7 +197,8 @@ ExecStart=$BINDIR/nightfalld \\
     --datadir $DATADIR \\
     run \\
     --listen 0.0.0.0:$P2P_PORT \\
-    --rpc-listen 127.0.0.1:$RPC_PORT
+    --rpc-listen 127.0.0.1:$RPC_PORT \\
+    --introducer
 
 Restart=always
 # Do not respawn faster than this. A node that crashes on a corrupt block file

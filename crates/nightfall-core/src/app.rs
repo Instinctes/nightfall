@@ -116,6 +116,7 @@ pub struct App {
     pub backup_acked: bool,
     pub resync_confirm: bool,
     pub close_to_tray: bool,
+    pub prune: bool,
     pub mining_threads: usize,
     pub want_quit: bool,
     pub window_hidden: bool,
@@ -206,6 +207,7 @@ impl App {
             backup_acked: load_backup_acked(&datadir),
             resync_confirm: false,
             close_to_tray: load_close_to_tray(&datadir),
+            prune: load_flag(&datadir, "prune", false),
             mining_threads,
             want_quit: false,
             window_hidden: false,
@@ -255,6 +257,7 @@ impl App {
             peers_url: std::env::var("NIGHTFALL_PEERS_URL").ok(),
             // A desktop wallet wants peers, not petitioners.
             introducer: false,
+            prune: load_flag(&self.datadir, "prune", false),
             proxy: {
                 let from_env = std::env::var("NIGHTFALL_PROXY").ok();
                 if from_env.as_ref().map(|s| !s.is_empty()).unwrap_or(false) {
@@ -319,6 +322,32 @@ impl App {
     pub fn set_close_to_tray(&mut self, on: bool) {
         self.close_to_tray = on;
         save_flag(&self.datadir, "close_to_tray", on);
+    }
+
+    pub fn set_prune(&mut self, on: bool, ctx: &egui::Context) {
+        if !on && self.prune {
+            if let Some(s) = &self.status {
+                if s.pruned {
+                    self.toasts.error(
+                        ctx,
+                        "Already pruned — Resync chain from a seed to store full history again",
+                    );
+                    return;
+                }
+            }
+        }
+        self.prune = on;
+        save_flag(&self.datadir, "prune", on);
+        if let Some(node) = &self.node {
+            if let Err(e) = node.set_prune(on) {
+                self.toasts.error(ctx, e.to_string());
+            } else if on {
+                self.toasts.info(
+                    ctx,
+                    "Prune on — bodies older than 500 blocks will be dropped",
+                );
+            }
+        }
     }
 
     pub fn set_mining_threads(&mut self, n: usize) {

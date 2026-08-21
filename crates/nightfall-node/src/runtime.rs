@@ -4,7 +4,7 @@ use crate::rpc;
 use crate::session::{
     fanout_block, fluff_tx, inbound_key, outbound_key, stem_tx, SessionHandle, SessionPool,
 };
-use nightfall_consensus::{Block, BlockTemplate, Chain, Mempool};
+use nightfall_consensus::{Block, BlockTemplate, Chain, Mempool, PRUNE_KEEP_BLOCKS};
 use nightfall_crypto::{default_threads, mine_parallel, Address};
 use nightfall_ledger::Transaction;
 use nightfall_p2p::{
@@ -73,6 +73,9 @@ pub struct NodeConfig {
     /// The node still syncs and still dials out — it just refuses to be
     /// anybody's long-term peer.
     pub introducer: bool,
+    /// Drop block bodies older than the reorg window. UTXO and headers stay.
+    /// Seeds that serve IBD or the light API must leave this off.
+    pub prune: bool,
 }
 
 /// Where a new install finds listening nodes when the compiled-in seeds
@@ -206,6 +209,8 @@ pub struct NodeInner {
     pub hashrate_prev_total: AtomicU64,
     /// Hashes in the last one-second heartbeat. Integer H/s for RPC.
     pub hashrate_hps: AtomicU64,
+    /// `Some(n)` = keep only `n` full bodies. `None` = archive.
+    pub prune_keep: Option<usize>,
 }
 
 /// Upper bound on buffered branch blocks. A fork deeper than this is past
@@ -240,7 +245,14 @@ fn load_known_peers(datadir: &std::path::Path) -> Vec<String> {
 }
 
 impl NodeInner {
-    pub fn persist(&self) -> anyhow::Result<()> {
+    pub fn persist(&mut self) -> anyhow::Result<()> {
+        if let Some(keep) = self.prune_keep {
+            match self.chain.prune_keep(keep) {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("pruned {n} old block bodies (keeping {keep})"),
+                Err(e) => tracing::warn!("prune failed: {e}"),
+            }
+        }
         self.store.save(&self.chain)
     }
 
@@ -524,6 +536,10 @@ pub struct StatusSnap {
     pub hashrate: u64,
     pub mining_threads: usize,
     pub sync_hold: SyncHold,
+    /// True when old block bodies have been discarded.
+    pub pruned: bool,
+    /// First height whose body is still on disk. 0 = archive.
+    pub prune_height: u64,
 }
 
 /// Why mining is held, for the UI. Distinct from the mining-hold number
@@ -568,6 +584,19 @@ pub struct NodeHandle {
 
 impl NodeHandle {
     pub fn start(cfg: NodeConfig) -> anyhow::Result<Self> {
+        if cfg.prune
+            && cfg
+                .mobile_listen
+                .as_ref()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+        {
+            anyhow::bail!(
+                "a pruned node cannot serve the light API — phones scan from \
+                 genesis and the bodies are gone. Run an archive node for \
+                 --mobile-listen (seeds stay full)"
+            );
+        }
         let store = ChainStore::new(&cfg.datadir);
         // Own file, already validated: replay without proofs (seconds).
         // File changed or no record: full verify in the background, RPC/light
@@ -576,11 +605,23 @@ impl NodeHandle {
         let trusted = store.is_own_file_trusted();
         let need_slow_replay = stored && !trusted;
         let preview = store.peek_meta();
-        let chain = if need_slow_replay {
+        let mut chain = if need_slow_replay {
             Chain::new_fair(cfg.network)?
         } else {
             store.load_or_new(cfg.network)?
         };
+        let prune_keep = if cfg.prune || chain.is_pruned() {
+            Some(PRUNE_KEEP_BLOCKS)
+        } else {
+            None
+        };
+        if let Some(keep) = prune_keep {
+            let dropped = chain.prune_keep(keep)?;
+            if dropped > 0 {
+                tracing::info!("pruned {dropped} old block bodies (keeping {keep})");
+                store.save(&chain)?;
+            }
+        }
         let genesis_hex = preview
             .as_ref()
             .map(|(_, _, g)| g.clone())
@@ -666,6 +707,7 @@ impl NodeHandle {
             proxy: parse_proxy_cfg(cfg.proxy.as_deref())?,
             last_tor_ok: Arc::new(AtomicBool::new(false)),
             stem_embargo: HashMap::new(),
+            prune_keep,
         };
         let state: SharedState = Arc::new(Mutex::new(inner));
 
@@ -688,7 +730,7 @@ impl NodeHandle {
             let datadir = cfg.datadir.clone();
             thread::spawn(move || loop {
                 thread::sleep(Duration::from_secs(30));
-                if let Ok(g) = st.lock() {
+                if let Ok(mut g) = st.lock() {
                     if !g.loading {
                         if let Err(e) = g.persist() {
                             tracing::warn!("persist: {e}");
@@ -939,9 +981,10 @@ impl NodeHandle {
             0
         } else {
             g.chain
-                .blocks
+                .headers
                 .last()
-                .map(|b| b.header.timestamp_unix)
+                .map(|h| h.timestamp_unix)
+                .or_else(|| g.chain.blocks.last().map(|b| b.header.timestamp_unix))
                 .unwrap_or(0)
         };
         let mut peer_versions = BTreeMap::new();
@@ -991,6 +1034,8 @@ impl NodeHandle {
                 0
             },
             mining_threads: g.mining_threads.load(Ordering::Relaxed),
+            pruned: g.chain.is_pruned(),
+            prune_height: g.chain.first_height,
             sync_hold: if loading {
                 SyncHold::Synced
             } else {
@@ -1004,6 +1049,29 @@ impl NodeHandle {
                 )
             },
         })
+    }
+
+    /// Turn prune on. Cannot be turned off without a resync — the bodies
+    /// are gone. A node that is already pruned stays pruned.
+    pub fn set_prune(&self, on: bool) -> anyhow::Result<()> {
+        let mut g = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("node state lock poisoned"))?;
+        if !on && g.chain.is_pruned() {
+            anyhow::bail!(
+                "already pruned — resync the chain from an archive node to store full history again"
+            );
+        }
+        g.prune_keep = if on || g.chain.is_pruned() {
+            Some(PRUNE_KEEP_BLOCKS)
+        } else {
+            None
+        };
+        if on {
+            g.persist()?;
+        }
+        Ok(())
     }
 
     /// Change the outbound SOCKS5 proxy. Existing sockets stay up; new dials
@@ -1874,8 +1942,12 @@ fn peer_io_loop(
             PeerMsg::GetBlocks { from_height, limit } => {
                 let blocks = {
                     let g = state.lock().unwrap();
-                    g.chain
-                        .blocks_from(from_height, limit.min(MAX_BLOCKS_PER_REQUEST))
+                    if from_height < g.chain.first_height {
+                        Vec::new()
+                    } else {
+                        g.chain
+                            .blocks_from(from_height, limit.min(MAX_BLOCKS_PER_REQUEST))
+                    }
                 };
                 sess.send(&PeerMsg::Blocks { blocks })?;
             }
@@ -2107,6 +2179,9 @@ fn consider_branch(state: &SharedState, block: Block, peer_label: &str) {
 
     // Walk forward for as far as the run is contiguous. A gap simply ends it;
     // the next push round fills in what is missing.
+    //
+    // On an archive node this prefix starts at genesis. On a pruned node
+    // it starts at `first_height` — `evaluate_reorg_at` is told that.
     let mut candidate: Vec<Block> = g.chain.blocks[..=fork_at].to_vec();
     let mut cursor = g.chain.blocks[fork_at].hash().0;
     let mut added = 0usize;
@@ -2123,7 +2198,9 @@ fn consider_branch(state: &SharedState, block: Block, peer_label: &str) {
     }
 
     // Cheap rejection before rebuilding anything.
-    let claimed: u128 = candidate.iter().map(|b| b.work()).sum();
+    // Pruned candidate is the window only — add the horizon's work or a
+    // heavier suffix always looks lighter than the live chain.
+    let claimed: u128 = g.chain.horizon_work + candidate.iter().map(|b| b.work()).sum::<u128>();
     if claimed <= g.chain.total_work {
         return;
     }
@@ -2131,7 +2208,8 @@ fn consider_branch(state: &SharedState, block: Block, peer_label: &str) {
     let before = g.chain.block_count();
     let network = g.chain.network;
     let our_work = g.chain.total_work;
-    let our_hashes: Vec<_> = g.chain.blocks.iter().map(|b| b.hash()).collect();
+    let our_hashes = g.chain.hash_chain();
+    let base = g.chain.pruned_base();
     let guard = Arc::clone(&g.reorg_in_flight);
     drop(g);
 
@@ -2140,8 +2218,9 @@ fn consider_branch(state: &SharedState, block: Block, peer_label: &str) {
         return;
     };
 
-    // Verified with the lock released. See `Chain::evaluate_reorg`.
-    let verdict = Chain::evaluate_reorg(network, our_work, &our_hashes, candidate, now_unix());
+    // Verified with the lock released. See `Chain::evaluate_reorg_at`.
+    let verdict =
+        Chain::evaluate_reorg_at(network, our_work, &our_hashes, base, candidate, now_unix());
 
     let Ok(g) = state.lock() else { return };
     let mut g = g;
@@ -2206,7 +2285,7 @@ fn common_ancestor(
 ) -> u64 {
     let our_hash_at = |h: u64| -> Option<String> {
         let g = state.lock().ok()?;
-        g.chain.blocks.get(h as usize).map(|b| b.hash().to_hex())
+        g.chain.hash_at(h).map(|h| h.to_hex())
     };
 
     // Fast path: we agree at their tip, so they are simply behind.
@@ -2454,20 +2533,29 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
         }
 
         let ancestor = common_ancestor(state, &mut stream, peer_h, &peer_tip);
-        let (network, our_work, our_hashes, prefix, rewind, guard) = {
+        let (network, our_work, our_hashes, prefix, rewind, guard, base) = {
             let g = state.lock().unwrap();
             let our_tip = g.chain.tip_height().map(|h| h.0).unwrap_or(0);
             let rewind = our_tip.saturating_sub(ancestor) as usize;
-            let prefix_end = (ancestor as usize)
-                .saturating_add(1)
-                .min(g.chain.blocks.len());
+            let prefix = match g.chain.bodies_through(ancestor) {
+                Some(p) => p,
+                None => {
+                    tracing::warn!(
+                        "peer {addr} diverges below the prune horizon at height {} — not adopting",
+                        g.chain.first_height
+                    );
+                    g.stalled_on_fork.store(true, Ordering::SeqCst);
+                    break;
+                }
+            };
             (
                 g.chain.network,
                 g.chain.total_work,
-                g.chain.blocks.iter().map(|b| b.hash()).collect::<Vec<_>>(),
-                g.chain.blocks[..prefix_end].to_vec(),
+                g.chain.hash_chain(),
+                prefix,
                 rewind,
                 Arc::clone(&g.reorg_in_flight),
+                g.chain.pruned_base(),
             )
         };
 
@@ -2502,8 +2590,9 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
         }
 
         // Shared prefix is our own file; only the suffix is verified.
-        // See `Chain::evaluate_reorg`.
-        let verdict = Chain::evaluate_reorg(network, our_work, &our_hashes, candidate, now_unix());
+        // See `Chain::evaluate_reorg_at`.
+        let verdict =
+            Chain::evaluate_reorg_at(network, our_work, &our_hashes, base, candidate, now_unix());
 
         let mut g = state.lock().unwrap();
         match verdict {

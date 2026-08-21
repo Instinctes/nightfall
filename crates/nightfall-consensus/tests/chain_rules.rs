@@ -869,3 +869,69 @@ fn assume_valid_never_reaches_a_chain_shorter_than_the_pin() {
         "a chain below the pinned height must still have its proof of work checked"
     );
 }
+
+#[test]
+fn prune_keeps_count_and_utxo_drops_old_bodies() {
+    let miner = WalletKeys::generate().address();
+    let mut chain = devnet();
+    for i in 0..12u64 {
+        chain
+            .mine_block(&miner, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+    let count = chain.block_count();
+    let tip = chain.tip_hash();
+    let root = chain.ledger.utxo_root();
+    let dropped = chain.prune_keep(4).unwrap();
+    assert_eq!(dropped, 8);
+    assert!(chain.is_pruned());
+    assert_eq!(chain.first_height, 8);
+    assert_eq!(chain.blocks.len(), 4);
+    assert_eq!(chain.block_count(), count);
+    assert_eq!(chain.tip_hash(), tip);
+    assert_eq!(chain.ledger.utxo_root(), root);
+    assert!(chain.block_by_height(0).is_none());
+    assert!(chain.block_by_height(8).is_some());
+    assert!(chain.blocks_from(0, 4).is_empty());
+    assert_eq!(chain.blocks_from(8, 4).len(), 4);
+    chain.verify_supply().unwrap();
+    chain
+        .mine_block(&miner, vec![], NOW + 12 * TARGET_BLOCK_TIME_SECS)
+        .unwrap();
+    assert_eq!(chain.block_count(), count + 1);
+    assert_eq!(chain.blocks.len(), 5);
+}
+
+#[test]
+fn prune_reorg_inside_the_window_still_works() {
+    let a = WalletKeys::from_seed([1u8; 32]).address();
+    let b = WalletKeys::from_seed([2u8; 32]).address();
+    let mut stem = devnet();
+    for i in 0..4u64 {
+        stem.mine_block(&a, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+    let mut ours = stem.clone();
+    for i in 4..10u64 {
+        ours.mine_block(&a, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+    ours.prune_keep(6).unwrap();
+    assert_eq!(ours.first_height, 4);
+
+    let mut theirs = stem;
+    for i in 4..12u64 {
+        theirs
+            .mine_block(&b, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+    let suffix = theirs.blocks[ours.first_height as usize..].to_vec();
+    assert_eq!(suffix[0].header.height.0, ours.first_height);
+    let adopted = ours
+        .maybe_reorg_to(suffix, NOW + 20_000)
+        .expect("pruned reorg evaluates");
+    assert!(adopted, "heavier suffix inside the window must win");
+    assert_eq!(ours.block_count(), 12);
+    assert!(ours.is_pruned());
+    ours.verify_supply().unwrap();
+}

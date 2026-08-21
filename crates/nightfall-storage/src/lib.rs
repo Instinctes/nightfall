@@ -7,8 +7,10 @@
 //! and again after every accepted block. At 84 blocks that was already a 1.5 MB
 //! rewrite; the cost grows linearly with height forever (audit finding N-05).
 
-use nightfall_consensus::{Block, Chain};
-use nightfall_types::NetworkId;
+use nightfall_consensus::{Block, Chain, CompactHeader};
+use nightfall_crypto::Commitment;
+use nightfall_ledger::{LedgerState, UtxoEntry, UtxoSet};
+use nightfall_types::{Hash256, Height, NetworkId};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -28,6 +30,18 @@ struct ChainMeta {
     validated_tip: String,
     #[serde(default)]
     validated_bytes: u64,
+    /// Height of the first body still in `blocks.jsonl`. Zero = archive.
+    #[serde(default)]
+    first_height: u64,
+    #[serde(default)]
+    pruned: bool,
+    /// Cumulative work of the horizon prefix, decimal string.
+    #[serde(default)]
+    horizon_work: String,
+    #[serde(default)]
+    validated_horizon_bytes: u64,
+    #[serde(default)]
+    validated_headers_bytes: u64,
 }
 
 /// Sidecar written next to an exported `blocks.jsonl`.
@@ -51,6 +65,14 @@ impl ChainStore {
 
     pub fn blocks_path(&self) -> PathBuf {
         self.dir.join("blocks.jsonl")
+    }
+
+    pub fn headers_path(&self) -> PathBuf {
+        self.dir.join("headers.jsonl")
+    }
+
+    pub fn horizon_path(&self) -> PathBuf {
+        self.dir.join("utxo-horizon.json")
     }
 
     pub fn meta_path(&self) -> PathBuf {
@@ -80,6 +102,12 @@ impl ChainStore {
         let validated_bytes = fs::metadata(self.blocks_path())
             .map(|m| m.len())
             .unwrap_or(0);
+        let validated_horizon_bytes = fs::metadata(self.horizon_path())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let validated_headers_bytes = fs::metadata(self.headers_path())
+            .map(|m| m.len())
+            .unwrap_or(0);
         let meta = ChainMeta {
             network: chain.network,
             genesis_hash: chain.genesis_hash.to_hex(),
@@ -87,6 +115,11 @@ impl ChainStore {
             protocol_version: nightfall_types::PROTOCOL_VERSION,
             validated_tip: chain.tip_hash().to_hex(),
             validated_bytes,
+            first_height: chain.first_height,
+            pruned: chain.is_pruned(),
+            horizon_work: chain.horizon_work.to_string(),
+            validated_horizon_bytes,
+            validated_headers_bytes,
         };
         let tmp = self.dir.join("chain-meta.json.tmp");
         fs::write(&tmp, serde_json::to_vec_pretty(&meta)?)?;
@@ -105,7 +138,7 @@ impl ChainStore {
         Some((m.block_count, m.validated_tip, m.genesis_hash))
     }
 
-    /// True when `blocks.jsonl` is byte-for-byte what this node last validated.
+    /// True when on-disk files are byte-for-byte what this node last validated.
     pub fn is_own_file_trusted(&self) -> bool {
         let Some(m) = self.read_meta() else {
             return false;
@@ -116,7 +149,19 @@ impl ChainStore {
         let bytes = fs::metadata(self.blocks_path())
             .map(|x| x.len())
             .unwrap_or(0);
-        m.validated_bytes == bytes && bytes > 0
+        if m.validated_bytes != bytes || bytes == 0 {
+            return false;
+        }
+        if !m.pruned && m.first_height == 0 {
+            return true;
+        }
+        let hz = fs::metadata(self.horizon_path())
+            .map(|x| x.len())
+            .unwrap_or(0);
+        let hd = fs::metadata(self.headers_path())
+            .map(|x| x.len())
+            .unwrap_or(0);
+        m.validated_horizon_bytes == hz && hz > 0 && m.validated_headers_bytes == hd && hd > 0
     }
 
     fn read_meta(&self) -> Option<ChainMeta> {
@@ -128,6 +173,16 @@ impl ChainStore {
     /// Copy `blocks.jsonl` plus a small manifest. The importer still verifies
     /// every block — this is a faster start, not a trust shortcut.
     pub fn export_snapshot(&self, out: &Path) -> anyhow::Result<SnapshotManifest> {
+        if self
+            .read_meta()
+            .map(|m| m.pruned || m.first_height > 0)
+            .unwrap_or(false)
+        {
+            anyhow::bail!(
+                "this datadir is pruned — it cannot export a full snapshot. \
+                 Resync from an archive node (a seed) first"
+            );
+        }
         let src = self.blocks_path();
         if !src.exists() {
             anyhow::bail!("no blocks.jsonl in {}", self.dir.display());
@@ -184,6 +239,11 @@ impl ChainStore {
             protocol_version: nightfall_types::PROTOCOL_VERSION,
             validated_tip: String::new(),
             validated_bytes: 0,
+            first_height: 0,
+            pruned: false,
+            horizon_work: String::new(),
+            validated_horizon_bytes: 0,
+            validated_headers_bytes: 0,
         };
         fs::write(self.meta_path(), serde_json::to_vec_pretty(&meta)?)?;
         let chain = self.load_or_new(network)?;
@@ -220,6 +280,9 @@ impl ChainStore {
     /// Persist. Appends only what is new unless the chain shrank or diverged.
     pub fn save(&self, chain: &Chain) -> anyhow::Result<()> {
         self.ensure_dir()?;
+        if chain.is_pruned() {
+            return self.save_pruned(chain);
+        }
         let on_disk = self.stored_block_count();
         let have = chain.block_count();
 
@@ -236,9 +299,8 @@ impl ChainStore {
         // length comparison cannot see.
         if on_disk > 0 {
             let ancestor_matches = chain
-                .blocks
-                .get(on_disk as usize - 1)
-                .map(|b| b.hash().to_hex())
+                .hash_at(on_disk - 1)
+                .map(|h| h.to_hex())
                 .zip(self.stored_tip())
                 .map(|(current, stored)| current == stored)
                 .unwrap_or(false);
@@ -269,7 +331,95 @@ impl ChainStore {
         Ok(())
     }
 
+    fn save_pruned(&self, chain: &Chain) -> anyhow::Result<()> {
+        let meta = self.read_meta();
+        let stored_first = meta.as_ref().map(|m| m.first_height).unwrap_or(0);
+        let stored_count = meta.as_ref().map(|m| m.block_count).unwrap_or(0);
+        let stored_tip = meta
+            .as_ref()
+            .map(|m| m.validated_tip.as_str())
+            .unwrap_or("");
+        let ancestor_ok = stored_count == 0
+            || chain
+                .hash_at(stored_count - 1)
+                .map(|h| h.to_hex() == stored_tip)
+                .unwrap_or(false);
+        let horizon_moved = stored_first != chain.first_height;
+        let need_rewrite_bodies = !self.blocks_path().exists()
+            || horizon_moved
+            || stored_count > chain.block_count()
+            || !ancestor_ok;
+
+        self.write_headers(chain)?;
+        self.write_horizon(chain)?;
+
+        if need_rewrite_bodies {
+            self.rewrite_bodies(chain)?;
+        } else if stored_count < chain.block_count() {
+            let already = stored_count.saturating_sub(chain.first_height) as usize;
+            let mut file = BufWriter::new(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.blocks_path())?,
+            );
+            for block in chain.blocks.iter().skip(already) {
+                serde_json::to_writer(&mut file, block)?;
+                file.write_all(b"\n")?;
+            }
+            file.flush()?;
+        }
+
+        self.write_meta(chain)?;
+        Ok(())
+    }
+
+    fn write_headers(&self, chain: &Chain) -> anyhow::Result<()> {
+        let tmp = self.dir.join("headers.jsonl.tmp");
+        {
+            let mut file = BufWriter::new(File::create(&tmp)?);
+            for h in &chain.headers {
+                serde_json::to_writer(&mut file, h)?;
+                file.write_all(b"\n")?;
+            }
+            file.flush()?;
+        }
+        fs::rename(tmp, self.headers_path())?;
+        Ok(())
+    }
+
+    fn write_horizon(&self, chain: &Chain) -> anyhow::Result<()> {
+        let Some(horizon) = chain.horizon.as_ref() else {
+            anyhow::bail!("pruned chain is missing its UTXO horizon");
+        };
+        let tmp = self.dir.join("utxo-horizon.json.tmp");
+        fs::write(&tmp, serde_json::to_vec(&horizon_to_file(horizon))?)?;
+        fs::rename(tmp, self.horizon_path())?;
+        Ok(())
+    }
+
+    fn rewrite_bodies(&self, chain: &Chain) -> anyhow::Result<()> {
+        let tmp = self.dir.join("blocks.jsonl.tmp");
+        {
+            let mut file = BufWriter::new(File::create(&tmp)?);
+            for block in &chain.blocks {
+                serde_json::to_writer(&mut file, block)?;
+                file.write_all(b"\n")?;
+            }
+            file.flush()?;
+        }
+        fs::rename(tmp, self.blocks_path())?;
+        Ok(())
+    }
+
     fn rewrite_all(&self, chain: &Chain) -> anyhow::Result<()> {
+        if chain.is_pruned() {
+            self.write_headers(chain)?;
+            self.write_horizon(chain)?;
+            self.rewrite_bodies(chain)?;
+            self.write_meta(chain)?;
+            return Ok(());
+        }
         let tmp = self.dir.join("blocks.jsonl.tmp");
         {
             let mut file = BufWriter::new(File::create(&tmp)?);
@@ -334,10 +484,19 @@ impl ChainStore {
         let current_bytes = fs::metadata(self.blocks_path())
             .map(|m| m.len())
             .unwrap_or(0);
-        let trusted = meta
+        let pruned = meta
             .as_ref()
-            .map(|m| m.validated_bytes == current_bytes && !m.validated_tip.is_empty())
+            .map(|m| m.pruned || m.first_height > 0)
             .unwrap_or(false);
+        let trusted = self.is_own_file_trusted();
+
+        if pruned && !trusted {
+            anyhow::bail!(
+                "pruned datadir failed the validation record — the dropped \
+                 bodies cannot be re-checked. Resync the chain (Settings → \
+                 Resync chain, keep wallet) or copy an archive blocks.jsonl"
+            );
+        }
 
         if !trusted && current_bytes > 0 {
             tracing::info!(
@@ -348,6 +507,28 @@ impl ChainStore {
         let now = now_unix();
         let expected = meta.as_ref().map(|m| m.block_count).unwrap_or(0);
         let mut chain = Chain::new_fair(network)?;
+
+        if pruned {
+            let m = meta.as_ref().expect("pruned load has meta");
+            chain.first_height = m.first_height;
+            chain.horizon_work = m.horizon_work.parse().unwrap_or(0);
+            let horizon = load_horizon_file(&self.horizon_path())?;
+            chain.ledger = horizon.clone();
+            chain.horizon = Some(horizon);
+            chain.total_work = chain.horizon_work;
+            chain.headers = load_jsonl_headers(&self.headers_path())?
+                .into_iter()
+                .filter(|h| h.height < m.first_height)
+                .collect();
+            if chain.headers.len() as u64 != m.first_height {
+                anyhow::bail!(
+                    "headers.jsonl prefix is {} long, prune horizon is {}",
+                    chain.headers.len(),
+                    m.first_height
+                );
+            }
+        }
+
         let file = BufReader::new(File::open(self.blocks_path())?);
 
         for (i, line) in file.lines().enumerate() {
@@ -397,8 +578,109 @@ impl ChainStore {
             .verify_supply()
             .map_err(|e| anyhow::anyhow!("stored chain violates the supply invariant: {e}"))?;
 
+        if pruned && expected > 0 && chain.block_count() != expected {
+            anyhow::bail!(
+                "pruned chain rebuilt to {} blocks, meta says {expected}",
+                chain.block_count()
+            );
+        }
+
         Ok(chain)
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct HorizonFile {
+    height: u64,
+    minted: u64,
+    burned: u64,
+    tx_count: u64,
+    coinbase_maturity: u64,
+    kernel_sum: String,
+    kernel_count: u64,
+    utxos: Vec<HorizonUtxo>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HorizonUtxo {
+    commit: String,
+    output_pk: String,
+    height: u64,
+    is_coinbase: bool,
+}
+
+fn horizon_to_file(h: &LedgerState) -> HorizonFile {
+    HorizonFile {
+        height: h.height.0,
+        minted: h.supply.total_minted_darks,
+        burned: h.supply.total_burned_darks,
+        tx_count: h.tx_count,
+        coinbase_maturity: h.coinbase_maturity,
+        kernel_sum: h.kernels.sum.to_hex(),
+        kernel_count: h.kernels.count,
+        utxos: h
+            .utxos
+            .entries
+            .iter()
+            .map(|(k, e)| HorizonUtxo {
+                commit: Hash256(*k).to_hex(),
+                output_pk: Hash256(e.output_pk).to_hex(),
+                height: e.height,
+                is_coinbase: e.is_coinbase,
+            })
+            .collect(),
+    }
+}
+
+fn load_horizon_file(path: &Path) -> anyhow::Result<LedgerState> {
+    let file: HorizonFile = serde_json::from_slice(&fs::read(path)?)
+        .map_err(|e| anyhow::anyhow!("utxo-horizon.json is corrupt: {e}"))?;
+    let mut utxos = UtxoSet::new();
+    for u in file.utxos {
+        let commit =
+            Hash256::from_hex(&u.commit).map_err(|_| anyhow::anyhow!("bad commit in horizon"))?;
+        let pk = Hash256::from_hex(&u.output_pk)
+            .map_err(|_| anyhow::anyhow!("bad output_pk in horizon"))?;
+        utxos.insert(
+            Commitment(commit.0),
+            UtxoEntry {
+                output_pk: pk.0,
+                height: u.height,
+                is_coinbase: u.is_coinbase,
+            },
+        );
+    }
+    let sum = Hash256::from_hex(&file.kernel_sum)
+        .map_err(|_| anyhow::anyhow!("bad kernel_sum in horizon"))?;
+    Ok(LedgerState {
+        height: Height(file.height),
+        utxos,
+        kernels: nightfall_ledger::KernelAccumulator {
+            sum: Commitment(sum.0),
+            count: file.kernel_count,
+        },
+        supply: nightfall_ledger::SupplyState {
+            total_minted_darks: file.minted,
+            total_burned_darks: file.burned,
+        },
+        tx_count: file.tx_count,
+        coinbase_maturity: file.coinbase_maturity,
+    })
+}
+
+fn load_jsonl_headers(path: &Path) -> anyhow::Result<Vec<CompactHeader>> {
+    let file = BufReader::new(File::open(path)?);
+    let mut out = Vec::new();
+    for (i, line) in file.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let h: CompactHeader = serde_json::from_str(&line)
+            .map_err(|e| anyhow::anyhow!("header {i} is corrupt: {e}"))?;
+        out.push(h);
+    }
+    Ok(out)
 }
 
 /// Datadir epoch. The August 2026 v7 chain used `nightfall/<network>/`.
@@ -510,5 +792,42 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
         fs::remove_dir_all(&out).ok();
         fs::remove_dir_all(&dest).ok();
+    }
+
+    #[test]
+    fn pruned_roundtrip_keeps_utxo_and_drops_bodies() {
+        use nightfall_crypto::WalletKeys;
+        let dir = std::env::temp_dir().join(format!("nf-prune-{}", now_unix()));
+        fs::create_dir_all(&dir).unwrap();
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+        for i in 0..12u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+        let full_count = chain.block_count();
+        let tip = chain.tip_hash();
+        let root = chain.ledger.utxo_root();
+        let dropped = chain.prune_keep(4).unwrap();
+        assert_eq!(dropped, 8);
+        assert_eq!(chain.first_height, 8);
+        assert_eq!(chain.blocks.len(), 4);
+        assert_eq!(chain.block_count(), full_count);
+        store.save(&chain).unwrap();
+        assert!(store.horizon_path().exists());
+        assert!(store.headers_path().exists());
+
+        let loaded = store.load_or_new(NetworkId::Devnet).unwrap();
+        assert_eq!(loaded.tip_hash(), tip);
+        assert_eq!(loaded.block_count(), full_count);
+        assert_eq!(loaded.first_height, 8);
+        assert_eq!(loaded.blocks.len(), 4);
+        assert_eq!(loaded.ledger.utxo_root(), root);
+        loaded.verify_supply().unwrap();
+        assert!(loaded.block_by_height(0).is_none());
+        assert!(loaded.block_by_height(8).is_some());
+        fs::remove_dir_all(&dir).ok();
     }
 }

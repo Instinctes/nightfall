@@ -188,6 +188,8 @@ Four pieces make that sound:
 - **The transaction graph is obscured, not erased.** Spent outputs stay visible. Cut-through would delete the per-input signature that makes non-interactive payments safe; the two are mutually exclusive and we chose payments that work without both parties online.
 - **Network-layer privacy is stem/fluff, not magic.** A new transaction is forwarded to one random peer first (Dandelion-class). Older nodes still fluff immediately. Tor is optional (`--proxy 127.0.0.1:9050` / `NIGHTFALL_PROXY`). See [docs/PRIVACY.md](docs/PRIVACY.md).
 - **Not audited by anyone outside the project.** See [Honest status](#honest-status).
+- **A checkpoint skips re-hashing old proof of work.** You are trusting the
+  binary's pin. Off with `NIGHTFALL_NO_ASSUME_VALID=1`.
 
 ---
 
@@ -234,6 +236,14 @@ attempt. That is the price of ASIC resistance, and it is why a phone cannot
 validate the chain and why a node records a local validation marker rather than
 re-hashing its own history on every restart.
 
+Releases also pin a historical mainnet hash (`CHECKPOINTS`, currently
+height 25,000). Below that pin, proof of work is not re-hashed on replay
+— linkage and the pin still are. That is Bitcoin's `assumevalid`: a
+trust assumption on whoever built the binary. `NIGHTFALL_NO_ASSUME_VALID=1`
+turns it off. Reproduce a pin with
+`cargo run --release -p nightfall-node --example checkpoint -- <height>`.
+See [docs/SPEC.md](docs/SPEC.md) §2.5.
+
 ---
 
 ## Running a node
@@ -243,7 +253,16 @@ cargo build --release -p nightfall-node -p nightfall-wallet
 
 ./target/release/nightfalld --network mainnet init
 ./target/release/nightfalld --network mainnet run
+# laptop: drop bodies older than 500 blocks (UTXO stays)
+./target/release/nightfalld --network mainnet run --prune
 ```
+
+`--prune` is for machines that should not keep the whole chain in RAM.
+Seeds that serve IBD or the phone/web light API **must not** prune —
+those clients scan from genesis. A pruned Core wallet cannot rescan from
+birth on this machine; use the light API or Settings → Resync chain
+(downloads an archive from a seed). Same trust class as Bitcoin prune:
+you trust *this node's* disk, not a stranger's UTXO file.
 
 Builds from `main` dial `seed.nightfallcoin.org:17891` on startup and need no
 configuration. Each node advertises its listening port in the handshake and

@@ -1878,6 +1878,21 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         );
 
         ui.add_space(12.0);
+        let pruned = app.status.as_ref().map(|s| s.pruned).unwrap_or(false);
+        let prune_height = app.status.as_ref().map(|s| s.prune_height).unwrap_or(0);
+        if pruned {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!(
+                    "This node is pruned. Bodies start at height {}. \
+                     Rescan from genesis needs an archive node or the phone/web light API.",
+                    format_int(prune_height)
+                ))
+                .size(11.5)
+                .color(WARN),
+            );
+        }
+        ui.add_space(12.0);
         if ghost_button(ui, "Rescan from genesis").clicked() {
             if let Some(node) = app.node.clone() {
                 let wallet = std::sync::Arc::clone(&app.wallet);
@@ -1989,6 +2004,41 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                     let _ = app.address_book.save(&app.datadir);
                 }
             });
+        }
+    });
+
+    ui.add_space(14.0);
+
+    titled_card(ui, "Storage", |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            let mut prune = app.prune;
+            if ui
+                .checkbox(&mut prune, "Prune old blocks — keep UTXO + last 500 bodies")
+                .changed()
+            {
+                app.set_prune(prune, ctx);
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "Laptop default for a chain that no longer fits in RAM. Seeds stay full archives. \
+                 After prune you cannot rescan stealth outputs from genesis on this machine — \
+                 use the phone/web wallet (light API) or Resync chain from a seed.",
+            )
+            .size(11.0)
+            .color(TEXT_FAINT),
+        );
+        if let Some(s) = &app.status {
+            if s.pruned {
+                ui.add_space(6.0);
+                kv(
+                    ui,
+                    "Bodies from",
+                    RichText::new(format_int(s.prune_height)).monospace(),
+                );
+            }
         }
     });
 

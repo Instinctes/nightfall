@@ -12,7 +12,53 @@
  *      reaches ports 80/443, so the light node forwards :80 → :17888.
  */
 
-const MOBILE_UPSTREAM = "http://seed1.nightfallcoin.org/";
+/** Light nodes the browser and phone wallets read through, in order.
+ *
+ * One address was one machine, and one machine is one VPS ticket away from
+ * every light wallet showing a spinner — which is exactly what happened on
+ * 20 August, at two dozen users. The list is tried in order and the first
+ * node that answers wins; a dead entry costs one timeout, not an outage.
+ *
+ * These are *display* only. A light wallet trusts them for what it shows and
+ * for nothing else: the seed never leaves the device, and a hostile node can
+ * hide a payment or invent one on screen but cannot spend. Adding a name here
+ * widens who can lie to a screen, so the list stays short and ours.
+ */
+const MOBILE_UPSTREAMS = [
+    // Two machines, two providers. seed1/seed2 are the same Vultr box;
+    // listing both would only add a timeout when that box is down.
+    "http://seed1.nightfallcoin.org/",
+    "http://seed.nightfallcoin.org/",
+];
+const UPSTREAM_TIMEOUT_MS = 6000;
+
+/** POST a JSON-RPC body to the first light node that answers.
+ *
+ * Returns the upstream `Response`, or throws if every node failed. An
+ * upstream that answers with 5xx counts as failed — a proxy that faithfully
+ * relays "502" from a node that is still doing initial block download is
+ * technically correct and useless to a wallet.
+ */
+async function lightFetch(body) {
+    let lastErr = "no upstream configured";
+    for (const url of MOBILE_UPSTREAMS) {
+        try {
+            const r = await fetch(url, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body,
+                signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+            });
+            if (r.ok) {
+                return r;
+            }
+            lastErr = `HTTP ${r.status}`;
+        } catch (e) {
+            lastErr = (e && e.message) || String(e);
+        }
+    }
+    throw new Error(lastErr);
+}
 const MOBILE_ALLOWED = new Set([
     "status",
     "scan_feed",
@@ -164,11 +210,7 @@ async function proxyWalletApi(request) {
     });
 
     try {
-        const upstream = await fetch(MOBILE_UPSTREAM, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body,
-        });
+        const upstream = await lightFetch(body);
         const out = await upstream.text();
         return new Response(out, {
             status: upstream.status,
@@ -187,11 +229,9 @@ async function proxyWalletApi(request) {
 
 async function proxyPeers() {
     try {
-        const upstream = await fetch(MOBILE_UPSTREAM, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ method: "peers", params: {}, id: 1 }),
-        });
+        const upstream = await lightFetch(
+            JSON.stringify({ method: "peers", params: {}, id: 1 }),
+        );
         const payload = await upstream.json();
         const r = payload && payload.result;
         if (!r || !Array.isArray(r.peers)) {
@@ -219,16 +259,8 @@ async function proxyPeers() {
 async function proxyNetwork() {
     try {
         const [statusRes, peersRes] = await Promise.all([
-            fetch(MOBILE_UPSTREAM, {
-                method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ method: "status", params: {}, id: 1 }),
-            }),
-            fetch(MOBILE_UPSTREAM, {
-                method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ method: "peers", params: {}, id: 1 }),
-            }),
+            lightFetch(JSON.stringify({ method: "status", params: {}, id: 1 })),
+            lightFetch(JSON.stringify({ method: "peers", params: {}, id: 1 })),
         ]);
         const statusPayload = await statusRes.json();
         const r = statusPayload && statusPayload.result;
@@ -277,11 +309,9 @@ async function proxyNetwork() {
 
 async function proxySupply() {
     try {
-        const upstream = await fetch(MOBILE_UPSTREAM, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ method: "status", params: {}, id: 1 }),
-        });
+        const upstream = await lightFetch(
+            JSON.stringify({ method: "status", params: {}, id: 1 }),
+        );
         const payload = await upstream.json();
         const r = payload && payload.result;
         if (!r) {
@@ -313,8 +343,100 @@ async function proxySupply() {
     }
 }
 
+/** Discord member count, shaped for a shields.io endpoint badge.
+ *
+ * The obvious way to put a live count on the README is
+ * `img.shields.io/discord/<server id>`, and it is the wrong way: it reads
+ * Discord's *widget*, and turning the widget on publishes `widget.json`,
+ * which enumerates the usernames of everyone currently online. Publishing a
+ * list of who is in the room, on a privacy coin, to decorate a badge.
+ *
+ * The invite endpoint gives the same number to anyone who asks, without a
+ * token and without exposing a single member. So the badge is fed from here
+ * instead, cached for an hour because nobody needs a live-to-the-second
+ * count of a chat room.
+ */
+const DISCORD_INVITE = "Wj6pTNmVEr";
+const DISCORD_BADGE_KEY = "https://nightfallcoin.org/__discord-badge";
+const DISCORD_REFRESH_SECS = 1800;
+
+function badgeBody(message) {
+    return JSON.stringify({
+        schemaVersion: 1,
+        label: "discord",
+        message,
+        color: "5865F2",
+    });
+}
+
+function badgeResponse(message, fetchedAt) {
+    return new Response(badgeBody(message), {
+        status: 200,
+        headers: {
+            "Content-Type": "application/json; charset=utf-8",
+            // Long enough that shields.io does not hammer this, short enough
+            // that a new member shows up the same day.
+            "Cache-Control": "public, max-age=1800",
+            "X-Fetched-At": String(fetchedAt),
+            // shields.io fetches this cross-origin.
+            "Access-Control-Allow-Origin": "*",
+            ...securityHeaders("/discord.json"),
+        },
+    });
+}
+
+async function discordBadge(ctx) {
+    // Discord refuses roughly a third of the requests that leave a Cloudflare
+    // address — shared egress, and the invite endpoint is rate limited per IP.
+    // Measured, not assumed: ten calls in a row returned the count seven times
+    // and failed three. A badge that flips between "21 members" and "join"
+    // depending on which Worker answered is worse than no badge, and shields.io
+    // will happily cache whichever it happened to catch.
+    //
+    // So the last good answer is kept and served whenever upstream declines.
+    const cache = caches.default;
+    const key = new Request(DISCORD_BADGE_KEY);
+    const cached = await cache.match(key);
+
+    if (cached) {
+        const age = Date.now() / 1000 - Number(cached.headers.get("X-Fetched-At") || 0);
+        if (age < DISCORD_REFRESH_SECS) {
+            return cached;
+        }
+    }
+
+    try {
+        const r = await fetch(
+            `https://discord.com/api/v10/invites/${DISCORD_INVITE}?with_counts=true`,
+            { headers: { "User-Agent": "nightfallcoin.org" } },
+        );
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const d = await r.json();
+        const n = d.approximate_member_count;
+        if (typeof n !== "number" || n < 0) throw new Error("no count");
+
+        const fresh = badgeResponse(
+            `${n} member${n === 1 ? "" : "s"}`,
+            Math.floor(Date.now() / 1000),
+        );
+        // Keep a copy for far longer than we serve it, so a stale number is
+        // always available when Discord says no.
+        const keep = new Response(fresh.clone().body, fresh);
+        keep.headers.set("Cache-Control", "public, max-age=86400");
+        if (ctx && ctx.waitUntil) {
+            ctx.waitUntil(cache.put(key, keep));
+        } else {
+            await cache.put(key, keep);
+        }
+        return fresh;
+    } catch {
+        // Stale beats wrong. "join" is the last resort and is still true.
+        return cached || badgeResponse("join", 0);
+    }
+}
+
 export default {
-    async fetch(request, env) {
+    async fetch(request, env, ctx) {
         const url = new URL(request.url);
 
         // Localhost is exempt so `wrangler dev` does not bounce to production.
@@ -338,6 +460,14 @@ export default {
                 return jsonResponse(405, { error: "GET" }, { Allow: "GET, HEAD" });
             }
             return proxySupply();
+        }
+
+        // Feeds the README's Discord badge. See discordBadge().
+        if (url.pathname === "/discord.json") {
+            if (request.method !== "GET" && request.method !== "HEAD") {
+                return jsonResponse(405, { error: "GET" }, { Allow: "GET, HEAD" });
+            }
+            return discordBadge(ctx);
         }
 
         // Listening nodes a fresh wallet can dial when the compiled-in

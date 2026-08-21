@@ -129,12 +129,20 @@ impl WalletState {
         // Snapshot the blocks under the lock, then release it before scanning:
         // trial-decrypting every output is not something to do while holding
         // the node's state mutex.
+        let from = wallet.scan_from();
         let blocks = {
             let shared = node.shared();
             let guard = shared
                 .lock()
                 .map_err(|_| anyhow::anyhow!("node state lock poisoned"))?;
-            guard.chain.blocks.clone()
+            if guard.chain.is_pruned() && from < guard.chain.first_height {
+                anyhow::bail!(
+                    "this node is pruned; bodies start at height {}. \
+                     Cannot rescan from {from}. Use an archive node or the light API",
+                    guard.chain.first_height
+                );
+            }
+            guard.chain.blocks_from(from, usize::MAX)
         };
         wallet.scan_blocks(&blocks)
     }

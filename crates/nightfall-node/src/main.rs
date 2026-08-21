@@ -71,6 +71,11 @@ enum Commands {
         /// the 128 a normal node has seats for. Still syncs and dials out.
         #[arg(long, default_value_t = false)]
         introducer: bool,
+        /// Drop block bodies older than the 500-block reorg window.
+        /// UTXO and headers stay. Cannot rescan from genesis afterwards.
+        /// Seeds that serve IBD or --mobile-listen must not set this.
+        #[arg(long, default_value_t = false)]
+        prune: bool,
     },
     /// Write `blocks.jsonl` + `snapshot.json`. The importer still verifies PoW.
     ExportSnapshot {
@@ -192,6 +197,7 @@ fn main() -> anyhow::Result<()> {
             proxy,
             mobile_listen,
             introducer,
+            prune,
         } => {
             let listen =
                 listen.unwrap_or_else(|| format!("0.0.0.0:{}", network.default_p2p_port()));
@@ -224,6 +230,7 @@ fn main() -> anyhow::Result<()> {
                 mobile_listen: mobile_listen.clone(),
                 peers_url: std::env::var("NIGHTFALL_PEERS_URL").ok(),
                 introducer,
+                prune,
             };
 
             println!("{COIN_NAME} node starting");
@@ -235,6 +242,14 @@ fn main() -> anyhow::Result<()> {
                 println!("mobile......... {m}");
             }
             println!("mine........... {mine}");
+            println!(
+                "prune.......... {}",
+                if prune {
+                    "yes — bodies older than 500 blocks will be dropped"
+                } else {
+                    "no — full archive"
+                }
+            );
 
             let handle = NodeHandle::start(cfg)?;
             println!("genesis........ {}", handle.genesis_hex());
@@ -279,6 +294,12 @@ fn print_status(
     println!("network........ {network}");
     println!("datadir........ {}", datadir.display());
     println!("blocks......... {}", chain.block_count());
+    if chain.is_pruned() {
+        println!(
+            "pruned......... yes — bodies from height {}",
+            chain.first_height
+        );
+    }
     println!(
         "tip_height..... {}",
         chain

@@ -9,6 +9,7 @@ description = "Filesystem chain + wallet storage"
 nightfall-types = { workspace = true }
 nightfall-consensus = { workspace = true }
 nightfall-ledger = { workspace = true }
+nightfall-crypto = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
