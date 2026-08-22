@@ -55,6 +55,14 @@ pub struct SnapshotManifest {
     pub genesis: String,
     pub tip: String,
     pub blocks: u64,
+    /// `"json"` or `"binary"`. Absent in snapshots written before the binary
+    /// format existed, and those are all JSON — hence the default.
+    #[serde(default = "json_format_name")]
+    pub format: String,
+}
+
+fn json_format_name() -> String {
+    "json".to_string()
 }
 
 pub struct ChainStore {
@@ -268,12 +276,16 @@ impl ChainStore {
                  Resync from an archive node (a seed) first"
             );
         }
+        let fmt = self.format();
         let src = self.blocks_path();
         if !src.exists() {
-            anyhow::bail!("no blocks.jsonl in {}", self.dir.display());
+            anyhow::bail!("no {} in {}", fmt.file_name(), self.dir.display());
         }
         fs::create_dir_all(out)?;
-        fs::copy(&src, out.join("blocks.jsonl"))?;
+        // Copy it out under the name that says what is actually inside. A
+        // binary file called blocks.jsonl is the kind of thing that gets
+        // discovered by a stranger's node refusing to start.
+        fs::copy(&src, out.join(fmt.file_name()))?;
         let meta = self
             .read_meta()
             .ok_or_else(|| anyhow::anyhow!("no chain-meta.json — run the node once"))?;
@@ -283,6 +295,10 @@ impl ChainStore {
             genesis: meta.genesis_hash,
             tip: meta.validated_tip,
             blocks: meta.block_count,
+            format: match fmt {
+                Format::Json => "json".into(),
+                Format::Binary => "binary".into(),
+            },
         };
         fs::write(out.join("snapshot.json"), serde_json::to_vec_pretty(&snap)?)?;
         Ok(snap)
@@ -292,13 +308,28 @@ impl ChainStore {
     /// checks. `validated_bytes` is forced to 0 so a copied file is never
     /// trusted as if this node had already verified it.
     pub fn import_snapshot(&self, from: &Path, network: NetworkId) -> anyhow::Result<Chain> {
-        let src = if from.is_file() {
-            from.to_path_buf()
+        // A snapshot may be either format, and the two are not
+        // interchangeable by filename. Pick the file that is there, and
+        // remember what it is.
+        let (src, src_fmt) = if from.is_file() {
+            let f = if from.extension().and_then(|e| e.to_str()) == Some("bin") {
+                Format::Binary
+            } else {
+                Format::Json
+            };
+            (from.to_path_buf(), f)
+        } else if from.join(codec::BLOCKS_BIN).exists() {
+            (from.join(codec::BLOCKS_BIN), Format::Binary)
         } else {
-            from.join("blocks.jsonl")
+            (from.join(codec::BLOCKS_JSONL), Format::Json)
         };
         if !src.exists() {
-            anyhow::bail!("no blocks.jsonl at {}", src.display());
+            anyhow::bail!(
+                "no {} or {} at {}",
+                codec::BLOCKS_BIN,
+                codec::BLOCKS_JSONL,
+                from.display()
+            );
         }
         let manifest: Option<SnapshotManifest> = fs::read_to_string(from.join("snapshot.json"))
             .ok()
@@ -313,7 +344,19 @@ impl ChainStore {
             }
         }
         self.ensure_dir()?;
-        fs::copy(&src, self.blocks_path())?;
+        // Write the destination in the destination's own format. A plain copy
+        // would put JSON in a file this datadir is about to read as bincode.
+        let dst_fmt = self.format();
+        if src_fmt == dst_fmt {
+            fs::copy(&src, self.blocks_path())?;
+        } else {
+            let blocks = codec::read_blocks(File::open(&src)?, src_fmt)?;
+            let mut w = BufWriter::new(File::create(self.blocks_path())?);
+            for b in &blocks {
+                codec::write_block(&mut w, b, dst_fmt)?;
+            }
+            w.flush()?;
+        }
         let meta = ChainMeta {
             network,
             genesis_hash: manifest
@@ -484,12 +527,12 @@ impl ChainStore {
     }
 
     fn rewrite_bodies(&self, chain: &Chain) -> anyhow::Result<()> {
-        let tmp = self.dir.join("blocks.jsonl.tmp");
+        let fmt = self.format();
+        let tmp = self.dir.join(format!("{}.tmp", fmt.file_name()));
         {
             let mut file = BufWriter::new(File::create(&tmp)?);
             for block in &chain.blocks {
-                serde_json::to_writer(&mut file, block)?;
-                file.write_all(b"\n")?;
+                codec::write_block(&mut file, block, fmt)?;
             }
             file.flush()?;
         }
@@ -505,12 +548,12 @@ impl ChainStore {
             self.write_meta(chain)?;
             return Ok(());
         }
-        let tmp = self.dir.join("blocks.jsonl.tmp");
+        let fmt = self.format();
+        let tmp = self.dir.join(format!("{}.tmp", fmt.file_name()));
         {
             let mut file = BufWriter::new(File::create(&tmp)?);
             for block in &chain.blocks {
-                serde_json::to_writer(&mut file, block)?;
-                file.write_all(b"\n")?;
+                codec::write_block(&mut file, block, fmt)?;
             }
             file.flush()?;
         }
@@ -859,7 +902,10 @@ mod tests {
         store.save(&chain).unwrap();
         let snap = store.export_snapshot(&out).unwrap();
         assert_eq!(snap.blocks, chain.block_count());
-        assert!(out.join("blocks.jsonl").exists());
+        // The exported file is named after what is inside it.
+        assert_eq!(snap.format, "binary");
+        assert!(out.join(codec::BLOCKS_BIN).exists());
+        assert!(!out.join(codec::BLOCKS_JSONL).exists());
         assert!(out.join("snapshot.json").exists());
 
         let imported = ChainStore::new(&dest)
@@ -918,6 +964,9 @@ mod tests {
         use nightfall_crypto::WalletKeys;
         let dir = std::env::temp_dir().join(format!("nf-mig-{}", now_unix()));
         fs::create_dir_all(&dir).unwrap();
+        // A fresh datadir now defaults to binary, so lay down the historic
+        // file first: this test is about converting an old node.
+        fs::write(dir.join(codec::BLOCKS_JSONL), b"").unwrap();
         let store = ChainStore::new(&dir);
         let miner = WalletKeys::generate().address();
         let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
@@ -954,6 +1003,9 @@ mod tests {
         use nightfall_crypto::WalletKeys;
         let dir = std::env::temp_dir().join(format!("nf-mig-app-{}", now_unix()));
         fs::create_dir_all(&dir).unwrap();
+        // A fresh datadir now defaults to binary, so lay down the historic
+        // file first: this test is about converting an old node.
+        fs::write(dir.join(codec::BLOCKS_JSONL), b"").unwrap();
         let store = ChainStore::new(&dir);
         let miner = WalletKeys::generate().address();
         let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
@@ -995,6 +1047,9 @@ mod tests {
         use nightfall_crypto::WalletKeys;
         let dir = std::env::temp_dir().join(format!("nf-mig-twice-{}", now_unix()));
         fs::create_dir_all(&dir).unwrap();
+        // A fresh datadir now defaults to binary, so lay down the historic
+        // file first: this test is about converting an old node.
+        fs::write(dir.join(codec::BLOCKS_JSONL), b"").unwrap();
         let store = ChainStore::new(&dir);
         let miner = WalletKeys::generate().address();
         let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
@@ -1004,6 +1059,86 @@ mod tests {
 
         let err = store.migrate_to_binary().unwrap_err().to_string();
         assert!(err.contains("already binary"), "got: {err}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Snapshots written before the binary format exist in the wild, and a
+    /// datadir created today reads bincode. Importing one into the other must
+    /// convert, not copy: a straight copy puts JSON in a file the node is
+    /// about to parse as bincode, and the node then refuses to start.
+    #[test]
+    fn a_json_snapshot_imports_into_a_binary_datadir() {
+        use nightfall_crypto::WalletKeys;
+        let src = std::env::temp_dir().join(format!("nf-xsnap-src-{}", now_unix()));
+        let out = std::env::temp_dir().join(format!("nf-xsnap-out-{}", now_unix()));
+        let dest = std::env::temp_dir().join(format!("nf-xsnap-dst-{}", now_unix()));
+        fs::create_dir_all(&src).unwrap();
+        // An old node: JSON on disk.
+        fs::write(src.join(codec::BLOCKS_JSONL), b"").unwrap();
+        let store = ChainStore::new(&src);
+        assert_eq!(store.format(), Format::Json);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+        for i in 0..3u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+        store.save(&chain).unwrap();
+        let snap = store.export_snapshot(&out).unwrap();
+        assert_eq!(snap.format, "json");
+
+        // A new node: binary by default.
+        let dest_store = ChainStore::new(&dest);
+        let imported = dest_store.import_snapshot(&out, NetworkId::Devnet).unwrap();
+        assert_eq!(imported.tip_hash(), chain.tip_hash());
+        assert_eq!(dest_store.format(), Format::Binary);
+        imported.verify_supply().unwrap();
+
+        // And it survives a restart, which is where a mis-copied file shows up.
+        let reloaded = dest_store.load_or_new(NetworkId::Devnet).unwrap();
+        assert_eq!(reloaded.tip_hash(), chain.tip_hash());
+
+        fs::remove_dir_all(&src).ok();
+        fs::remove_dir_all(&out).ok();
+        fs::remove_dir_all(&dest).ok();
+    }
+
+    /// The bug this test exists for: `rewrite_all` and `rewrite_bodies` wrote
+    /// raw JSON regardless of the datadir's format. A reorg that shortens the
+    /// chain takes that path, so a converted node would have quietly written a
+    /// JSON file named blocks.bin and refused to start on the next restart.
+    #[test]
+    fn a_rewrite_keeps_the_format_the_datadir_is_in() {
+        use nightfall_crypto::WalletKeys;
+        let dir = std::env::temp_dir().join(format!("nf-rewrite-{}", now_unix()));
+        fs::create_dir_all(&dir).unwrap();
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+        for i in 0..6u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+        store.save(&chain).unwrap();
+        assert_eq!(store.format(), Format::Binary);
+
+        // Shorter chain than what is on disk: this is the reorg path, and it
+        // rewrites the whole file instead of appending.
+        let mut shorter = Chain::new_fair(NetworkId::Devnet).unwrap();
+        for i in 0..3u64 {
+            shorter
+                .mine_block(&miner, vec![], now_unix() + 1000 + i * 15)
+                .unwrap();
+        }
+        store.save(&shorter).unwrap();
+
+        assert!(!dir.join(format!("{}.tmp", codec::BLOCKS_BIN)).exists());
+        let reloaded = store.load_or_new(NetworkId::Devnet).unwrap();
+        assert_eq!(reloaded.block_count(), shorter.block_count());
+        assert_eq!(reloaded.tip_hash(), shorter.tip_hash());
+        reloaded.verify_supply().unwrap();
         fs::remove_dir_all(&dir).ok();
     }
 }

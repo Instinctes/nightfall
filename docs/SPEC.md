@@ -271,7 +271,15 @@ A node reads whichever chain file it finds in its datadir:
 | `blocks.jsonl` | one JSON object per line (historic default) |
 | `blocks.bin` | `u32` little-endian record length, then bincode |
 
-`blocks.bin` wins if both are present.
+`blocks.bin` wins if both are present. An **empty** datadir — a fresh
+install — starts out binary; an existing `blocks.jsonl` keeps its format
+until the operator converts it. Snapshots are written under the name of
+the format they contain and carry a `format` field in `snapshot.json`;
+the importer converts if the destination differs.
+
+A datadir written in binary cannot be read by a node older than the
+format: it finds no `blocks.jsonl` and resyncs from genesis. That is a
+software downgrade cost, not a chain event.
 
 **Neither is consensus.** A block hash is computed over raw field bytes,
 never over the serialised form, and the P2P wire stays newline-delimited

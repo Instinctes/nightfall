@@ -62,11 +62,24 @@ impl Format {
 ///
 /// Binary wins when both exist, which is the state a conversion leaves behind
 /// on purpose: the old file stays until the operator deletes it.
+///
+/// An **empty** datadir gets binary. A node installed today should not spend
+/// its first year writing 10.7 GB of decimal digits and then be asked to
+/// convert; there is no history to be compatible with yet. An existing
+/// `blocks.jsonl` still wins over the default, so nothing already on disk
+/// changes format by itself.
+///
+/// The cost of that default is a one-way door for the *software*, not the
+/// chain: a datadir written by this version cannot be read by a nightfalld
+/// older than the binary format, which would find no `blocks.jsonl` and
+/// resync from genesis. The chain is unaffected either way.
 pub fn detect(dir: &Path) -> Format {
     if dir.join(BLOCKS_BIN).exists() {
         Format::Binary
-    } else {
+    } else if dir.join(BLOCKS_JSONL).exists() {
         Format::Json
+    } else {
+        Format::Binary
     }
 }
 
@@ -221,5 +234,33 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("corrupt"), "got: {err}");
+    }
+
+    /// A datadir with nothing in it is a new install, and a new install has no
+    /// history to stay compatible with. It should not start out writing the
+    /// format we just spent a release converting away from.
+    #[test]
+    fn an_empty_datadir_starts_out_binary() {
+        let dir = std::env::temp_dir().join(format!("nf-detect-new-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(detect(&dir), Format::Binary);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other half of that: a datadir that already holds a JSON chain keeps
+    /// writing JSON. Switching format underneath an existing file would append
+    /// bincode records to a text file and corrupt it.
+    #[test]
+    fn an_existing_json_chain_keeps_its_format() {
+        let dir = std::env::temp_dir().join(format!("nf-detect-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(BLOCKS_JSONL), b"{}\n").unwrap();
+        assert_eq!(detect(&dir), Format::Json);
+
+        // …until a conversion puts blocks.bin next to it, at which point the
+        // new file wins and the old one is only a fallback the operator keeps.
+        std::fs::write(dir.join(BLOCKS_BIN), b"").unwrap();
+        assert_eq!(detect(&dir), Format::Binary);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
