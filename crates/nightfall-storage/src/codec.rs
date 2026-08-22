@@ -126,12 +126,25 @@ pub fn read_blocks<R: Read>(r: R, fmt: Format) -> anyhow::Result<Vec<Block>> {
             let mut r = BufReader::new(r);
             let mut len_buf = [0u8; 4];
             let mut i = 0usize;
+            let mut first = true;
             loop {
                 match r.read_exact(&mut len_buf) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                     Err(e) => return Err(e.into()),
                 }
+                // A JSON chain file in a binary datadir reads its first two
+                // characters as part of a length prefix and reports an absurd
+                // number, which tells the operator nothing. Name it instead:
+                // this happened in the wild, and the fix is a rename.
+                if first && &len_buf[..2] == b"{\"" {
+                    anyhow::bail!(
+                        "this file holds JSON, not the binary format — \
+                         rename it to {BLOCKS_JSONL} and the node will read it"
+                    );
+                }
+                first = false;
+
                 let len = u32::from_le_bytes(len_buf);
                 if len == 0 || len > MAX_RECORD_BYTES {
                     anyhow::bail!("block {i} claims {len} bytes — the file is corrupt");
@@ -262,5 +275,24 @@ mod tests {
         std::fs::write(dir.join(BLOCKS_BIN), b"").unwrap();
         assert_eq!(detect(&dir), Format::Binary);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The failure that actually happened: a bug wrote JSON into a file named
+    /// blocks.bin, and the reader answered "block 0 claims 1701323387 bytes",
+    /// which sounds like disk corruption and is not. Say what it is.
+    #[test]
+    fn json_in_a_binary_file_names_the_problem() {
+        let chain = sample_chain();
+        let mut buf = Vec::new();
+        for b in &chain.blocks {
+            write_block(&mut buf, b, Format::Json).unwrap();
+        }
+        let err = read_blocks(&buf[..], Format::Binary)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("JSON") && err.contains(BLOCKS_JSONL),
+            "the error must tell the operator to rename the file, got: {err}"
+        );
     }
 }
