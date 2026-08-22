@@ -21,7 +21,7 @@ never touch the chain, and hidden inflation isn't something you take on trust �
 [Web wallet](https://nightfallcoin.org/wallet/) ·
 [Start mining](#start-mining) ·
 [Discord](https://discord.gg/Wj6pTNmVEr) ·
-[Live network](https://nightfallcoin.org/network/) ·
+[Emission schedule](https://nightfallcoin.org/emission/) ·
 [Protocol spec](docs/SPEC.md) ·
 [Security review (v8)](docs/AUDIT-2026-08-16.md) ·
 [v4 audit](docs/AUDIT-2026-08-12.md)
@@ -441,7 +441,10 @@ official download is on [nightfallcoin.org](https://nightfallcoin.org) or the
 every binary has a published checksum.
 
 Live chain numbers, no addresses, no tracking:
-**[nightfallcoin.org/network](https://nightfallcoin.org/network/)**.
+**[nightfallcoin.org/network.json](https://nightfallcoin.org/network.json)** —
+height, tip, difficulty, minted, burned, and whether the supply invariant
+holds. The full halving curve is at
+**[nightfallcoin.org/emission](https://nightfallcoin.org/emission/)**.
 
 ## Contributing
 
