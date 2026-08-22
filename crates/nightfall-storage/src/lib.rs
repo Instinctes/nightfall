@@ -76,8 +76,9 @@ impl ChainStore {
 
     /// The chain file this datadir actually has.
     ///
-    /// Binary when `blocks.bin` exists, JSON otherwise. A node therefore reads
-    /// whichever it finds and nothing changes for anyone who has not run
+    /// Binary when `blocks.bin` exists, JSON when only `blocks.jsonl` does,
+    /// and binary for a datadir with neither — a fresh install. A node reads
+    /// whichever it finds, so nothing changes for anyone who has not run
     /// `nightfalld migrate-storage`.
     pub fn blocks_path(&self) -> PathBuf {
         self.dir.join(self.format().file_name())

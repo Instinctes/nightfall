@@ -903,8 +903,9 @@ impl NodeHandle {
     ///
     /// Used when a fork is deeper than [`nightfall_consensus::MAX_REORG_DEPTH`]:
     /// the node cannot adopt the heavier branch, so the only way onto the
-    /// live tip is to throw away `blocks.jsonl` and download it. Coinbase on
-    /// the abandoned branch is gone either way.
+    /// live tip is to throw away the chain file and download it. Coinbase on
+    /// the abandoned branch is gone either way. The old file is kept under
+    /// `chain-backup-<stamp>/` and the datadir keeps its storage format.
     pub fn resync_chain(&self) -> anyhow::Result<PathBuf> {
         self.mining_enabled.store(false, Ordering::SeqCst);
         let (sessions, backup) = {
@@ -917,12 +918,20 @@ impl NodeHandle {
             }
             let stamp = now_unix();
             let dir = g.store.dir.clone();
+            let fmt = g.store.format();
             let blocks = g.store.blocks_path();
             let meta = g.store.meta_path();
             let backup = dir.join(format!("chain-backup-{stamp}"));
             fs::create_dir_all(&backup)?;
             if blocks.exists() {
-                fs::rename(&blocks, backup.join("blocks.jsonl"))?;
+                // Back it up under its own name. A binary file called
+                // blocks.jsonl is a trap for whoever opens the backup later.
+                fs::rename(&blocks, backup.join(fmt.file_name()))?;
+                // An empty file of the same name keeps this datadir in the
+                // format it was already in. Without it the directory looks
+                // brand new, and a resync would quietly change the disk
+                // format underneath an operator who only asked to resync.
+                fs::write(&blocks, b"")?;
             }
             if meta.exists() {
                 fs::rename(&meta, backup.join("chain-meta.json"))?;
