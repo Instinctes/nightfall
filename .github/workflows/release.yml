@@ -104,6 +104,15 @@ jobs:
             (New-Object System.Text.UTF8Encoding $false)
           )
           Get-Content "dist/SHA256SUMS-$version-windows.txt"
+        env:
+          # Without this the step falls back to `github.ref_name`, which is the
+          # branch when the workflow is started by hand rather than by a tag.
+          # It then writes SHA256SUMS-main-windows.txt while every later step
+          # looks for SHA256SUMS-<version>-windows.txt, and the run dies on a
+          # missing file with an error that talks about carriage returns.
+          # Latent since the workflow was written; only a manual re-run reaches
+          # it, which is exactly when nobody is expecting a workflow bug.
+          INPUT_TAG: ${{ github.event.inputs.tag }}
 
       - name: The checksum list must be readable off Windows
         shell: pwsh
