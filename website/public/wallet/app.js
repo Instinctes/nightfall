@@ -13,11 +13,13 @@ import init, {
   wallet_history,
   build_send,
   probe_crypto,
-} from "./pkg/nightfall_web.js?v=s4";
+} from "./pkg/nightfall_web.js?v=087";
 
 const STORE = "nf-web-wallet-v1";
 const NODE_STORE = "nf-web-node";
 const HIDE_STORE = "nf-web-hide";
+const BOOK_STORE = "nf-web-book";
+const OUTBOX_STORE = "nf-web-outbox";
 const $ = (s, r = document) => r.querySelector(s);
 const app = $("#app");
 
@@ -25,13 +27,14 @@ const WARN =
   "This phone or browser trusts a node for what it shows. A hostile node can hide a payment or invent one on the screen. It cannot spend — the seed never leaves this device. Anyone who can run script on this page can read a saved wallet. The 24 words are the real backup.";
 
 const FEE = "0.001";
-const BUILD = "0.7.0+s4";
+const BUILD = "0.8.2";
 
 let wasmReady = init();
 let state = null;
 let phrasePending = null;
 let tab = "wallet";
 let sheet = null;
+let bookFrom = "send";
 let hideBal = localStorage.getItem(HIDE_STORE) === "1";
 let lastBal = null;
 let lastHist = [];
@@ -50,6 +53,90 @@ function forget() {
   state = null;
   lastBal = null;
   lastHist = [];
+}
+
+/* Address book.
+ *
+ * Local to this browser and nothing else. It is never sent anywhere, it is not
+ * part of the wallet file, and it does not survive clearing site data — which
+ * is the honest trade for not having a server hold a list of who you pay.
+ */
+function loadBook() {
+  try {
+    const v = JSON.parse(localStorage.getItem(BOOK_STORE) || "[]");
+    return Array.isArray(v) ? v.filter((e) => e && e.addr) : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function saveBook(list) {
+  localStorage.setItem(BOOK_STORE, JSON.stringify(list));
+}
+
+function bookLabel(addr) {
+  const hit = loadBook().find((e) => e.addr === addr);
+  return hit ? hit.label : "";
+}
+
+function addToBook(label, addr) {
+  const list = loadBook().filter((e) => e.addr !== addr);
+  list.push({ label: label.trim().slice(0, 40) || shortAddr(addr), addr });
+  list.sort((a, b) => a.label.localeCompare(b.label));
+  saveBook(list);
+}
+
+/* Outbox: transactions this browser broadcast that no block has taken yet.
+ *
+ * A payment goes to exactly one randomly chosen peer, which is what keeps it
+ * from being traced back here, and nothing repeats it. One dropped hop used to
+ * end the payment silently. Nodes now forget an unmined transaction after six
+ * hours, so the sender is the only one who can put it back — which means the
+ * sender has to keep it.
+ */
+function loadOutbox() {
+  try {
+    const v = JSON.parse(localStorage.getItem(OUTBOX_STORE) || "[]");
+    return Array.isArray(v) ? v : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function saveOutbox(list) {
+  localStorage.setItem(OUTBOX_STORE, JSON.stringify(list.slice(-20)));
+}
+
+function rememberOutbound(txid, tx) {
+  const list = loadOutbox().filter((e) => e.txid !== txid);
+  list.push({ txid, tx, at: Math.floor(Date.now() / 1000) });
+  saveOutbox(list);
+}
+
+/* Re-submit anything still pending, then drop what the wallet now shows as
+ * confirmed. A rejection is ignored on purpose: the usual reason is that the
+ * inputs are already spent, which is what confirmation looks like from the
+ * outside. The history is the authority, not the reply. */
+async function flushOutbox() {
+  const list = loadOutbox();
+  if (!list.length) return;
+  const pending = new Set(
+    (lastHist || []).filter((e) => e.direction === "Sent" && e.pending).map((e) => e.txid),
+  );
+  const keep = [];
+  for (const e of list) {
+    // Give up after a day. By then it is not a dropped hop, it is a payment
+    // the network refuses, and retrying for ever hides that.
+    const stale = Math.floor(Date.now() / 1000) - (e.at || 0) > 86400;
+    if (!pending.has(e.txid) || stale) continue;
+    try {
+      await rpc("submit_tx", { tx: e.tx });
+    } catch (_) {
+      /* see above */
+    }
+    keep.push(e);
+  }
+  saveOutbox(keep);
 }
 
 function nodeUrl() {
@@ -85,7 +172,7 @@ function wasmCall(fn, ...args) {
     const m = String(e && e.message ? e.message : e);
     if (/unreachable|Unreachable/i.test(m)) {
       throw new Error(
-        "Could not build the transaction in this browser. Try again, or send from Core / the Android app. (" +
+        "Could not build the transaction in this browser. Try again, or send from the Core wallet. (" +
           m +
           ")",
       );
@@ -124,7 +211,15 @@ function dirMeta(d) {
 }
 
 function screen(html) {
-  app.innerHTML = html;
+  // The tab bar is written at the end of each template, but it must not live
+  // inside the part that scrolls. On iOS a `position: fixed` bar drifts upward
+  // with momentum scrolling — it is positioned against a layout viewport that
+  // the collapsing toolbar keeps resizing. Lifting it out of the scroller and
+  // making it a flex sibling removes the whole class of problem: it is not in
+  // the scrolling box, so scrolling cannot move it.
+  app.innerHTML = `<div class="view">${html}</div>`;
+  const bar = app.querySelector(".view > .nav");
+  if (bar) app.appendChild(bar);
 }
 
 function icons() {
@@ -275,6 +370,7 @@ function renderApp() {
     onboard();
     return;
   }
+  if (sheet === "book") return renderBook();
   if (sheet === "receive") return renderReceive();
   if (sheet === "send") return renderSend();
   if (sheet === "seed") return renderSeed();
@@ -373,40 +469,94 @@ function renderActivity() {
   bindNav();
 }
 
+function setRow(id, icon, title, sub, opts = {}) {
+  const tone = opts.tone ? ` tone-${opts.tone}` : "";
+  const tail = opts.value
+    ? `<span class="set-val mono">${escapeHtml(opts.value)}</span>`
+    : `<span class="chev" aria-hidden="true">›</span>`;
+  return `<button class="set-row${tone}" id="${id}">
+    <span class="ico" aria-hidden="true">${icon}</span>
+    <span class="txt">
+      <span class="t">${escapeHtml(title)}</span>
+      <span class="s">${escapeHtml(sub)}</span>
+    </span>
+    ${tail}
+  </button>`;
+}
+
 function renderSettings() {
   let info = { birth_height: "—", scanned_to: "—", outputs: "—" };
   try {
     info = parseJson(wallet_info(state));
   } catch (_) {}
+
+  const I = {
+    key: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2 20 3M17 6l2 2M14 9l2 2"/></svg>`,
+    eye: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>`,
+    sync: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/></svg>`,
+    node: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>`,
+    book: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H19v15H6.5A2.5 2.5 0 0 0 4 20.5Z"/><path d="M4 20.5A2.5 2.5 0 0 1 6.5 18H19v3H6.5A2.5 2.5 0 0 1 4 20.5Z"/><path d="M9 7.5h6M9 11h4"/></svg>`,
+    trash: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>`,
+  };
+
   screen(`
     <div class="screen">
-      <p class="kicker">Settings</p>
-      <h1>Wallet</h1>
-      <button class="settings-item" id="show-seed">
-        Recovery phrase
-        <small>24 words. Anyone who sees them can spend.</small>
-      </button>
-      <button class="settings-item" id="show-view">
-        View key
-        <small>Reads amounts and memos. Cannot spend.</small>
-      </button>
-      <button class="settings-item" id="rescan">
-        Rescan from birth height
-        <small>Birth ${info.birth_height} · scanned to ${info.scanned_to} · ${info.outputs} unspent</small>
-      </button>
-      <div class="card">
-        <p class="kicker">Trusted node</p>
-        <p class="hint">The website Worker proxies to the seed. This field is informational — the browser always talks to /wallet-api.</p>
-        <input id="node" value="${escapeHtml(nodeUrl() || "seed.nightfallcoin.org (via /wallet-api)")}" readonly>
-        <p class="hint">Tip ${lastTip || lastBal?.tip || "—"} · protocol v8 · ${BUILD}</p>
+      <header class="page-head">
+        <p class="kicker">Settings</p>
+        <h1>Your wallet</h1>
+        <p class="lede">Keys live in this browser. Nothing here is sent anywhere.</p>
+      </header>
+
+      <p class="group-label">Keys and backup</p>
+      <div class="set-group">
+        ${setRow("show-seed", I.key, "Recovery phrase", "24 words · the only way back to these coins")}
+        ${setRow("show-view", I.eye, "View key", "Reads amounts and memos · cannot spend")}
       </div>
-      <div class="card"><p class="hint">${WARN}</p></div>
-      <button class="ghost" id="wipe">Remove wallet from this browser</button>
-      <p class="hint" style="margin-top:1rem"><a href="/">nightfallcoin.org</a></p>
+
+      <p class="group-label">Contacts</p>
+      <div class="set-group">
+        ${setRow("open-book", I.book, "Address book", `${loadBook().length} saved · this browser only`)}
+      </div>
+
+      <p class="group-label">Sync</p>
+      <div class="set-group">
+        <div class="set-stats">
+          <div><span class="k">Birth</span><span class="v mono">${escapeHtml(String(info.birth_height))}</span></div>
+          <div><span class="k">Scanned to</span><span class="v mono">${escapeHtml(String(info.scanned_to))}</span></div>
+          <div><span class="k">Unspent</span><span class="v mono">${escapeHtml(String(info.outputs))}</span></div>
+        </div>
+        ${setRow("rescan", I.sync, "Rescan from birth height", "Forgets what it found and walks the chain again")}
+      </div>
+
+      <p class="group-label">Connection</p>
+      <div class="set-group">
+        <div class="kv"><span class="k">Node</span><span class="v mono">${escapeHtml(nodeUrl() || "seed.nightfallcoin.org")}</span></div>
+        <div class="kv"><span class="k">Route</span><span class="v mono">/wallet-api</span></div>
+        <div class="kv"><span class="k">Tip</span><span class="v mono">${escapeHtml(String(lastTip || lastBal?.tip || "—"))}</span></div>
+        <div class="kv"><span class="k">Protocol</span><span class="v mono">v8 · wire v6</span></div>
+        <div class="kv"><span class="k">Build</span><span class="v mono">${BUILD}</span></div>
+      </div>
+
+      <details class="note">
+        <summary>What this wallet cannot promise</summary>
+        <p>${WARN}</p>
+      </details>
+
+      <p class="group-label danger">Danger</p>
+      <div class="set-group danger">
+        ${setRow("wipe", I.trash, "Remove wallet from this browser", "Needs the 24 words to come back", { tone: "danger" })}
+      </div>
+
+      <p class="foot-link"><a href="/">nightfallcoin.org</a></p>
     </div>
     ${nav()}
   `);
   bindNav();
+  $("#open-book").onclick = () => {
+    bookFrom = "settings";
+    sheet = "book";
+    renderApp();
+  };
   $("#show-seed").onclick = () => {
     sheet = "seed";
     renderApp();
@@ -437,6 +587,81 @@ function renderSettings() {
   };
 }
 
+function renderBook() {
+  const book = loadBook();
+  screen(`
+    <div class="screen">
+      <button class="linkish" id="back">← Back</button>
+      <h1>Address book</h1>
+      <p class="hint">Names for addresses you pay often. Stored in this browser
+        only — never sent anywhere, and not part of the wallet backup. Clearing
+        site data clears this list; the 24 words do not restore it.</p>
+
+      <div class="field">
+        <label for="b-label">Name</label>
+        <input id="b-label" placeholder="Rent, Anna, exchange…" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="b-addr">Address</label>
+        <input id="b-addr" placeholder="nf1…" spellcheck="false" autocomplete="off" autocapitalize="none">
+        <p class="field-err" id="b-err"></p>
+      </div>
+      <button class="primary" id="b-add">Add to book</button>
+
+      <p class="group-label" style="margin-top:26px">${book.length} saved</p>
+      <div class="set-group">
+        ${
+          book.length
+            ? book
+                .map(
+                  (e, i) => `<div class="book-row">
+                    <span class="txt">
+                      <span class="t">${escapeHtml(e.label)}</span>
+                      <span class="s mono">${escapeHtml(shortAddr(e.addr))}</span>
+                    </span>
+                    <button type="button" class="rm" data-i="${i}" aria-label="Remove ${escapeHtml(e.label)}">Remove</button>
+                  </div>`,
+                )
+                .join("")
+            : `<p class="hint" style="padding:16px;margin:0">Nothing saved yet.</p>`
+        }
+      </div>
+    </div>
+    ${nav()}
+  `);
+  bindNav();
+  $("#back").onclick = () => {
+    if (bookFrom === "settings") {
+      sheet = null;
+      tab = "settings";
+    } else {
+      sheet = "send";
+    }
+    renderApp();
+  };
+  $("#b-add").onclick = () => {
+    const label = $("#b-label").value.trim();
+    const addr = $("#b-addr").value.trim();
+    if (!addr.startsWith("nf1") || addr.length < 20) {
+      $("#b-err").textContent = "That does not look like an nf1 address.";
+      return;
+    }
+    addToBook(label, addr);
+    renderBook();
+  };
+  document.querySelectorAll(".book-row .rm").forEach((b) => {
+    b.onclick = () => {
+      const list = loadBook();
+      const gone = list[Number(b.dataset.i)];
+      if (!gone) return;
+      if (!confirm(`Remove "${gone.label}" from the book? The coins are not affected.`)) return;
+      list.splice(Number(b.dataset.i), 1);
+      saveBook(list);
+      renderBook();
+    };
+  });
+}
+
 function renderSeed() {
   let phrase = "";
   let err = "";
@@ -449,12 +674,16 @@ function renderSeed() {
     <div class="screen">
       <button class="linkish" id="back">← Settings</button>
       <h1>Recovery phrase</h1>
-      <p class="hint">Paper first. A password manager is next-best. Anyone with these words can spend.</p>
-      <div id="secret" hidden>${wordGrid(phrase)}</div>
+      <p class="hint">Paper first, a password manager second. Anyone who reads these
+        twenty-four words can spend every coin this wallet holds.</p>
+      <div id="secret" hidden>
+        ${wordGrid(phrase)}
+        <p class="hint" style="margin-top:14px">Write them in this order. Order is part of the key.</p>
+      </div>
       <button class="primary" id="reveal">Show the 24 words</button>
       <button class="ghost" id="copy" hidden>Copy all 24 words</button>
       <p class="ok" id="copied" hidden></p>
-      <p class="warn">${escapeHtml(err)}</p>
+      ${err ? `<p class="warn">${escapeHtml(err)}</p>` : ""}
     </div>
   `);
   $("#back").onclick = () => {
@@ -491,10 +720,12 @@ function renderViewKey() {
     <div class="screen">
       <button class="linkish" id="back">← Settings</button>
       <h1>View key</h1>
-      <p class="hint">A view key decrypts amounts and memos. It cannot sign. Treat it as sensitive.</p>
+      <p class="hint">Hand this to an accountant and they see every amount and memo
+        you receive — and cannot move a single coin. Spending needs the phrase.</p>
       <div class="secret mono">${escapeHtml(key)}</div>
       <button class="primary" id="copy">Copy view key</button>
-      <p class="warn">${escapeHtml(err)}</p>
+      <p class="ok" id="copied" hidden></p>
+      ${err ? `<p class="warn">${escapeHtml(err)}</p>` : ""}
     </div>
   `);
   $("#back").onclick = () => {
@@ -502,7 +733,13 @@ function renderViewKey() {
     renderApp();
   };
   $("#copy").onclick = async () => {
-    await navigator.clipboard.writeText(key);
+    const ok = await copyText(key);
+    const n = $("#copied");
+    if (n) {
+      n.hidden = false;
+      n.textContent = ok ? "Copied to the clipboard." : "Could not copy — select the key and copy it yourself.";
+      n.className = ok ? "ok" : "warn";
+    }
   };
 }
 
@@ -542,36 +779,161 @@ function renderReceive() {
 }
 
 function renderSend() {
-  const spend = fmtAmt(lastBal?.available);
+  const book = loadBook();
+  const availStr = lastBal?.available ?? "0";
+  const avail = Number(availStr) || 0;
+  const fee = Number(FEE);
+
   screen(`
     <div class="screen">
       <button class="linkish" id="back">← Wallet</button>
       <h1>Send</h1>
-      <p class="hint">Wrong address = gone forever. Fee ${FEE} NIGHT, burned while blocks still pay a subsidy. Spendable ${spend} NIGHT.</p>
-      <input id="to" placeholder="nf1…" spellcheck="false" autocomplete="off">
-      <input id="amt" placeholder="Amount" inputmode="decimal">
-      <input id="memo" placeholder="Memo (optional)">
+      <p class="hint">Amounts and the recipient are hidden on the chain. The fee
+        is burned while blocks still pay a subsidy — no miner receives it.</p>
+
+      <div class="field">
+        <label for="to">To address</label>
+        <input id="to" placeholder="nf1…" spellcheck="false" autocomplete="off" autocapitalize="none">
+        ${
+          book.length
+            ? `<div class="chips" id="chips">${book
+                .map(
+                  (e, i) =>
+                    `<button type="button" class="chip" data-i="${i}" title="${escapeHtml(e.addr)}">${escapeHtml(e.label)}</button>`,
+                )
+                .join("")}</div>`
+            : ""
+        }
+        <div class="field-actions">
+          <button type="button" class="linkish" id="save-addr" hidden>Save this address</button>
+          <button type="button" class="linkish" id="open-book">Address book</button>
+        </div>
+        <p class="field-note hot">There is no undo and no support desk. An address
+          typed wrong is a payment to nobody.</p>
+        <p class="field-err" id="err-to"></p>
+      </div>
+
+      <div class="field">
+        <label for="amt">Amount</label>
+        <div class="amount-box">
+          <input id="amt" placeholder="0.00" inputmode="decimal" autocomplete="off">
+          <span class="unit">NIGHT</span>
+          <button type="button" class="max" id="max">MAX</button>
+        </div>
+        <p class="field-note">Spendable ${fmtAmt(availStr)} NIGHT</p>
+        <p class="field-err" id="err-amt"></p>
+      </div>
+
+      <div class="field">
+        <label for="memo">Memo <span class="dim">— optional, encrypted</span></label>
+        <input id="memo" placeholder="Only the recipient can read it" autocomplete="off">
+      </div>
+
+      <div class="summary" id="summary">
+        <div class="line"><span class="k">They receive</span><span class="v" id="s-amt">—</span></div>
+        <div class="line"><span class="k">Fee, burned</span><span class="v">${FEE} NIGHT</span></div>
+        <div class="line total"><span class="k">Leaves your wallet</span><span class="v" id="s-total">—</span></div>
+        <div class="line" id="s-rest-line"><span class="k">Spendable after</span><span class="v" id="s-rest">${fmtAmt(availStr)}</span></div>
+      </div>
+
       <button class="primary" id="go">Review</button>
       <p id="err" class="warn"></p>
     </div>
   `);
+
+  const $to = $("#to");
+  const $amt = $("#amt");
+  const trim = (n) => {
+    const t = n.toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
+    return t || "0";
+  };
+
+  function recompute() {
+    const v = Number($amt.value.trim());
+    const ok = $amt.value.trim() !== "" && Number.isFinite(v) && v > 0;
+    $("#s-amt").textContent = ok ? `${fmtAmt(trim(v))} NIGHT` : "—";
+    $("#s-total").textContent = ok ? `${fmtAmt(trim(v + fee))} NIGHT` : "—";
+    const rest = avail - (ok ? v + fee : 0);
+    $("#s-rest").textContent = `${fmtAmt(trim(Math.max(rest, 0)))} NIGHT`;
+    // Saying "not enough" here, next to the number, beats saying it after the
+    // proofs have already been built.
+    $("#s-rest-line").classList.toggle("short", ok && rest < 0);
+    $("#err-amt").textContent = ok && rest < 0 ? "More than you can spend, fee included." : "";
+  }
+
+  $amt.oninput = recompute;
+  $("#max").onclick = () => {
+    $amt.value = trim(Math.max(avail - fee, 0));
+    recompute();
+    $amt.focus();
+  };
+  function refreshSaveBtn() {
+    const v = $to.value.trim();
+    const known = v && bookLabel(v);
+    const b = $("#save-addr");
+    if (b) b.hidden = !(v.startsWith("nf1") && v.length >= 20 && !known);
+  }
+
+  $to.oninput = () => {
+    $("#err-to").textContent = "";
+    refreshSaveBtn();
+  };
+  refreshSaveBtn();
+
+  document.querySelectorAll("#chips .chip").forEach((c) => {
+    c.onclick = () => {
+      $to.value = book[Number(c.dataset.i)].addr;
+      $("#err-to").textContent = "";
+      refreshSaveBtn();
+      $amt.focus();
+    };
+  });
+
+  const saveBtn = $("#save-addr");
+  if (saveBtn) {
+    saveBtn.onclick = () => {
+      const addr = $to.value.trim();
+      const label = prompt("Name for this address? It stays in this browser.");
+      if (label === null) return;
+      addToBook(label, addr);
+      renderSend();
+    };
+  }
+  $("#open-book").onclick = () => {
+    bookFrom = "send";
+    sheet = "book";
+    renderApp();
+  };
+
+  recompute();
+
   $("#back").onclick = () => {
     sheet = null;
     renderApp();
   };
   $("#go").onclick = () => {
-    const to = $("#to").value.trim();
-    const amt = $("#amt").value.trim();
+    const to = $to.value.trim();
+    const amt = $amt.value.trim();
     const memo = $("#memo").value;
+    $("#err-to").textContent = "";
+    $("#err-amt").textContent = "";
     if (!to.startsWith("nf1") || to.length < 20) {
-      $("#err").textContent = "that does not look like an nf1 address";
+      $("#err-to").textContent = "That does not look like an nf1 address.";
+      $to.focus();
       return;
     }
-    if (!amt) {
-      $("#err").textContent = "enter an amount";
+    const v = Number(amt);
+    if (!amt || !Number.isFinite(v) || v <= 0) {
+      $("#err-amt").textContent = "Enter an amount.";
+      $amt.focus();
       return;
     }
-    if (!confirm(`Send ${amt} NIGHT to\n${shortAddr(to)}\nplus ${FEE} NIGHT fee?`)) return;
+    if (v + fee > avail) {
+      $("#err-amt").textContent = "More than you can spend, fee included.";
+      $amt.focus();
+      return;
+    }
+    if (!confirm(`Send ${fmtAmt(trim(v))} NIGHT to\n${shortAddr(to)}\n\nFee ${FEE} NIGHT, burned.\nLeaves your wallet: ${fmtAmt(trim(v + fee))} NIGHT`)) return;
     doSend(to, amt, memo);
   };
 }
@@ -597,6 +959,7 @@ async function doSend(to, amt, memo) {
     renderHome();
     const res = await rpc("submit_tx", { tx: built.tx });
     state = built.state;
+    rememberOutbound(res.txid || built.txid, built.tx);
     save();
     lastStatus = "sent " + (res.txid || built.txid);
     await sync();
@@ -633,6 +996,7 @@ async function sync() {
     save();
     lastBal = parseJson(wallet_balance(state, tip));
     lastHist = parseJson(wallet_history(state));
+    await flushOutbox();
     lastStatus = found ? `found ${found} new output(s)` : "up to date";
   } catch (e) {
     lastErr = e.message || String(e);

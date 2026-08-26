@@ -587,6 +587,76 @@ fn mempool_picks_high_fees_and_skips_conflicts() {
     assert_eq!(mp.len(), 0);
 }
 
+/// A stand-in transaction. `Mempool` is a map with a policy; it does not
+/// validate, so a coinbase is fine for testing the policy.
+fn some_tx(n: u64) -> nightfall_ledger::Transaction {
+    let who = WalletKeys::generate().address();
+    nightfall_ledger::build_coinbase(&who, 6 * 100_000_000, n, b"nightfall:test").unwrap()
+}
+
+/// The bug this exists for: `remove_included` only drops what a block
+/// consumed, so a transaction no miner ever takes was never dropped at all.
+/// Two mainnet seeds were holding 60 and 117 of them on 26 Aug 2026.
+#[test]
+fn a_transaction_nobody_mines_is_eventually_forgotten() {
+    let mut mp = Mempool::default();
+    let old = some_tx(1);
+    let fresh = some_tx(2);
+    let old_id = old.txid().to_hex();
+    let fresh_id = fresh.txid().to_hex();
+
+    assert!(mp.insert(old, NOW));
+    assert!(mp.insert(fresh, NOW + Mempool::MAX_AGE_SECS));
+    assert_eq!(mp.len(), 2);
+
+    // One second past the horizon of the first, still inside the second's.
+    let dropped = mp.expire(NOW + Mempool::MAX_AGE_SECS + 1);
+    assert_eq!(dropped, 1, "exactly the stale one goes");
+    assert!(!mp.txs.contains_key(&old_id), "stale entry survived");
+    assert!(mp.txs.contains_key(&fresh_id), "fresh entry was thrown out");
+    assert!(mp.first_seen(&old_id).is_none(), "timestamp index leaked");
+}
+
+// Not tested here: the sweep that `insert` performs when the map is already at
+// MAX_ENTRIES. Filling it honestly means building 10,000 transactions, and each
+// one carries a bulletproof — minutes of CI for one branch. The behaviour it
+// guards (a full pool of corpses must not refuse a live transaction forever) is
+// the same `expire` the test above covers; what is untested is only the call
+// site. If MAX_ENTRIES ever becomes configurable, test it properly then.
+
+/// The index that remembers arrival times must shrink with the map, or it
+/// becomes the unbounded growth the entry cap exists to prevent.
+#[test]
+fn the_timestamp_index_never_outgrows_the_mempool() {
+    let mut mp = Mempool::default();
+    let tx = some_tx(7);
+    let id = tx.txid().to_hex();
+    mp.insert(tx.clone(), NOW);
+
+    let block = Block {
+        header: BlockHeader {
+            version: 8,
+            height: Height(1),
+            prev_hash: Hash256([0; 32]),
+            utxo_root: Hash256([0; 32]),
+            kernel_sum: nightfall_crypto::Commitment([0; 32]),
+            body_root: Hash256([0; 32]),
+            timestamp_unix: NOW,
+            difficulty: 1,
+            nonce: 0,
+            reward_darks: 0,
+        },
+        body: nightfall_ledger::BlockBody::aggregate(std::slice::from_ref(&tx)),
+    };
+    mp.remove_included(&block);
+
+    assert_eq!(mp.len(), 0);
+    assert!(
+        mp.first_seen(&id).is_none(),
+        "arrival time outlived the transaction it belonged to"
+    );
+}
+
 #[test]
 fn genesis_is_fair_and_network_separated() {
     let d = Chain::new_fair(NetworkId::Devnet).unwrap();

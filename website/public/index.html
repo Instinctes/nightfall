@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>NIGHTFALLCOIN — money that refuses to snitch</title>
-<meta name="description" content="A privacy-first Layer-1 with a cryptographically provable supply. Confidential amounts, no addresses on chain, memory-hard CPU mining, 90 million hard cap, zero premine.">
+<meta name="description" content="A privacy Layer-1 where amounts and addresses are hidden and the total supply is still something anyone can prove. CPU mineable, 90 million hard cap, zero premine, no company. Protocol v8, live on mainnet.">
 <meta property="og:title" content="NIGHTFALLCOIN — money that refuses to snitch">
-<meta property="og:description" content="Confidential amounts. No addresses on chain. A supply anyone can prove. Fair launch, zero premine.">
+<meta property="og:description" content="Hidden amounts, no addresses on chain — and a supply you can prove yourself. CPU mineable, zero premine, no company. Not “100% anonymous”, and we say so.">
 <meta property="og:type" content="website">
 <meta name="theme-color" content="#0e0b18">
 <link rel="icon" href="/assets/favicon-32.png" sizes="32x32" type="image/png">
@@ -16,7 +16,7 @@
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
-<link rel="stylesheet" href="css/style.css?v=live-5">
+<link rel="stylesheet" href="css/style.css?v=v2-8">
 </head>
 <body>
 
@@ -24,12 +24,12 @@
   <div class="wrap">
     <a class="brand" href="#top"><img class="mark" src="/assets/logo-256.png" alt="" width="34" height="34"> <span class="brand-word">NIGHTFALL</span></a>
     <div class="nav-links">
+      <a href="#why">Why</a>
       <a href="#proof">Provable supply</a>
       <a href="#privacy">Privacy</a>
       <a href="#mining">Mining</a>
-      <a href="#specs">Specs</a>
       <a href="#honest">Limitations</a>
-      <a href="/network/">Network</a>
+      <a href="/emission/">Emission</a>
       <a href="/audit/">Audit</a>
       <a href="/wallet/">Web wallet</a>
       <div class="nav-social">
@@ -50,13 +50,19 @@
   <div class="wrap">
     <div class="hero-grid">
       <div>
-        <img class="hero-coin reveal" src="/assets/logo.png" alt="NIGHTFALLCOIN" width="96" height="96">
-        <div class="eyebrow reveal"><span class="dot"></span> Protocol v8 · new genesis · 6 NIGHT / 7.5M blocks</div>
+        <div class="hero-mark reveal">
+          <span class="coin-holder">
+            <img class="hero-coin" src="/assets/logo.png" alt="NIGHTFALLCOIN" width="96" height="96">
+          </span>
+          <span class="hero-tagline" id="hero-tagline" aria-label="Born when the lights go out"><span class="w" aria-hidden="true">Born</span> <span class="w" aria-hidden="true">when</span> <span class="w" aria-hidden="true">the</span> <span class="w" aria-hidden="true">lights</span> <span class="w" aria-hidden="true">go</span> <span class="w" aria-hidden="true">out</span><i class="caret" aria-hidden="true"></i></span>
+        </div>
+        <div class="eyebrow reveal"><span class="dot"></span> Live on mainnet · CPU mineable · no premine</div>
         <h1 class="reveal" data-delay="1">Money that refuses<br>to <span class="grad-text">snitch</span>.</h1>
         <p class="lede reveal" data-delay="2">
-          No company, no premine, no admin key. Amounts stay hidden, addresses
-          never touch the chain, and you can prove the supply yourself.
-          This is <em>not</em> “100% anonymous.” The honest list is below.
+          Every public blockchain turns your salary, your rent and every
+          donation you make into a permanent record anyone can read. Nightfall
+          hides the amounts and the addresses — and still lets you
+          <em>prove</em> nobody printed a coin.
         </p>
         <div class="hero-cta reveal" data-delay="3">
           <a class="btn btn-primary" href="#download">Get the wallet</a>
@@ -96,12 +102,68 @@
             <span class="dot"></span>
             <span id="supply-proof-text">Checking the chain…</span>
           </div>
-          <p class="supply-note">Every node re-checks that no coin exists which was never mined. <a href="/network/">Full numbers</a> — height, difficulty, listener count. No addresses.</p>
+          <p class="supply-note">Every node re-checks that no coin exists which was never mined. The raw figures are at <a href="/network.json">/network.json</a> — height, difficulty, supply. No addresses, on that endpoint or anywhere else.</p>
         </div>
       </div>
     </div>
   </div>
 </header>
+
+<!-- ===================================================== honesty, up front -->
+<section class="upfront">
+  <div class="wrap">
+    <div class="upfront-grid reveal">
+      <div class="upfront-item">
+        <div class="upfront-k">Not “100% anonymous”</div>
+        <p>Amounts and addresses are hidden. The transaction graph is mixed inside every block, not erased. We will not claim otherwise.</p>
+      </div>
+      <div class="upfront-item">
+        <div class="upfront-k">This is the second genesis</div>
+        <p>v4 had a balance proof that proved nothing. v7 minted almost everything too early. We published both failures and started over.</p>
+      </div>
+      <div class="upfront-item">
+        <div class="upfront-k">No outside audit yet</div>
+        <p>The cryptography was written and reviewed by the same people. Passing tests is not an outside review.</p>
+      </div>
+    </div>
+    <p class="upfront-foot reveal">
+      Three things you would normally have to dig for.
+      <a href="#honest">The complete list of what is missing</a> ·
+      <a href="https://github.com/Instinctes/nightfall/blob/main/docs/RESET.md">Why we reset</a>
+    </p>
+  </div>
+</section>
+
+<!-- ================================================================ stakes -->
+<section class="stakes" id="why">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <div class="kicker">Why this exists</div>
+      <h2>A public ledger is a <span class="grad-text">permanent record</span></h2>
+      <p>
+        Transparency was sold as a feature. In practice it means that anyone who
+        learns one of your addresses — an exchange, an employer, a shop, someone
+        you paid once — can read backwards and forwards through everything else
+        you ever did with it.
+      </p>
+    </div>
+
+    <div class="grid grid-3">
+      <div class="card reveal">
+        <h3>Your salary is public</h3>
+        <p>Get paid on a transparent chain and the amount, the schedule and the payer are visible to everyone who has ever seen that address, forever. You cannot take it back later.</p>
+      </div>
+      <div class="card reveal" data-delay="1">
+        <h3>So is what you support</h3>
+        <p>Donations to a party, a union, a church, a legal defence fund. In some countries that is merely embarrassing. In others it is a list somebody is compiling.</p>
+      </div>
+      <div class="card reveal" data-delay="2">
+        <h3>And it is retroactive</h3>
+        <p>Privacy you add later does not help. Everything already written stays written, and analysis only gets better. The only version that works is the one that was private from the first block.</p>
+      </div>
+    </div>
+  </div>
+</section>
 
 <!-- ====================================================== provable supply -->
 <section class="proof" id="proof">
@@ -148,8 +210,8 @@
       </div>
       <div class="card reveal" data-delay="2">
         <div class="ico"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg></div>
-        <h3>An auditable fee</h3>
-        <p>While blocks still pay a subsidy, fees are burned — the fee is the one public number in a transaction, so the burn can be checked rather than merely claimed. After the last reward, that same public fee goes to the miner. Nothing is minted either way.</p>
+        <h3>A fee you can audit</h3>
+        <p>The fee is the one public number in a transaction, deliberately. Today it is burned, and anyone can check the burn instead of taking it on faith. Once the last subsidy is paid, that same visible fee goes to the miner who found the block. Neither case mints anything.</p>
       </div>
     </div>
   </div>
@@ -168,15 +230,30 @@
     </div>
 
     <div class="grid grid-2">
-      <div class="card reveal">
+      <div class="card card-lead reveal">
+        <div class="ico"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="8" cy="6" r="2"/><circle cx="16" cy="12" r="2"/><circle cx="10" cy="18" r="2"/></svg></div>
+        <h3>Every block is a CoinJoin</h3>
+        <p>A block does not store a list of transactions. Every payment in it is merged into one flat, sorted set of inputs and outputs, so an observer cannot tell which input paid which output. Not an optional mixer you remember to use, not a service that takes a cut — it happens to every payment, in every block, whether you asked or not.</p>
+      </div>
+      <div class="card card-lead reveal" data-delay="1">
+        <div class="ico"><svg viewBox="0 0 24 24"><path d="M15 7a5 5 0 11-4.9 6H3v-2h7.1A5 5 0 0115 7z"/><path d="M17 12h.01"/></svg></div>
+        <h3>Prove what you choose, to whom you choose</h3>
+        <p>Hand an accountant a view key and they see every amount and memo you send or receive — and nothing else. It is structurally incapable of moving a coin. Need to prove a single payment instead? A receipt opens exactly one output and leaves the rest of your wallet shut.</p>
+      </div>
+      <div class="card reveal" data-delay="2">
         <div class="ico"><svg viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><path d="M4 4l16 16"/></svg></div>
         <h3>Amounts are commitments, not numbers</h3>
         <p>What lands on the chain is a Pedersen commitment — a point on an elliptic curve that mathematically binds the sender to a value while revealing nothing about it. Only you and the recipient know what moved.</p>
       </div>
-      <div class="card reveal" data-delay="1">
+      <div class="card reveal" data-delay="3">
         <div class="ico"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-6 8-6s8 2 8 6"/></svg></div>
         <h3>Your address never appears</h3>
         <p>Every payment generates a fresh one-time key derived from a shared secret. Two payments to the same address share no visible field — not even the sender can link them afterwards.</p>
+      </div>
+      <div class="card reveal" data-delay="1">
+        <div class="ico"><svg viewBox="0 0 24 24"><path d="M12 2v20M2 12h20"/><circle cx="12" cy="12" r="9"/></svg></div>
+        <h3>No admin, no freeze, no keys</h3>
+        <p>There is no mint authority, no blacklist, no pause switch. Not as a policy — the capability simply does not exist in the protocol, and a fair genesis with zero allocations is enforced in code.</p>
       </div>
       <div class="card reveal" data-delay="2">
         <div class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 8l9 6 9-6"/></svg></div>
@@ -184,29 +261,9 @@
         <p>Attach a note to a payment; only the recipient can read it. Every payload is padded to the same size, so even the length of what you wrote gives nothing away.</p>
       </div>
       <div class="card reveal" data-delay="3">
-        <div class="ico"><svg viewBox="0 0 24 24"><path d="M15 7a5 5 0 11-4.9 6H3v-2h7.1A5 5 0 0115 7z"/><path d="M17 12h.01"/></svg></div>
-        <h3>View keys that cannot spend</h3>
-        <p>Hand an accountant, an auditor or a partner a key that reveals every amount and memo you send or receive — and nothing else. It is structurally incapable of moving a coin.</p>
-      </div>
-      <div class="card reveal" data-delay="1">
-        <div class="ico"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="8" cy="6" r="2"/><circle cx="16" cy="12" r="2"/><circle cx="10" cy="18" r="2"/></svg></div>
-        <h3>Blocks dissolve transactions</h3>
-        <p>A block does not store a list of transactions. Every payment in it is merged into one flat, sorted set of inputs and outputs, so an observer cannot tell which input paid which output. CoinJoin, automatically, in every block.</p>
-      </div>
-      <div class="card reveal" data-delay="2">
-        <div class="ico"><svg viewBox="0 0 24 24"><path d="M12 2v20M2 12h20"/><circle cx="12" cy="12" r="9"/></svg></div>
-        <h3>No admin, no freeze, no keys</h3>
-        <p>There is no mint authority, no blacklist, no pause switch. Not as a policy — the capability simply does not exist in the protocol, and a fair genesis with zero allocations is enforced in code.</p>
-      </div>
-      <div class="card reveal" data-delay="3">
         <div class="ico"><svg viewBox="0 0 24 24"><path d="M4 12h16M12 4v16"/></svg></div>
-        <h3>Stem first, then fluff</h3>
-        <p>A payment is handed to one random peer before the network hears it. Combine that with Tor in the wallet if you do not want your ISP to see which seed you dial.</p>
-      </div>
-      <div class="card reveal">
-        <div class="ico"><svg viewBox="0 0 24 24"><path d="M9 12l2 2 4-4"/><path d="M12 3l7 4v5c0 4.5-3 8-7 9-4-1-7-4.5-7-9V7z"/></svg></div>
-        <h3>Prove one payment</h3>
-        <p>A view key shows everything. A receipt shows one output: the commitment opens to the amount, and the spend key of your address signs it. An auditor does not need the rest of your wallet.</p>
+        <h3>Your payment does not shout</h3>
+        <p>A transaction is handed to one random peer before the rest of the network hears it, so the node that relays it first is not obviously its origin. Tor is on by default; if it is down the node falls back to clearnet and tells you.</p>
       </div>
     </div>
   </div>
@@ -239,8 +296,8 @@
       </div>
       <div class="step reveal" data-delay="1">
         <div>
-          <h3>Connect to a peer before you mine</h3>
-          <p>Two miners who never meet build two separate chains from the same genesis, and the lighter one is discarded when they finally connect. The wallet warns you loudly if you are mining with no peers.</p>
+          <h3>Peers connect themselves — just never mine without them</h3>
+          <p>The wallet dials the network on startup and there is nothing to enter. It matters because two miners who never meet build two separate chains from the same genesis, and the lighter one is discarded when they finally connect. So if the wallet ever says <em>No peers — mining solo</em>, something is in the way — a firewall, a dead proxy, no connection. Fix that before you leave the machine running for hours.</p>
         </div>
       </div>
       <div class="step reveal" data-delay="2">
@@ -308,74 +365,77 @@
       </p>
     </div>
 
-    <div class="notice reveal">
-      <b>v0.7.0 is a new chain.</b>
-      Genesis <code>061a052d…</code>, protocol v8, wire v6. Every coin
-      mined on the August 2026 chain (<code>c8614333…</code>, wallets 0.6.x)
-      stays on that archive. It is not NIGHT here. We reset because that
-      emission minted almost everything in seven years and two miners held
-      the float. The record is on GitHub:
-      <a href="https://github.com/Instinctes/nightfall/blob/main/docs/HISTORY.md">HISTORY.md</a>,
-      <a href="https://github.com/Instinctes/nightfall/blob/main/docs/RESET.md">RESET.md</a>.
+    <!-- Filled in by main.js once the visitor's platform is known. Marked
+         hidden so a browser with JS off never sees an empty box. -->
+    <div class="dl-primary reveal" id="dl-primary" hidden>
+      <div class="dl-primary-body">
+        <div class="dl-primary-label">Recommended for your device</div>
+        <div class="os" id="dl-primary-os">—</div>
+        <div class="req" id="dl-primary-req">—</div>
+      </div>
+      <a class="btn btn-primary btn-lg" id="dl-primary-link" href="#">Download</a>
     </div>
 
-    <div class="dl-grid">
-      <div class="dl reveal">
+    <div class="dl-grid" id="dl-grid">
+      <div class="dl reveal" data-plat="mac-arm">
         <div class="os">macOS · Apple Silicon</div>
         <div class="req">M1 – M4 · macOS 11+</div>
-        <a class="btn btn-primary" href="downloads/NIGHTFALLCOIN-Core-0.7.8-macOS-arm64.dmg">Download 0.7.8</a>
+        <a class="btn btn-primary" href="downloads/NIGHTFALLCOIN-Core-0.8.2-macOS-arm64.dmg">Download 0.8.2</a>
       </div>
-      <div class="dl reveal" data-delay="1">
+      <div class="dl reveal" data-plat="mac-intel" data-delay="1">
         <div class="os">macOS · Intel</div>
         <div class="req">macOS 10.15 Catalina+</div>
-        <a class="btn btn-primary" href="downloads/NIGHTFALLCOIN-Core-0.7.8-macOS-intel.dmg">Download 0.7.8</a>
+        <a class="btn btn-primary" href="downloads/NIGHTFALLCOIN-Core-0.8.2-macOS-intel.dmg">Download 0.8.2</a>
       </div>
-      <div class="dl reveal" data-delay="2">
+      <div class="dl reveal" data-plat="windows" data-delay="2">
         <div class="os">Windows</div>
         <div class="req">64-bit · Windows 10+</div>
-        <a class="btn btn-primary" href="downloads/nightfall-core-0.7.8-windows-x64.exe">Download 0.7.8</a>
+        <a class="btn btn-primary" href="downloads/nightfall-core-0.8.2-windows-x64.exe">Download 0.8.2</a>
       </div>
-      <div class="dl reveal">
+      <div class="dl reveal" data-plat="linux">
         <div class="os">Linux · x64</div>
         <div class="req">Debian / Ubuntu · or any systemd box</div>
-        <a class="btn btn-primary" href="downloads/nightfalld-0.7.8-linux-x64">Download nightfalld</a>
+        <a class="btn btn-primary" href="downloads/nightfalld-0.8.2-linux-x64">Download nightfalld</a>
       </div>
-      <div class="dl reveal">
-        <div class="os">Android · arm64</div>
-        <div class="req">Sideload APK · 64-bit</div>
-        <a class="btn btn-primary" href="downloads/NIGHTFALLCOIN-0.7.0-android-arm64.apk?v=signed">Download 0.7.0</a>
-      </div>
-      <div class="dl reveal">
-        <div class="os">iPhone · arm64</div>
-        <div class="req">Sideload IPA · iOS 17+</div>
-        <a class="btn btn-primary" href="downloads/NIGHTFALLCOIN-0.7.0-ios-arm64.ipa">Download 0.7.0</a>
-      </div>
-      <div class="dl reveal">
-        <div class="os">Browser · any device</div>
-        <div class="req">iPhone, iPad, desktop · Add to Home Screen</div>
+      <div class="dl reveal" data-plat="web">
+        <div class="os">Phone &amp; browser</div>
+        <div class="req">iPhone, Android, desktop · nothing to install</div>
         <a class="btn btn-primary" href="/wallet/">Open the web wallet</a>
       </div>
     </div>
 
-    <p class="faint reveal" style="margin-top:24px;text-align:center;font-size:.9rem">
-      Builds are unsigned. macOS: right-click → Open on first launch.
-      Windows: More info → Run anyway.
-      iPhone: the IPA is unsigned. Install with AltStore, Sideloadly or
-      Xcode using your own Apple ID. Tapping the file does nothing — that
-      is Apple, not us. The web wallet needs no install.
-      <br>
-      Verify what you downloaded against
-      <a href="downloads/SHA256SUMS-0.7.8.txt">SHA256SUMS-0.7.8.txt</a>,
-      <a href="downloads/SHA256SUMS-0.7.8-windows.txt">SHA256SUMS-0.7.8-windows.txt</a>,
-      <a href="downloads/SHA256SUMS-0.7.8-linux.txt">SHA256SUMS-0.7.8-linux.txt</a>,
-      <a href="downloads/SHA256SUMS-0.7.0-android.txt">SHA256SUMS-0.7.0-android.txt</a>
-      and
-      <a href="downloads/SHA256SUMS-0.7.0-ios.txt">SHA256SUMS-0.7.0-ios.txt</a>,
-      or <a href="/build/">build it yourself from source</a> —
-      that is the point.
-      Linux Core and the CLI wallet are on the same checksum list;
-      a one-command node install is on <a href="/build/#linux">the build page</a>.
-    </p>
+    <div class="dl-notes reveal">
+      <details class="dl-note">
+        <summary>The builds are unsigned — what you will see</summary>
+        <p>
+          <b>macOS</b> refuses a normal double-click: right-click the app →
+          <b>Open</b> → <b>Open</b>, once.
+          <b>Windows</b> shows SmartScreen: <b>More info</b> → <b>Run anyway</b>.
+          On a phone there is nothing to sign and nothing to install — the web
+          wallet runs in the browser and can be added to the home screen.
+        </p>
+        <p class="faint">
+          Code signing certificates are issued to a company. There is no
+          company here, which is the same reason there is no premine.
+        </p>
+      </details>
+
+      <details class="dl-note">
+        <summary>Verify what you downloaded</summary>
+        <p>Compare the file you got against the published checksum before you run it:</p>
+        <ul class="sums">
+          <li><a href="downloads/SHA256SUMS-0.8.2.txt">SHA256SUMS-0.8.2.txt</a> <span class="faint">— macOS</span></li>
+          <li><a href="downloads/SHA256SUMS-0.8.2-windows.txt">SHA256SUMS-0.8.2-windows.txt</a> <span class="faint">— Windows</span></li>
+          <li><a href="downloads/SHA256SUMS-0.8.2-linux.txt">SHA256SUMS-0.8.2-linux.txt</a> <span class="faint">— Linux Core and CLI wallet</span></li>
+        </ul>
+        <p class="faint">
+          Or skip the question entirely and
+          <a href="/build/">build it yourself from source</a> — that is the
+          point. A one-command node install is on
+          <a href="/build/#linux">the build page</a>.
+        </p>
+      </details>
+    </div>
   </div>
 </section>
 
@@ -440,19 +500,20 @@
         <h4>Run it</h4>
         <a href="#download">Download wallet</a>
         <a href="/wallet/">Web wallet</a>
-        <a href="/network/">Network numbers</a>
+        <a href="/emission/">Emission schedule</a>
         <a href="https://github.com/Instinctes/nightfall/blob/main/docs/MAINNET.md">Run a node</a>
         <a href="https://github.com/Instinctes/nightfall/blob/main/FAIR_LAUNCH.md">Fair launch rules</a>
         <a href="https://github.com/Instinctes/nightfall/blob/main/MANIFESTO.md">Manifesto</a>
       </div>
     </div>
     <div style="display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap;border-top:1px solid var(--border);padding-top:22px">
-      <span class="tagline">Born when the lights go out. No official price — mine it or receive it.</span>
+      <span class="tagline">No official price, no listing, no premine — mine it or receive it.</span>
       <span>MIT or Apache-2.0 · no warranty of any kind</span>
     </div>
   </div>
 </footer>
 
-<script src="js/main.js?v=live-2"></script>
+<script src="js/main.js?v=v2-5"></script>
+<script src="/js/nav.js?v=1"></script>
 </body>
 </html>

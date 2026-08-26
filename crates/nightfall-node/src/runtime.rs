@@ -303,7 +303,7 @@ impl NodeInner {
     pub fn submit_tx(&mut self, tx: Transaction) -> Result<String, String> {
         self.chain.precheck_tx(&tx).map_err(|e| e.to_string())?;
         let id = tx.txid().to_hex();
-        if !self.mempool.insert(tx.clone()) {
+        if !self.mempool.insert(tx.clone(), now_unix()) {
             return Ok(id);
         }
         // Origin always stems: the first hop is one random peer, not a
@@ -2084,6 +2084,7 @@ fn peer_io_loop(
                     match g.chain.apply_block(block.clone(), now_unix()) {
                         Ok(()) => {
                             g.mempool.remove_included(&block);
+                            g.mempool.expire(now_unix());
                             g.bump_tip();
                             let _ = g.persist();
                             g.branch.clear();
@@ -2111,7 +2112,7 @@ fn peer_io_loop(
                 let newly = {
                     let mut g = state.lock().unwrap();
                     match g.chain.precheck_tx(&tx) {
-                        Ok(()) => g.mempool.insert(tx.clone()),
+                        Ok(()) => g.mempool.insert(tx.clone(), now_unix()),
                         Err(e) => {
                             tracing::debug!("reject tx: {e}");
                             false
@@ -3050,6 +3051,7 @@ fn mining_loop(state: SharedState) {
         match g.chain.apply_block(block.clone(), now_unix()) {
             Ok(()) => {
                 g.mempool.remove_included(&block);
+                g.mempool.expire(now_unix());
                 g.bump_tip();
                 found_counter.fetch_add(1, Ordering::Relaxed);
                 let _ = g.persist();

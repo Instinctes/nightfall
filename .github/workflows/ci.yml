@@ -40,6 +40,12 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+      # Three UI bugs shipped on 26 Aug 2026 because a selector was written for
+      # markup that does not exist. A human found all three by squinting at a
+      # phone; this finds them in a second. See scripts/check-web-wallet.mjs.
+      - name: Browser wallet, static checks
+        run: node scripts/check-web-wallet.mjs
+
       # The whole point of the project. Every test in this suite is the
       # inverse of an exploit that once worked against a real build.
       - name: Exploit regression suite

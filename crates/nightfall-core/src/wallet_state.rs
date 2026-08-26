@@ -144,7 +144,35 @@ impl WalletState {
             }
             guard.chain.blocks_from(from, usize::MAX)
         };
-        wallet.scan_blocks(&blocks)
+        let n = wallet.scan_blocks(&blocks)?;
+        Self::resend_pending(wallet, node);
+        Ok(n)
+    }
+
+    /// Put unconfirmed payments back on the wire.
+    ///
+    /// A transaction is handed to one randomly chosen peer and nothing repeats
+    /// it, so a single dropped hop used to end a payment quietly — the wallet
+    /// said "pending" and no node in the world still held it. Re-submitting on
+    /// every sync closes that: the mempool forgets after six hours, this puts
+    /// it back, and the loop ends when a block takes it or the sender gives up.
+    ///
+    /// Failures are ignored on purpose. The node rejects a transaction whose
+    /// inputs are already spent, which is exactly what happens the moment it
+    /// confirms — that is a success wearing an error's clothes, and the next
+    /// scan will notice properly.
+    fn resend_pending(wallet: &mut nightfall_wallet::Wallet, node: &NodeHandle) {
+        let pending = wallet.resendable();
+        if pending.is_empty() {
+            return;
+        }
+        let shared = node.shared();
+        let Ok(mut guard) = shared.lock() else {
+            return;
+        };
+        for (_txid, tx) in pending {
+            let _ = guard.submit_tx(tx);
+        }
     }
 
     /// Build and submit a payment.

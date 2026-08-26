@@ -1055,6 +1055,8 @@ impl Chain {
 #[derive(Clone, Debug, Default)]
 pub struct Mempool {
     pub txs: HashMap<String, Transaction>,
+    /// txid -> when this node first saw it, unix seconds. See [`Self::expire`].
+    seen: HashMap<String, u64>,
 }
 
 impl Mempool {
@@ -1062,11 +1064,68 @@ impl Mempool {
     /// vector for any peer.
     pub const MAX_ENTRIES: usize = 10_000;
 
-    pub fn insert(&mut self, tx: Transaction) -> bool {
+    /// How long a transaction may wait for a block before this node forgets it.
+    ///
+    /// Six hours is 1,440 blocks at the 15-second target — the same span as
+    /// coinbase maturity. A payment that no miner has taken in that time is not
+    /// going to be taken.
+    pub const MAX_AGE_SECS: u64 = 6 * 3600;
+
+    /// Take a transaction, remembering when it arrived.
+    ///
+    /// `now_unix` is passed in rather than read from the clock because this
+    /// crate also compiles to wasm32, where `SystemTime::now()` aborts.
+    pub fn insert(&mut self, tx: Transaction, now_unix: u64) -> bool {
         if self.txs.len() >= Self::MAX_ENTRIES {
-            return false;
+            // Full is usually not "too much traffic", it is "too many corpses".
+            // Sweep before refusing, so a long-running node heals itself
+            // instead of quietly going deaf.
+            self.expire(now_unix);
+            if self.txs.len() >= Self::MAX_ENTRIES {
+                return false;
+            }
         }
-        self.txs.insert(tx.txid().to_hex(), tx).is_none()
+        let id = tx.txid().to_hex();
+        let fresh = self.txs.insert(id.clone(), tx).is_none();
+        self.seen.entry(id).or_insert(now_unix);
+        fresh
+    }
+
+    /// Forget transactions no block ever took.
+    ///
+    /// Returns how many were dropped.
+    ///
+    /// This did not exist until 0.8.2, and its absence was visible on mainnet:
+    /// [`Self::remove_included`] only deletes what a block *consumed*, so a
+    /// transaction that never reaches a block is never removed. On 26 Aug 2026
+    /// one seed was holding 60 such entries and the other 117 — different sets
+    /// of the same corpses, because each had heard different ones. Left alone
+    /// the map walks to `MAX_ENTRIES` and the node stops accepting new
+    /// transactions at all.
+    ///
+    /// Dropping one is not a loss: a transaction this node forgets is still
+    /// held by whoever created it, and the wallet re-submits it. Forgetting is
+    /// how the two halves fit together.
+    pub fn expire(&mut self, now_unix: u64) -> usize {
+        let before = self.txs.len();
+        let cutoff = now_unix.saturating_sub(Self::MAX_AGE_SECS);
+        let seen = &self.seen;
+        self.txs
+            .retain(|id, _| seen.get(id).map(|t| *t > cutoff).unwrap_or(true));
+        let live: std::collections::HashSet<&String> = self.txs.keys().collect();
+        let keep: Vec<String> = self
+            .seen
+            .keys()
+            .filter(|k| live.contains(k))
+            .cloned()
+            .collect();
+        self.seen.retain(|k, _| keep.contains(k));
+        before - self.txs.len()
+    }
+
+    /// When this node first saw a transaction, if it is still held.
+    pub fn first_seen(&self, txid: &str) -> Option<u64> {
+        self.seen.get(txid).copied()
     }
 
     /// Drop everything the block consumed.
@@ -1084,6 +1143,10 @@ impl Mempool {
             let duplicated = tx.outputs.iter().any(|o| created.contains(&o.commit.0));
             !consumed && !duplicated
         });
+        // The timestamp index has to shrink with the map, or it becomes the
+        // unbounded thing the cap was supposed to prevent.
+        let live: std::collections::HashSet<String> = self.txs.keys().cloned().collect();
+        self.seen.retain(|k, _| live.contains(k));
     }
 
     /// Select transactions for a block, highest fee first and skipping any that

@@ -7,6 +7,166 @@
 
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
+    /* ----------------------------------------------------- the typed line -- */
+    /* The words are struck by CSS on a fixed cadence. The caret is here
+       because it has to know where each word actually ends, and only the
+       browser knows that — after the font has loaded, at this viewport, at
+       this zoom. Guessing the positions in CSS would be wrong on first paint
+       and wrong again on every device that is not the one it was written on.
+
+       Everything below is decoration. If it never runs, the line is still
+       struck out in full and reads exactly the same. */
+    const tagline = document.getElementById("hero-tagline");
+    if (tagline && !reduced) {
+        const words = [...tagline.querySelectorAll(".w")];
+        const caret = tagline.querySelector(".caret");
+
+        if (words.length && caret && typeof caret.animate === "function") {
+            const START = 550; // matches the CSS delay on the first word
+            const STEP = 115; // and its interval
+
+            const run = () => {
+                const base = tagline.getBoundingClientRect().left;
+                // Where the caret rests after each word is struck.
+                const stops = words.map((w) => {
+                    const r = w.getBoundingClientRect();
+                    return Math.round(r.right - base) + 3;
+                });
+                if (!stops.length || stops[stops.length - 1] <= 0) return;
+
+                caret.style.transform = `translateX(${stops[0]}px)`;
+
+                // One keyframe per word, `steps` between them: the caret jumps
+                // to each position and waits, the way a carriage does. Easing
+                // it would turn a typewriter into a slide.
+                caret.animate(
+                    stops.map((x) => ({ transform: `translateX(${x}px)` })),
+                    {
+                        duration: STEP * (stops.length - 1),
+                        delay: START,
+                        easing: `steps(${Math.max(stops.length - 1, 1)}, end)`,
+                        fill: "both",
+                    },
+                );
+
+                // Blink once the line is finished, then leave. A caret that
+                // blinks forever beside a headline is a distraction, not a
+                // detail.
+                setTimeout(() => caret.classList.add("on"), START + STEP * stops.length);
+                setTimeout(() => {
+                    caret.classList.remove("on");
+                    caret.style.opacity = "0";
+                }, START + STEP * stops.length + 2600);
+            };
+
+            // Measure after the webfont settles, or the caret lands where the
+            // fallback font ended.
+            if (document.fonts && document.fonts.ready) {
+                document.fonts.ready.then(run).catch(run);
+            } else {
+                run();
+            }
+        }
+    }
+
+    /* ------------------------------------------------- pick their platform -- */
+    /* Seven download cards of equal weight ask every visitor to work out which
+       one is theirs, and put an unsigned iPhone IPA beside the thing almost
+       everyone actually wants. This promotes one card and leaves the rest
+       exactly where they were — nothing is hidden, and a browser with JS off
+       simply sees the original grid. */
+    const platform = () => {
+        const ua = navigator.userAgent || "";
+        const plat = navigator.platform || "";
+        const touch = navigator.maxTouchPoints || 0;
+
+        // Phones get the browser wallet. The sideloaded APK and IPA were
+        // retired in 0.8.2: an unsigned build that needs AltStore or a
+        // developer account is a worse first five minutes than a page that
+        // opens, and the web wallet does the same two jobs — receive and send.
+        //
+        // iPadOS 13+ reports itself as a Mac. The touch points give it away:
+        // no Mac has ever had five of them.
+        const iOS = /iPhone|iPad|iPod/i.test(ua) || (/Mac/i.test(plat) && touch > 1);
+        if (/Android/i.test(ua) || iOS) {
+            return {
+                key: "web",
+                os: "Phone · nothing to install",
+                req: iOS
+                    ? "Safari → Share → Add to Home Screen"
+                    : "Chrome → menu → Add to Home screen",
+                href: "/wallet/",
+                cta: "Open the web wallet",
+            };
+        }
+        if (/Win/i.test(plat) || /Windows/i.test(ua)) {
+            return {
+                key: "windows",
+                os: "Windows",
+                req: "64-bit · Windows 10+",
+                href: "downloads/nightfall-core-0.8.2-windows-x64.exe",
+                cta: "Download 0.8.2",
+            };
+        }
+        if (/Mac/i.test(plat) || /Mac OS X/i.test(ua)) {
+            // Apple Silicon cannot be read directly. Rosetta reports an Intel
+            // platform string on an M-series machine, so a WebGL renderer probe
+            // is the usual tell — and when it is inconclusive, Apple Silicon is
+            // now the overwhelmingly likelier machine to be sitting in front of.
+            let arm = true;
+            try {
+                const gl = document.createElement("canvas").getContext("webgl");
+                const dbg = gl && gl.getExtension("WEBGL_debug_renderer_info");
+                if (dbg) {
+                    const r = String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL));
+                    if (/Intel/i.test(r)) arm = false;
+                }
+            } catch (_) {
+                /* probe unavailable — keep the likelier default */
+            }
+            return arm
+                ? {
+                      key: "mac-arm",
+                      os: "macOS · Apple Silicon",
+                      req: "M1 – M4 · macOS 11+",
+                      href: "downloads/NIGHTFALLCOIN-Core-0.8.2-macOS-arm64.dmg",
+                      cta: "Download 0.8.2",
+                  }
+                : {
+                      key: "mac-intel",
+                      os: "macOS · Intel",
+                      req: "macOS 10.15 Catalina+",
+                      href: "downloads/NIGHTFALLCOIN-Core-0.8.2-macOS-intel.dmg",
+                      cta: "Download 0.8.2",
+                  };
+        }
+        if (/Linux/i.test(plat) || /Linux/i.test(ua)) {
+            return {
+                key: "linux",
+                os: "Linux · x64",
+                req: "Debian / Ubuntu · or any systemd box",
+                href: "downloads/nightfalld-0.8.2-linux-x64",
+                cta: "Download nightfalld",
+            };
+        }
+        return null;
+    };
+
+    const primary = document.getElementById("dl-primary");
+    if (primary) {
+        const p = platform();
+        if (p) {
+            document.getElementById("dl-primary-os").textContent = p.os;
+            document.getElementById("dl-primary-req").textContent = p.req;
+            const link = document.getElementById("dl-primary-link");
+            link.href = p.href;
+            link.textContent = p.cta;
+            primary.hidden = false;
+            const card = document.querySelector(`.dl[data-plat="${p.key}"]`);
+            if (card) card.classList.add("is-yours");
+        }
+    }
+
     /* ------------------------------------------------------ nav on scroll -- */
     const nav = document.getElementById("nav");
     const onScroll = () => nav.classList.toggle("scrolled", window.scrollY > 20);

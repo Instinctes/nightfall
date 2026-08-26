@@ -27,8 +27,15 @@
 const MOBILE_UPSTREAMS = [
     // Two machines, two providers. seed1/seed2 are the same Vultr box;
     // listing both would only add a timeout when that box is down.
-    "http://seed1.nightfallcoin.org/",
+    //
+    // Contabo first since 23 Aug 2026. It answers `status` in 0.3 s; the
+    // Vultr box was taking 8.2 s under an account-wide CPU cap, which is
+    // past the timeout below — so every light request was paying six
+    // seconds to watch the first entry fail before the second one served
+    // it. Order the list by who actually answers, not by who is nominally
+    // the light node.
     "http://seed.nightfallcoin.org/",
+    "http://seed1.nightfallcoin.org/",
 ];
 const UPSTREAM_TIMEOUT_MS = 6000;
 
@@ -478,6 +485,25 @@ export default {
                 return jsonResponse(405, { error: "GET" }, { Allow: "GET, HEAD" });
             }
             return proxyPeers();
+        }
+
+        // The /network/ page was removed on 22 August 2026. Its URL is in the
+        // README, in Discord and in posts that are already published, so it
+        // redirects rather than 404s — an old link should land somewhere, not
+        // nowhere. Exact matches only: /network.json below is a live endpoint
+        // and must not be swallowed by a prefix test.
+        if (url.pathname === "/network" || url.pathname === "/network/") {
+            const home = new URL(url);
+            home.pathname = "/";
+            home.search = "";
+            return new Response(null, {
+                status: 301,
+                headers: {
+                    Location: home.toString(),
+                    "Cache-Control": "public, max-age=3600",
+                    ...securityHeaders("/"),
+                },
+            });
         }
 
         // Public numbers only. No addresses, no graph.

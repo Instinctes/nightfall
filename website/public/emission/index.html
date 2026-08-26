@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Emission schedule — NIGHTFALLCOIN</title>
+<meta name="description" content="Every NIGHT halving to the last dark: 6 NIGHT per block, halving every 7,500,000 blocks, 90,000,000 cap, terminal supply 89,999,999.25, no tail emission.">
+<meta property="og:title" content="NIGHTFALLCOIN emission schedule">
+<meta property="og:description" content="Thirty eras, computed from the consensus rule itself. Half of all NIGHT is minted in the first three and a half years.">
+<meta property="og:type" content="article">
+<meta name="theme-color" content="#0e0b18">
+<link rel="icon" href="/assets/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="stylesheet" href="/css/style.css?v=live-6">
+<style>
+  /* Scoped to this page: a 30-row financial table is the only thing on the
+     site that needs it, and the shared stylesheet should not carry it. */
+  .e-lede-cards { display:grid; gap:14px; margin:30px 0 22px;
+                   grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); }
+  .e-card { background:var(--surface); border:1px solid var(--border);
+             border-radius:16px; padding:17px 19px; }
+  .e-card b { display:block; font-size:1.42rem; letter-spacing:-.01em; margin-bottom:2px; }
+  .e-card small { color:var(--text-faint); font-size:.7rem; letter-spacing:.1em;
+                   text-transform:uppercase; }
+  .e-card p { margin:7px 0 0; font-size:.83rem; color:var(--text-dim); line-height:1.5; }
+
+  .e-live { display:flex; flex-wrap:wrap; gap:9px 26px; align-items:center;
+             background:var(--bg-2); border:1px solid var(--border);
+             border-left:3px solid var(--violet); border-radius:16px;
+             padding:15px 19px; margin:0 0 34px; }
+  .e-live .k { color:var(--text-faint); font-size:.7rem; letter-spacing:.1em;
+                text-transform:uppercase; margin-right:8px; }
+  .e-live .v { font-weight:650; }
+  .e-live .dot { width:8px; height:8px; border-radius:50%; background:var(--success);
+                  box-shadow:0 0 0 4px rgba(74,224,168,.14); display:inline-block; margin-right:9px; }
+
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+           font-variant-numeric:tabular-nums; }
+
+  .e-wrap { background:var(--surface); border:1px solid var(--border);
+             border-radius:22px; overflow:hidden; margin:0 0 8px; }
+  .e-scroll { overflow-x:auto; -webkit-overflow-scrolling:touch; }
+  table.emission { width:100%; border-collapse:collapse; min-width:900px; }
+  table.emission thead th { position:sticky; top:0; z-index:2; background:var(--surface-2);
+      color:var(--text-dim); font-size:.66rem; letter-spacing:.11em; text-transform:uppercase;
+      font-weight:650; text-align:right; padding:14px 17px;
+      border-bottom:1px solid var(--border-hi); white-space:nowrap; }
+  table.emission thead th:first-child,
+  table.emission thead th:nth-child(2),
+  table.emission thead th:last-child { text-align:left; }
+  table.emission td { padding:12px 17px; border-bottom:1px solid rgba(46,38,72,.66);
+                       font-size:.88rem; }
+  table.emission tbody tr:last-child td { border-bottom:0; }
+  table.emission tbody tr:hover { background:rgba(124,92,255,.055); }
+  table.emission tbody tr[data-here] { background:rgba(124,92,255,.10);
+                                        box-shadow:inset 3px 0 0 var(--violet); }
+  .e-num, .e-pct { text-align:right; white-space:nowrap; }
+  .e-strong { font-weight:650; }
+  .e-dim { color:var(--text-dim); }
+  .dust td { color:var(--text-faint); }
+  .dust .e-strong { font-weight:500; }
+  .era { display:inline-flex; align-items:center; justify-content:center; min-width:29px;
+          height:29px; padding:0 8px; border-radius:9px; background:var(--surface-2);
+          border:1px solid var(--border-hi); font-size:.8rem; font-weight:650;
+          font-variant-numeric:tabular-nums; }
+  tr[data-here] .era { background:var(--grad); border-color:transparent; color:#fff; }
+  .dash { color:var(--text-faint); padding:0 7px; }
+  .e-blocks { white-space:nowrap; font-size:.82rem; }
+  .e-date { white-space:nowrap; color:var(--text-dim); }
+  .yrs { display:block; font-size:.7rem; color:var(--text-faint); }
+  .e-bar { height:3px; width:96px; margin:6px 0 0 auto; border-radius:2px;
+            background:rgba(255,255,255,.07); }
+  .e-bar i { display:block; height:100%; border-radius:2px; background:var(--grad-bright); }
+  .e-hint { color:var(--text-faint); font-size:.78rem; margin:0 0 34px; }
+
+  .e-notes { display:grid; gap:16px; grid-template-columns:repeat(auto-fit,minmax(290px,1fr));
+              margin-top:30px; }
+  .e-note { background:var(--bg-2); border:1px solid var(--border); border-radius:16px;
+             padding:19px 21px; }
+  .e-note h3 { margin:0 0 8px; font-size:.98rem; }
+  .e-note p { margin:0 0 10px; color:var(--text-dim); font-size:.88rem; line-height:1.6; }
+  .e-note p:last-child { margin-bottom:0; }
+  .a-violet { border-left:3px solid var(--violet); }
+  .a-teal { border-left:3px solid var(--teal); }
+  .a-magenta { border-left:3px solid var(--magenta); }
+  .a-warn { border-left:3px solid var(--warn); }
+
+  @media (max-width:820px) {
+    .e-wrap { border-radius:16px; }
+    .e-hint::before { content:"Swipe the table sideways for the rest of the columns. "; }
+  }
+</style>
+</head>
+<body>
+<nav id="nav">
+  <div class="wrap">
+    <a class="brand" href="/"><img class="mark" src="/assets/logo-256.png" alt="" width="34" height="34"> <span class="brand-word">NIGHTFALL</span></a>
+    <div class="nav-links">
+      <a href="/emission/">Emission</a>
+      <a href="/build/">Build</a>
+      <a href="/wallet/">Web wallet</a>
+      <div class="nav-social">
+        <a class="nav-icon" href="https://github.com/Instinctes/nightfall" target="_blank" rel="noopener noreferrer" title="Source on GitHub" aria-label="GitHub">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>
+        </a>
+        <a class="nav-icon" href="https://discord.gg/Wj6pTNmVEr" target="_blank" rel="noopener noreferrer" title="Discord" aria-label="Discord">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.317 4.37a19.79 19.79 0 00-4.885-1.515.074.074 0 00-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 00-5.487 0 12.64 12.64 0 00-.617-1.25.077.077 0 00-.079-.037A19.736 19.736 0 003.677 4.37a.07.07 0 00-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 00.031.057 19.9 19.9 0 005.993 3.03.078.078 0 00.084-.028 14.09 14.09 0 001.226-1.994.076.076 0 00-.041-.106 13.107 13.107 0 01-1.872-.892.077.077 0 01-.008-.128 10.2 10.2 0 00.372-.292.074.074 0 01.077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 01.078.01c.12.098.246.198.373.292a.077.077 0 01-.006.127 12.299 12.299 0 01-1.873.892.077.077 0 00-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 00.084.028 19.839 19.839 0 006.002-3.03.077.077 0 00.032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 00-.031-.03zM8.02 15.331c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg>
+        </a>
+      </div>
+      <a class="btn btn-primary" href="/#download">Download</a>
+    </div>
+  </div>
+</nav>
+
+<article class="doc">
+  <div class="wrap">
+    <p class="kicker" style="color:var(--teal);letter-spacing:.08em;text-transform:uppercase;font-size:.78rem;font-weight:700;margin:0 0 14px">Thirty eras, then nothing</p>
+    <h1>Emission schedule</h1>
+    <p class="lede">
+      Six NIGHT per block, halving every 7,500,000 blocks, a hard cap of
+      90,000,000 and no tail emission. Every figure below is computed from the
+      consensus rule itself — <code>reward &gt;&gt; halvings</code> on an integer
+      number of darks — not from a rounded summary.
+    </p>
+
+    <div class="e-lede-cards">
+      <div class="e-card"><small>Era-0 reward</small><b>6 NIGHT</b><p>Per block, from genesis.</p></div>
+      <div class="e-card"><small>Halving every</small><b>7,500,000</b><p>Blocks — 3 years 206 days at the 15-second target.</p></div>
+      <div class="e-card"><small>Hard cap</small><b>90,000,000</b><p>An upper bound, never actually reached.</p></div>
+      <div class="e-card"><small>Terminal supply</small><b>89,999,999.25</b><p>0.75 NIGHT short of the cap. See below for why.</p></div>
+      <div class="e-card"><small>Last paying era</small><b>29</b><p>Subsidy is zero from block 225,000,000, about year 107.</p></div>
+    </div>
+
+    <div class="e-live">
+      <span><span class="dot"></span><span class="k">Live</span></span>
+      <span><span class="k">Height</span><span class="v mono" id="e-height">—</span></span>
+      <span><span class="k">Mined</span><span class="v mono" id="e-mined">—</span></span>
+      <span><span class="k">Era 0 done</span><span class="v mono" id="e-era0">—</span></span>
+      <span><span class="k">Of the cap</span><span class="v mono" id="e-cap">—</span></span>
+    </div>
+
+    <div class="e-wrap">
+      <div class="e-scroll">
+      <table class="emission">
+        <thead>
+          <tr>
+            <th>Era</th><th>Block range</th><th>Reward / block</th><th>Per day</th>
+            <th>Minted in era</th><th>Cumulative supply</th><th>Share of cap</th><th>Starts</th>
+          </tr>
+        </thead>
+        <tbody>
+      <tr data-here="1"><td class="e-era"><span class="era">0</span></td><td class="e-blocks"><span class="mono">0</span><span class="dash">–</span><span class="mono">7,499,999</span></td><td class="e-num e-strong mono">6</td><td class="e-num mono e-dim">34,560</td><td class="e-num mono">45,000,000</td><td class="e-num mono e-strong">45,000,000</td><td class="e-pct"><span class="mono">50%</span><div class="e-bar"><i style="width:50.0000%"></i></div></td><td class="e-date">Aug 2026<span class="yrs">+0.0 yr</span></td></tr>
+      <tr><td class="e-era"><span class="era">1</span></td><td class="e-blocks"><span class="mono">7,500,000</span><span class="dash">–</span><span class="mono">14,999,999</span></td><td class="e-num e-strong mono">3</td><td class="e-num mono e-dim">17,280</td><td class="e-num mono">22,500,000</td><td class="e-num mono e-strong">67,500,000</td><td class="e-pct"><span class="mono">75%</span><div class="e-bar"><i style="width:75.0000%"></i></div></td><td class="e-date">Mar 2030<span class="yrs">+3.6 yr</span></td></tr>
+      <tr><td class="e-era"><span class="era">2</span></td><td class="e-blocks"><span class="mono">15,000,000</span><span class="dash">–</span><span class="mono">22,499,999</span></td><td class="e-num e-strong mono">1.5</td><td class="e-num mono e-dim">8,640</td><td class="e-num mono">11,250,000</td><td class="e-num mono e-strong">78,750,000</td><td class="e-pct"><span class="mono">87.5%</span><div class="e-bar"><i style="width:87.5000%"></i></div></td><td class="e-date">Oct 2033<span class="yrs">+7.1 yr</span></td></tr>
+      <tr><td class="e-era"><span class="era">3</span></td><td class="e-blocks"><span class="mono">22,500,000</span><span class="dash">–</span><span class="mono">29,999,999</span></td><td class="e-num e-strong mono">0.75</td><td class="e-num mono e-dim">4,320</td><td class="e-num mono">5,625,000</td><td class="e-num mono e-strong">84,375,000</td><td class="e-pct"><span class="mono">93.75%</span><div class="e-bar"><i style="width:93.7500%"></i></div></td><td class="e-date">Apr 2037<span class="yrs">+10.7 yr</span></td></tr>
+      <tr><td class="e-era"><span class="era">4</span></td><td class="e-blocks"><span class="mono">30,000,000</span><span class="dash">–</span><span class="mono">37,499,999</span></td><td class="e-num e-strong mono">0.375</td><td class="e-num mono e-dim">2,160</td><td class="e-num mono">2,812,500</td><td class="e-num mono e-strong">87,187,500</td><td class="e-pct"><span class="mono">96.875%</span><div class="e-bar"><i style="width:96.8750%"></i></div></td><td class="e-date">Nov 2040<span class="yrs">+14.3 yr</span></td></tr>
+      <tr><td class="e-era"><span class="era">5</span></td><td class="e-blocks"><span class="mono">37,500,000</span><span class="dash">–</span><span class="mono">44,999,999</span></td><td class="e-num e-strong mono">0.1875</td><td class="e-num mono e-dim">1,080</td><td class="e-num mono">1,406,250</td><td class="e-num mono e-strong">88,593,750</td><td class="e-pct"><span class="mono">98.4375%</span><div class="e-bar"><i style="width:98.4375%"></i></div></td><td class="e-date">Jun 2044<span class="yrs">+17.8 yr</span></td></tr>
+      <tr><td class="e-era"><span class="era">6</span></td><td class="e-blocks"><span class="mono">45,000,000</span><span class="dash">–</span><span class="mono">52,499,999</span></td><td class="e-num e-strong mono">0.09375</td><td class="e-num mono e-dim">540</td><td class="e-num mono">703,125</td><td class="e-num mono e-strong">89,296,875</td><td class="e-pct"><span class="mono">99.2188%</span><div class="e-bar"><i style="width:99.2188%"></i></div></td><td class="e-date">Jan 2048<span class="yrs">+21.4 yr</span></td></tr>
+      <tr><td class="e-era"><span class="era">7</span></td><td class="e-blocks"><span class="mono">52,500,000</span><span class="dash">–</span><span class="mono">59,999,999</span></td><td class="e-num e-strong mono">0.046875</td><td class="e-num mono e-dim">270</td><td class="e-num mono">351,562.5</td><td class="e-num mono e-strong">89,648,437.5</td><td class="e-pct"><span class="mono">99.6094%</span><div class="e-bar"><i style="width:99.6094%"></i></div></td><td class="e-date">Jul 2051<span class="yrs">+25.0 yr</span></td></tr>
+      <tr><td class="e-era"><span class="era">8</span></td><td class="e-blocks"><span class="mono">60,000,000</span><span class="dash">–</span><span class="mono">67,499,999</span></td><td class="e-num e-strong mono">0.0234375</td><td class="e-num mono e-dim">135</td><td class="e-num mono">175,781.25</td><td class="e-num mono e-strong">89,824,218.75</td><td class="e-pct"><span class="mono">99.8047%</span><div class="e-bar"><i style="width:99.8047%"></i></div></td><td class="e-date">Feb 2055<span class="yrs">+28.5 yr</span></td></tr>
+      <tr><td class="e-era"><span class="era">9</span></td><td class="e-blocks"><span class="mono">67,500,000</span><span class="dash">–</span><span class="mono">74,999,999</span></td><td class="e-num e-strong mono">0.01171875</td><td class="e-num mono e-dim">67.5</td><td class="e-num mono">87,890.625</td><td class="e-num mono e-strong">89,912,109.375</td><td class="e-pct"><span class="mono">99.9023%</span><div class="e-bar"><i style="width:99.9023%"></i></div></td><td class="e-date">Sep 2058<span class="yrs">+32.1 yr</span></td></tr>
+      <tr><td class="e-era"><span class="era">10</span></td><td class="e-blocks"><span class="mono">75,000,000</span><span class="dash">–</span><span class="mono">82,499,999</span></td><td class="e-num e-strong mono">0.00585937</td><td class="e-num mono e-dim">33.7499712</td><td class="e-num mono">43,945.275</td><td class="e-num mono e-strong">89,956,054.65</td><td class="e-pct"><span class="mono">99.9512%</span><div class="e-bar"><i style="width:99.9512%"></i></div></td><td class="e-date">Apr 2062<span class="yrs">+35.6 yr</span></td></tr>
+      <tr><td class="e-era"><span class="era">11</span></td><td class="e-blocks"><span class="mono">82,500,000</span><span class="dash">–</span><span class="mono">89,999,999</span></td><td class="e-num e-strong mono">0.00292968</td><td class="e-num mono e-dim">16.8749568</td><td class="e-num mono">21,972.6</td><td class="e-num mono e-strong">89,978,027.25</td><td class="e-pct"><span class="mono">99.9756%</span><div class="e-bar"><i style="width:99.9756%"></i></div></td><td class="e-date">Nov 2065<span class="yrs">+39.2 yr</span></td></tr>
+      <tr><td class="e-era"><span class="era">12</span></td><td class="e-blocks"><span class="mono">90,000,000</span><span class="dash">–</span><span class="mono">97,499,999</span></td><td class="e-num e-strong mono">0.00146484</td><td class="e-num mono e-dim">8.4374784</td><td class="e-num mono">10,986.3</td><td class="e-num mono e-strong">89,989,013.55</td><td class="e-pct"><span class="mono">99.9878%</span><div class="e-bar"><i style="width:99.9878%"></i></div></td><td class="e-date">May 2069<span class="yrs">+42.8 yr</span></td></tr>
+      <tr class="dust"><td class="e-era"><span class="era">13</span></td><td class="e-blocks"><span class="mono">97,500,000</span><span class="dash">–</span><span class="mono">104,999,999</span></td><td class="e-num e-strong mono">0.00073242</td><td class="e-num mono e-dim">4.2187392</td><td class="e-num mono">5,493.15</td><td class="e-num mono e-strong">89,994,506.7</td><td class="e-pct"><span class="mono">99.9939%</span><div class="e-bar"><i style="width:99.9939%"></i></div></td><td class="e-date">Dec 2072<span class="yrs">+46.3 yr</span></td></tr>
+      <tr class="dust"><td class="e-era"><span class="era">14</span></td><td class="e-blocks"><span class="mono">105,000,000</span><span class="dash">–</span><span class="mono">112,499,999</span></td><td class="e-num e-strong mono">0.00036621</td><td class="e-num mono e-dim">2.1093696</td><td class="e-num mono">2,746.575</td><td class="e-num mono e-strong">89,997,253.275</td><td class="e-pct"><span class="mono">99.9969%</span><div class="e-bar"><i style="width:99.9969%"></i></div></td><td class="e-date">Jul 2076<span class="yrs">+49.9 yr</span></td></tr>
+      <tr class="dust"><td class="e-era"><span class="era">15</span></td><td class="e-blocks"><span class="mono">112,500,000</span><span class="dash">–</span><span class="mono">119,999,999</span></td><td class="e-num e-strong mono">0.0001831</td><td class="e-num mono e-dim">1.054656</td><td class="e-num mono">1,373.25</td><td class="e-num mono e-strong">89,998,626.525</td><td class="e-pct"><span class="mono">99.9985%</span><div class="e-bar"><i style="width:99.9985%"></i></div></td><td class="e-date">Feb 2080<span class="yrs">+53.5 yr</span></td></tr>
+      <tr class="dust"><td class="e-era"><span class="era">16</span></td><td class="e-blocks"><span class="mono">120,000,000</span><span class="dash">–</span><span class="mono">127,499,999</span></td><td class="e-num e-strong mono">0.00009155</td><td class="e-num mono e-dim">0.527328</td><td class="e-num mono">686.625</td><td class="e-num mono e-strong">89,999,313.15</td><td class="e-pct"><span class="mono">99.9992%</span><div class="e-bar"><i style="width:99.9992%"></i></div></td><td class="e-date">Aug 2083<span class="yrs">+57.0 yr</span></td></tr>
+      <tr class="dust"><td class="e-era"><span class="era">17</span></td><td class="e-blocks"><span class="mono">127,500,000</span><span class="dash">–</span><span class="mono">134,999,999</span></td><td class="e-num e-strong mono">0.00004577</td><td class="e-num mono e-dim">0.2636352</td><td class="e-num mono">343.275</td><td class="e-num mono e-strong">89,999,656.425</td><td class="e-pct"><span class="mono">99.9996%</span><div class="e-bar"><i style="width:99.9996%"></i></div></td><td class="e-date">Mar 2087<span class="yrs">+60.6 yr</span></td></tr>
+      <tr class="dust"><td class="e-era"><span class="era">18</span></td><td class="e-blocks"><span class="mono">135,000,000</span><span class="dash">–</span><span class="mono">142,499,999</span></td><td class="e-num e-strong mono">0.00002288</td><td class="e-num mono e-dim">0.1317888</td><td class="e-num mono">171.6</td><td class="e-num mono e-strong">89,999,828.025</td><td class="e-pct"><span class="mono">99.9998%</span><div class="e-bar"><i style="width:99.9998%"></i></div></td><td class="e-date">Oct 2090<span class="yrs">+64.2 yr</span></td></tr>
+      <tr class="dust"><td class="e-era"><span class="era">19</span></td><td class="e-blocks"><span class="mono">142,500,000</span><span class="dash">–</span><span class="mono">149,999,999</span></td><td class="e-num e-strong mono">0.00001144</td><td class="e-num mono e-dim">0.0658944</td><td class="e-num mono">85.8</td><td class="e-num mono e-strong">89,999,913.825</td><td class="e-pct"><span class="mono">99.9999%</span><div class="e-bar"><i style="width:99.9999%"></i></div></td><td class="e-date">May 2094<span class="yrs">+67.7 yr</span></td></tr>
+      <tr class="dust"><td class="e-era"><span class="era">20</span></td><td class="e-blocks"><span class="mono">150,000,000</span><span class="dash">–</span><span class="mono">157,499,999</span></td><td class="e-num e-strong mono">0.00000572</td><td class="e-num mono e-dim">0.0329472</td><td class="e-num mono">42.9</td><td class="e-num mono e-strong">89,999,956.725</td><td class="e-pct"><span class="mono">100%</span><div class="e-bar"><i style="width:100.0000%"></i></div></td><td class="e-date">Dec 2097<span class="yrs">+71.3 yr</span></td></tr>
+      <tr class="dust"><td class="e-era"><span class="era">21</span></td><td class="e-blocks"><span class="mono">157,500,000</span><span class="dash">–</span><span class="mono">164,999,999</span></td><td class="e-num e-strong mono">0.00000286</td><td class="e-num mono e-dim">0.0164736</td><td class="e-num mono">21.45</td><td class="e-num mono e-strong">89,999,978.175</td><td class="e-pct"><span class="mono">100%</span><div class="e-bar"><i style="width:100.0000%"></i></div></td><td class="e-date">Jun 2101<span class="yrs">+74.9 yr</span></td></tr>
+      <tr class="dust"><td class="e-era"><span class="era">22</span></td><td class="e-blocks"><span class="mono">165,000,000</span><span class="dash">–</span><span class="mono">172,499,999</span></td><td class="e-num e-strong mono">0.00000143</td><td class="e-num mono e-dim">0.0082368</td><td class="e-num mono">10.725</td><td class="e-num mono e-strong">89,999,988.9</td><td class="e-pct"><span class="mono">100%</span><div class="e-bar"><i style="width:100.0000%"></i></div></td><td class="e-date">Jan 2105<span class="yrs">+78.4 yr</span></td></tr>
+      <tr class="dust"><td class="e-era"><span class="era">23</span></td><td class="e-blocks"><span class="mono">172,500,000</span><span class="dash">–</span><span class="mono">179,999,999</span></td><td class="e-num e-strong mono">0.00000071</td><td class="e-num mono e-dim">0.0040896</td><td class="e-num mono">5.325</td><td class="e-num mono e-strong">89,999,994.225</td><td class="e-pct"><span class="mono">100%</span><div class="e-bar"><i style="width:100.0000%"></i></div></td><td class="e-date">Aug 2108<span class="yrs">+82.0 yr</span></td></tr>
+      <tr class="dust"><td class="e-era"><span class="era">24</span></td><td class="e-blocks"><span class="mono">180,000,000</span><span class="dash">–</span><span class="mono">187,499,999</span></td><td class="e-num e-strong mono">0.00000035</td><td class="e-num mono e-dim">0.002016</td><td class="e-num mono">2.625</td><td class="e-num mono e-strong">89,999,996.85</td><td class="e-pct"><span class="mono">100%</span><div class="e-bar"><i style="width:100.0000%"></i></div></td><td class="e-date">Mar 2112<span class="yrs">+85.6 yr</span></td></tr>
+      <tr class="dust"><td class="e-era"><span class="era">25</span></td><td class="e-blocks"><span class="mono">187,500,000</span><span class="dash">–</span><span class="mono">194,999,999</span></td><td class="e-num e-strong mono">0.00000017</td><td class="e-num mono e-dim">0.0009792</td><td class="e-num mono">1.275</td><td class="e-num mono e-strong">89,999,998.125</td><td class="e-pct"><span class="mono">100%</span><div class="e-bar"><i style="width:100.0000%"></i></div></td><td class="e-date">Oct 2115<span class="yrs">+89.1 yr</span></td></tr>
+      <tr class="dust"><td class="e-era"><span class="era">26</span></td><td class="e-blocks"><span class="mono">195,000,000</span><span class="dash">–</span><span class="mono">202,499,999</span></td><td class="e-num e-strong mono">0.00000008</td><td class="e-num mono e-dim">0.0004608</td><td class="e-num mono">0.6</td><td class="e-num mono e-strong">89,999,998.725</td><td class="e-pct"><span class="mono">100%</span><div class="e-bar"><i style="width:100.0000%"></i></div></td><td class="e-date">Apr 2119<span class="yrs">+92.7 yr</span></td></tr>
+      <tr class="dust"><td class="e-era"><span class="era">27</span></td><td class="e-blocks"><span class="mono">202,500,000</span><span class="dash">–</span><span class="mono">209,999,999</span></td><td class="e-num e-strong mono">0.00000004</td><td class="e-num mono e-dim">0.0002304</td><td class="e-num mono">0.3</td><td class="e-num mono e-strong">89,999,999.025</td><td class="e-pct"><span class="mono">100%</span><div class="e-bar"><i style="width:100.0000%"></i></div></td><td class="e-date">Nov 2122<span class="yrs">+96.3 yr</span></td></tr>
+      <tr class="dust"><td class="e-era"><span class="era">28</span></td><td class="e-blocks"><span class="mono">210,000,000</span><span class="dash">–</span><span class="mono">217,499,999</span></td><td class="e-num e-strong mono">0.00000002</td><td class="e-num mono e-dim">0.0001152</td><td class="e-num mono">0.15</td><td class="e-num mono e-strong">89,999,999.175</td><td class="e-pct"><span class="mono">100%</span><div class="e-bar"><i style="width:100.0000%"></i></div></td><td class="e-date">Jun 2126<span class="yrs">+99.8 yr</span></td></tr>
+      <tr class="dust"><td class="e-era"><span class="era">29</span></td><td class="e-blocks"><span class="mono">217,500,000</span><span class="dash">–</span><span class="mono">224,999,999</span></td><td class="e-num e-strong mono">0.00000001</td><td class="e-num mono e-dim">0.0000576</td><td class="e-num mono">0.075</td><td class="e-num mono e-strong">89,999,999.25</td><td class="e-pct"><span class="mono">100%</span><div class="e-bar"><i style="width:100.0000%"></i></div></td><td class="e-date">Jan 2130<span class="yrs">+103.4 yr</span></td></tr>
+        </tbody>
+      </table>
+      </div>
+    </div>
+    <p class="e-hint">Amounts are exact. Dates assume the 15-second target holds on average from genesis, 16 August 2026.</p>
+
+    <div class="e-notes">
+      <div class="e-note a-violet">
+        <h3>Why 89,999,999.25 and not 90,000,000</h3>
+        <p>The reward is a right shift on an integer number of darks, and
+        <code>reward &gt;&gt; halvings</code> truncates. From era 10 on, the halved
+        value is no longer exactly representable, so a fraction of a dark is
+        dropped every block and never minted.</p>
+        <p>The cap is an upper bound the curve approaches and never touches. It is
+        also enforced separately: the payable reward is clamped so the cap cannot
+        be breached even by one dark, whatever the schedule says.</p>
+      </div>
+      <div class="e-note a-teal">
+        <h3>Half of it in the first era</h3>
+        <p>6 × 7,500,000 = 45,000,000, exactly half the cap. That identity is
+        asserted by a test, so the two constants cannot drift apart unnoticed.</p>
+        <p>75 % is minted by the end of era 1 and 99 % during era 6.
+        <b>89,000,000 NIGHT is reached at block 49,333,334</b>, about 23.4 years in.
+        The last percent then takes another eighty years.</p>
+      </div>
+      <div class="e-note a-magenta">
+        <h3>Fees are burned, not paid</h3>
+        <p>While the subsidy is positive the fee is destroyed and the miner
+        receives only the subsidy — so circulating supply is always <i>below</i>
+        the minted figures in this table, by the total burned.</p>
+        <p>Once the subsidy reaches zero the coinbase kernel carries the block's
+        fees instead: nothing is minted, nothing is burned, the miner is paid.
+        That is the entire long-term security budget. There is no tail emission.</p>
+      </div>
+      <div class="e-note a-warn">
+        <h3>The dates are projections</h3>
+        <p>Difficulty retargets every block over a 90-block weighted average, so
+        the network tracks 15 seconds closely — but a decade of drift is still a
+        decade of drift. Treat the years as indicative.</p>
+        <p>Block heights and reward amounts are not projections. They are
+        consensus, and you can re-derive every one of them from
+        <a href="https://github.com/Instinctes/nightfall/blob/main/crates/nightfall-types/src/lib.rs">the constants in the source</a>
+        or check the live figure yourself with <code>nightfall-wallet verify-supply</code>.</p>
+      </div>
+    </div>
+  </div>
+</article>
+
+<script src="/js/emission.js?v=1"></script>
+<script src="/js/nav.js?v=1"></script>
+</body>
+</html>

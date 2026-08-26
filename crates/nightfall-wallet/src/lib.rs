@@ -142,6 +142,19 @@ pub struct HistoryEntry {
     /// once a block consumes them.
     #[serde(default)]
     pub spent_commits: Vec<[u8; 32]>,
+    /// The transaction as it was broadcast, so it can be sent again.
+    ///
+    /// A new payment is handed to exactly one randomly chosen peer, which is
+    /// what stops an observer attributing it to this node. Nothing re-sends it.
+    /// Before 0.8.2 the transaction was thrown away the moment it was handed
+    /// over, so a single dropped hop meant the payment simply ceased to exist
+    /// while the wallet said "pending" for ever. It happened; see
+    /// `docs/HISTORY.md`.
+    ///
+    /// `None` on entries written by older versions. Those cannot be re-sent —
+    /// a rescan releases the coins instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<String>,
 }
 
 impl HistoryEntry {
@@ -537,6 +550,7 @@ impl Wallet {
                         txid: hex::encode(d.commit.0),
                         timestamp: out.timestamp,
                         spent_commits: Vec::new(),
+                        raw: None,
                     });
                 }
                 found += 1;
@@ -673,6 +687,7 @@ impl Wallet {
                             txid: hex::encode(d.commit.0),
                             timestamp: block.header.timestamp_unix,
                             spent_commits: Vec::new(),
+                            raw: None,
                         });
                     }
                     found += 1;
@@ -818,6 +833,25 @@ impl Wallet {
             .history
             .iter()
             .filter(|e| e.direction == Direction::Sent && e.is_pending())
+            .collect()
+    }
+
+    /// Unconfirmed sends this wallet can put back on the wire, newest first.
+    ///
+    /// The caller submits them; the wallet only remembers. Entries written
+    /// before 0.8.2 have no stored transaction and are skipped — there is
+    /// nothing to re-send, and pretending otherwise would be worse than saying
+    /// so.
+    pub fn resendable(&self) -> Vec<(String, Transaction)> {
+        self.db
+            .history
+            .iter()
+            .filter(|e| e.direction == Direction::Sent && e.is_pending())
+            .filter_map(|e| {
+                let raw = e.raw.as_ref()?;
+                let tx: Transaction = serde_json::from_str(raw).ok()?;
+                Some((e.txid.clone(), tx))
+            })
             .collect()
     }
 
@@ -1005,6 +1039,7 @@ impl Wallet {
                     txid,
                     timestamp,
                     spent_commits: tx.inputs.iter().map(|i| i.commit.0).collect(),
+                    raw: serde_json::to_string(tx).ok(),
                 },
             );
         }

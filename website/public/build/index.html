@@ -7,14 +7,14 @@
 <meta name="description" content="How to build NIGHTFALLCOIN Core from source and check the published SHA-256. Binaries stay unsigned.">
 <meta name="theme-color" content="#0e0b18">
 <link rel="icon" href="/assets/favicon-32.png" sizes="32x32" type="image/png">
-<link rel="stylesheet" href="/css/style.css?v=live-5">
+<link rel="stylesheet" href="/css/style.css?v=live-6">
 </head>
 <body>
 <nav id="nav">
   <div class="wrap">
     <a class="brand" href="/"><img class="mark" src="/assets/logo-256.png" alt="" width="34" height="34"> <span class="brand-word">NIGHTFALL</span></a>
     <div class="nav-links">
-      <a href="/network/">Network</a>
+      <a href="/emission/">Emission</a>
       <a href="/build/">Build</a>
       <a href="/wallet/">Web wallet</a>
       <div class="nav-social">
@@ -49,7 +49,7 @@
     <h2>1. Get the source</h2>
     <pre><code>git clone https://github.com/Instinctes/nightfall
 cd nightfall
-git checkout v0.7.8   # or the tag printed next to the download
+git checkout v0.8.2   # or the tag printed next to the download
 rustc --version</code></pre>
     <p>
       Use a current stable Rust. The lockfile pins crates; it does not pin
@@ -72,17 +72,23 @@ cargo build --release -p nightfall-node</code></pre>
 
     <h2>3. Check a downloaded file</h2>
     <p>macOS / Linux:</p>
-    <pre><code>shasum -a 256 NIGHTFALLCOIN-Core-0.7.8-macOS-arm64.dmg
-grep NIGHTFALLCOIN-Core-0.7.8-macOS-arm64.dmg SHA256SUMS-0.7.8.txt</code></pre>
+    <pre><code>shasum -a 256 NIGHTFALLCOIN-Core-0.8.2-macOS-arm64.dmg
+grep NIGHTFALLCOIN-Core-0.8.2-macOS-arm64.dmg SHA256SUMS-0.8.2.txt</code></pre>
     <p>Windows (PowerShell):</p>
-    <pre><code>Get-FileHash .\\nightfall-core-0.7.8-windows-x64.exe -Algorithm SHA256
-Get-Content .\\SHA256SUMS-0.7.8-windows.txt</code></pre>
+    <pre><code>Get-FileHash .\\nightfall-core-0.8.2-windows-x64.exe -Algorithm SHA256
+Get-Content .\\SHA256SUMS-0.8.2-windows.txt</code></pre>
     <p>
       The two lines must match. Checksums for the current desktop release:
-      <a href="/downloads/SHA256SUMS-0.7.8.txt">SHA256SUMS-0.7.8.txt</a>,
-      <a href="/downloads/SHA256SUMS-0.7.8-windows.txt">SHA256SUMS-0.7.8-windows.txt</a>,
-      <a href="/downloads/SHA256SUMS-0.7.8-linux.txt">SHA256SUMS-0.7.8-linux.txt</a>.
+      <a href="/downloads/SHA256SUMS-0.8.2.txt">SHA256SUMS-0.8.2.txt</a>,
+      <a href="/downloads/SHA256SUMS-0.8.2-windows.txt">SHA256SUMS-0.8.2-windows.txt</a>,
+      <a href="/downloads/SHA256SUMS-0.8.2-linux.txt">SHA256SUMS-0.8.2-linux.txt</a>.
       Phone builds are still 0.7.0 and have their own lists.
+    </p>
+    <p>
+      This site carries the current release only. Every earlier version, with
+      the same binaries and the same checksum lists, stays on the
+      <a href="https://github.com/Instinctes/nightfall/releases">releases page</a> —
+      nothing published has been withdrawn, it just is not mirrored here twice.
     </p>
 
     <h2>4. What this does not prove</h2>
@@ -103,11 +109,11 @@ sudo bash install-node.sh          # relay only
 sudo bash install-node.sh --mine   # also mines; holds a key</code></pre>
     <p>
       Prebuilt binaries, if you would rather not compile:
-      <a href="/downloads/nightfalld-0.7.8-linux-x64"><code>nightfalld-0.7.8-linux-x64</code></a>,
-      <a href="/downloads/nightfall-wallet-0.7.8-linux-x64"><code>nightfall-wallet-0.7.8-linux-x64</code></a>,
-      <a href="/downloads/nightfall-core-0.7.8-linux-x64"><code>nightfall-core-0.7.8-linux-x64</code></a>
+      <a href="/downloads/nightfalld-0.8.2-linux-x64"><code>nightfalld-0.8.2-linux-x64</code></a>,
+      <a href="/downloads/nightfall-wallet-0.8.2-linux-x64"><code>nightfall-wallet-0.8.2-linux-x64</code></a>,
+      <a href="/downloads/nightfall-core-0.8.2-linux-x64"><code>nightfall-core-0.8.2-linux-x64</code></a>
       (Core needs GTK). Check
-      <a href="/downloads/SHA256SUMS-0.7.8-linux.txt">SHA256SUMS-0.7.8-linux.txt</a>.
+      <a href="/downloads/SHA256SUMS-0.8.2-linux.txt">SHA256SUMS-0.8.2-linux.txt</a>.
     </p>
     <p>
       A public seed (always-on, no keys, TCP 17891 open) uses
@@ -118,5 +124,6 @@ sudo bash install-node.sh --mine   # also mines; holds a key</code></pre>
     </p>
   </div>
 </article>
+<script src="/js/nav.js?v=1"></script>
 </body>
 </html>

@@ -50,6 +50,20 @@ jobs:
       - name: Build
         run: cargo build --release -p nightfall-core -p nightfall-node -p nightfall-wallet
 
+      - name: The binary must agree with the tag
+        shell: pwsh
+        run: |
+          $tag = if ($env:INPUT_TAG) { $env:INPUT_TAG } else { "${{ github.ref_name }}" }
+          $version = $tag -replace '^v', ''
+          $got = (& ./target/release/nightfalld.exe --version).Split(' ')[1]
+          if ($got -ne $version) {
+            Write-Error "tag says $version, binary says $got"
+            exit 1
+          }
+          Write-Host "nightfalld reports $got, matching $tag"
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+
       - name: Collect and checksum
         shell: pwsh
         run: |
@@ -138,6 +152,23 @@ jobs:
 
       - name: Build
         run: cargo build --release -p nightfall-core -p nightfall-node -p nightfall-wallet
+
+      # The seeds once ran 0.8.0 code that introduced itself as 0.7.8, because
+      # the binary was built before the version bump. Nothing broke, but the
+      # network's own version census was wrong and nobody could tell from the
+      # outside. A tag is a promise about what is inside the file.
+      - name: The binary must agree with the tag
+        run: |
+          TAG="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+          VERSION="${TAG#v}"
+          GOT="$(./target/release/nightfalld --version | awk '{print $2}')"
+          if [ "$GOT" != "$VERSION" ]; then
+            echo "tag says $VERSION, binary says $GOT" >&2
+            exit 1
+          fi
+          echo "nightfalld reports $GOT, matching $TAG"
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
 
       - name: Collect and checksum
         run: |
