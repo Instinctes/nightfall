@@ -576,6 +576,14 @@ fn empty_state(ui: &mut egui::Ui, title: &str, hint: &str) {
     ui.add_space(18.0);
 }
 
+/// One row of the Activity list.
+///
+/// The columns are allocated at fixed widths on purpose. The first version
+/// asked `ui.available_width()` inside the row and subtracted a constant. That
+/// number changes the moment the scroll bar appears, so every row measured a
+/// slightly different width and the amounts walked sideways as you scrolled —
+/// which is exactly what it looked like: a broken table. A right-aligned column
+/// has to be pinned to a width the row cannot renegotiate.
 fn activity_row(ui: &mut egui::Ui, e: &nightfall_wallet::HistoryEntry, now: u64) {
     // Only glyphs that exist in egui's bundled font — a missing one renders
     // as a tofu box, which is what made the first build look broken.
@@ -585,57 +593,77 @@ fn activity_row(ui: &mut egui::Ui, e: &nightfall_wallet::HistoryEntry, now: u64)
         Direction::Sent => ("-", TEXT, "-"),
     };
 
+    const ICON_W: f32 = 18.0;
+    const AMOUNT_W: f32 = 150.0;
+    const H_MARGIN: f32 = 12.0;
+
+    let full = ui.available_width();
+    let inner = (full - H_MARGIN * 2.0).max(200.0);
+    let mid = (inner - ICON_W - AMOUNT_W - 14.0).max(90.0);
+
     egui::Frame::none()
         .fill(SURFACE_HI)
         .rounding(Rounding::same(ROUND_SM))
-        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+        .inner_margin(egui::Margin::symmetric(H_MARGIN, 10.0))
         .show(ui, |ui| {
+            ui.set_width(inner);
             ui.horizontal(|ui| {
-                ui.label(RichText::new(icon).size(15.0).color(color));
-                ui.add_space(6.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(ICON_W, 0.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.label(RichText::new(icon).size(15.0).color(color));
+                    },
+                );
 
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(e.direction.label()).size(13.0).strong());
-                        if e.is_pending() {
-                            badge(ui, "pending", WARN);
-                        }
-                    });
-                    let sub = if e.memo.is_empty() {
-                        match e.height {
-                            Some(h) => format!("block {h} · {}", ago(e.timestamp, now)),
-                            None => "waiting for a block".to_string(),
-                        }
-                    } else {
-                        e.memo.clone()
-                    };
-                    ui.label(RichText::new(sub).size(11.0).color(TEXT_FAINT));
-                });
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.vertical(|ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(format!("{sign}{}", night(e.amount)))
-                                    .size(13.5)
-                                    .color(color)
-                                    .monospace(),
-                            );
+                ui.allocate_ui_with_layout(
+                    Vec2::new(mid, 0.0),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        ui.set_width(mid);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(e.direction.label()).size(13.0).strong());
+                            if e.is_pending() {
+                                badge(ui, "pending", WARN);
+                            }
                         });
+                        let sub = if e.memo.is_empty() {
+                            match e.height {
+                                Some(h) => format!("block {h} · {}", ago(e.timestamp, now)),
+                                None => format!("not in a block yet · {}", ago(e.timestamp, now)),
+                            }
+                        } else {
+                            e.memo.clone()
+                        };
+                        // Truncate rather than wrap: a long memo used to push
+                        // the row taller and shove everything after it around.
+                        ui.add(
+                            egui::Label::new(RichText::new(sub).size(11.0).color(TEXT_FAINT))
+                                .truncate(),
+                        );
+                    },
+                );
+
+                ui.allocate_ui_with_layout(
+                    Vec2::new(AMOUNT_W, 0.0),
+                    egui::Layout::top_down(egui::Align::RIGHT),
+                    |ui| {
+                        ui.set_width(AMOUNT_W);
+                        ui.label(
+                            RichText::new(format!("{sign}{}", night(e.amount)))
+                                .size(13.5)
+                                .color(color)
+                                .monospace(),
+                        );
                         if e.fee > 0 {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new(format!("fee {}", night(e.fee)))
-                                            .size(10.0)
-                                            .color(TEXT_FAINT),
-                                    );
-                                },
+                            ui.label(
+                                RichText::new(format!("fee {}", night(e.fee)))
+                                    .size(10.0)
+                                    .color(TEXT_FAINT),
                             );
                         }
-                    });
-                });
+                    },
+                );
             });
         });
     ui.add_space(6.0);
@@ -1048,6 +1076,69 @@ pub fn activity(app: &mut App, ui: &mut egui::Ui) {
     });
     ui.add_space(12.0);
 
+    // A send that is not in a block will not get there by itself: Nightfall
+    // hands a new transaction to exactly one peer and nothing rebroadcasts it.
+    // Before this notice existed, the row just said "pending" forever and the
+    // only way to find out what that meant was to read the source.
+    let now_for_stuck = now_unix();
+    const STUCK_AFTER_SECS: u64 = 30 * 60;
+    let stuck: Vec<_> = entries
+        .iter()
+        .filter(|e| {
+            e.direction == Direction::Sent
+                && e.is_pending()
+                && now_for_stuck.saturating_sub(e.timestamp) > STUCK_AFTER_SECS
+        })
+        .collect();
+    if let Some(oldest) = stuck.iter().min_by_key(|e| e.timestamp) {
+        let n = stuck.len();
+        egui::Frame::none()
+            .fill(WARN.gamma_multiply(0.10))
+            .stroke(Stroke::new(1.0_f32, WARN.gamma_multiply(0.5)))
+            .rounding(Rounding::same(ROUND_SM))
+            .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    dot(ui, WARN, true);
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(if n == 1 {
+                            "One payment never made it into a block".to_string()
+                        } else {
+                            format!("{n} payments never made it into a block")
+                        })
+                        .size(13.0)
+                        .strong(),
+                    );
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Sent {} and still in no block. A transaction is handed to one \
+                         peer and nothing re-sends it, so this will not confirm on its \
+                         own. The coins were never spent — they are still yours, but this \
+                         wallet is holding them reserved for a payment that died.",
+                        ago(oldest.timestamp, now_for_stuck)
+                    ))
+                    .size(11.5)
+                    .color(TEXT_DIM),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ghost_button(ui, "Open Settings → Rescan").clicked() {
+                        app.view = View::Settings;
+                    }
+                    ui.label(
+                        RichText::new("releases the reserved coins, then send again")
+                            .size(11.0)
+                            .color(TEXT_FAINT),
+                    );
+                });
+            });
+        ui.add_space(12.0);
+    }
+
     let needle = app.activity_filter.to_lowercase();
     let filtered: Vec<_> = entries
         .iter()
@@ -1073,17 +1164,24 @@ pub fn activity(app: &mut App, ui: &mut egui::Ui) {
             );
         } else {
             let now = now_unix();
+            // Measured once, outside the loop. Inside it, `available_width`
+            // shrinks after the first row and again when the scroll bar shows,
+            // so every row got a different budget and the columns drifted.
+            const RECEIPT_W: f32 = 88.0;
+            let row_w = ui.available_width();
             for e in filtered {
+                let can_receipt = matches!(e.direction, Direction::Received | Direction::Mined);
+                let body_w = (row_w - if can_receipt { RECEIPT_W } else { 0.0 }).max(240.0);
                 ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.set_width(ui.available_width() - 88.0);
-                        activity_row(ui, e, now);
-                    });
-                    if matches!(
-                        e.direction,
-                        Direction::Received | Direction::Mined
-                    ) && ghost_button(ui, "Receipt").clicked()
-                    {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(body_w, 0.0),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            ui.set_width(body_w);
+                            activity_row(ui, e, now);
+                        },
+                    );
+                    if can_receipt && ghost_button(ui, "Receipt").clicked() {
                         match app
                             .wallet
                             .lock()

@@ -600,8 +600,28 @@ impl App {
 
         match result {
             Ok(txid) => {
-                self.toasts
-                    .success(ctx, format!("Sent — {}", short_hex(&txid)));
+                // "Sent" was a lie by one word. The transaction has been handed
+                // to the local node, not into a block, and the difference is
+                // hours of confusion when it never gets there.
+                self.toasts.success(
+                    ctx,
+                    format!("Submitted — {} · waiting for a block", short_hex(&txid)),
+                );
+                // A new payment goes to exactly one random peer first, so that
+                // it cannot be traced back to this node. With almost no peers
+                // that one hop is also the only hop, and nothing re-sends it.
+                // Say so now, while the sender is still looking at the screen.
+                let peers = self.status.as_ref().map(|s| s.peers).unwrap_or(0);
+                if peers < 3 {
+                    self.toasts.error(
+                        ctx,
+                        format!(
+                            "Only {peers} peer(s) connected — a payment handed to one peer \
+                             can be lost. If it has not confirmed in an hour, rescan in \
+                             Settings and send it again."
+                        ),
+                    );
+                }
                 self.send_to.clear();
                 self.send_amount.clear();
                 self.send_memo.clear();
@@ -870,6 +890,12 @@ impl eframe::App for App {
 
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
+                    // Always reserve the bar. With the default the bar appears
+                    // only once the page overflows, which takes ~10px of width
+                    // away mid-session — every right-aligned column then shifts
+                    // sideways as you scroll. Reserving it costs a sliver of
+                    // width and makes the layout stop moving.
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .show(ui, |ui| {
                         // Content is capped and centred: full-bleed cards on an
                         // ultra-wide display look sparse and are hard to read.
