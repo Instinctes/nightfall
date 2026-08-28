@@ -124,10 +124,14 @@
     function width(id, pct) {
         var el = $(id);
         if (!el) return;
-        // Anything above zero gets at least a hairline, so "small" never
-        // renders as "none".
+        // Anything above zero gets a hairline so "small" never renders as
+        // "none" — but the floor stays low on purpose. At 0.46 % issued the
+        // first version clamped every bar to the same 0.6 % and three very
+        // different numbers came out looking identical. A bar that lies to
+        // make itself visible is worse than a bar that is nearly empty:
+        // nearly empty *is* the story.
         var p = Math.max(0, Math.min(100, pct));
-        el.style.width = (p > 0 && p < 0.6 ? 0.6 : p) + "%";
+        el.style.width = (p > 0 && p < 0.12 ? 0.12 : p) + "%";
     }
 
     function renderVersions(map) {

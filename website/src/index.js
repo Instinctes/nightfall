@@ -408,8 +408,16 @@ async function proxyChain(url) {
             },
         });
     } catch (e) {
+        // `lightFetch` throws on any non-2xx, so a seed that is simply too old
+        // to know `get_headers` arrives here as a bare "HTTP 403". Saying
+        // "unreachable" about a node that answered immediately and correctly
+        // would send whoever reads this looking in the wrong place.
+        const msg = String((e && e.message) || e);
         return jsonResponse(502, {
-            error: `node unreachable: ${e.message || e}`,
+            error:
+                msg === "HTTP 403"
+                    ? "the seed is older than 0.8.3 and has no get_headers"
+                    : `node unreachable: ${msg}`,
         });
     }
 }

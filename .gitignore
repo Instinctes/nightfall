@@ -28,3 +28,8 @@ core.notes.json
 /mobile/ios/Libs/*.a
 *.xcuserstate
 xcuserdata/
+
+# The published binaries. They live on the releases page and Wrangler uploads
+# them to the site from the working copy — putting 60 MB of them in git as
+# well would only give the repository a second, slower copy that can drift.
+/website/public/downloads/
