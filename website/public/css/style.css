@@ -1172,15 +1172,26 @@ section {
 
 /* -------------------------------------------------------------- download -- */
 
+/* Five cards, five columns. `auto-fit` with a 220px floor gave four and
+   orphaned the fifth on its own row, hard against the left edge with two
+   thirds of the section empty beside it. */
 .dl-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    gap: 20px;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 16px;
+}
+
+@media (max-width: 1080px) {
+    .dl-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 18px;
+    }
 }
 
 @media (max-width: 900px) {
     .dl-grid {
         grid-template-columns: 1fr;
+        gap: 20px;
     }
 }
 
@@ -1188,9 +1199,18 @@ section {
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--r-lg);
-    padding: 30px;
+    padding: 28px 20px;
     text-align: center;
     transition: transform 0.3s, border-color 0.3s, box-shadow 0.3s;
+    /* Column, so the button can be pushed to the bottom. The Linux card has a
+       two-line subtitle and its button sat a whole line lower than the other
+       four: five cards, two button heights. */
+    display: flex;
+    flex-direction: column;
+}
+
+.dl .btn {
+    margin-top: auto;
 }
 
 .dl:hover {
@@ -1208,7 +1228,8 @@ section {
 .dl .req {
     color: var(--text-faint);
     font-size: 0.84rem;
-    margin-bottom: 20px;
+    line-height: 1.5;
+    margin-bottom: 22px;
 }
 
 /* --------------------------------------------------------------- honest -- */
@@ -1703,8 +1724,10 @@ footer {
     justify-content: space-between;
     gap: 26px;
     flex-wrap: wrap;
-    margin: 0 auto 26px;
-    max-width: 780px;
+    /* Same width as the grid below. It was a centred 780px band above a
+       full-width grid, above notes at a third width again: three blocks in
+       one section, no two edges lining up. */
+    margin: 0 0 22px;
     padding: 26px 30px;
     border: 1px solid var(--border-hi);
     border-radius: var(--r-lg);
@@ -1761,10 +1784,14 @@ footer {
 
 /* -- download: the fine print, now foldable ------------------------------- */
 .dl-notes {
-    max-width: 780px;
-    margin: 30px auto 0;
+    margin: 30px 0 0;
     display: grid;
     gap: 12px;
+}
+
+/* The boxes span the section; the prose inside stays readable. */
+.dl-note > p {
+    max-width: 68ch;
 }
 
 .dl-note {
