@@ -14,8 +14,14 @@
 
     var DARKS = 1e8;           // 1 NIGHT
     var TARGET = 15;           // seconds per block
-    var REFRESH_MS = 20000;
+    // Blocks land every 15 s. Polling slower than that guarantees the page is
+    // usually showing something that has already been superseded.
+    var REFRESH_MS = 10000;
     var WANT = 60;             // headers to ask for
+
+    var lastOk = 0;            // when data last arrived, unix seconds
+    var lastTip = 0;           // highest block already on screen
+    var inFlight = false;
 
     function $(id) { return document.getElementById(id); }
 
@@ -77,7 +83,7 @@
         setText("s-peers", int(n.peers));
 
         // Green only when the node is caught up and the chain is moving. A
-        // tip older than four target intervals is worth a colour change, not
+        // tip older than eight target intervals is worth a colour change, not
         // an alarm — a single slow block is normal.
         var dot = $("dot");
         if (dot) {
@@ -190,8 +196,14 @@
         }
         headers.slice().reverse().slice(0, 25).forEach(function (h) {
             var tr = document.createElement("tr");
+            // Anything above the highest block we had last time is new since
+            // the reader last looked, and gets one flash to say so.
+            if (lastTip && Number(h.height) > lastTip) tr.className = "c-new";
             cell(tr, int(h.height), "mono");
-            cell(tr, ago(h.time), "c-dim");
+            var age = cell(tr, ago(h.time), "c-dim");
+            // The table is redrawn every ten seconds; the ages have to move
+            // every second or the page looks frozen between fetches.
+            age.dataset.t = String(h.time || "");
             cell(tr, int(h.difficulty), "mono c-num");
             cell(tr, h.inputs === undefined ? "—" : int(h.inputs), "mono c-num");
             cell(tr, h.outputs === undefined ? "—" : int(h.outputs), "mono c-num");
@@ -207,6 +219,7 @@
         if (cls) td.className = cls;
         td.textContent = text;
         tr.appendChild(td);
+        return td;
     }
 
     /* --------------------------------------------------------- chart -- */
@@ -274,6 +287,7 @@
         var avg = solves.reduce(function (a, s) { return a + s.t; }, 0) / solves.length;
         setText("chart-avg",
             "Average over these " + solves.length + " blocks: " + avg.toFixed(1) + " s");
+        setText("s-avg", avg.toFixed(1) + "s");
     }
 
     function el(name, attrs) {
@@ -293,7 +307,26 @@
         });
     }
 
+    function setLive(state, text) {
+        var dot = $("dot");
+        if (dot && state) dot.className = "c-dot " + state;
+        setText("s-live", text);
+    }
+
+    /** Seconds since data last arrived, rendered as a phrase. */
+    function freshness() {
+        if (!lastOk) return "connecting…";
+        var s = Math.floor(Date.now() / 1000) - lastOk;
+        if (s <= 1) return "live · just updated";
+        if (s < 60) return "live · updated " + s + "s ago";
+        return "stale · last update " + Math.floor(s / 60) + "m ago";
+    }
+
     function load() {
+        if (inFlight) return;
+        inFlight = true;
+        var btn = $("refresh");
+        if (btn) btn.disabled = true;
         var problems = [];
 
         var a = getJSON("/network.json").then(renderStatus).catch(function (e) {
@@ -306,6 +339,10 @@
             });
             renderBlocks(hs);
             renderChart(hs);
+            if (hs.length) {
+                var top = Number(hs[hs.length - 1].height);
+                if (top > lastTip) lastTip = top;
+            }
         }).catch(function (e) {
             problems.push("Block headers unavailable: " + e.message);
             var body = $("blocks");
@@ -322,15 +359,46 @@
         });
 
         Promise.all([a, b]).then(function () {
-            showError(problems.length ? problems.join(" · ") : "");
+            inFlight = false;
+            if (btn) btn.disabled = false;
+            if (problems.length) {
+                showError(problems.join(" · "));
+                // The pulse stops when the data stops. An animation that keeps
+                // running through a failed fetch tells the reader everything
+                // is fine while it is not.
+                setLive("bad", "not updating — " + problems.length + " endpoint(s) failing");
+            } else {
+                showError("");
+                lastOk = Math.floor(Date.now() / 1000);
+                setLive(null, freshness());
+            }
         });
     }
 
     load();
     setInterval(load, REFRESH_MS);
-    // The age columns drift between refreshes; keep them honest.
+
+    // Every timestamp on the page moves once a second, without a request.
+    // Between two fetches the page would otherwise sit perfectly still and
+    // look like a screenshot of a chain rather than a chain.
     setInterval(function () {
-        var s = $("s-age");
-        if (s && s.dataset && s.dataset.t) s.textContent = ago(s.dataset.t);
+        var nodes = document.querySelectorAll("[data-t]");
+        for (var i = 0; i < nodes.length; i++) {
+            var v = nodes[i].dataset.t;
+            if (v) nodes[i].textContent = ago(v);
+        }
+        if (lastOk) setText("s-live", freshness());
     }, 1000);
+
+    var btn = $("refresh");
+    if (btn) btn.addEventListener("click", load);
+
+    // Coming back to a backgrounded tab should not show a minute-old chain.
+    // Browsers throttle timers in hidden tabs, so the interval alone is not
+    // enough.
+    document.addEventListener("visibilitychange", function () {
+        if (!document.hidden) load();
+    });
+    window.addEventListener("focus", load);
+    window.addEventListener("online", load);
 })();

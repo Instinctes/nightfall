@@ -75,6 +75,33 @@ if (existsSync(DL)) {
     console.log("downloads/ not present (it is gitignored) — checking versions only");
 }
 
+/* Nothing may ship to the site that is not a deliberate file.
+ *
+ * On 28 Aug 2026 five `.fuse_hidden…` files were being served live — stale
+ * copies of whole pages, left behind when `sed -i` replaced a file that was
+ * still open across a FUSE mount. They had no extension, so every check that
+ * walks *.html and *.js looked straight past them, and Wrangler happily
+ * uploaded all five. One of them answered 200 on the apex.
+ */
+const ALLOWED_EXT = /\.(html|js|css|json|txt|svg|png|jpg|jpeg|webp|ico|woff2?|wasm|dmg|exe|sh|xml|webmanifest)$/i;
+const strays = [];
+const sweep = (dir, rel) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+        const full = dir + e.name;
+        if (e.isDirectory()) {
+            sweep(full + "/", rel + e.name + "/");
+            continue;
+        }
+        if (e.name.startsWith(".") || !ALLOWED_EXT.test(e.name)) {
+            // Extensionless release binaries are the one legitimate exception.
+            if (rel === "downloads/" && !e.name.startsWith(".")) continue;
+            strays.push(rel + e.name);
+        }
+    }
+};
+sweep(PUB, "");
+for (const s of strays) problems.push(`${s} is not a file this site should serve`);
+
 if (problems.length) {
     console.error("download link problems:");
     for (const p of problems) console.error("  - " + p);

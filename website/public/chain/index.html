@@ -27,6 +27,35 @@
   .c-dot.warn { background:var(--warn); box-shadow:0 0 0 4px rgba(255,200,92,.14); }
   .c-dot.bad { background:var(--magenta); box-shadow:0 0 0 4px rgba(184,69,216,.16); }
 
+  .c-live { display:inline-flex; align-items:center; gap:9px; font-weight:600;
+            font-size:.83rem; color:var(--text-dim); }
+  .c-refresh { margin-left:auto; background:var(--surface); color:var(--text-dim);
+               border:1px solid var(--border); border-radius:var(--r-pill);
+               padding:6px 14px; font:inherit; font-size:.78rem; cursor:pointer;
+               transition:border-color .15s, color .15s; }
+  .c-refresh:hover { border-color:var(--border-hi); color:var(--text); }
+  .c-refresh:disabled { opacity:.5; cursor:default; }
+
+  /* The dot pulses only while data is actually arriving. A decorative
+     animation that keeps running through a failed fetch is a lie. */
+  .c-dot.ok { animation:c-pulse 2.4s ease-in-out infinite; }
+  @keyframes c-pulse {
+    0%,100% { box-shadow:0 0 0 0 rgba(74,224,168,.45); }
+    50%     { box-shadow:0 0 0 6px rgba(74,224,168,0); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .c-dot.ok { animation:none; }
+    .c-new td { animation:none !important; }
+  }
+
+  /* A block that arrived since the last render. Without this the table
+     redraws every ten seconds and nothing tells you anything changed. */
+  @keyframes c-flash {
+    from { background:rgba(124,92,255,.22); }
+    to   { background:transparent; }
+  }
+  .c-new td { animation:c-flash 2.2s ease-out 1; }
+
   .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
           font-variant-numeric:tabular-nums; }
 
@@ -60,9 +89,15 @@
             gap:8px 16px; align-items:center; }
   .c-line .lbl { color:var(--text-dim); font-size:.86rem; }
   .c-line .amt { text-align:right; font-weight:650; }
-  .c-track { height:8px; border-radius:99px; background:var(--bg); overflow:hidden;
-             border:1px solid var(--border); }
-  .c-fill { height:100%; border-radius:99px; background:var(--grad-bright); width:0; }
+  /* display:block is load-bearing. Both of these are <span>, so without it
+     they stay inline, width and height are ignored outright, and every bar on
+     the page renders as an empty outline — which is exactly what shipped in
+     0.8.4 until someone looked at it. The class had a rule; the rule was just
+     not enough. No static check catches that. */
+  .c-track { display:block; height:8px; border-radius:99px; background:var(--bg);
+             overflow:hidden; border:1px solid var(--border); }
+  .c-fill { display:block; height:100%; border-radius:99px;
+            background:var(--grad-bright); width:0; }
   .c-fill.dim { background:var(--border-hi); }
   .c-fill.warn { background:var(--warn); }
 
@@ -150,11 +185,14 @@
     </p>
 
     <div class="c-strip" id="strip">
-      <span><span class="c-dot" id="dot"></span><span class="k">Tip</span><span class="v mono" id="s-tip">—</span></span>
+      <span class="c-live"><span class="c-dot" id="dot"></span><span id="s-live">connecting…</span></span>
+      <span><span class="k">Height</span><span class="v mono" id="s-tip">—</span></span>
       <span><span class="k">Last block</span><span class="v mono" id="s-age">—</span></span>
+      <span><span class="k">Avg block</span><span class="v mono" id="s-avg">—</span></span>
       <span><span class="k">Difficulty</span><span class="v mono" id="s-diff">—</span></span>
       <span><span class="k">Mempool</span><span class="v mono" id="s-mem">—</span></span>
       <span><span class="k">Peers</span><span class="v mono" id="s-peers">—</span></span>
+      <button type="button" class="c-refresh" id="refresh">Refresh</button>
     </div>
 
     <div id="err-slot"></div>
