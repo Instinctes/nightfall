@@ -593,11 +593,21 @@ body::before {
 
 /* -------------------------------------------------------------- words --- */
 
+/* Columns are sized from the longest word, not from the container.
+ *
+ * The first version used `repeat(4, minmax(0, 1fr))`, which lets a column be
+ * narrower than its content — and a single seed word has no space in it, so
+ * it cannot wrap. The result was a grid that overflowed and got clipped:
+ * "blanket" read "blanke", "convince" read "convinc". On a screen whose whole
+ * job is transcribing 24 words correctly, that is the worst possible bug.
+ *
+ * `auto-fit` with a floor wide enough for the longest BIP-39 word means the
+ * column count adapts to the width instead of the words being cut to fit. */
 .words {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
     gap: 8px;
-    margin: 16px 0 4px;
+    margin: 18px 0 6px;
 }
 
 /* Back link, then title, then one line of explanation — the same rhythm the
@@ -631,9 +641,14 @@ body::before {
 .words > span,
 .words .word {
     display: grid;
-    grid-template-columns: 1.9em minmax(0, 1fr);
+    grid-template-columns: 2.1em minmax(0, 1fr);
     align-items: baseline;
     gap: 10px;
+    /* Belt and braces: if a word still cannot fit, it wraps inside its own
+       chip rather than disappearing past the edge. A wrapped word is ugly;
+       a truncated one is wrong. */
+    overflow-wrap: anywhere;
+    min-width: 0;
     background: var(--bg-2);
     border: 1px solid var(--border);
     border-radius: var(--r-sm);
@@ -1152,6 +1167,72 @@ label {
     font-size: 0.84rem;
 }
 
+/* A callout for the one sentence on the screen that cannot be undone.
+ *
+ * "Nobody can reset this" was set in .hint — the faintest colour in the
+ * stylesheet, smaller than everything around it. The most consequential line
+ * on the most consequential screen was also the least visible one. */
+.callout {
+    display: flex;
+    gap: 11px;
+    align-items: flex-start;
+    text-align: left;
+    background: rgba(255, 107, 138, 0.07);
+    border: 1px solid rgba(255, 107, 138, 0.32);
+    border-radius: var(--r-md);
+    padding: 13px 15px;
+    margin: 16px 0 4px;
+    font-size: 0.88rem;
+    line-height: 1.55;
+    color: var(--text);
+}
+.callout b {
+    color: var(--danger);
+}
+.callout .ico {
+    flex: 0 0 auto;
+    color: var(--danger);
+    font-size: 1rem;
+    line-height: 1.45;
+}
+
+/* The two confirmation fields, side by side once there is room. Each keeps a
+   real label; a placeholder is not a label — it vanishes the moment you type,
+   exactly when you most want to know which word is being asked for. */
+.confirm {
+    display: grid;
+    gap: 10px;
+    margin-top: 6px;
+    text-align: left;
+}
+@media (min-width: 560px) {
+    .confirm {
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+    }
+}
+.confirm label {
+    display: block;
+    font-size: 0.74rem;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+    margin-bottom: 6px;
+}
+.confirm input {
+    margin: 0;
+}
+
+/* Step counter above the title, so the flow says where you are. */
+.step {
+    font-size: 0.72rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--violet-hi, #9b83ff);
+    font-weight: 700;
+    margin: 0 0 6px;
+}
+
 /* -------------------------------------------------------- onboarding --- */
 
 .onboard {
@@ -1285,8 +1366,10 @@ label {
         grid-template-columns: repeat(2, minmax(0, 200px));
     }
 
-    .words {
-        grid-template-columns: repeat(4, minmax(0, 1fr));
+    /* auto-fit already picks the column count; the seed screen just gets more
+       room to spread into than a send form needs. */
+    .onboard.onboard-wide {
+        max-width: 760px;
     }
 
     /* A settings list does not get better by being 980px wide — it gets

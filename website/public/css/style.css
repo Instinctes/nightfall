@@ -188,6 +188,9 @@ nav .wrap {
     gap: 26px;
     margin-left: auto;
     align-items: center;
+    /* One row, always. If it ever does not fit, the drawer below 820px is
+       the answer — not a second row that moves the page down. */
+    flex-wrap: nowrap;
 }
 
 .nav-links a {
@@ -195,6 +198,10 @@ nav .wrap {
     font-size: 0.92rem;
     position: relative;
     transition: color 0.2s;
+    /* A label may never break in half. "Provable supply" and "Web wallet"
+       each wrapped onto two lines, which pushed the whole bar to two rows —
+       a header that changes height depending on the window width. */
+    white-space: nowrap;
 }
 
 .nav-links a:hover {

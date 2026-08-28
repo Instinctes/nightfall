@@ -13,7 +13,7 @@ import init, {
   wallet_history,
   build_send,
   probe_crypto,
-} from "./pkg/nightfall_web.js?v=089";
+} from "./pkg/nightfall_web.js?v=090";
 
 const STORE = "nf-web-wallet-v1";
 const NODE_STORE = "nf-web-node";
@@ -304,16 +304,29 @@ function wordGrid(phrase) {
 function backup(phrase) {
   const words = phrase.trim().split(/\s+/);
   screen(`
-    <div class="onboard">
+    <div class="onboard onboard-wide">
+      <p class="step">Step 1 of 2 · Back up</p>
       <h1>Write these 24 words down</h1>
-      <p class="hint">Paper first. A password manager is next-best. Not a screenshot, not chat, not email. Anyone with these words can spend. Nobody can reset this.</p>
+      <p class="hint">These words <em>are</em> the wallet. Paper first; a password manager is the next best thing. Not a screenshot, not a chat message, not email.</p>
       ${wordGrid(phrase)}
       <button class="ghost" id="copy">Copy all 24 words</button>
       <p class="ok" id="copied" hidden>Copied. Clear the clipboard when you have stored them.</p>
-      <p class="hint">Type word 4 and word 18 to continue.</p>
-      <input id="w4" placeholder="Word 4" autocomplete="off">
-      <input id="w18" placeholder="Word 18" autocomplete="off">
-      <button class="primary" id="done" disabled>I have the words</button>
+      <div class="callout">
+        <span class="ico" aria-hidden="true">!</span>
+        <span><b>Nobody can reset this.</b> There is no company, no support address and no recovery link. Anyone who reads these words can spend your coins; if you lose them, the coins are gone.</span>
+      </div>
+      <p class="hint" style="margin-top:18px">Two of them, to prove the copy is right.</p>
+      <div class="confirm">
+        <div>
+          <label for="w4">Word 4</label>
+          <input id="w4" autocomplete="off" autocapitalize="none" spellcheck="false" inputmode="text">
+        </div>
+        <div>
+          <label for="w18">Word 18</label>
+          <input id="w18" autocomplete="off" autocapitalize="none" spellcheck="false" inputmode="text">
+        </div>
+      </div>
+      <button class="primary" id="done" disabled>I have written them down</button>
       <p id="err" class="warn"></p>
     </div>
   `);

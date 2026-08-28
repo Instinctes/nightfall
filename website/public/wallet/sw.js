@@ -1,4 +1,4 @@
-const CACHE = "night-wallet-v15";
+const CACHE = "night-wallet-v16";
 const SHELL = ["./index.html", "./style.css"];
 
 self.addEventListener("install", (e) => {
