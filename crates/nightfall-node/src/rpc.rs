@@ -344,6 +344,79 @@ pub(crate) fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
             }
         }
 
+        // Block headers plus the three counts an observer can legitimately
+        // see. Everything here is already public in the block: the amounts
+        // stay in their commitments, the outputs stay unlinkable, and no
+        // address exists on the chain to reveal in the first place.
+        //
+        // Separate from `get_blocks` on purpose. `get_blocks` ships full
+        // bodies with range proofs — megabytes, and useless to a browser.
+        // This is the shape a chain view actually wants, and it is small
+        // enough to be safe on the public light API.
+        "get_headers" => {
+            const MAX_HEADERS: usize = 512;
+            let g = state.lock().unwrap();
+            let tip = g.chain.tip_height().map(|h| h.0).unwrap_or(0);
+            let limit = req
+                .params
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(50)
+                .clamp(1, MAX_HEADERS as u64) as usize;
+            // No `from` means "the newest ones", which is what a viewer opens
+            // with and what saves it a round trip to learn the tip first.
+            let from = match req.params.get("from").and_then(|v| v.as_u64()) {
+                Some(f) => f,
+                None => tip.saturating_sub(limit as u64 - 1),
+            };
+            let from = from.max(g.chain.first_height);
+
+            let mut out = Vec::with_capacity(limit);
+            for b in g.chain.blocks_from(from, limit) {
+                out.push(json!({
+                    "height": b.header.height.0,
+                    "hash": b.hash().to_hex(),
+                    "prev_hash": b.header.prev_hash.to_hex(),
+                    "time": b.header.timestamp_unix,
+                    "difficulty": b.header.difficulty,
+                    "reward": b.header.reward_darks,
+                    "utxo_root": b.header.utxo_root.to_hex(),
+                    "inputs": b.body.inputs.len(),
+                    "outputs": b.body.outputs.len(),
+                    "kernels": b.body.kernels.len(),
+                }));
+            }
+            // A pruned node has thrown the bodies away but kept every header.
+            // Serve those rather than an empty list, with the counts left out
+            // so nobody mistakes "not stored" for "zero".
+            if out.is_empty() && !g.chain.headers.is_empty() {
+                for h in g
+                    .chain
+                    .headers
+                    .iter()
+                    .filter(|h| h.height >= from)
+                    .take(limit)
+                {
+                    out.push(json!({
+                        "height": h.height,
+                        "hash": h.hash.to_hex(),
+                        "prev_hash": h.prev_hash.to_hex(),
+                        "time": h.timestamp_unix,
+                        "difficulty": h.difficulty,
+                    }));
+                }
+            }
+            ok(
+                json!({
+                    "tip_height": tip,
+                    "first_height": g.chain.first_height,
+                    "pruned": g.chain.is_pruned(),
+                    "headers": out,
+                }),
+                id,
+            )
+        }
+
         "mine_one" => {
             // Build the template and mine it without holding the lock.
             let (template, miner_present) = {

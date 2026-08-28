@@ -298,6 +298,20 @@ async function proxyNetwork() {
             loading: !!r.loading,
             genesis: r.genesis || "",
             protocol_version: r.protocol_version,
+            // Everything below is for the chain view. All of it is public
+            // bookkeeping — set sizes, roots and the version census — and none
+            // of it says anything about who holds what.
+            wire_version: r.wire_version,
+            utxos: r.utxos,
+            kernels: r.kernels,
+            utxo_root: r.utxo_root || "",
+            total_work: r.total_work || "",
+            mempool: r.mempool,
+            tip_time: r.tip_time,
+            peer_versions: r.peer_versions || {},
+            pruned: !!r.pruned,
+            ticker: r.ticker || "NIGHT",
+            network: r.network || "mainnet",
         });
         return new Response(body, {
             status: 200,
@@ -341,6 +355,56 @@ async function proxySupply() {
                 "Content-Type": "application/json; charset=utf-8",
                 "Cache-Control": "public, max-age=15, must-revalidate",
                 ...securityHeaders("/supply"),
+            },
+        });
+    } catch (e) {
+        return jsonResponse(502, {
+            error: `node unreachable: ${e.message || e}`,
+        });
+    }
+}
+
+/** Block headers for the chain view.
+ *
+ * Everything this returns is already public in the block. What is *not* here
+ * is anything the protocol hides: no amounts, no addresses, no sender and no
+ * receiver. There is no way to add them later either — they do not exist on
+ * the chain to be read. A viewer that could show them would be a bug report.
+ *
+ * The upstream caps `limit` at 512; this caps it lower, because the page asks
+ * for 60 and nothing about a public endpoint should invite more.
+ */
+async function proxyChain(url) {
+    const limit = Math.min(
+        Math.max(parseInt(url.searchParams.get("limit") || "60", 10) || 60, 1),
+        200,
+    );
+    const fromRaw = url.searchParams.get("from");
+    const params = { limit };
+    if (fromRaw !== null && /^\d+$/.test(fromRaw)) {
+        params.from = parseInt(fromRaw, 10);
+    }
+    try {
+        const upstream = await lightFetch(
+            JSON.stringify({ method: "get_headers", params, id: 1 }),
+        );
+        const payload = await upstream.json();
+        const r = payload && payload.result;
+        if (!r || !Array.isArray(r.headers)) {
+            // A seed still on 0.8.2 has no `get_headers` and answers 403 with
+            // an error body. Say so plainly instead of rendering an empty
+            // table that looks like an empty chain.
+            const why =
+                (payload && payload.error && (payload.error.message || payload.error)) ||
+                "seed returned no headers";
+            return jsonResponse(502, { error: String(why) });
+        }
+        return new Response(JSON.stringify(r), {
+            status: 200,
+            headers: {
+                "Content-Type": "application/json; charset=utf-8",
+                "Cache-Control": "public, max-age=15, must-revalidate",
+                ...securityHeaders("/chain.json"),
             },
         });
     } catch (e) {
@@ -512,6 +576,14 @@ export default {
                 return jsonResponse(405, { error: "GET" }, { Allow: "GET, HEAD" });
             }
             return proxyNetwork();
+        }
+
+        // Block headers for /chain/. Headers and counts, nothing hidden.
+        if (url.pathname === "/chain.json") {
+            if (request.method !== "GET" && request.method !== "HEAD") {
+                return jsonResponse(405, { error: "GET" }, { Allow: "GET, HEAD" });
+            }
+            return proxyChain(url);
         }
 
         // Everything else is static. No forms, no other API.

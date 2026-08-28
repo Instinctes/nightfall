@@ -13,7 +13,7 @@ import init, {
   wallet_history,
   build_send,
   probe_crypto,
-} from "./pkg/nightfall_web.js?v=087";
+} from "./pkg/nightfall_web.js?v=088";
 
 const STORE = "nf-web-wallet-v1";
 const NODE_STORE = "nf-web-node";
@@ -27,7 +27,7 @@ const WARN =
   "This phone or browser trusts a node for what it shows. A hostile node can hide a payment or invent one on the screen. It cannot spend — the seed never leaves this device. Anyone who can run script on this page can read a saved wallet. The 24 words are the real backup.";
 
 const FEE = "0.001";
-const BUILD = "0.8.2";
+const BUILD = "0.8.3";
 
 let wasmReady = init();
 let state = null;

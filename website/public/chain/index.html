@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Chain — NIGHTFALLCOIN</title>
+<meta name="description" content="Everything a NIGHT block can honestly show: supply proof, emission against schedule, difficulty, block times, recent blocks and the version census. No addresses, no amounts — those do not exist on this chain.">
+<meta property="og:title" content="NIGHTFALLCOIN chain view">
+<meta property="og:description" content="A privacy chain cannot have a normal block explorer. Here is everything it can prove instead — starting with the fact that nobody printed coins.">
+<meta property="og:type" content="website">
+<meta name="theme-color" content="#0e0b18">
+<link rel="icon" href="/assets/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="stylesheet" href="/css/style.css?v=live-6">
+<style>
+  /* Scoped to this page. The shared stylesheet has no reason to carry a
+     block table or a hand-drawn chart. */
+  .c-strip { display:flex; flex-wrap:wrap; gap:10px 30px; align-items:center;
+             background:var(--bg-2); border:1px solid var(--border);
+             border-left:3px solid var(--violet); border-radius:16px;
+             padding:15px 19px; margin:0 0 30px; }
+  .c-strip .k { color:var(--text-faint); font-size:.7rem; letter-spacing:.1em;
+                text-transform:uppercase; margin-right:8px; }
+  .c-strip .v { font-weight:650; }
+  .c-dot { width:8px; height:8px; border-radius:50%; background:var(--text-faint);
+           display:inline-block; margin-right:9px; vertical-align:middle; }
+  .c-dot.ok { background:var(--success); box-shadow:0 0 0 4px rgba(74,224,168,.14); }
+  .c-dot.warn { background:var(--warn); box-shadow:0 0 0 4px rgba(255,200,92,.14); }
+  .c-dot.bad { background:var(--magenta); box-shadow:0 0 0 4px rgba(184,69,216,.16); }
+
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+          font-variant-numeric:tabular-nums; }
+
+  .c-cards { display:grid; gap:14px; margin:0 0 34px;
+             grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); }
+  .c-card { background:var(--surface); border:1px solid var(--border);
+            border-radius:16px; padding:17px 19px; }
+  .c-card b { display:block; font-size:1.36rem; letter-spacing:-.01em; margin-bottom:2px;
+              word-break:break-word; }
+  .c-card small { color:var(--text-faint); font-size:.7rem; letter-spacing:.1em;
+                  text-transform:uppercase; }
+  .c-card p { margin:7px 0 0; font-size:.82rem; color:var(--text-dim); line-height:1.5; }
+
+  /* Supply proof — the one thing a privacy coin is always asked about. */
+  .c-proof { background:var(--surface); border:1px solid var(--border);
+             border-radius:22px; padding:26px 26px 22px; margin:0 0 34px; }
+  .c-proof-head { display:flex; flex-wrap:wrap; gap:12px; align-items:center;
+                  justify-content:space-between; margin-bottom:20px; }
+  .c-proof-head h2 { margin:0; font-size:1.2rem; }
+  .c-badge { display:inline-flex; align-items:center; gap:8px; border-radius:var(--r-pill);
+             padding:7px 15px; font-size:.8rem; font-weight:650;
+             border:1px solid var(--border-hi); background:var(--bg-2); }
+  .c-badge.ok { color:var(--success); border-color:rgba(74,224,168,.4); }
+  .c-badge.bad { color:var(--warn); border-color:rgba(255,200,92,.45); }
+  .c-formula { background:var(--bg); border:1px solid var(--border); border-radius:14px;
+               padding:15px 18px; margin:0 0 20px; overflow-x:auto;
+               font-size:.92rem; color:var(--text-dim); }
+  .c-formula b { color:var(--text); font-weight:600; }
+  .c-bars { display:grid; gap:13px; }
+  .c-line { display:grid; grid-template-columns:minmax(120px,auto) 1fr minmax(150px,auto);
+            gap:8px 16px; align-items:center; }
+  .c-line .lbl { color:var(--text-dim); font-size:.86rem; }
+  .c-line .amt { text-align:right; font-weight:650; }
+  .c-track { height:8px; border-radius:99px; background:var(--bg); overflow:hidden;
+             border:1px solid var(--border); }
+  .c-fill { height:100%; border-radius:99px; background:var(--grad-bright); width:0; }
+  .c-fill.dim { background:var(--border-hi); }
+  .c-fill.warn { background:var(--warn); }
+
+  /* Hand-drawn SVG. No chart library, no CDN, and the policy allows neither. */
+  .c-chart { background:var(--surface); border:1px solid var(--border);
+             border-radius:22px; padding:22px 24px 16px; margin:0 0 34px; }
+  .c-chart h2 { margin:0 0 4px; font-size:1.1rem; }
+  .c-chart .sub { margin:0 0 18px; font-size:.84rem; color:var(--text-dim); }
+  .c-chart svg { width:100%; height:190px; display:block; overflow:visible; }
+  .c-legend { display:flex; flex-wrap:wrap; gap:8px 22px; margin-top:12px;
+              font-size:.78rem; color:var(--text-dim); }
+  .c-legend i { width:11px; height:3px; border-radius:2px; display:inline-block;
+                margin-right:7px; vertical-align:middle; }
+
+  .c-wrap { background:var(--surface); border:1px solid var(--border);
+            border-radius:22px; overflow:hidden; margin:0 0 12px; }
+  .c-scroll { overflow-x:auto; -webkit-overflow-scrolling:touch; }
+  table.c-blocks { width:100%; border-collapse:collapse; min-width:660px; font-size:.88rem; }
+  table.c-blocks th { text-align:left; padding:13px 16px; font-size:.68rem;
+                      letter-spacing:.1em; text-transform:uppercase;
+                      color:var(--text-faint); font-weight:650;
+                      border-bottom:1px solid var(--border); white-space:nowrap;
+                      background:var(--bg-2); position:sticky; top:0; }
+  table.c-blocks td { padding:12px 16px; border-bottom:1px solid var(--border);
+                      white-space:nowrap; }
+  table.c-blocks tr:last-child td { border-bottom:0; }
+  table.c-blocks tbody tr:hover td { background:var(--surface-2); }
+  .c-num { text-align:right; }
+  .c-hash { color:var(--text-faint); font-size:.82rem; }
+  .c-dim { color:var(--text-dim); }
+
+  .c-vers { display:grid; gap:10px; }
+  .c-ver { display:grid; grid-template-columns:minmax(120px,auto) 1fr 46px;
+           gap:8px 14px; align-items:center; font-size:.87rem; }
+  .c-ver .n { text-align:right; color:var(--text-dim); font-variant-numeric:tabular-nums; }
+
+  .c-err { border:1px solid rgba(255,200,92,.4); background:rgba(255,200,92,.07);
+           border-radius:14px; padding:14px 17px; color:var(--warn); font-size:.88rem;
+           margin:0 0 22px; }
+  .c-skel { color:var(--text-faint); }
+
+  @media (max-width: 620px) {
+    .c-line { grid-template-columns:1fr auto; }
+    .c-line .c-track { grid-column:1 / -1; order:3; }
+    .c-proof { padding:20px 18px 18px; }
+    .c-chart { padding:18px 16px 12px; }
+  }
+</style>
+</head>
+<body>
+<nav id="nav">
+  <div class="wrap">
+    <a class="brand" href="/"><img class="mark" src="/assets/logo-256.png" alt="" width="34" height="34"> <span class="brand-word">NIGHTFALL</span></a>
+    <div class="nav-links">
+      <a href="/chain/">Chain</a>
+      <a href="/emission/">Emission</a>
+      <a href="/build/">Build</a>
+      <a href="/wallet/">Web wallet</a>
+      <div class="nav-social">
+        <a class="nav-icon" href="https://github.com/Instinctes/nightfall" target="_blank" rel="noopener noreferrer" title="Source on GitHub" aria-label="GitHub">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>
+        </a>
+        <a class="nav-icon" href="https://discord.gg/Wj6pTNmVEr" target="_blank" rel="noopener noreferrer" title="Discord" aria-label="Discord">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.317 4.37a19.79 19.79 0 00-4.885-1.515.074.074 0 00-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 00-5.487 0 12.64 12.64 0 00-.617-1.25.077.077 0 00-.079-.037A19.736 19.736 0 003.677 4.37a.07.07 0 00-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 00.031.057 19.9 19.9 0 005.993 3.03.078.078 0 00.084-.028 14.09 14.09 0 001.226-1.994.076.076 0 00-.041-.106 13.107 13.107 0 01-1.872-.892.077.077 0 01-.008-.128 10.2 10.2 0 00.372-.292.074.074 0 01.077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 01.078.01c.12.098.246.198.373.292a.077.077 0 01-.006.127 12.299 12.299 0 01-1.873.892.077.077 0 00-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 00.084.028 19.839 19.839 0 006.002-3.03.077.077 0 00.032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 00-.031-.03zM8.02 15.331c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg>
+        </a>
+      </div>
+      <a class="btn btn-primary" href="/#download">Download</a>
+    </div>
+  </div>
+</nav>
+
+<article class="doc">
+  <div class="wrap">
+    <p class="kicker" style="color:var(--teal);letter-spacing:.08em;text-transform:uppercase;font-size:.78rem;font-weight:700;margin:0 0 14px">Everything the chain can honestly show</p>
+    <h1>Chain</h1>
+    <p class="lede">
+      NIGHT cannot have a normal block explorer. There are no addresses on the
+      chain, the amounts are commitments, and the transaction graph is cut
+      through and aggregated before a block is sealed. An explorer that could
+      show you who paid whom would be a bug report, not a feature.
+    </p>
+    <p class="lede">
+      What a node <em>can</em> prove is here, live, recomputed on every load —
+      starting with the question every private currency is asked first.
+    </p>
+
+    <div class="c-strip" id="strip">
+      <span><span class="c-dot" id="dot"></span><span class="k">Tip</span><span class="v mono" id="s-tip">—</span></span>
+      <span><span class="k">Last block</span><span class="v mono" id="s-age">—</span></span>
+      <span><span class="k">Difficulty</span><span class="v mono" id="s-diff">—</span></span>
+      <span><span class="k">Mempool</span><span class="v mono" id="s-mem">—</span></span>
+      <span><span class="k">Peers</span><span class="v mono" id="s-peers">—</span></span>
+    </div>
+
+    <div id="err-slot"></div>
+
+    <!-- ------------------------------------------------ supply proof -- -->
+    <section class="c-proof">
+      <div class="c-proof-head">
+        <h2>Nobody printed coins</h2>
+        <span class="c-badge" id="inv-badge"><span class="c-dot"></span><span id="inv-text">checking…</span></span>
+      </div>
+      <div class="c-formula mono">
+        Σ&nbsp;UTXO&nbsp;−&nbsp;Σ&nbsp;kernel_excess&nbsp;=&nbsp;<b>(minted&nbsp;−&nbsp;burned)&nbsp;·&nbsp;G</b>
+      </div>
+      <p style="margin:-8px 0 20px;font-size:.88rem;color:var(--text-dim);line-height:1.6">
+        Amounts are hidden, so a private chain has to prove its own supply by
+        arithmetic instead of by counting. Every node recomputes this over the
+        whole UTXO set and refuses a block that breaks it. One coin minted out
+        of nowhere and the equation stops balancing everywhere at once.
+      </p>
+      <div class="c-bars">
+        <div class="c-line">
+          <span class="lbl">Circulating</span>
+          <span class="c-track"><span class="c-fill" id="f-circ"></span></span>
+          <span class="amt mono" id="v-circ">—</span>
+        </div>
+        <div class="c-line">
+          <span class="lbl">Minted, all time</span>
+          <span class="c-track"><span class="c-fill dim" id="f-mint"></span></span>
+          <span class="amt mono" id="v-mint">—</span>
+        </div>
+        <div class="c-line">
+          <span class="lbl">Burned in fees</span>
+          <span class="c-track"><span class="c-fill warn" id="f-burn"></span></span>
+          <span class="amt mono" id="v-burn">—</span>
+        </div>
+        <div class="c-line">
+          <span class="lbl">Hard cap</span>
+          <span class="c-track"><span class="c-fill dim" style="width:100%"></span></span>
+          <span class="amt mono">90,000,000</span>
+        </div>
+      </div>
+      <p style="margin:20px 0 0;font-size:.84rem;color:var(--text-faint);line-height:1.6">
+        <span class="mono" id="v-pct">—</span> of the cap has been issued.
+        Fees are burned rather than paid to the miner, so circulating supply is
+        always a little below what was minted. See the
+        <a href="/emission/">full emission schedule</a>.
+      </p>
+    </section>
+
+    <!-- ------------------------------------------------ chain sizes -- -->
+    <h2 style="margin:0 0 16px;font-size:1.15rem">The set the network agrees on</h2>
+    <div class="c-cards">
+      <div class="c-card">
+        <small>Unspent outputs</small><b class="mono" id="v-utxos">—</b>
+        <p>Commitments currently spendable. Not a user count — one wallet holds many.</p>
+      </div>
+      <div class="c-card">
+        <small>Kernels</small><b class="mono" id="v-kernels">—</b>
+        <p>One per transaction ever made, kept forever. The chain's only transaction counter.</p>
+      </div>
+      <div class="c-card">
+        <small>Total work</small><b class="mono" id="v-work">—</b>
+        <p>Accumulated difficulty. This, not length, is what decides the winning chain.</p>
+      </div>
+      <div class="c-card">
+        <small>UTXO root</small><b class="mono c-hash" id="v-root">—</b>
+        <p>Merkle root over the whole set. Two honest nodes at the same height print the same string.</p>
+      </div>
+    </div>
+
+    <!-- ------------------------------------------------ chart -- -->
+    <section class="c-chart">
+      <h2>Block time and difficulty</h2>
+      <p class="sub">
+        Target is 15 seconds. Difficulty is retargeted every block by an LWMA
+        over a 90-block window, so the line should drift, never jump.
+      </p>
+      <svg id="chart" viewBox="0 0 720 190" preserveAspectRatio="none" role="img" aria-label="Block time and difficulty over the most recent blocks"></svg>
+      <div class="c-legend">
+        <span><i style="background:var(--violet-hi)"></i>Difficulty</span>
+        <span><i style="background:var(--teal)"></i>Seconds between blocks</span>
+        <span><i style="background:var(--border-hi)"></i>15 s target</span>
+        <span id="chart-avg" class="c-dim"></span>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------ blocks -- -->
+    <h2 style="margin:0 0 6px;font-size:1.15rem">Recent blocks</h2>
+    <p style="margin:0 0 16px;font-size:.88rem;color:var(--text-dim);max-width:46em">
+      Inputs, outputs and kernels are counts, not contents. A block with one
+      output and one kernel is an empty block carrying only its coinbase.
+    </p>
+    <div class="c-wrap">
+      <div class="c-scroll">
+        <table class="c-blocks">
+          <thead>
+            <tr>
+              <th>Height</th><th>Age</th><th class="c-num">Difficulty</th>
+              <th class="c-num">In</th><th class="c-num">Out</th><th class="c-num">Kernels</th>
+              <th class="c-num">Reward</th><th>Hash</th>
+            </tr>
+          </thead>
+          <tbody id="blocks"><tr><td colspan="8" class="c-skel">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <p style="margin:0 0 40px;font-size:.8rem;color:var(--text-faint)">
+      Times are what the miner stamped on the block, checked against the median
+      of the previous eleven. They are not exact clocks.
+    </p>
+
+    <!-- ------------------------------------------------ versions -- -->
+    <h2 style="margin:0 0 6px;font-size:1.15rem">What the network is running</h2>
+    <p style="margin:0 0 18px;font-size:.88rem;color:var(--text-dim);max-width:46em">
+      Counted from the handshake of every peer this node has met. It is a
+      sample from one vantage point, not a census — but it is the only honest
+      answer to "has everyone upgraded yet".
+    </p>
+    <div class="c-vers" id="versions"><span class="c-skel">Loading…</span></div>
+
+    <h2 id="cannot">What you cannot see here, and why</h2>
+    <p>
+      Every explorer for a transparent coin is a surveillance tool that
+      happens to be useful. Ours cannot be one, because the data is not on the
+      chain to publish:
+    </p>
+    <ul>
+      <li><b>No balances.</b> There are no reusable addresses. Each payment creates a one-time stealth output that only the receiver can recognise, with their view key.</li>
+      <li><b>No amounts.</b> Values are Pedersen commitments. A range proof shows each one is a sane positive number without revealing it.</li>
+      <li><b>No sender or receiver.</b> Mimblewimble cuts through spent outputs and aggregates what is left into one flat block body. The individual transactions do not survive into the block.</li>
+      <li><b>No transaction search.</b> Deliberately. A kernel lookup would let anyone with a transaction id confirm a payment they were not part of, and hand this server a record of who asked.</li>
+    </ul>
+    <p>
+      Your own history lives in your wallet, where it belongs. If you need to
+      prove a payment to someone else — an auditor, an exchange, a court — use
+      a <a href="/view-key/">view key</a>: it discloses exactly what you choose
+      and nothing else.
+    </p>
+
+    <div class="notice" style="margin:28px 0 0">
+      This page reads one node, and that node is ours. It is a convenience, not
+      an authority. Everything shown here is recomputed by every node on the
+      network independently — including yours, if you
+      <a href="/build/">run one</a>. If this page and your node ever disagree,
+      your node is right.
+    </div>
+  </div>
+</article>
+<script src="/js/nav.js?v=1"></script>
+<script src="/js/chain.js?v=1"></script>
+</body>
+</html>

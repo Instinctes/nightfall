@@ -2,7 +2,7 @@
 //!
 //! The full RPC is unauthenticated and includes `mine_one`. A phone must never
 //! reach that. This listener answers only `status`, `scan_feed`, `submit_tx`,
-//! `get_utxo_root`, `banner` and `peers`.
+//! `get_utxo_root`, `banner`, `peers` and `get_headers`.
 //!
 //! Plain HTTP. TLS belongs on a reverse proxy (Caddy / nginx) in front.
 
@@ -23,6 +23,11 @@ const ALLOWED: &[&str] = &[
     "get_utxo_root",
     "banner",
     "peers",
+    // Read-only, and small: headers plus input/output/kernel counts. Nothing
+    // here is hidden by the protocol in the first place. `get_blocks` stays
+    // off this list — full bodies with range proofs do not belong on a public
+    // endpoint that anyone can hammer.
+    "get_headers",
 ];
 const MAX_BODY: usize = 512 * 1024;
 const PER_IP_PER_MIN: u32 = 120;
@@ -202,4 +207,32 @@ fn write_http(stream: &mut TcpStream, code: u16, body: &str) -> anyhow::Result<(
     stream.write_all(body.as_bytes())?;
     stream.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ALLOWED;
+
+    /// The public endpoint is an allow-list, and this test exists so that
+    /// widening it stays a deliberate act. `get_blocks` in particular must
+    /// never appear here: it serves full bodies with range proofs, which is
+    /// megabytes per call and a free amplifier for anyone who asks twice.
+    #[test]
+    fn the_public_endpoint_serves_only_what_it_is_meant_to() {
+        for m in [
+            "status",
+            "scan_feed",
+            "submit_tx",
+            "get_utxo_root",
+            "banner",
+            "peers",
+            "get_headers",
+        ] {
+            assert!(ALLOWED.contains(&m), "{m} should be reachable");
+        }
+        for m in ["get_blocks", "mine_one", "verify_supply"] {
+            assert!(!ALLOWED.contains(&m), "{m} must not be public");
+        }
+        assert_eq!(ALLOWED.len(), 7, "adding a method here needs a reason");
+    }
 }

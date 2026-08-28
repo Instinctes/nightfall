@@ -46,6 +46,12 @@ jobs:
       - name: Browser wallet, static checks
         run: node scripts/check-web-wallet.mjs
 
+      # Same class of bug, same one-second check, for the chain view: an id the
+      # script reaches for that the page never renders, a class with no rule,
+      # an inline script the CSP will block, a missing Worker route.
+      - name: Chain page, static checks
+        run: node scripts/check-chain-page.mjs
+
       # The whole point of the project. Every test in this suite is the
       # inverse of an exploit that once worked against a real build.
       - name: Exploit regression suite
