@@ -48,6 +48,23 @@ if (/<script(?![^>]*\bsrc=)[^>]*>[\s\S]*?\S[\s\S]*?<\/script>/.test(html)) {
     problems.push("inline <script> in the page — the CSP blocks it");
 }
 
+/* The cache buster must be the workspace version.
+ *
+ * chain.js is served with max-age=86400. On 28 Aug 2026 it was changed three
+ * times in one afternoon while the page kept pointing at `?v=1`, so every
+ * visitor who had opened the page earlier that day was running the first
+ * version for another 24 hours — invisible bars and all — while the HTML
+ * around it was current. Tying the buster to the version means a release
+ * cannot forget to break the cache. */
+const wsVersion = (readFileSync(ROOT + "Cargo.toml", "utf8").match(
+    /^version\s*=\s*"([^"]+)"/m,
+) || [])[1];
+for (const m of html.matchAll(/src="\/js\/([a-z-]+\.js)\?v=([^"]+)"/g)) {
+    if (m[2] !== wsVersion) {
+        problems.push(`${m[1]} is busted with ?v=${m[2]}, but this release is ${wsVersion}`);
+    }
+}
+
 /* Both endpoints the page depends on must exist in the Worker. */
 const worker = readFileSync(ROOT + "website/src/index.js", "utf8");
 for (const path of ["/network.json", "/chain.json"]) {
