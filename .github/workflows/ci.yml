@@ -52,6 +52,13 @@ jobs:
       - name: Chain page, static checks
         run: node scripts/check-chain-page.mjs
 
+      # The 0.8.3 bump updated every .html and left js/main.js pointing at
+      # 0.8.2 files that had just been deleted — the "recommended for your
+      # device" button was a 404 and a person found it in a screenshot. This
+      # compares the links against the directory listing, both directions.
+      - name: Download links, static checks
+        run: node scripts/check-download-links.mjs
+
       # The whole point of the project. Every test in this suite is the
       # inverse of an exploit that once worked against a real build.
       - name: Exploit regression suite
