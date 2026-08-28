@@ -360,6 +360,20 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
         ui.label(RichText::new(eta).size(11.5).color(ACCENT_HI));
     }
 
+    // Mining is on and nothing is happening. Before 0.8.4 this was silent:
+    // the switch said mining, the rate said 0, and the reason was in a log
+    // line at the moment it scrolled past. One person on Discord ran for
+    // hours like this without knowing.
+    let idle = app.status.as_ref().map(|s| s.mining_idle).unwrap_or("");
+    if app.is_mining() && !idle.is_empty() {
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(format!("Not mining right now — {idle}"))
+                .size(11.5)
+                .color(WARN),
+        );
+    }
+
     if balances.immature > 0 {
         ui.add_space(8.0);
         ui.label(

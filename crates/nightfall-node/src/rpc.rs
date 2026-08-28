@@ -227,6 +227,14 @@ pub(crate) fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
                         0
                     },
                     "mining_threads": g.mining_threads.load(Ordering::Relaxed),
+                    // Why a switched-on miner is producing nothing. Until
+                    // 0.8.4 "mining: true, hashrate: 0" had three different
+                    // causes and looked the same from outside.
+                    "mining_idle": match g.mining_idle_reason.load(Ordering::Relaxed) {
+                        1 => "behind a peer",
+                        2 => "no template",
+                        _ => "",
+                    },
                     "pruned": chain.is_pruned(),
                     "prune_height": chain.first_height,
                 }),

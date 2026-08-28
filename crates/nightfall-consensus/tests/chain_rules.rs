@@ -1005,3 +1005,99 @@ fn prune_reorg_inside_the_window_still_works() {
     assert!(ours.is_pruned());
     ours.verify_supply().unwrap();
 }
+
+/// Seal a template with real work and apply it. The devnet difficulty is low
+/// enough that this is a handful of hashes, not a wait.
+fn mine_template(chain: &mut Chain, template: BlockTemplate) -> Hash256 {
+    let params = chain.pow_params();
+    let mut nonce = 0u64;
+    loop {
+        let mut header = template.header.clone();
+        header.nonce = nonce;
+        if nightfall_crypto::meets_difficulty(header.pow_hash(params), header.difficulty) {
+            let block = template.clone().seal(nonce);
+            let hash = block.hash();
+            chain.apply_block(block, header.timestamp_unix).unwrap();
+            return hash;
+        }
+        nonce += 1;
+    }
+}
+
+/// One unusable transaction must not stop a miner.
+///
+/// Reported from Discord on 28 Aug 2026: `WARN template: ledger: duplicate
+/// output commitment …`, repeating once a second. The log line was the small
+/// part. `build_template` is all-or-nothing, so the whole template was
+/// discarded over that single entry, the miner slept a second and tried the
+/// same doomed set again — and hashed **nothing** for as long as the entry
+/// stayed. Six hours, without a restart.
+///
+/// A coinbase in the mempool is used as the poison here because the ledger
+/// refuses it for a reason that can never resolve itself, which is exactly the
+/// shape of the original: permanent, and not the miner's fault.
+#[test]
+fn one_poisoned_transaction_does_not_stop_the_block() {
+    let mut chain = devnet();
+    let miner = WalletKeys::generate().address();
+    chain.mine_block(&miner, vec![], NOW).unwrap();
+
+    let poison = some_tx(7);
+    let poison_id = poison.txid().to_hex();
+
+    // The old path: everything is thrown away.
+    assert!(
+        chain
+            .build_template(&miner, vec![poison.clone()], NOW + TARGET_BLOCK_TIME_SECS)
+            .is_err(),
+        "the poison must really be unusable, or this test proves nothing"
+    );
+
+    // The new path: the block still gets built, and we are told what went.
+    let (template, dropped) = chain
+        .build_template_filtering(&miner, vec![poison], NOW + TARGET_BLOCK_TIME_SECS)
+        .expect("a bad transaction must not cost us the block");
+    assert_eq!(dropped, vec![poison_id], "the offender must be named");
+    assert_eq!(template.header.height, Height(1));
+
+    // And the block it produces is a real one.
+    let sealed = mine_template(&mut chain, template);
+    assert_eq!(chain.tip_hash(), sealed);
+    chain.verify_supply().unwrap();
+}
+
+/// The clean path must stay cheap: nothing to filter, nothing reported.
+#[test]
+fn filtering_reports_nothing_when_there_is_nothing_wrong() {
+    let mut chain = devnet();
+    let miner = WalletKeys::generate().address();
+    chain.mine_block(&miner, vec![], NOW).unwrap();
+
+    let (_, dropped) = chain
+        .build_template_filtering(&miner, vec![], NOW + TARGET_BLOCK_TIME_SECS)
+        .unwrap();
+    assert!(dropped.is_empty());
+}
+
+/// After a reorg the mempool used to keep transactions the new branch had
+/// already mined — which is how the poison got in there in the first place.
+#[test]
+fn the_mempool_can_be_reconciled_against_the_chain() {
+    let mut chain = devnet();
+    let miner = WalletKeys::generate().address();
+    chain.mine_block(&miner, vec![], NOW).unwrap();
+
+    let mut mp = Mempool::default();
+    let poison = some_tx(9);
+    let poison_id = poison.txid().to_hex();
+    assert!(mp.insert(poison, NOW));
+
+    let bad = mp.unacceptable_ids(|tx| chain.precheck_tx(tx).is_ok());
+    assert_eq!(bad, vec![poison_id.clone()]);
+    assert_eq!(mp.drop_ids(&bad), 1);
+    assert!(mp.txs.is_empty());
+    assert!(
+        mp.first_seen(&poison_id).is_none(),
+        "the timestamp index has to shrink with the map"
+    );
+}

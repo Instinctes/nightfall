@@ -19,7 +19,7 @@ use std::fs;
 use std::io::BufReader;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -220,6 +220,13 @@ pub struct NodeInner {
     pub hashrate_prev_total: AtomicU64,
     /// Hashes in the last one-second heartbeat. Integer H/s for RPC.
     pub hashrate_hps: AtomicU64,
+    /// Why the miner is producing nothing while it is switched on.
+    ///
+    /// 0 = hashing, 1 = holding off because a peer is ahead, 2 = the chain
+    /// will not give us a template. Before 0.8.4 all three looked identical
+    /// from outside: "mining: on, hashrate: 0", and the only way to tell them
+    /// apart was to read a log at the right second.
+    pub mining_idle_reason: AtomicU8,
     /// `Some(n)` = keep only `n` full bodies. `None` = archive.
     pub prune_keep: Option<usize>,
 }
@@ -583,6 +590,10 @@ pub struct StatusSnap {
     pub fork_rewind: u64,
     /// Hashes per second over the last heartbeat. 0 when not mining.
     pub hashrate: u64,
+    /// Empty while hashing. Otherwise why a switched-on miner is idle, so the
+    /// UI can say it instead of showing "mining · 0 H/s" and leaving the user
+    /// to guess.
+    pub mining_idle: &'static str,
     pub mining_threads: usize,
     pub sync_hold: SyncHold,
     /// True when old block bodies have been discarded.
@@ -752,6 +763,7 @@ impl NodeHandle {
             mining_threads: Arc::clone(&mining_threads),
             hashrate_prev_total: AtomicU64::new(0),
             hashrate_hps: AtomicU64::new(0),
+            mining_idle_reason: AtomicU8::new(0),
             sessions: Arc::clone(&sessions),
             tip_notify: Arc::clone(&tip_notify),
             proxy: parse_proxy_cfg(cfg.proxy.as_deref())?,
@@ -1087,6 +1099,15 @@ impl NodeHandle {
             reorg_in_flight: reorging,
             best_peer_height,
             fork_rewind,
+            mining_idle: if !mining_on {
+                ""
+            } else {
+                match g.mining_idle_reason.load(Ordering::Relaxed) {
+                    1 => "waiting to catch up with the network",
+                    2 => "the chain will not give this node a block template",
+                    _ => "",
+                }
+            },
             hashrate: if mining_on {
                 g.hashrate_hps.load(Ordering::Relaxed)
             } else {
@@ -2313,6 +2334,18 @@ fn consider_branch(state: &SharedState, block: Block, peer_label: &str) {
     match verdict {
         Ok(Some(chain)) => {
             if g.chain.adopt_reorg(chain) {
+                // A reorg replaces the chain wholesale, and until 0.8.4 the
+                // mempool was never told. Anything the new branch had already
+                // mined stayed behind and then poisoned every block template
+                // — which is how one node stopped mining for hours while its
+                // log repeated "duplicate output commitment" once a second.
+                let dropped = g
+                    .mempool
+                    .unacceptable_ids(|tx| g.chain.precheck_tx(tx).is_ok());
+                if !dropped.is_empty() {
+                    let n = g.mempool.drop_ids(&dropped);
+                    tracing::info!("reorg: dropped {n} mempool tx(s) the new branch invalidates");
+                }
                 let after = g.chain.block_count();
                 tracing::info!(
                     "reorged onto a heavier branch from {peer_label}: {before} -> {after} blocks, \
@@ -2706,6 +2739,16 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
         match verdict {
             Ok(Some(chain)) => {
                 if g.chain.adopt_reorg(chain) {
+                    // Same reconciliation as the other reorg path above.
+                    let dropped = g
+                        .mempool
+                        .unacceptable_ids(|tx| g.chain.precheck_tx(tx).is_ok());
+                    if !dropped.is_empty() {
+                        let n = g.mempool.drop_ids(&dropped);
+                        tracing::info!(
+                            "reorg: dropped {n} mempool tx(s) the new branch invalidates"
+                        );
+                    }
                     g.bump_tip();
                     let _ = g.persist();
                     tracing::info!(
@@ -2958,34 +3001,70 @@ fn mining_loop(state: SharedState) {
         // to start). After MAX_CATCHUP_WAIT_SECS an isolated node mines too.
         if let Some(behind) = blocks_behind(&state) {
             tracing::debug!("holding off mining — {behind} block(s) behind a peer");
+            state
+                .lock()
+                .unwrap()
+                .mining_idle_reason
+                .store(1, Ordering::Relaxed);
             thread::sleep(Duration::from_secs(1));
             continue;
         }
 
         // --- build template under the lock (cheap) ---
+        //
+        // One unusable mempool entry used to stop this node mining outright:
+        // the whole template was discarded, we slept a second, and tried the
+        // same doomed set again. Now the offender is dropped and the block is
+        // built without it.
         let template: Option<BlockTemplate> = {
-            let g = state.lock().unwrap();
-            match &g.miner {
+            let mut g = state.lock().unwrap();
+            let built = match &g.miner {
                 None => None,
                 Some(miner) => {
                     let txs = g
                         .mempool
                         .select_for_block(nightfall_consensus::MAX_TXS_PER_BLOCK - 1);
-                    match g.chain.build_template(miner, txs, now_unix()) {
-                        Ok(t) => Some(t),
+                    match g.chain.build_template_filtering(miner, txs, now_unix()) {
+                        Ok((t, dropped)) => Some((t, dropped)),
                         Err(e) => {
+                            // Nothing left to blame on a transaction: this is
+                            // the chain itself refusing, and it is worth a
+                            // warning every time.
                             tracing::warn!("template: {e}");
                             None
                         }
                     }
                 }
+            };
+            match built {
+                None => None,
+                Some((t, dropped)) => {
+                    if !dropped.is_empty() {
+                        let n = g.mempool.drop_ids(&dropped);
+                        tracing::warn!(
+                            "dropped {n} unusable transaction(s) from the mempool; \
+                             mining continues"
+                        );
+                    }
+                    Some(t)
+                }
             }
         };
 
         let Some(template) = template else {
+            state
+                .lock()
+                .unwrap()
+                .mining_idle_reason
+                .store(2, Ordering::Relaxed);
             thread::sleep(Duration::from_secs(1));
             continue;
         };
+        state
+            .lock()
+            .unwrap()
+            .mining_idle_reason
+            .store(0, Ordering::Relaxed);
 
         // --- hash WITHOUT the lock ---
         let difficulty = template.header.difficulty;

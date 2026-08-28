@@ -443,6 +443,61 @@ impl Chain {
     }
 
     /// Build an unsealed block. Cheap — no hashing beyond the roots.
+    /// Build a template, dropping any transaction the ledger will not take.
+    ///
+    /// Returns the template and the txids that were left out, so the caller
+    /// can purge them from the mempool instead of offering them again.
+    ///
+    /// This exists because the plain `build_template` is all-or-nothing, and
+    /// on 28 August 2026 that turned one unusable mempool entry into a total
+    /// mining outage: the miner rebuilt the template once a second, the ledger
+    /// refused the whole thing over a single transaction, the template was
+    /// discarded, and the node hashed *nothing* — for as long as the entry
+    /// stayed, which without a restart is six hours. The log said
+    /// "duplicate output commitment" once a second and nothing said "you have
+    /// stopped mining".
+    ///
+    /// The fast path is unchanged: one attempt, one ledger clone. Filtering
+    /// only happens once that attempt has already failed, so the common case
+    /// pays nothing for it.
+    pub fn build_template_filtering(
+        &self,
+        miner: &Address,
+        extra_txs: Vec<Transaction>,
+        timestamp_unix: u64,
+    ) -> Result<(BlockTemplate, Vec<String>), ConsensusError> {
+        // The crate also compiles to wasm32 and carries no logging dependency,
+        // so the failure is swallowed here and the node logs what was dropped
+        // using the list this returns.
+        if let Ok(t) = self.build_template(miner, extra_txs.clone(), timestamp_unix) {
+            return Ok((t, Vec::new()));
+        }
+
+        // Test each candidate on its own against the current ledger. A
+        // transaction that cannot be accepted now will not become acceptable
+        // by being tried again in a second.
+        let height = self.next_height();
+        let ctx = self.proof_ctx();
+        let mut keep = Vec::with_capacity(extra_txs.len());
+        let mut dropped = Vec::new();
+        for tx in extra_txs {
+            match self.ledger.check_tx_acceptable(&tx, height, ctx) {
+                Ok(()) => keep.push(tx),
+                Err(_) => dropped.push(tx.txid().to_hex()),
+            }
+        }
+
+        // If the remainder still will not build, mine an empty block rather
+        // than mine nothing. A block with only its coinbase is a perfectly
+        // good block; a miner that refuses to produce one is simply off.
+        match self.build_template(miner, keep, timestamp_unix) {
+            Ok(t) => Ok((t, dropped)),
+            Err(_) => self
+                .build_template(miner, Vec::new(), timestamp_unix)
+                .map(|t| (t, dropped)),
+        }
+    }
+
     pub fn build_template(
         &self,
         miner: &Address,
@@ -1147,6 +1202,36 @@ impl Mempool {
         // unbounded thing the cap was supposed to prevent.
         let live: std::collections::HashSet<String> = self.txs.keys().cloned().collect();
         self.seen.retain(|k, _| live.contains(k));
+    }
+
+    /// Forget specific transactions by id.
+    ///
+    /// Used when the ledger has refused a transaction for a reason that will
+    /// not change on its own — a spent input, or an output that already
+    /// exists. Offering such an entry to the block builder again next second
+    /// is not optimism, it is a loop.
+    pub fn drop_ids(&mut self, ids: &[String]) -> usize {
+        let before = self.txs.len();
+        for id in ids {
+            self.txs.remove(id);
+            self.seen.remove(id);
+        }
+        before - self.txs.len()
+    }
+
+    /// Ids of everything the predicate rejects, without removing anything.
+    ///
+    /// Split from [`Self::drop_ids`] so the caller can hold the chain and the
+    /// mempool one at a time rather than borrowing both at once.
+    pub fn unacceptable_ids<F>(&self, mut acceptable: F) -> Vec<String>
+    where
+        F: FnMut(&Transaction) -> bool,
+    {
+        self.txs
+            .iter()
+            .filter(|(_, tx)| !acceptable(tx))
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// Select transactions for a block, highest fee first and skipping any that
