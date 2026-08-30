@@ -1,0 +1,30 @@
+[package]
+name = "nightfall-swap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NIGHT ↔ BTC atomic swap — experimental, not for real coins"
+
+[dependencies]
+nightfall-crypto = { workspace = true }
+nightfall-ledger = { workspace = true }
+nightfall-types = { workspace = true }
+nightfall-consensus = { workspace = true }
+curve25519-dalek = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+rand_chacha = { workspace = true }
+ecdsa_fun = { workspace = true }
+sigma_fun = { workspace = true }
+bitcoin = { workspace = true }
+# HTTP basic auth for the bitcoind RPC header.
+base64 = "0.22"
+uuid = { workspace = true }
+ureq = { workspace = true }
+
+[dev-dependencies]
+nightfall-ledger = { workspace = true }

@@ -16,6 +16,9 @@ fn night(darks: u64) -> String {
     format!("{}.{:08}", format_int(whole), frac)
 }
 
+// `manual_is_multiple_of` does not exist on every toolchain we build with;
+// `unknown_lints` keeps the older one from failing on the allow itself.
+#[allow(unknown_lints)]
 #[allow(clippy::manual_is_multiple_of)]
 fn night_compact(darks: u64) -> String {
     if darks % DARKS_PER_NIGHT == 0 {

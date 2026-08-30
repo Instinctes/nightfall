@@ -87,6 +87,15 @@ except Exception:
 PY
 )"
     rm -f "$body"
+
+    # A truncated or unreadable body parses as height 0. That is not
+    # "the chain is at genesis" — writing 0 into the state file made the
+    # next check scream "has not moved past block 0".
+    if [ -z "$h" ] || [ "$h" -eq 0 ] 2>/dev/null; then
+        problems+=("$host answered with no usable height")
+        heights+=("0")
+        continue
+    fi
     heights+=("$h")
 
     # `1` sorts before `0.9`, so compare as numbers, not strings.

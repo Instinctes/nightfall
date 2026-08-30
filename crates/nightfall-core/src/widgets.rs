@@ -151,15 +151,51 @@ pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
         .inner
 }
 
+/// Small, spaced, uppercase — the web wallet's section heading.
+///
+/// egui has no letter-spacing, so the gaps are inserted between characters
+/// with a thin space. It is a hack, and it is the difference between a
+/// heading that looks designed and one that looks like bold text.
+pub fn kicker(ui: &mut egui::Ui, text: &str) {
+    let spaced: String = text
+        .to_uppercase()
+        .chars()
+        .flat_map(|c| [c, '\u{2009}'])
+        .collect();
+    ui.label(
+        RichText::new(spaced.trim_end())
+            .size(10.5)
+            .color(TEXT_FAINT)
+            .strong(),
+    );
+}
+
+/// A bordered chip that sits on the page rather than inside a coloured
+/// wash, so it reads as information and not as an alarm.
+pub fn pill(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
+    let galley =
+        ui.painter()
+            .layout_no_wrap(text.to_string(), egui::FontId::proportional(11.0), color);
+    let size = galley.size() + Vec2::new(22.0, 9.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
+    ui.painter().rect(
+        rect,
+        Rounding::same(ROUND_PILL),
+        BG,
+        Stroke::new(1.0_f32, color.gamma_multiply(0.4)),
+    );
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2.0, galley, color);
+    resp
+}
+
 /// A card with a title row.
+///
+/// The title uses [`kicker`], so every tab picks up the web wallet's
+/// heading rhythm from one place instead of eighteen call sites.
 pub fn titled_card<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     card(ui, |ui| {
-        ui.label(
-            RichText::new(title.to_uppercase())
-                .size(11.0)
-                .color(TEXT_FAINT)
-                .strong(),
-        );
+        kicker(ui, title);
         ui.add_space(10.0);
         add(ui)
     })

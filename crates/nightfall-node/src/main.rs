@@ -127,6 +127,25 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let network: NetworkId = cli.network.into();
     let datadir = cli.datadir.unwrap_or_else(|| default_data_dir(network));
+
+    // One writer per data directory. The wallet takes the same lock, so a
+    // node and a Core wallet cannot both open the same folder — which they
+    // could before, and which produced a `blocks.bin` neither of them wrote.
+    //
+    // `Banner` is exempt: it prints constants and never opens the directory,
+    // so refusing it would be an obstacle with no safety behind it.
+    let _dir_lock = if matches!(cli.command, Commands::Banner) {
+        None
+    } else {
+        match nightfall_storage::dirlock::acquire(&datadir) {
+            Ok(lock) => Some(lock),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+    };
+
     let store = ChainStore::new(&datadir);
 
     match cli.command {

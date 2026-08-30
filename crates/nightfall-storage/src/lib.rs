@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod codec;
+pub mod dirlock;
 pub use codec::Format;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

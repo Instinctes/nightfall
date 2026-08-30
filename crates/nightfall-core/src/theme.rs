@@ -46,8 +46,9 @@ pub const WARN: Color32 = Color32::from_rgb(0xFF, 0xC8, 0x5C);
 pub const DANGER: Color32 = Color32::from_rgb(0xFF, 0x7B, 0x8A);
 
 // --- geometry -------------------------------------------------------------
-/// Cards. Generous, matching the reference look.
-pub const ROUND: f32 = 20.0;
+/// Cards. Matches the web wallet's `--r-lg`, so the two surfaces read as
+/// one product rather than two that happen to share a palette.
+pub const ROUND: f32 = 24.0;
 /// Buttons, inputs, chips.
 pub const ROUND_SM: f32 = 12.0;
 /// Fully rounded pills.

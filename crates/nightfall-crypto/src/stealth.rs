@@ -55,7 +55,7 @@ pub const MEMO_LEN: usize = 64;
 /// Always exactly this long after padding, so ciphertext size reveals nothing.
 const PAYLOAD_LEN: usize = 8 + 32 + MEMO_LEN;
 
-fn shared_secret(point: &RistrettoPoint) -> [u8; 32] {
+pub(crate) fn shared_secret(point: &RistrettoPoint) -> [u8; 32] {
     hash_multi(
         b"nightfall:stealth:shared:v2",
         &[point.compress().as_bytes()],
@@ -63,11 +63,11 @@ fn shared_secret(point: &RistrettoPoint) -> [u8; 32] {
     .0
 }
 
-fn derive_blind(t: &[u8; 32]) -> Scalar {
+pub(crate) fn derive_blind(t: &[u8; 32]) -> Scalar {
     blind_from_bytes(b"nightfall:stealth:blind:v2", t)
 }
 
-fn derive_key_offset(t: &[u8; 32]) -> Scalar {
+pub(crate) fn derive_key_offset(t: &[u8; 32]) -> Scalar {
     blind_from_bytes(b"nightfall:stealth:ko:v2", t)
 }
 
@@ -104,8 +104,22 @@ fn derive_key_offset(t: &[u8; 32]) -> Scalar {
 ///
 /// Monero adopted the identical construction in 2022 and needed a hard fork to
 /// do it. Adding it here while the chain is being reset costs nothing.
+/// The view tag, exposed for the swap module's lock verification.
+pub(crate) fn derive_view_tag_pub(t: &[u8; 32]) -> u8 {
+    derive_view_tag(t)
+}
+
 fn derive_view_tag(t: &[u8; 32]) -> u8 {
     hash_multi(b"nightfall:stealth:viewtag:v3", &[t]).0[0]
+}
+
+/// AEAD key and nonce, exposed inside the crate so the swap tests can build
+/// an output whose sealed payload disagrees with its commitment. Without this
+/// the hostile-payload branch of `SharedLock::verify_lock` is unreachable from
+/// a test, and an unreachable branch is an untested one.
+#[cfg(test)]
+pub(crate) fn derive_aead_pub(t: &[u8; 32]) -> ([u8; 32], [u8; 24]) {
+    derive_aead(t)
 }
 
 fn derive_aead(t: &[u8; 32]) -> ([u8; 32], [u8; 24]) {
@@ -206,7 +220,7 @@ impl Output {
         v
     }
 
-    fn sig_message(&self) -> Vec<u8> {
+    pub(crate) fn sig_message(&self) -> Vec<u8> {
         hash_multi(OUTPUT_SIG_DOMAIN, &[&self.commitment_bytes()])
             .0
             .to_vec()

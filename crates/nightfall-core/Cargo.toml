@@ -18,6 +18,9 @@ nightfall-storage = { workspace = true }
 nightfall-node = { path = "../nightfall-node" }
 nightfall-p2p = { workspace = true }
 nightfall-wallet = { path = "../nightfall-wallet" }
+nightfall-swap = { path = "../nightfall-swap" }
+# Only to parse the Bitcoin addresses the user types; this wallet holds NIGHT.
+bitcoin = { workspace = true }
 anyhow = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }

@@ -12,10 +12,11 @@ members = [
     "crates/nightfall-core",
     "crates/nightfall-mobile",
     "crates/nightfall-web",
+    "crates/nightfall-swap",
 ]
 
 [workspace.package]
-version = "0.8.4"
+version = "0.9.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nightfallcoin/nightfall"
@@ -58,6 +59,14 @@ anyhow = "1"
 dirs = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+rand_chacha = "0.3"
+generic-array = "0.14"
+digest = "0.10"
+sigma_fun = { version = "0.9", default-features = false, features = ["secp256k1", "serde", "alloc"] }
+ecdsa_fun = { version = "0.12", features = ["libsecp_compat", "serde", "adaptor"] }
+bitcoin = { version = "0.32", features = ["serde", "rand-std", "base64"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [profile.release]
 lto = true

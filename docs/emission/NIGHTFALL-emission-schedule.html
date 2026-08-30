@@ -1,0 +1,521 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NIGHTFALLCOIN — Emission schedule</title>
+<style>
+  :root {
+    --bg: #0e0b18; --bg-2: #141022; --surface: #1a1430; --surface-2: #221a3c;
+    --border: #2e2648; --border-hi: #45396a;
+    --text: #f2eefc; --text-dim: #a89fc6; --text-faint: #6f668f;
+    --violet: #7c5cff; --violet-hi: #9b83ff; --magenta: #b845d8; --teal: #35a3c4;
+    --success: #4ae0a8; --warn: #ffc85c;
+    --grad: linear-gradient(110deg, #5633c4 0%, #8e31b2 48%, #276f8e 100%);
+    --grad-bright: linear-gradient(110deg, #7c5cff 0%, #b845d8 48%, #35a3c4 100%);
+    --r-lg: 24px; --r-md: 16px; --r-pill: 999px;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    background-image:
+      radial-gradient(900px 500px at 12% -8%, rgba(124,92,255,.16), transparent 60%),
+      radial-gradient(760px 460px at 92% 0%, rgba(184,69,216,.12), transparent 62%);
+    background-attachment: fixed;
+  }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 56px 24px 96px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+           font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1; }
+
+  header .eyebrow {
+    display:inline-block; font-size:12px; letter-spacing:.16em; text-transform:uppercase;
+    color: var(--text-faint); border:1px solid var(--border); border-radius: var(--r-pill);
+    padding: 5px 14px; margin-bottom: 22px;
+  }
+  h1 { margin: 0 0 12px; font-size: clamp(30px, 4.6vw, 46px); line-height: 1.1; letter-spacing: -.02em; }
+  h1 span { background: var(--grad-bright); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .lede { margin: 0; max-width: 74ch; color: var(--text-dim); font-size: 16.5px; }
+
+  .cards { display:grid; gap:14px; margin: 38px 0 10px;
+            grid-template-columns: repeat(auto-fit, minmax(196px, 1fr)); }
+  .card { background: var(--surface); border:1px solid var(--border); border-radius: var(--r-md); padding: 18px 20px; }
+  .card b { display:block; font-size: 23px; letter-spacing:-.01em; margin-bottom: 3px; }
+  .card small { color: var(--text-faint); font-size: 12px; letter-spacing:.09em; text-transform: uppercase; }
+  .card p { margin: 7px 0 0; font-size: 13px; color: var(--text-dim); line-height:1.5; }
+
+  .live { display:flex; flex-wrap:wrap; gap: 10px 26px; align-items:center;
+           background: var(--bg-2); border:1px solid var(--border); border-left: 3px solid var(--violet);
+           border-radius: var(--r-md); padding: 16px 20px; margin: 26px 0 44px; }
+  .live .dot { width:8px; height:8px; border-radius:50%; background: var(--success);
+                box-shadow: 0 0 0 4px rgba(74,224,168,.14); display:inline-block; margin-right:9px; }
+  .live .k { color: var(--text-faint); font-size:12px; letter-spacing:.09em; text-transform:uppercase; margin-right:8px; }
+  .live .v { font-weight:600; }
+
+  h2 { font-size: 13px; letter-spacing:.16em; text-transform:uppercase; color: var(--text-faint);
+        margin: 0 0 16px; font-weight: 600; }
+
+  .tablewrap { background: var(--surface); border:1px solid var(--border);
+                border-radius: var(--r-lg); overflow: hidden; }
+  .scroll { overflow-x: auto; }
+  table { width:100%; border-collapse: collapse; min-width: 940px; }
+  thead th {
+    position: sticky; top: 0; z-index: 2;
+    background: var(--surface-2); color: var(--text-dim);
+    font-size: 11px; letter-spacing: .11em; text-transform: uppercase; font-weight: 600;
+    text-align: right; padding: 15px 18px; border-bottom: 1px solid var(--border-hi); white-space: nowrap;
+  }
+  thead th:first-child, thead th:nth-child(2), thead th:last-child { text-align: left; }
+  tbody td { padding: 13px 18px; border-bottom: 1px solid rgba(46,38,72,.66); vertical-align: middle; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:hover { background: rgba(124,92,255,.055); }
+  tbody tr[data-here] { background: rgba(124,92,255,.10); box-shadow: inset 3px 0 0 var(--violet); }
+  tbody tr[data-here]:hover { background: rgba(124,92,255,.14); }
+  .c-num, .c-pct { text-align: right; white-space: nowrap; }
+  .strong { font-weight: 650; }
+  .dim { color: var(--text-dim); }
+  .dust td { color: var(--text-faint); }
+  .dust .strong { font-weight: 500; }
+
+  .era { display:inline-flex; align-items:center; justify-content:center; min-width: 30px; height: 30px;
+          padding: 0 8px; border-radius: 9px; background: var(--surface-2); border:1px solid var(--border-hi);
+          font-size: 13px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  tr[data-here] .era { background: var(--grad); border-color: transparent; color: #fff; }
+  .dash { color: var(--text-faint); padding: 0 7px; }
+  .c-blocks { font-size: 13.5px; white-space: nowrap; }
+  .c-date { white-space: nowrap; color: var(--text-dim); }
+  .yrs { display:block; font-size: 11.5px; color: var(--text-faint); }
+  .bar { height: 3px; border-radius: 2px; background: rgba(255,255,255,.07); margin-top: 6px; width: 100px; margin-left:auto; }
+  .bar i { display:block; height:100%; border-radius:2px; background: var(--grad-bright); }
+
+  .split { display:grid; gap:18px; grid-template-columns: repeat(auto-fit, minmax(300px,1fr)); margin-top: 44px; }
+  .note { background: var(--bg-2); border:1px solid var(--border); border-radius: var(--r-md); padding: 20px 22px; }
+  .note h3 { margin: 0 0 9px; font-size: 15px; }
+  .note p { margin: 0 0 10px; color: var(--text-dim); font-size: 14px; }
+  .note p:last-child { margin-bottom: 0; }
+  .note code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+                background: var(--surface); border:1px solid var(--border); border-radius:6px;
+                padding: 1px 6px; font-size: 12.5px; color: var(--violet-hi); }
+  .accent-teal { border-left: 3px solid var(--teal); }
+  .accent-violet { border-left: 3px solid var(--violet); }
+  .accent-magenta { border-left: 3px solid var(--magenta); }
+  .accent-warn { border-left: 3px solid var(--warn); }
+
+  footer { margin-top: 46px; padding-top: 22px; border-top: 1px solid var(--border);
+            color: var(--text-faint); font-size: 13px; }
+  footer a { color: var(--text-dim); }
+
+  @media (max-width: 620px) { .wrap { padding: 36px 14px 64px; } }
+  @media print {
+    body { background:#fff; color:#111; } .wrap { padding: 0; }
+    .tablewrap, .card, .note, .live { border-color:#ccc; background:#fff; }
+    h1 span { color:#111; -webkit-text-fill-color:#111; }
+    thead th { background:#f2f2f2; color:#333; }
+    .dust td { color:#666; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <span class="eyebrow">NIGHTFALLCOIN · NIGHT</span>
+    <h1>Emission schedule — <span>every halving to the last dark</span></h1>
+    <p class="lede">Six NIGHT per block, halving every 7,500,000 blocks, hard cap 90,000,000, no tail
+    emission and no premine. The whole curve is thirty eras long and then the subsidy is zero —
+    computed here from the consensus rule itself, not from a rounded summary.</p>
+  </header>
+
+  <div class="cards">
+    <div class="card"><small>Era-0 reward</small><b>6 NIGHT</b><p>Per block, from genesis.</p></div>
+    <div class="card"><small>Halving every</small><b>7,500,000</b><p>Blocks — about 3 years 7 months at the 15-second target.</p></div>
+    <div class="card"><small>Hard cap</small><b>90,000,000</b><p>An upper bound, never actually reached.</p></div>
+    <div class="card"><small>Terminal supply</small><b>89,999,999.25</b><p>0.75 NIGHT below the cap. Why: see the note below.</p></div>
+    <div class="card"><small>Last paying era</small><b>29</b><p>Subsidy is zero from block 225,000,000, about year 107. After that, fees only.</p></div>
+  </div>
+
+  <div class="live">
+    <span><span class="dot"></span><span class="k">Live at time of writing</span></span>
+    <span><span class="k">Height</span><span class="v mono">34,247</span></span>
+    <span><span class="k">Mined</span><span class="v mono">205,482 NIGHT</span></span>
+    <span><span class="k">Era 0 complete</span><span class="v mono">0.457%</span></span>
+    <span><span class="k">Of the cap</span><span class="v mono">0.228%</span></span>
+  </div>
+
+  <h2>The full curve</h2>
+  <div class="tablewrap">
+    <div class="scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>Era</th>
+          <th>Block range</th>
+          <th>Reward / block</th>
+          <th>Per day</th>
+          <th>Minted in era</th>
+          <th>Cumulative supply</th>
+          <th>Share of cap</th>
+          <th>Starts</th>
+        </tr>
+      </thead>
+      <tbody>
+      <tr data-here="1">
+        <td class="c-era"><span class="era">0</span></td>
+        <td class="c-blocks"><span class="mono">0</span><span class="dash">–</span><span class="mono">7,499,999</span></td>
+        <td class="c-num strong mono">6</td>
+        <td class="c-num mono dim">34,560</td>
+        <td class="c-num mono">45,000,000</td>
+        <td class="c-num mono strong">45,000,000</td>
+        <td class="c-pct"><span class="mono">50%</span><div class="bar"><i style="width:50.0000%"></i></div></td>
+        <td class="c-date">Aug 2026<span class="yrs">+0.0 yr</span></td>
+      </tr>
+      <tr>
+        <td class="c-era"><span class="era">1</span></td>
+        <td class="c-blocks"><span class="mono">7,500,000</span><span class="dash">–</span><span class="mono">14,999,999</span></td>
+        <td class="c-num strong mono">3</td>
+        <td class="c-num mono dim">17,280</td>
+        <td class="c-num mono">22,500,000</td>
+        <td class="c-num mono strong">67,500,000</td>
+        <td class="c-pct"><span class="mono">75%</span><div class="bar"><i style="width:75.0000%"></i></div></td>
+        <td class="c-date">Mar 2030<span class="yrs">+3.6 yr</span></td>
+      </tr>
+      <tr>
+        <td class="c-era"><span class="era">2</span></td>
+        <td class="c-blocks"><span class="mono">15,000,000</span><span class="dash">–</span><span class="mono">22,499,999</span></td>
+        <td class="c-num strong mono">1.5</td>
+        <td class="c-num mono dim">8,640</td>
+        <td class="c-num mono">11,250,000</td>
+        <td class="c-num mono strong">78,750,000</td>
+        <td class="c-pct"><span class="mono">87.5%</span><div class="bar"><i style="width:87.5000%"></i></div></td>
+        <td class="c-date">Oct 2033<span class="yrs">+7.1 yr</span></td>
+      </tr>
+      <tr>
+        <td class="c-era"><span class="era">3</span></td>
+        <td class="c-blocks"><span class="mono">22,500,000</span><span class="dash">–</span><span class="mono">29,999,999</span></td>
+        <td class="c-num strong mono">0.75</td>
+        <td class="c-num mono dim">4,320</td>
+        <td class="c-num mono">5,625,000</td>
+        <td class="c-num mono strong">84,375,000</td>
+        <td class="c-pct"><span class="mono">93.75%</span><div class="bar"><i style="width:93.7500%"></i></div></td>
+        <td class="c-date">Apr 2037<span class="yrs">+10.7 yr</span></td>
+      </tr>
+      <tr>
+        <td class="c-era"><span class="era">4</span></td>
+        <td class="c-blocks"><span class="mono">30,000,000</span><span class="dash">–</span><span class="mono">37,499,999</span></td>
+        <td class="c-num strong mono">0.375</td>
+        <td class="c-num mono dim">2,160</td>
+        <td class="c-num mono">2,812,500</td>
+        <td class="c-num mono strong">87,187,500</td>
+        <td class="c-pct"><span class="mono">96.875%</span><div class="bar"><i style="width:96.8750%"></i></div></td>
+        <td class="c-date">Nov 2040<span class="yrs">+14.3 yr</span></td>
+      </tr>
+      <tr>
+        <td class="c-era"><span class="era">5</span></td>
+        <td class="c-blocks"><span class="mono">37,500,000</span><span class="dash">–</span><span class="mono">44,999,999</span></td>
+        <td class="c-num strong mono">0.1875</td>
+        <td class="c-num mono dim">1,080</td>
+        <td class="c-num mono">1,406,250</td>
+        <td class="c-num mono strong">88,593,750</td>
+        <td class="c-pct"><span class="mono">98.4375%</span><div class="bar"><i style="width:98.4375%"></i></div></td>
+        <td class="c-date">Jun 2044<span class="yrs">+17.8 yr</span></td>
+      </tr>
+      <tr>
+        <td class="c-era"><span class="era">6</span></td>
+        <td class="c-blocks"><span class="mono">45,000,000</span><span class="dash">–</span><span class="mono">52,499,999</span></td>
+        <td class="c-num strong mono">0.09375</td>
+        <td class="c-num mono dim">540</td>
+        <td class="c-num mono">703,125</td>
+        <td class="c-num mono strong">89,296,875</td>
+        <td class="c-pct"><span class="mono">99.2188%</span><div class="bar"><i style="width:99.2188%"></i></div></td>
+        <td class="c-date">Jan 2048<span class="yrs">+21.4 yr</span></td>
+      </tr>
+      <tr>
+        <td class="c-era"><span class="era">7</span></td>
+        <td class="c-blocks"><span class="mono">52,500,000</span><span class="dash">–</span><span class="mono">59,999,999</span></td>
+        <td class="c-num strong mono">0.046875</td>
+        <td class="c-num mono dim">270</td>
+        <td class="c-num mono">351,562.5</td>
+        <td class="c-num mono strong">89,648,437.5</td>
+        <td class="c-pct"><span class="mono">99.6094%</span><div class="bar"><i style="width:99.6094%"></i></div></td>
+        <td class="c-date">Jul 2051<span class="yrs">+25.0 yr</span></td>
+      </tr>
+      <tr>
+        <td class="c-era"><span class="era">8</span></td>
+        <td class="c-blocks"><span class="mono">60,000,000</span><span class="dash">–</span><span class="mono">67,499,999</span></td>
+        <td class="c-num strong mono">0.0234375</td>
+        <td class="c-num mono dim">135</td>
+        <td class="c-num mono">175,781.25</td>
+        <td class="c-num mono strong">89,824,218.75</td>
+        <td class="c-pct"><span class="mono">99.8047%</span><div class="bar"><i style="width:99.8047%"></i></div></td>
+        <td class="c-date">Feb 2055<span class="yrs">+28.5 yr</span></td>
+      </tr>
+      <tr>
+        <td class="c-era"><span class="era">9</span></td>
+        <td class="c-blocks"><span class="mono">67,500,000</span><span class="dash">–</span><span class="mono">74,999,999</span></td>
+        <td class="c-num strong mono">0.01171875</td>
+        <td class="c-num mono dim">67.5</td>
+        <td class="c-num mono">87,890.625</td>
+        <td class="c-num mono strong">89,912,109.375</td>
+        <td class="c-pct"><span class="mono">99.9023%</span><div class="bar"><i style="width:99.9023%"></i></div></td>
+        <td class="c-date">Sep 2058<span class="yrs">+32.1 yr</span></td>
+      </tr>
+      <tr>
+        <td class="c-era"><span class="era">10</span></td>
+        <td class="c-blocks"><span class="mono">75,000,000</span><span class="dash">–</span><span class="mono">82,499,999</span></td>
+        <td class="c-num strong mono">0.00585937</td>
+        <td class="c-num mono dim">33.7499712</td>
+        <td class="c-num mono">43,945.275</td>
+        <td class="c-num mono strong">89,956,054.65</td>
+        <td class="c-pct"><span class="mono">99.9512%</span><div class="bar"><i style="width:99.9512%"></i></div></td>
+        <td class="c-date">Apr 2062<span class="yrs">+35.6 yr</span></td>
+      </tr>
+      <tr>
+        <td class="c-era"><span class="era">11</span></td>
+        <td class="c-blocks"><span class="mono">82,500,000</span><span class="dash">–</span><span class="mono">89,999,999</span></td>
+        <td class="c-num strong mono">0.00292968</td>
+        <td class="c-num mono dim">16.8749568</td>
+        <td class="c-num mono">21,972.6</td>
+        <td class="c-num mono strong">89,978,027.25</td>
+        <td class="c-pct"><span class="mono">99.9756%</span><div class="bar"><i style="width:99.9756%"></i></div></td>
+        <td class="c-date">Nov 2065<span class="yrs">+39.2 yr</span></td>
+      </tr>
+      <tr>
+        <td class="c-era"><span class="era">12</span></td>
+        <td class="c-blocks"><span class="mono">90,000,000</span><span class="dash">–</span><span class="mono">97,499,999</span></td>
+        <td class="c-num strong mono">0.00146484</td>
+        <td class="c-num mono dim">8.4374784</td>
+        <td class="c-num mono">10,986.3</td>
+        <td class="c-num mono strong">89,989,013.55</td>
+        <td class="c-pct"><span class="mono">99.9878%</span><div class="bar"><i style="width:99.9878%"></i></div></td>
+        <td class="c-date">May 2069<span class="yrs">+42.8 yr</span></td>
+      </tr>
+      <tr class="dust">
+        <td class="c-era"><span class="era">13</span></td>
+        <td class="c-blocks"><span class="mono">97,500,000</span><span class="dash">–</span><span class="mono">104,999,999</span></td>
+        <td class="c-num strong mono">0.00073242</td>
+        <td class="c-num mono dim">4.2187392</td>
+        <td class="c-num mono">5,493.15</td>
+        <td class="c-num mono strong">89,994,506.7</td>
+        <td class="c-pct"><span class="mono">99.9939%</span><div class="bar"><i style="width:99.9939%"></i></div></td>
+        <td class="c-date">Dec 2072<span class="yrs">+46.3 yr</span></td>
+      </tr>
+      <tr class="dust">
+        <td class="c-era"><span class="era">14</span></td>
+        <td class="c-blocks"><span class="mono">105,000,000</span><span class="dash">–</span><span class="mono">112,499,999</span></td>
+        <td class="c-num strong mono">0.00036621</td>
+        <td class="c-num mono dim">2.1093696</td>
+        <td class="c-num mono">2,746.575</td>
+        <td class="c-num mono strong">89,997,253.275</td>
+        <td class="c-pct"><span class="mono">99.9969%</span><div class="bar"><i style="width:99.9969%"></i></div></td>
+        <td class="c-date">Jul 2076<span class="yrs">+49.9 yr</span></td>
+      </tr>
+      <tr class="dust">
+        <td class="c-era"><span class="era">15</span></td>
+        <td class="c-blocks"><span class="mono">112,500,000</span><span class="dash">–</span><span class="mono">119,999,999</span></td>
+        <td class="c-num strong mono">0.0001831</td>
+        <td class="c-num mono dim">1.054656</td>
+        <td class="c-num mono">1,373.25</td>
+        <td class="c-num mono strong">89,998,626.525</td>
+        <td class="c-pct"><span class="mono">99.9985%</span><div class="bar"><i style="width:99.9985%"></i></div></td>
+        <td class="c-date">Feb 2080<span class="yrs">+53.5 yr</span></td>
+      </tr>
+      <tr class="dust">
+        <td class="c-era"><span class="era">16</span></td>
+        <td class="c-blocks"><span class="mono">120,000,000</span><span class="dash">–</span><span class="mono">127,499,999</span></td>
+        <td class="c-num strong mono">0.00009155</td>
+        <td class="c-num mono dim">0.527328</td>
+        <td class="c-num mono">686.625</td>
+        <td class="c-num mono strong">89,999,313.15</td>
+        <td class="c-pct"><span class="mono">99.9992%</span><div class="bar"><i style="width:99.9992%"></i></div></td>
+        <td class="c-date">Aug 2083<span class="yrs">+57.0 yr</span></td>
+      </tr>
+      <tr class="dust">
+        <td class="c-era"><span class="era">17</span></td>
+        <td class="c-blocks"><span class="mono">127,500,000</span><span class="dash">–</span><span class="mono">134,999,999</span></td>
+        <td class="c-num strong mono">0.00004577</td>
+        <td class="c-num mono dim">0.2636352</td>
+        <td class="c-num mono">343.275</td>
+        <td class="c-num mono strong">89,999,656.425</td>
+        <td class="c-pct"><span class="mono">99.9996%</span><div class="bar"><i style="width:99.9996%"></i></div></td>
+        <td class="c-date">Mar 2087<span class="yrs">+60.6 yr</span></td>
+      </tr>
+      <tr class="dust">
+        <td class="c-era"><span class="era">18</span></td>
+        <td class="c-blocks"><span class="mono">135,000,000</span><span class="dash">–</span><span class="mono">142,499,999</span></td>
+        <td class="c-num strong mono">0.00002288</td>
+        <td class="c-num mono dim">0.1317888</td>
+        <td class="c-num mono">171.6</td>
+        <td class="c-num mono strong">89,999,828.025</td>
+        <td class="c-pct"><span class="mono">99.9998%</span><div class="bar"><i style="width:99.9998%"></i></div></td>
+        <td class="c-date">Oct 2090<span class="yrs">+64.2 yr</span></td>
+      </tr>
+      <tr class="dust">
+        <td class="c-era"><span class="era">19</span></td>
+        <td class="c-blocks"><span class="mono">142,500,000</span><span class="dash">–</span><span class="mono">149,999,999</span></td>
+        <td class="c-num strong mono">0.00001144</td>
+        <td class="c-num mono dim">0.0658944</td>
+        <td class="c-num mono">85.8</td>
+        <td class="c-num mono strong">89,999,913.825</td>
+        <td class="c-pct"><span class="mono">99.9999%</span><div class="bar"><i style="width:99.9999%"></i></div></td>
+        <td class="c-date">May 2094<span class="yrs">+67.7 yr</span></td>
+      </tr>
+      <tr class="dust">
+        <td class="c-era"><span class="era">20</span></td>
+        <td class="c-blocks"><span class="mono">150,000,000</span><span class="dash">–</span><span class="mono">157,499,999</span></td>
+        <td class="c-num strong mono">0.00000572</td>
+        <td class="c-num mono dim">0.0329472</td>
+        <td class="c-num mono">42.9</td>
+        <td class="c-num mono strong">89,999,956.725</td>
+        <td class="c-pct"><span class="mono">100%</span><div class="bar"><i style="width:100.0000%"></i></div></td>
+        <td class="c-date">Dec 2097<span class="yrs">+71.3 yr</span></td>
+      </tr>
+      <tr class="dust">
+        <td class="c-era"><span class="era">21</span></td>
+        <td class="c-blocks"><span class="mono">157,500,000</span><span class="dash">–</span><span class="mono">164,999,999</span></td>
+        <td class="c-num strong mono">0.00000286</td>
+        <td class="c-num mono dim">0.0164736</td>
+        <td class="c-num mono">21.45</td>
+        <td class="c-num mono strong">89,999,978.175</td>
+        <td class="c-pct"><span class="mono">100%</span><div class="bar"><i style="width:100.0000%"></i></div></td>
+        <td class="c-date">Jun 2101<span class="yrs">+74.9 yr</span></td>
+      </tr>
+      <tr class="dust">
+        <td class="c-era"><span class="era">22</span></td>
+        <td class="c-blocks"><span class="mono">165,000,000</span><span class="dash">–</span><span class="mono">172,499,999</span></td>
+        <td class="c-num strong mono">0.00000143</td>
+        <td class="c-num mono dim">0.0082368</td>
+        <td class="c-num mono">10.725</td>
+        <td class="c-num mono strong">89,999,988.9</td>
+        <td class="c-pct"><span class="mono">100%</span><div class="bar"><i style="width:100.0000%"></i></div></td>
+        <td class="c-date">Jan 2105<span class="yrs">+78.4 yr</span></td>
+      </tr>
+      <tr class="dust">
+        <td class="c-era"><span class="era">23</span></td>
+        <td class="c-blocks"><span class="mono">172,500,000</span><span class="dash">–</span><span class="mono">179,999,999</span></td>
+        <td class="c-num strong mono">0.00000071</td>
+        <td class="c-num mono dim">0.0040896</td>
+        <td class="c-num mono">5.325</td>
+        <td class="c-num mono strong">89,999,994.225</td>
+        <td class="c-pct"><span class="mono">100%</span><div class="bar"><i style="width:100.0000%"></i></div></td>
+        <td class="c-date">Aug 2108<span class="yrs">+82.0 yr</span></td>
+      </tr>
+      <tr class="dust">
+        <td class="c-era"><span class="era">24</span></td>
+        <td class="c-blocks"><span class="mono">180,000,000</span><span class="dash">–</span><span class="mono">187,499,999</span></td>
+        <td class="c-num strong mono">0.00000035</td>
+        <td class="c-num mono dim">0.002016</td>
+        <td class="c-num mono">2.625</td>
+        <td class="c-num mono strong">89,999,996.85</td>
+        <td class="c-pct"><span class="mono">100%</span><div class="bar"><i style="width:100.0000%"></i></div></td>
+        <td class="c-date">Mar 2112<span class="yrs">+85.6 yr</span></td>
+      </tr>
+      <tr class="dust">
+        <td class="c-era"><span class="era">25</span></td>
+        <td class="c-blocks"><span class="mono">187,500,000</span><span class="dash">–</span><span class="mono">194,999,999</span></td>
+        <td class="c-num strong mono">0.00000017</td>
+        <td class="c-num mono dim">0.0009792</td>
+        <td class="c-num mono">1.275</td>
+        <td class="c-num mono strong">89,999,998.125</td>
+        <td class="c-pct"><span class="mono">100%</span><div class="bar"><i style="width:100.0000%"></i></div></td>
+        <td class="c-date">Oct 2115<span class="yrs">+89.1 yr</span></td>
+      </tr>
+      <tr class="dust">
+        <td class="c-era"><span class="era">26</span></td>
+        <td class="c-blocks"><span class="mono">195,000,000</span><span class="dash">–</span><span class="mono">202,499,999</span></td>
+        <td class="c-num strong mono">0.00000008</td>
+        <td class="c-num mono dim">0.0004608</td>
+        <td class="c-num mono">0.6</td>
+        <td class="c-num mono strong">89,999,998.725</td>
+        <td class="c-pct"><span class="mono">100%</span><div class="bar"><i style="width:100.0000%"></i></div></td>
+        <td class="c-date">Apr 2119<span class="yrs">+92.7 yr</span></td>
+      </tr>
+      <tr class="dust">
+        <td class="c-era"><span class="era">27</span></td>
+        <td class="c-blocks"><span class="mono">202,500,000</span><span class="dash">–</span><span class="mono">209,999,999</span></td>
+        <td class="c-num strong mono">0.00000004</td>
+        <td class="c-num mono dim">0.0002304</td>
+        <td class="c-num mono">0.3</td>
+        <td class="c-num mono strong">89,999,999.025</td>
+        <td class="c-pct"><span class="mono">100%</span><div class="bar"><i style="width:100.0000%"></i></div></td>
+        <td class="c-date">Nov 2122<span class="yrs">+96.3 yr</span></td>
+      </tr>
+      <tr class="dust">
+        <td class="c-era"><span class="era">28</span></td>
+        <td class="c-blocks"><span class="mono">210,000,000</span><span class="dash">–</span><span class="mono">217,499,999</span></td>
+        <td class="c-num strong mono">0.00000002</td>
+        <td class="c-num mono dim">0.0001152</td>
+        <td class="c-num mono">0.15</td>
+        <td class="c-num mono strong">89,999,999.175</td>
+        <td class="c-pct"><span class="mono">100%</span><div class="bar"><i style="width:100.0000%"></i></div></td>
+        <td class="c-date">Jun 2126<span class="yrs">+99.8 yr</span></td>
+      </tr>
+      <tr class="dust">
+        <td class="c-era"><span class="era">29</span></td>
+        <td class="c-blocks"><span class="mono">217,500,000</span><span class="dash">–</span><span class="mono">224,999,999</span></td>
+        <td class="c-num strong mono">0.00000001</td>
+        <td class="c-num mono dim">0.0000576</td>
+        <td class="c-num mono">0.075</td>
+        <td class="c-num mono strong">89,999,999.25</td>
+        <td class="c-pct"><span class="mono">100%</span><div class="bar"><i style="width:100.0000%"></i></div></td>
+        <td class="c-date">Jan 2130<span class="yrs">+103.4 yr</span></td>
+      </tr>
+      </tbody>
+    </table>
+    </div>
+  </div>
+
+  <div class="split">
+    <div class="note accent-violet">
+      <h3>Why 89,999,999.25 and not 90,000,000</h3>
+      <p>The reward is a right shift on an integer number of darks, and
+      <code>reward &gt;&gt; halvings</code> truncates. From era 10 onward the halved value is no
+      longer exactly representable, so a fraction of a dark is dropped every block and never
+      minted.</p>
+      <p>The cap is therefore an upper bound the curve approaches and never touches. It is
+      also enforced separately: the payable reward is clamped so the cap cannot be breached
+      even by one dark, whatever the schedule says.</p>
+    </div>
+
+    <div class="note accent-teal">
+      <h3>Half of all NIGHT in the first era</h3>
+      <p>6 × 7,500,000 = 45,000,000, exactly half the cap — that identity is asserted by a test,
+      so the constants cannot drift apart unnoticed.</p>
+      <p>75 % is minted by the end of era 1 and 99 % during era 6. The remaining 1 % takes another
+      eighty years. <b>89,000,000 NIGHT is reached at block 49,333,334</b>, about 23.4 years in.</p>
+    </div>
+
+    <div class="note accent-magenta">
+      <h3>Fees are burned, not paid</h3>
+      <p>While the subsidy is positive the fee is destroyed and the miner receives only the
+      subsidy — so circulating supply is always <i>below</i> the minted figures in this table by
+      the total burned.</p>
+      <p>Once the subsidy reaches zero the coinbase kernel carries the block's fees instead:
+      nothing is minted, nothing is burned, and the miner is paid. That is the whole
+      long-term security budget. There is no tail emission.</p>
+    </div>
+
+    <div class="note accent-warn">
+      <h3>The dates are projections, not promises</h3>
+      <p>Every date assumes the 15-second target holds on average from genesis
+      (16 August 2026). Difficulty retargets every block over a 90-block weighted average, so the
+      network tracks that target closely — but a decade of drift is still a decade of drift.</p>
+      <p>Block heights and reward amounts, by contrast, are exact. They are consensus, not
+      forecast.</p>
+    </div>
+  </div>
+
+  <footer>
+    Generated from the consensus constants in <code>nightfall-types</code> and the reward rule in
+    <code>nightfall-consensus</code> — <span class="mono">INITIAL_BLOCK_REWARD_NIGHT&nbsp;=&nbsp;6</span>,
+    <span class="mono">HALVING_INTERVAL_BLOCKS&nbsp;=&nbsp;7,500,000</span>,
+    <span class="mono">MAX_SUPPLY_NIGHT&nbsp;=&nbsp;90,000,000</span>,
+    <span class="mono">TARGET_BLOCK_TIME_SECS&nbsp;=&nbsp;15</span>.
+    Verify any of it yourself with <code>nightfall-wallet verify-supply</code>.
+    · <a href="https://nightfallcoin.org">nightfallcoin.org</a>
+  </footer>
+
+</div>
+</body>
+</html>

@@ -18,5 +18,17 @@ anyhow = { workspace = true }
 dirs = { workspace = true }
 tracing = { workspace = true }
 
+# One writer per data directory. The lock is held by the OS so that a crash
+# frees it; see src/dirlock.rs.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
+
 [dev-dependencies]
 nightfall-crypto = { workspace = true }

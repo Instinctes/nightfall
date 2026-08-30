@@ -185,6 +185,10 @@ struct WalletFile {
     /// this field existed: they may well hold coins from genesis.
     #[serde(default)]
     birth_height: u64,
+    /// Commitments held by an in-progress swap. Must not be selected for a
+    /// normal payment — otherwise the lock is spent out from under the swap.
+    #[serde(default)]
+    reserved: Vec<String>,
 }
 
 /// Balance split by what the user can actually do with it.
@@ -862,6 +866,9 @@ impl Wallet {
     pub fn balances(&self, tip_height: u64, maturity: u64) -> Balances {
         let mut b = Balances::default();
         for o in self.db.outputs.iter().filter(|o| !o.spent) {
+            if self.is_reserved(&o.commit) {
+                continue;
+            }
             if o.is_coinbase && tip_height < o.height.saturating_add(maturity) {
                 b.immature = b.immature.saturating_add(o.value);
             } else {
@@ -921,6 +928,7 @@ impl Wallet {
             .outputs
             .iter()
             .filter(|o| !o.spent)
+            .filter(|o| !self.is_reserved(&o.commit))
             .filter(|o| {
                 maturity == 0 || !o.is_coinbase || tip_height >= o.height.saturating_add(maturity)
             })
@@ -949,6 +957,33 @@ impl Wallet {
 
     pub fn select_coins(&self, target: u64) -> anyhow::Result<Vec<Spendable>> {
         self.select_coins_at(target, 0, 0)
+    }
+
+    fn is_reserved(&self, commit: &Commitment) -> bool {
+        let h = commit.to_hex();
+        self.db.reserved.iter().any(|r| r == &h)
+    }
+
+    /// Hold these outputs for a swap. A later ordinary payment will not
+    /// select them. Mutation test: drop the filter in `select_coins_at` and
+    /// `reserved_output_is_not_spent_as_a_normal_payment` fails.
+    pub fn reserve_commits(&mut self, hexes: &[String]) -> anyhow::Result<()> {
+        for h in hexes {
+            if !self.db.reserved.contains(h) {
+                self.db.reserved.push(h.clone());
+            }
+        }
+        self.save()
+    }
+
+    pub fn release_commits(&mut self, hexes: &[String]) -> anyhow::Result<()> {
+        self.db.reserved.retain(|r| !hexes.contains(r));
+        self.save()
+    }
+
+    #[cfg(test)]
+    pub fn test_insert_output(&mut self, o: OwnedOutput) {
+        self.db.outputs.push(o);
     }
 
     /// Build a signed transaction paying `amount` to `to`.
@@ -1394,6 +1429,35 @@ mod tests {
         let other = WalletKeys::generate().address();
         let e = w.create_payment(&other, 1_000, 10, "").unwrap_err();
         assert!(e.to_string().contains("insufficient funds"), "got: {e}");
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn reserved_output_is_not_spent_as_a_normal_payment() {
+        let d = tmpdir("reserved");
+        let mut w = Wallet::open(&d, NetworkId::Devnet, "w.seed").unwrap();
+        let commit = Commitment::from_point(nightfall_crypto::generator_g());
+        w.test_insert_output(OwnedOutput {
+            commit,
+            value: 1_000_000,
+            blind_hex: hex::encode([1u8; 32]),
+            key_offset_hex: hex::encode([2u8; 32]),
+            memo: String::new(),
+            height: 0,
+            spent: false,
+            is_coinbase: false,
+        });
+        w.reserve_commits(&[commit.to_hex()]).unwrap();
+        let other = WalletKeys::generate().address();
+        let e = w.create_payment(&other, 1, 1, "").unwrap_err();
+        assert!(
+            e.to_string().contains("insufficient funds"),
+            "reserved coin was selectable; got {e}"
+        );
+        w.release_commits(&[commit.to_hex()]).unwrap();
+        // After release the selector sees the coin. Building the tx still
+        // needs a real spend secret; we only assert selection succeeds.
+        assert!(w.select_coins(1).is_ok());
         fs::remove_dir_all(&d).ok();
     }
 

@@ -35,6 +35,11 @@ pub use rangeproof::{RangeError, RangeProofBytes, RANGE_BITS};
 pub use schnorr::{SchnorrSig, SCHNORR_DOMAIN};
 pub use stealth::*;
 
+/// Cross-curve DLEQ (Ristretto ↔ secp256k1). Experimental — swap only.
+pub mod dleq;
+/// Shared outputs for atomic swaps. Experimental — see the module docs.
+pub mod swap;
+
 pub mod rangeproofs {
     pub use crate::rangeproof::{prove, verify};
 }

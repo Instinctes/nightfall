@@ -30,17 +30,19 @@ pub enum View {
     Activity,
     Mining,
     Network,
+    Swap,
     Settings,
 }
 
 impl View {
-    pub const ALL: [(View, &'static str); 7] = [
+    pub const ALL: [(View, &'static str); 8] = [
         (View::Dashboard, "Dashboard"),
         (View::Send, "Send"),
         (View::Receive, "Receive"),
         (View::Activity, "Activity"),
         (View::Mining, "Mining"),
         (View::Network, "Network"),
+        (View::Swap, "Swap"),
         (View::Settings, "Settings"),
     ];
 }
@@ -135,6 +137,37 @@ pub struct App {
     pub book_name: String,
     pub book_addr: String,
 
+    // Swap
+    pub swap_draft: nightfall_swap::ui::Draft,
+    /// Packet to hand to the counterparty, rendered for copying.
+    pub swap_packet_out: String,
+    /// Packet pasted from the counterparty, before it is believed.
+    pub swap_packet_in: String,
+    /// Why the pasted packet was refused. Every rejection names its reason.
+    pub swap_import_error: Option<String>,
+    pub swap_start_error: Option<String>,
+    /// Live handshakes, by swap id. Reloaded from `{datadir}/swaps/{id}.secret`.
+    pub swap_sessions: std::collections::HashMap<String, nightfall_swap::session::Session>,
+    /// Bitcoin addresses the user supplies, because this wallet holds NIGHT
+    /// and not Bitcoin. Where a refund, a redeem and a punish would pay.
+    pub swap_btc_refund: String,
+    pub swap_btc_redeem: String,
+    pub swap_btc_punish: String,
+
+    /// Bob's funding input for TX_lock, as typed.
+    pub swap_funding: nightfall_swap::ui::FundingDraft,
+    /// The signed transaction pasted back from the user's Bitcoin wallet.
+    pub swap_signed_hex: String,
+    pub swap_lock_note: Option<Result<String, String>>,
+
+    /// A destructive button was pressed once; it asks before it acts.
+    ///
+    /// The action itself is kept, not its wording. Recovering it from the
+    /// confirmation text meant every new button had to be added to a string
+    /// comparison, and forgetting to would silently run the *wrong*
+    /// transaction. The id is text so this crate needs no uuid dependency.
+    pub swap_confirm: Option<(String, nightfall_swap::ui::Action)>,
+
     pub onboarding: Option<Onboarding>,
     tray: Option<Tray>,
     pending_chain_check: Option<Arc<Mutex<Option<ChainCheck>>>>,
@@ -219,6 +252,22 @@ impl App {
             address_book: AddressBook::load(&datadir),
             book_name: String::new(),
             book_addr: String::new(),
+            swap_draft: nightfall_swap::ui::Draft {
+                give_night: true,
+                ..Default::default()
+            },
+            swap_sessions: std::collections::HashMap::new(),
+            swap_btc_refund: String::new(),
+            swap_btc_redeem: String::new(),
+            swap_btc_punish: String::new(),
+            swap_funding: nightfall_swap::ui::FundingDraft::default(),
+            swap_signed_hex: String::new(),
+            swap_lock_note: None,
+            swap_packet_out: String::new(),
+            swap_packet_in: String::new(),
+            swap_import_error: None,
+            swap_start_error: None,
+            swap_confirm: None,
             onboarding: if has_seed {
                 None
             } else {
@@ -914,6 +963,7 @@ impl eframe::App for App {
                                     View::Activity => views::activity(self, ui),
                                     View::Mining => views::mining(self, ui),
                                     View::Network => views::network(self, ui, ctx),
+                                    View::Swap => crate::views_swap::swap(self, ui, ctx),
                                     View::Settings => views::settings(self, ui, ctx),
                                 },
                             );

@@ -133,23 +133,71 @@ mod tests {
         assert_eq!(WalletKeys::from_mnemonic(&messy).unwrap().seed, keys.seed);
     }
 
+    /// A test vector, not a wallet. Generated for this test and never funded.
+    const TRANSPOSE_VECTOR: &str = "cereal hedgehog hotel assist warrior learn \
+        bamboo expect heart fetch work animal aim must raise wool diet enemy \
+        climb drift share valve fringe prison";
+
     #[test]
     fn rejects_a_transposed_word() {
         // The whole point of the checksum. A user who swaps two words must be
         // told, not handed an empty wallet and left to conclude the coins are
         // gone.
-        let keys = WalletKeys::generate();
-        let mut words: Vec<&str> = {
-            let p = keys.to_mnemonic();
-            Box::leak(p.into_boxed_str()).split(' ').collect()
-        };
-        words.swap(0, 1);
+        //
+        // Deliberately a fixed vector rather than `generate()`. The checksum
+        // is 8 bits, so a transposition of a *random* phrase still validates
+        // roughly once in 256 runs — this test failed in a full workspace run
+        // and passed on its own, which is the behaviour that teaches people
+        // to re-run a red build instead of reading it. A flaky test is worse
+        // than no test: it spends the credibility of every other one.
+        let words: Vec<&str> = TRANSPOSE_VECTOR.split_whitespace().collect();
+        assert_eq!(words.len(), 24, "the vector must be a 24-word phrase");
+        assert!(
+            WalletKeys::from_mnemonic(&words.join(" ")).is_ok(),
+            "precondition: the vector itself is a valid phrase"
+        );
 
-        // A swap of two identical words is a no-op; regenerate if so.
-        if words[0] == words[1] {
-            return;
+        let mut swapped = words.clone();
+        swapped.swap(0, 1);
+        assert_ne!(swapped[0], swapped[1], "the swap must change something");
+        assert!(
+            WalletKeys::from_mnemonic(&swapped.join(" ")).is_err(),
+            "a transposed phrase must be refused, not silently accepted"
+        );
+    }
+
+    /// The property the fixed vector cannot show on its own: the checksum
+    /// catches transpositions in general, not just that one.
+    ///
+    /// Stated as a rate rather than an absolute, because it genuinely is one
+    /// — 8 checksum bits mean roughly 1 in 256 transpositions slips through,
+    /// and a test claiming otherwise would be claiming something false.
+    #[test]
+    fn transpositions_are_caught_almost_always() {
+        let mut tried = 0usize;
+        let mut caught = 0usize;
+        for _ in 0..300 {
+            let keys = WalletKeys::generate();
+            let phrase = keys.to_mnemonic();
+            let words: Vec<&str> = phrase.split(' ').collect();
+            if words[0] == words[1] {
+                continue;
+            }
+            let mut swapped = words.clone();
+            swapped.swap(0, 1);
+            tried += 1;
+            if WalletKeys::from_mnemonic(&swapped.join(" ")).is_err() {
+                caught += 1;
+            }
         }
-        assert!(WalletKeys::from_mnemonic(&words.join(" ")).is_err());
+        assert!(tried > 250, "expected most draws to be usable, got {tried}");
+        // 1/256 slip-through means ~99.6%. A floor of 95% fails loudly if the
+        // checksum stops being checked, and never fails for being unlucky.
+        let rate = caught as f64 / tried as f64;
+        assert!(
+            rate > 0.95,
+            "the checksum caught only {caught} of {tried} transpositions ({rate:.3})"
+        );
     }
 
     #[test]

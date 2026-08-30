@@ -100,6 +100,19 @@ impl WalletState {
             .unwrap_or_default()
     }
 
+    /// Free outputs a swap was holding.
+    ///
+    /// The reserving half lives on `Wallet` and is exercised there; it gets a
+    /// wrapper here once the app actually builds a NIGHT lock. Releasing is
+    /// needed already: a swap file removed without it would strand the coins
+    /// with nothing left to free them.
+    pub fn release_commits(&mut self, hexes: &[String]) -> anyhow::Result<()> {
+        match self.inner.as_mut() {
+            Some(w) => w.release_commits(hexes),
+            None => Ok(()),
+        }
+    }
+
     pub fn output_count(&self) -> usize {
         self.wallet().map(|w| w.spendable_count()).unwrap_or(0)
     }

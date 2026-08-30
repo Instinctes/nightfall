@@ -33,3 +33,11 @@ xcuserdata/
 # them to the site from the working copy — putting 60 MB of them in git as
 # well would only give the repository a second, slower copy that can drift.
 /website/public/downloads/
+
+# Local build state and machine-specific paths. These leaked into a sync once;
+# local.properties names the SDK path of whoever built last, and the rest is
+# cache that is reproducible from source.
+mobile/android/.gradle/
+mobile/android/local.properties
+mobile/android/app/src/main/jniLibs/
+scripts/__pycache__/
