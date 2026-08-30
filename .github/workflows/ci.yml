@@ -59,6 +59,14 @@ jobs:
       - name: Download links, static checks
         run: node scripts/check-download-links.mjs
 
+      # The site had a checker and was right every release; README had none
+      # and drifted. On the 0.9.0 tag it still told people to verify against
+      # SHA256SUMS-0.8.2.txt — two releases old and already deleted from the
+      # downloads page. Someone following our own instructions would have hit
+      # a missing file while doing the careful thing.
+      - name: Documentation versions, static checks
+        run: node scripts/check-docs-version.mjs
+
       # The whole point of the project. Every test in this suite is the
       # inverse of an exploit that once worked against a real build.
       - name: Exploit regression suite
