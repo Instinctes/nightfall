@@ -221,10 +221,12 @@ mod tests {
         let path = secret_path(&dir, Uuid::new_v4());
         write_secret_file(&path, b"{\"first\":true}").unwrap();
 
+        // Loosen it the way a backup or a `cp` would. Unix only — Windows
+        // has no mode bits, and the permission half of this test does not
+        // apply there.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            // Loosen it the way a backup or a `cp` would.
             let mut perm = fs::metadata(&path).unwrap().permissions();
             perm.set_mode(0o644);
             fs::set_permissions(&path, perm).unwrap();
@@ -233,15 +235,28 @@ mod tests {
                 0o644,
                 "precondition: the file is world-readable before the rewrite"
             );
+        }
 
-            write_secret_file(&path, b"{\"second\":true}").unwrap();
+        // The rewrite itself is not platform-specific and must happen
+        // everywhere.
+        //
+        // It used to sit inside the `cfg(unix)` block above while the content
+        // assertion below stayed outside it. On Windows the second write
+        // therefore never ran, and the test failed asking why the file still
+        // held the first payload — a red build caused by the test, not by the
+        // code. Found by the Windows runner on the v0.9.0 tag.
+        write_secret_file(&path, b"{\"second\":true}").unwrap();
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
             assert_eq!(
                 fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600,
                 "a rewrite must tighten the mode, not inherit the loose one"
             );
         }
+
         // And the content really was replaced, so this is not passing by
         // having quietly done nothing.
         assert_eq!(
