@@ -92,7 +92,7 @@
   /* display:block is load-bearing. Both of these are <span>, so without it
      they stay inline, width and height are ignored outright, and every bar on
      the page renders as an empty outline — which is exactly what shipped in
-     0.8.4 until someone looked at it. The class had a rule; the rule was just
+     0.9.0 until someone looked at it. The class had a rule; the rule was just
      not enough. No static check catches that. */
   .c-track { display:block; height:8px; border-radius:99px; background:var(--bg);
              overflow:hidden; border:1px solid var(--border); }
@@ -342,7 +342,7 @@
     </div>
   </div>
 </article>
-<script src="/js/nav.js?v=0.8.4"></script>
-<script src="/js/chain.js?v=0.8.4"></script>
+<script src="/js/nav.js?v=0.9.0"></script>
+<script src="/js/chain.js?v=0.9.0"></script>
 </body>
 </html>
