@@ -929,9 +929,35 @@ fn assume_valid_never_reaches_a_chain_shorter_than_the_pin() {
 
     // Same blocks, one with its proof of work destroyed. A rebuild that
     // trusted the prefix would accept it.
+    //
+    // Tamper until the work is *actually* broken, and say so.
+    //
+    // The first version bumped the nonce once and assumed that was enough.
+    // It is not: the new hash still meets the target with probability
+    // 1/difficulty, and the difficulty here is 60 — so roughly one run in
+    // sixty tampered a block that still had valid work, and the assertion
+    // below failed for no reason at all. It bit the Windows runner during the
+    // v0.9.0 release, which made it look platform-specific. It was not. It
+    // was a 1.7% coin flip, and the test was the thing that was wrong.
+    //
+    // A test for "proof of work is still checked" has to hand the checker
+    // something that genuinely fails proof of work.
     let mut tampered = short.blocks.clone();
     let last = tampered.len() - 1;
-    tampered[last].header.nonce = tampered[last].header.nonce.wrapping_add(1);
+    let difficulty = tampered[last].header.difficulty;
+    let mut attempts = 0u64;
+    loop {
+        tampered[last].header.nonce = tampered[last].header.nonce.wrapping_add(1);
+        if !tampered[last].pow_is_valid(NetworkId::Devnet.pow_params()) {
+            break;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 100_000,
+            "could not construct a header that fails difficulty {difficulty}; \
+             at difficulty 1 none exists, and this test cannot mean anything there"
+        );
+    }
 
     let out = Chain::rebuild_from_blocks(NetworkId::Devnet, tampered, NOW + 10_000);
     assert!(
