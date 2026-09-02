@@ -67,6 +67,15 @@ jobs:
       - name: Documentation versions, static checks
         run: node scripts/check-docs-version.mjs
 
+      # The weekly archive script decides which old archives to delete. It
+      # sorted names as strings, which is correct until the block height gains
+      # a digit: "…-99981" sorts above "…-100248", so the newest archive would
+      # have landed last in the list and been deleted by the same run that had
+      # just uploaded it — leaving the download page pointing at a file the
+      # script had thrown away. At 95,867 blocks that was about two weeks out.
+      - name: Chain archive retirement order
+        run: bash scripts/weekly-chain-archive.sh --self-test
+
       # The whole point of the project. Every test in this suite is the
       # inverse of an exploit that once worked against a real build.
       - name: Exploit regression suite
