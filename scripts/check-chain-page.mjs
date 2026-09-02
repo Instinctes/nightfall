@@ -89,10 +89,36 @@ for (const path of ["/network.json", "/chain.json"]) {
  * the part a user cannot guess and the part that would be wrong if someone
  * copied a block and edited only the heading.
  *
- * "What we ship" is read from the files in downloads/ rather than from a list
- * in this script: the artefacts are the ground truth, and a list here would
- * be one more thing to forget to update. */
-const shippedFiles = readdirSync(ROOT + "website/public/downloads").join(" ");
+ * "What we ship" is read from the download links in the pages rather than from
+ * a list in this script: a list here would be one more thing to forget to
+ * update.
+ *
+ * It reads the links and not the directory. The first version listed
+ * website/public/downloads/, which is the obvious ground truth and works on
+ * any machine that has just built a release — and does not exist at all in a
+ * fresh clone, because that directory is gitignored. CI crashed on the
+ * readdir. The links are committed, name the same artefacts, and are what a
+ * visitor actually gets. */
+const linkedArtefacts = [];
+(function collect(dir) {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+        if (e.name === "downloads" || e.name === "pkg" || e.name.startsWith(".")) continue;
+        const p = dir + "/" + e.name;
+        if (e.isDirectory()) collect(p);
+        else if (/\.(html|js)$/.test(e.name)) {
+            for (const m of readFileSync(p, "utf8").matchAll(
+                /["'(]\/?downloads\/([A-Za-z0-9._-]+)/g,
+            )) {
+                linkedArtefacts.push(m[1]);
+            }
+        }
+    }
+})(ROOT + "website/public");
+
+if (linkedArtefacts.length === 0) {
+    problems.push("no download links found anywhere on the site — the platform check has nothing to work from");
+}
+const shippedFiles = linkedArtefacts.join(" ");
 const platforms = [
     ["Windows", /windows/i, /%?APPDATA%?|env:APPDATA/],
     ["macOS", /macos|\.dmg/i, /Library\/Application\\? Support\/nightfall/],
