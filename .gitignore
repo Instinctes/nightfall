@@ -41,3 +41,14 @@ mobile/android/.gradle/
 mobile/android/local.properties
 mobile/android/app/src/main/jniLibs/
 scripts/__pycache__/
+
+# Chain archives from scripts/make-chain-bootstrap.sh. 150 MB each, rebuilt
+# from a datadir on demand and published to a release, so git would only hold
+# a second copy that goes stale.
+/bootstrap/
+
+# Local working notes. They never belong in the public mirror, and being
+# absent is not protection — one `git add -A` after a stray copy would be
+# enough.
+/brain.md
+/todo.md
