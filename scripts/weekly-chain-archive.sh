@@ -222,17 +222,78 @@ if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
         --notes "The chain as one file, rebuilt weekly. Your node still re-checks every block; see /chain/#bootstrap."
 fi
 
-# The archive goes up alone and its arrival is confirmed before anything that
-# describes it follows. The first run uploaded all three at once, the 158 MB
-# archive did not make it, and the release was left holding a checksum for a
-# file that did not exist — a download page reading that manifest would have
-# offered a dead link.
-say "==> uploading the archive ($(du -h "$BIN" | cut -f1))"
-gh release upload "$TAG" "$BIN" --clobber --repo "$REPO"
+BASE="$(basename "$BIN")"
+NEW_SHA="$(shasum -a 256 "$BIN" | cut -d' ' -f1)"
+asset_exists() {
+    [ -n "$(gh release view "$TAG" --repo "$REPO" --json assets \
+        -q ".assets[] | select(.name==\"$1\") | .name")" ]
+}
+
+# An archive named the same as the one already published needs care, because
+# the website is pointing at that name right now.
+#
+# The name is <height>-<date>, so it repeats whenever a run happens without
+# the chain having moved — the wallet was closed, or the archive is rebuilt
+# twice in a day. `gh release upload --clobber` handles that by deleting the
+# existing asset and then uploading, which means the link on the live page is
+# a 404 for the whole upload. Measured: seven minutes for 151 MB, on a page
+# that says in its own source that it must link something real at every
+# instant.
+if asset_exists "$BASE"; then
+    OLD_SHA="$(gh release download "$TAG" --repo "$REPO" \
+        --pattern "$(basename "$MANIFEST")" --output - 2>/dev/null \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin).get("blocks_bin_sha256",""))' 2>/dev/null || true)"
+
+    if [ "$OLD_SHA" = "$NEW_SHA" ]; then
+        say "==> the chain has not moved since the last archive"
+        step "$BASE is already published, byte for byte."
+        step "Nothing to upload, nothing to deploy."
+        ok=1
+        exit 0
+    fi
+
+    # Same name, different content — a reorg at the same height would do it.
+    # Upload beside the live asset under a working name, then swap. GitHub
+    # can rename an asset in one call, so the gap is that call rather than
+    # the upload.
+    say "==> same name, different chain — publishing beside the live file"
+    TMPNAME="$BASE.incoming"
+    cp "$BIN" "$WORK/$TMPNAME"
+    gh release upload "$TAG" "$WORK/$TMPNAME" --clobber --repo "$REPO"
+    step "uploaded as $TMPNAME"
+
+    # Numeric ids from the REST API on purpose. `gh release view --json
+    # assets` returns GraphQL node ids ("RA_kwDO…"), which the REST asset
+    # endpoints reject with a 404 that reads like the asset is missing rather
+    # than like the id is the wrong kind.
+    asset_id() {
+        gh api "repos/$REPO/releases/tags/$TAG" \
+            --jq ".assets[] | select(.name==\"$1\") | .id" 2>/dev/null
+    }
+    OLD_ID="$(asset_id "$BASE")"
+    NEW_ID="$(asset_id "$TMPNAME")"
+    [ -n "$NEW_ID" ] || die "the replacement archive did not land"
+    if [ -n "$OLD_ID" ]; then
+        gh api -X DELETE "repos/$REPO/releases/assets/$OLD_ID" >/dev/null \
+            || die "could not remove the old archive"
+    fi
+    gh api -X PATCH "repos/$REPO/releases/assets/$NEW_ID" -f name="$BASE" >/dev/null \
+        || die "uploaded the new archive but could not rename it to $BASE — \
+the release now holds $TMPNAME and the page still points at $BASE"
+    step "swapped in as $BASE"
+else
+    # The archive goes up alone and its arrival is confirmed before anything
+    # that describes it follows. The first run uploaded all three at once, the
+    # 158 MB archive did not make it, and the release was left holding a
+    # checksum for a file that did not exist — a download page reading that
+    # manifest would have offered a dead link.
+    say "==> uploading the archive ($(du -h "$BIN" | cut -f1))"
+    gh release upload "$TAG" "$BIN" --repo "$REPO"
+fi
 
 WANT="$(wc -c < "$BIN" | tr -d ' ')"
 GOT="$(gh release view "$TAG" --repo "$REPO" --json assets \
-    -q ".assets[] | select(.name == \"$(basename "$BIN")\") | \"\(.state) \(.size)\"")"
+    -q ".assets[] | select(.name == \"$BASE\") | \"\(.state) \(.size)\"")"
 [ "$GOT" = "uploaded $WANT" ] || die "archive did not land: wanted \"uploaded $WANT\", release says \"${GOT:-nothing}\""
 step "confirmed: $WANT bytes"
 
