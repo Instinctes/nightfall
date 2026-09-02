@@ -402,3 +402,57 @@
     window.addEventListener("focus", load);
     window.addEventListener("online", load);
 })();
+
+/* ------------------------------------------------------------ bootstrap ---
+ *
+ * The chain archive, described from its own manifest rather than from
+ * numbers typed into the page.
+ *
+ * A hardcoded height goes stale the moment the next archive is published,
+ * and a stale figure here is worse than none: it tells a newcomer they are
+ * downloading 95k blocks when they are downloading 80k, and they only find
+ * out after the sync they were trying to avoid. So the page asks the file.
+ *
+ * If no archive has been published yet, the section says so plainly instead
+ * of showing dashes forever.
+ */
+(function bootstrapPanel() {
+    // Deliberately not under /downloads/. That directory is checked against
+    // the release version by scripts/check-download-links.mjs, and this file
+    // carries a chain height rather than a release number — putting it there
+    // would mean weakening a check to fit a file that is metadata, not a
+    // download.
+    const MANIFEST = "/chain/bootstrap.json";
+    const set = (id, text) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = text;
+    };
+
+    fetch(MANIFEST, { cache: "no-cache" })
+        .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
+        .then((m) => {
+            set("bs-height", Number(m.height).toLocaleString("en-US"));
+            set("bs-date", (m.taken_utc || "").slice(0, 10) || "—");
+            const mb = Math.round((m.archive_bytes || 0) / 1048576);
+            set("bs-size", mb ? `${mb} MB` : "—");
+            const sha = m.blocks_bin_sha256 || "";
+            set("bs-sha", sha ? sha.slice(0, 16) + "…" : "—");
+
+            const link = document.getElementById("bs-link");
+            if (link && m.url) link.href = m.url;
+            if (link && m.archive) link.textContent = `Download the chain — ${m.archive}`;
+        })
+        .catch(() => {
+            // No manifest yet. Say that, rather than leaving four dashes and
+            // a download button that goes to an empty release.
+            for (const id of ["bs-height", "bs-date", "bs-size", "bs-sha"]) set(id, "—");
+            const note = document.getElementById("bs-missing");
+            if (note) note.hidden = false;
+            const link = document.getElementById("bs-link");
+            if (link) {
+                link.setAttribute("aria-disabled", "true");
+                link.style.opacity = "0.5";
+                link.style.pointerEvents = "none";
+            }
+        });
+})();

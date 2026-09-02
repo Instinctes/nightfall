@@ -23,6 +23,11 @@ const wanted = new Set();
 for (const m of js.matchAll(/\$\("([A-Za-z0-9_-]+)"\)/g)) wanted.add(m[1]);
 for (const m of js.matchAll(/setText\("([A-Za-z0-9_-]+)"/g)) wanted.add(m[1]);
 for (const m of js.matchAll(/width\("([A-Za-z0-9_-]+)"/g)) wanted.add(m[1]);
+// The three helpers above were the only shapes this knew about, so a section
+// written with plain `getElementById` was invisible to it — five new ids went
+// in and the count did not move. A check that silently covers less than you
+// think is the thing it was written to prevent.
+for (const m of js.matchAll(/getElementById\("([A-Za-z0-9_-]+)"\)/g)) wanted.add(m[1]);
 const present = new Set([...html.matchAll(/id="([A-Za-z0-9_-]+)"/g)].map((m) => m[1]));
 for (const id of wanted) {
     if (!present.has(id)) problems.push(`script reaches for #${id}, the page never renders it`);

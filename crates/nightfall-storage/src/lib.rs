@@ -27,6 +27,19 @@ struct ChainMeta {
     genesis_hash: String,
     block_count: u64,
     protocol_version: u32,
+    /// Which installation produced the validation record below.
+    ///
+    /// Without this, the record says only "somebody verified a file of this
+    /// size", and anyone shipping `blocks.bin` next to a `chain-meta.json`
+    /// turns off proof-of-work checking on every machine that unpacks it.
+    /// Measured before this field existed: copying both files into a fresh
+    /// datadir loaded the chain in silence, while copying `blocks.bin` alone
+    /// logged "re-verifying proof of work for the whole chain".
+    ///
+    /// The id is random, created once per datadir, and never leaves it. A
+    /// record carrying somebody else's id is not ours and buys nothing.
+    #[serde(default)]
+    validated_by: String,
     /// Tip hash this node validated in full, and the size of the blocks file at
     /// that moment. Both must match on reload before we trust our own past
     /// work and skip re-verifying proof of work.
@@ -121,6 +134,32 @@ impl ChainStore {
             .unwrap_or(0)
     }
 
+    /// A random identifier for this datadir, made once and kept.
+    ///
+    /// Not a secret and not an identity on the network — it never leaves the
+    /// machine and is only ever compared with itself. Its whole job is to let
+    /// `is_own_file_trusted` tell "I verified this" apart from "a file says
+    /// somebody did".
+    ///
+    /// A missing or unreadable id yields an empty string, which no record can
+    /// match, so the failure mode is a re-verification rather than a wrongly
+    /// trusted chain.
+    pub fn install_id(&self) -> String {
+        let path = self.dir.join("install-id");
+        if let Ok(s) = fs::read_to_string(&path) {
+            let s = s.trim().to_string();
+            if !s.is_empty() {
+                return s;
+            }
+        }
+        let mut bytes = [0u8; 16];
+        getrandom_bytes(&mut bytes);
+        let id = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let _ = fs::create_dir_all(&self.dir);
+        let _ = fs::write(&path, &id);
+        id
+    }
+
     fn write_meta(&self, chain: &Chain) -> anyhow::Result<()> {
         let validated_bytes = fs::metadata(self.blocks_path())
             .map(|m| m.len())
@@ -136,6 +175,7 @@ impl ChainStore {
             genesis_hash: chain.genesis_hash.to_hex(),
             block_count: chain.block_count(),
             protocol_version: nightfall_types::PROTOCOL_VERSION,
+            validated_by: self.install_id(),
             validated_tip: chain.tip_hash().to_hex(),
             validated_bytes,
             first_height: chain.first_height,
@@ -167,6 +207,13 @@ impl ChainStore {
             return false;
         };
         if m.validated_tip.is_empty() {
+            return false;
+        }
+        // A record from another installation is somebody else's word, not
+        // our own past work. This is the line that makes a downloadable
+        // chain archive safe: ship the blocks, and the receiving node still
+        // checks every one of them.
+        if m.validated_by.is_empty() || m.validated_by != self.install_id() {
             return false;
         }
         let bytes = fs::metadata(self.blocks_path())
@@ -367,6 +414,7 @@ impl ChainStore {
                 .unwrap_or_default(),
             block_count: manifest.as_ref().map(|m| m.blocks).unwrap_or(0),
             protocol_version: nightfall_types::PROTOCOL_VERSION,
+            validated_by: String::new(),
             validated_tip: String::new(),
             validated_bytes: 0,
             first_height: 0,
@@ -856,6 +904,33 @@ pub fn harden_permissions(path: &Path) -> anyhow::Result<()> {
         let _ = path;
     }
     Ok(())
+}
+
+/// Random bytes without pulling a crate in for sixteen of them.
+///
+/// `getrandom` is already in the tree through the crypto crates, but this
+/// module has no need of it otherwise, and a chain-id that is merely unique
+/// per datadir does not need a cryptographic source. It does need to not
+/// collide, hence time plus address plus process, mixed.
+fn getrandom_bytes(out: &mut [u8]) {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut seed = DefaultHasher::new();
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+        .hash(&mut seed);
+    std::process::id().hash(&mut seed);
+    (out.as_ptr() as usize).hash(&mut seed);
+    let mut x = seed.finish();
+    for b in out.iter_mut() {
+        // xorshift64*, enough to spread the bits of one hash over 16 bytes.
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        *b = (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u8;
+    }
 }
 
 #[cfg(test)]

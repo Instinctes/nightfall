@@ -305,6 +305,58 @@
       of the previous eleven. They are not exact clocks.
     </p>
 
+    <!-- ------------------------------------------------ bootstrap -- -->
+    <h2 id="bootstrap" style="margin:0 0 6px;font-size:1.15rem">Skip the first sync</h2>
+    <p style="margin:0 0 18px;font-size:.88rem;color:var(--text-dim);max-width:46em">
+      A new node fetches the chain block by block from whichever peers it
+      finds. That works, and on a young network with few peers it is slow.
+      This is the same chain as one file.
+    </p>
+
+    <div class="c-cards" style="margin-bottom:18px">
+      <div class="c-card">
+        <small>Height in the archive</small><b class="mono" id="bs-height">—</b>
+        <p>Everything after this still arrives from the network, as usual.</p>
+      </div>
+      <div class="c-card">
+        <small>Taken</small><b class="mono" id="bs-date">—</b>
+        <p>Rebuilt weekly. An older copy is not wrong, only further behind.</p>
+      </div>
+      <div class="c-card">
+        <small>Size</small><b class="mono" id="bs-size">—</b>
+        <p>Not compressed: the file is hashes and proofs, and zstd takes only 8&nbsp;% off.</p>
+      </div>
+      <div class="c-card">
+        <small>SHA-256</small><b class="mono c-hash" id="bs-sha">—</b>
+        <p>Of the unpacked chain file. Check it before you use it.</p>
+      </div>
+    </div>
+
+    <p style="margin:0 0 14px">
+      <a class="btn btn-primary" id="bs-link" href="https://github.com/Instinctes/nightfall/releases/tag/chain-bootstrap">Download the chain</a>
+    </p>
+
+    <div class="c-wrap" style="padding:18px 20px;margin-bottom:14px">
+      <p style="margin:0 0 10px;font-size:.9rem"><b>Stop the wallet first</b>, then put the file in place:</p>
+      <pre style="margin:0"><code>shasum -a 256 nightfall-chain-&lt;height&gt;-&lt;date&gt;.bin
+
+# macOS
+mv nightfall-chain-*.bin ~/Library/Application\ Support/nightfall/mainnet/n8/blocks.bin
+# Linux
+mv nightfall-chain-*.bin ~/.local/share/nightfall/mainnet/n8/blocks.bin</code></pre>
+    </div>
+
+    <p style="margin:0 0 40px;font-size:.84rem;color:var(--text-faint);line-height:1.6;max-width:46em">
+      <b>This is not a shortcut around verification.</b> Your node re-derives
+      every block hash and re-checks every proof of work in the file before it
+      accepts a single one — the first start after this will take a while, and
+      that is the check running. The archive replaces the download, not the
+      checking. It deliberately contains the blocks and nothing else: the
+      metadata file that records "this chain was already verified here" is left
+      out, because shipping it would switch that checking off.
+      <span id="bs-missing" hidden>No archive has been published yet.</span>
+    </p>
+
     <!-- ------------------------------------------------ versions -- -->
     <h2 style="margin:0 0 6px;font-size:1.15rem">What the network is running</h2>
     <p style="margin:0 0 18px;font-size:.88rem;color:var(--text-dim);max-width:46em">
