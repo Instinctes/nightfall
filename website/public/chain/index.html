@@ -337,13 +337,23 @@
     </p>
 
     <div class="c-wrap" style="padding:18px 20px;margin-bottom:14px">
-      <p style="margin:0 0 10px;font-size:.9rem"><b>Stop the wallet first</b>, then put the file in place:</p>
-      <pre style="margin:0"><code>shasum -a 256 nightfall-chain-&lt;height&gt;-&lt;date&gt;.bin
+      <p style="margin:0 0 10px;font-size:.9rem"><b>Stop the wallet first</b>, then check the file and put it in place. Compare the hash against the one above before you move anything.</p>
+      <pre style="margin:0"><code># Windows (PowerShell)
+Get-FileHash nightfall-chain-&lt;height&gt;-&lt;date&gt;.bin -Algorithm SHA256
+Move-Item nightfall-chain-*.bin "$env:APPDATA\nightfall\mainnet\n8\blocks.bin" -Force
 
 # macOS
+shasum -a 256 nightfall-chain-&lt;height&gt;-&lt;date&gt;.bin
 mv nightfall-chain-*.bin ~/Library/Application\ Support/nightfall/mainnet/n8/blocks.bin
+
 # Linux
+sha256sum nightfall-chain-&lt;height&gt;-&lt;date&gt;.bin
 mv nightfall-chain-*.bin ~/.local/share/nightfall/mainnet/n8/blocks.bin</code></pre>
+      <p style="margin:10px 0 0;font-size:.84rem;color:var(--text-dim)">
+        Replacing the file on a node that has already synced is safe but
+        pointless: the wallet notices the chain file is not the one it
+        validated and re-checks all of it from the start.
+      </p>
     </div>
 
     <p style="margin:0 0 40px;font-size:.84rem;color:var(--text-faint);line-height:1.6;max-width:46em">

@@ -7,7 +7,7 @@
  * id the script reaches for but the page never renders are both silent — the
  * browser does not complain, it just shows nothing.
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 
 const ROOT = new URL("../", import.meta.url).pathname;
 const html = readFileSync(ROOT + "website/public/chain/index.html", "utf8");
@@ -74,6 +74,52 @@ for (const m of html.matchAll(/src="\/js\/([a-z-]+\.js)\?v=([^"]+)"/g)) {
 const worker = readFileSync(ROOT + "website/src/index.js", "utf8");
 for (const path of ["/network.json", "/chain.json"]) {
     if (!worker.includes(`"${path}"`)) problems.push(`Worker has no route for ${path}`);
+}
+
+/* The bootstrap instructions must cover every platform we ship a wallet for.
+ *
+ * The first version of that section had macOS and Linux and simply omitted
+ * Windows, which is the platform whose users are least likely to work out the
+ * datadir path on their own. Nothing failed; the instructions were just
+ * missing a third of the audience. So the platforms are checked against the
+ * download page rather than against a list typed here — add a Windows build
+ * and forget the instructions, and this fails.
+ *
+ * Each platform is matched by the shape of its own datadir, because that is
+ * the part a user cannot guess and the part that would be wrong if someone
+ * copied a block and edited only the heading.
+ *
+ * "What we ship" is read from the files in downloads/ rather than from a list
+ * in this script: the artefacts are the ground truth, and a list here would
+ * be one more thing to forget to update. */
+const shippedFiles = readdirSync(ROOT + "website/public/downloads").join(" ");
+const platforms = [
+    ["Windows", /windows/i, /%?APPDATA%?|env:APPDATA/],
+    ["macOS", /macos|\.dmg/i, /Library\/Application\\? Support\/nightfall/],
+    ["Linux", /linux/i, /\.local\/share\/nightfall/],
+];
+for (const [name, artefact, mark] of platforms) {
+    if (artefact.test(shippedFiles) && !mark.test(html)) {
+        problems.push(
+            `downloads offers a ${name} build, but the bootstrap instructions ` +
+                `never mention its datadir — those users have nowhere to put the file`,
+        );
+    }
+}
+
+/* Hashing tools differ per platform and the wrong one is a dead end.
+ *
+ * `shasum` is a Perl script that is not guaranteed on a Linux box, and does
+ * not exist on Windows at all. Telling every platform to run it, which the
+ * first version did, means the verification step silently gets skipped by the
+ * people most likely to need it. */
+for (const [tool, why] of [
+    ["Get-FileHash", "Windows has no shasum"],
+    ["sha256sum", "shasum is not guaranteed on Linux"],
+]) {
+    if (!html.includes(tool)) {
+        problems.push(`bootstrap instructions never use ${tool} — ${why}`);
+    }
 }
 
 /* The nav link must be on every page that has a nav, or the page is orphaned. */
