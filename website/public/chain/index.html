@@ -10,7 +10,7 @@
 <meta property="og:type" content="website">
 <meta name="theme-color" content="#0e0b18">
 <link rel="icon" href="/assets/favicon-32.png" sizes="32x32" type="image/png">
-<link rel="stylesheet" href="/css/style.css?v=live-7">
+<link rel="stylesheet" href="/css/style.css?v=2c072424">
 <style>
   /* Scoped to this page. The shared stylesheet has no reason to carry a
      block table or a hand-drawn chart. */
@@ -79,8 +79,14 @@
      and break-all is there because the name has no spaces to break at. */
   .c-dl { flex-direction:column; gap:3px; white-space:normal; max-width:100%;
           text-align:center; line-height:1.3; }
-  .c-dl-file { font-size:.72rem; font-weight:500; opacity:.85;
-               word-break:break-all; }
+  /* The gradient runs violet → magenta → teal, and white on that teal end
+     measures 2.92:1. Fine for the bold 15px label above; thin for an 11px
+     monospace line. A soft dark shadow lifts it off the light end without
+     touching the brand gradient, which is used on every button on the site
+     and is not this section's to change. */
+  .c-dl-file { font-size:.74rem; font-weight:500; opacity:.92;
+               letter-spacing:.01em; word-break:break-all;
+               text-shadow:0 1px 2px rgba(10,6,26,.55); }
 
   /* Supply proof — the one thing a privacy coin is always asked about. */
   .c-proof { background:var(--surface); border:1px solid var(--border);

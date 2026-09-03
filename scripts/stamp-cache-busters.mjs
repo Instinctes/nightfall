@@ -34,12 +34,12 @@ const PUB = ROOT + "website/public/";
 const check = process.argv.includes("--check");
 
 const fingerprints = new Map();
-function fingerprint(name) {
-    if (!fingerprints.has(name)) {
-        const body = readFileSync(PUB + "js/" + name);
-        fingerprints.set(name, createHash("sha256").update(body).digest("hex").slice(0, 8));
+function fingerprint(rel) {
+    if (!fingerprints.has(rel)) {
+        const body = readFileSync(PUB + rel);
+        fingerprints.set(rel, createHash("sha256").update(body).digest("hex").slice(0, 8));
     }
-    return fingerprints.get(name);
+    return fingerprints.get(rel);
 }
 
 const pages = [];
@@ -58,11 +58,15 @@ let rewritten = 0;
 for (const page of pages) {
     const path = PUB + page;
     const before = readFileSync(path, "utf8");
+    // Scripts and stylesheets both. The stylesheet was the same bug wearing a
+    // different attribute: style.css sat at a hand-written ?v=live-7, so a CSS
+    // fix reached nobody who had loaded the site before. Catching one and not
+    // the other would have been the same mistake twice in an afternoon.
     const after = before.replace(
-        /(src="\/js\/([a-z0-9-]+\.js)\?v=)([^"]*)(")/g,
-        (whole, head, name, current, tail) => {
-            const want = fingerprint(name);
-            if (current !== want) stale.push(`${page}: ${name} is stamped ?v=${current}, content is ${want}`);
+        /((?:src|href)="\/((?:js|css)\/[a-z0-9-]+\.(?:js|css))\?v=)([^"]*)(")/g,
+        (whole, head, rel, current, tail) => {
+            const want = fingerprint(rel);
+            if (current !== want) stale.push(`${page}: ${rel} is stamped ?v=${current}, content is ${want}`);
             return head + want + tail;
         },
     );
@@ -81,11 +85,11 @@ if (check) {
         console.error("\nrun: node scripts/stamp-cache-busters.mjs");
         process.exit(1);
     }
-    console.log(`cache busters ok — ${pages.length} pages, ${fingerprints.size} scripts`);
+    console.log(`cache busters ok — ${pages.length} pages, ${fingerprints.size} assets`);
 } else {
     console.log(
         rewritten
-            ? `stamped ${rewritten} page(s) across ${fingerprints.size} scripts`
+            ? `stamped ${rewritten} page(s) across ${fingerprints.size} assets`
             : `nothing to do — ${pages.length} pages already current`,
     );
 }

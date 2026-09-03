@@ -85,6 +85,14 @@ jobs:
       - name: Cache busters match file contents
         run: node scripts/stamp-cache-busters.mjs --check
 
+      # `.container a` is (0,1,1) and outranks `.btn-primary` at (0,1,0), so a
+      # button inside that container silently loses its white lettering. Four
+      # rules had it independently; the nav one repainted the site's main
+      # Download button in --text-dim on every page, and it survived that long
+      # because a button with unreadable text still looks like a button.
+      - name: Button colours survive container link rules
+        run: node scripts/check-button-colours.mjs
+
       # The whole point of the project. Every test in this suite is the
       # inverse of an exploit that once worked against a real build.
       - name: Exploit regression suite

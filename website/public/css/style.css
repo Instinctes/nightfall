@@ -193,7 +193,7 @@ nav .wrap {
     flex-wrap: nowrap;
 }
 
-.nav-links a {
+.nav-links a:not(.btn) {
     color: var(--text-dim);
     font-size: 0.92rem;
     position: relative;
@@ -1311,7 +1311,18 @@ section {
     max-width: 46em;
 }
 
-.doc a {
+/* Prose links, and only prose links.
+ *
+ * `.doc a` is (0,1,1) and beat `.btn-primary` at (0,1,0), so any button
+ * placed inside a documentation column was painted the link violet instead
+ * of white — violet lettering on the violet gradient the button is filled
+ * with. The archive download button on /chain/ shipped that way and was
+ * close to unreadable; it took someone saying "the text isn't really
+ * visible" to catch it, because the button is still obviously a button.
+ *
+ * The navigation already guards against exactly this with
+ * `a:not(.btn):not(.nav-icon)`. This rule simply never learned it. */
+.doc a:not(.btn) {
     color: var(--violet-hi);
 }
 
@@ -1383,7 +1394,7 @@ footer {
     margin: 0 0 14px;
 }
 
-.foot-col a {
+.foot-col a:not(.btn) {
     display: block;
     color: var(--text-dim);
     margin-bottom: 9px;
@@ -1713,7 +1724,7 @@ footer {
     font-size: 0.9rem;
 }
 
-.upfront-foot a {
+.upfront-foot a:not(.btn) {
     color: var(--text-dim);
 }
 
