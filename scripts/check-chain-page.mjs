@@ -61,14 +61,15 @@ if (/<script(?![^>]*\bsrc=)[^>]*>[\s\S]*?\S[\s\S]*?<\/script>/.test(html)) {
  * version for another 24 hours — invisible bars and all — while the HTML
  * around it was current. Tying the buster to the version means a release
  * cannot forget to break the cache. */
-const wsVersion = (readFileSync(ROOT + "Cargo.toml", "utf8").match(
-    /^version\s*=\s*"([^"]+)"/m,
-) || [])[1];
-for (const m of html.matchAll(/src="\/js\/([a-z-]+\.js)\?v=([^"]+)"/g)) {
-    if (m[2] !== wsVersion) {
-        problems.push(`${m[1]} is busted with ?v=${m[2]}, but this release is ${wsVersion}`);
-    }
-}
+// Superseded by scripts/stamp-cache-busters.mjs, which stamps the file's own
+// content hash and is checked separately.
+//
+// Tying the buster to the release version fixed the failure it was written
+// for — a release forgetting to bump it — and created another. A version does
+// not change when a page is fixed between releases, so on 3 Sep the chain
+// page's download button was fixed, deployed, correct on the server, and
+// still broken in every browser that had loaded ?v=0.9.0 earlier that day.
+// A hash changes exactly when the file does, which covers both.
 
 /* Both endpoints the page depends on must exist in the Worker. */
 const worker = readFileSync(ROOT + "website/src/index.js", "utf8");

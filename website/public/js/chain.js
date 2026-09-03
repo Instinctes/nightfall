@@ -440,7 +440,18 @@
 
             const link = document.getElementById("bs-link");
             if (link && m.url) link.href = m.url;
-            if (link && m.archive) link.textContent = `Download the chain — ${m.archive}`;
+
+            // The file name goes in its own element rather than into the
+            // link's text. Written as one string it made a 513px button on a
+            // 375px phone: `.btn` is `white-space: nowrap`, correct for
+            // "Download" and wrong for a 40-character archive name, and the
+            // overflow gave the whole page a sideways scrollbar. As a second
+            // line it wraps and the button stays inside the screen.
+            const file = document.getElementById("bs-file");
+            if (file && m.archive) {
+                file.textContent = m.archive;
+                file.hidden = false;
+            }
         })
         .catch(() => {
             // No manifest yet. Say that, rather than leaving four dashes and

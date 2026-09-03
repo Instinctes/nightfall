@@ -69,6 +69,19 @@
                   text-transform:uppercase; }
   .c-card p { margin:7px 0 0; font-size:.82rem; color:var(--text-dim); line-height:1.5; }
 
+  /* The archive download.
+     `.btn` is white-space:nowrap, which is right for "Download" and wrong
+     once the archive's file name is appended: 513px of button in a 375px
+     phone, overflowing far enough to give the whole page a sideways
+     scrollbar. Rather than loosen .btn everywhere, this one stacks — action
+     on the first line, file name on the second — and is allowed to wrap.
+     max-width keeps it inside the column no matter how long the name grows,
+     and break-all is there because the name has no spaces to break at. */
+  .c-dl { flex-direction:column; gap:3px; white-space:normal; max-width:100%;
+          text-align:center; line-height:1.3; }
+  .c-dl-file { font-size:.72rem; font-weight:500; opacity:.85;
+               word-break:break-all; }
+
   /* Supply proof — the one thing a privacy coin is always asked about. */
   .c-proof { background:var(--surface); border:1px solid var(--border);
              border-radius:22px; padding:26px 26px 22px; margin:0 0 34px; }
@@ -333,7 +346,7 @@
     </div>
 
     <p style="margin:0 0 14px">
-      <a class="btn btn-primary" id="bs-link" href="https://github.com/Instinctes/nightfall/releases/tag/chain-bootstrap">Download the chain</a>
+      <a class="btn btn-primary c-dl" id="bs-link" href="https://github.com/Instinctes/nightfall/releases/tag/chain-bootstrap"><span>Download the chain</span><span class="c-dl-file mono" id="bs-file" hidden></span></a>
     </p>
 
     <div class="c-wrap" style="padding:18px 20px;margin-bottom:14px">
@@ -404,7 +417,7 @@ mv nightfall-chain-*.bin ~/.local/share/nightfall/mainnet/n8/blocks.bin</code></
     </div>
   </div>
 </article>
-<script src="/js/nav.js?v=0.9.0"></script>
-<script src="/js/chain.js?v=0.9.0"></script>
+<script src="/js/nav.js?v=d89ab34c"></script>
+<script src="/js/chain.js?v=d63fca71"></script>
 </body>
 </html>

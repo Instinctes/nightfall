@@ -76,6 +76,15 @@ jobs:
       - name: Chain archive retirement order
         run: bash scripts/weekly-chain-archive.sh --self-test
 
+      # /js is served with max-age=86400, so ?v= is the only thing that tells
+      # a returning browser to fetch again. Maintained by hand it drifted:
+      # nav.js sat at ?v=1 on five pages since it was written, and chain.js
+      # was pinned to the release version — which does not change when a page
+      # is fixed between releases. A mobile fix went live on 3 Sep, correct on
+      # the server, and ran nowhere that had loaded the page that day.
+      - name: Cache busters match file contents
+        run: node scripts/stamp-cache-busters.mjs --check
+
       # The whole point of the project. Every test in this suite is the
       # inverse of an exploit that once worked against a real build.
       - name: Exploit regression suite
