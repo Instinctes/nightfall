@@ -133,6 +133,17 @@ jobs:
         shell: bash
         run: |
           TAG="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+          # `gh release upload` needs a release, and pushing a tag does not
+          # make one. On 0.9.1 both jobs built for half an hour and then
+          # failed on this line because the release did not exist yet —
+          # the tag did, which looks the same until you read the error.
+          # Create it if it is missing; --verify-tag so a typo in the tag
+          # cannot invent a release for a commit nobody tagged.
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "NIGHTFALLCOIN Core ${TAG#v}" \
+              --notes "Binaries built by this workflow. Verify the SHA256 before running anything."
+          fi
           # --clobber so re-running for a tag replaces rather than fails.
           gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
         env:
@@ -196,6 +207,14 @@ jobs:
       - name: Attach to release
         run: |
           TAG="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+          # Same guard as the Windows job — see the comment there. Whichever
+          # of the two finishes first creates the release; the other finds it.
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "NIGHTFALLCOIN Core ${TAG#v}" \
+              --notes "Binaries built by this workflow. Verify the SHA256 before running anything." \
+              || true
+          fi
           gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
