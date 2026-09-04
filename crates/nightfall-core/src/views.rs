@@ -702,211 +702,202 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         .map(|w| w.address_string())
         .unwrap_or_default();
 
-    ui.set_max_width(660.0);
+    // Three cards and a summary, rather than one long column.
+    //
+    // Everything used to live in a single card: address, book, amount, memo,
+    // fee, button, stacked with blank space between them. Nothing said which
+    // parts belonged together, so the form had to be read top to bottom every
+    // time. The grouping here is the same one the user already has in their
+    // head — who, how much, what it costs — and the summary at the end states
+    // the consequence before the irreversible button.
+    narrow_column(ui, 660.0, |ui| {
+        let mut addr_state = None;
 
-    card(ui, |ui| {
-        ui.set_width(ui.available_width());
+        titled_card(ui, "Recipient", |ui| {
+            ui.set_width(ui.available_width());
 
-        // Recipient
-        ui.label(
-            RichText::new("Recipient address")
-                .size(12.0)
-                .color(TEXT_DIM),
-        );
-        ui.add_space(5.0);
-        ui.add(
-            egui::TextEdit::multiline(&mut app.send_to)
-                .desired_rows(2)
-                .desired_width(f32::INFINITY)
-                .font(egui::TextStyle::Monospace)
-                .hint_text("nf1…"),
-        );
+            field_label(ui, "Address", None);
+            ui.add(
+                egui::TextEdit::multiline(&mut app.send_to)
+                    .margin(FIELD_MARGIN)
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY)
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text("nf1…"),
+            );
 
-        // Live validation — a wrong address must never reach a signature.
-        let trimmed = app.send_to.trim().to_string();
-        let addr_state = if trimmed.is_empty() {
-            None
-        } else if trimmed == own_address {
-            Some(Err("This is your own address".to_string()))
-        } else {
-            Some(Address::decode(&trimmed).map_err(|e| e.to_string()))
-        };
+            // Live validation — a wrong address must never reach a signature.
+            // Untouched by the redesign: this is the check that stands between a
+            // typo and a payment that cannot come back.
+            let trimmed = app.send_to.trim().to_string();
+            addr_state = if trimmed.is_empty() {
+                None
+            } else if trimmed == own_address {
+                Some(Err("This is your own address".to_string()))
+            } else {
+                Some(Address::decode(&trimmed).map_err(|e| e.to_string()))
+            };
 
-        ui.add_space(5.0);
-        match &addr_state {
-            None => {
-                ui.label(
-                    RichText::new("Paste the nf1 address the recipient shared with you.")
-                        .size(11.0)
-                        .color(TEXT_FAINT),
-                );
-            }
-            Some(Ok(a)) => {
-                ui.horizontal(|ui| {
-                    dot(ui, SUCCESS, false);
-                    ui.add_space(3.0);
+            ui.add_space(5.0);
+            match &addr_state {
+                None => {
                     ui.label(
-                        RichText::new(format!("Valid address · {}", a.short()))
-                            .size(11.0)
-                            .color(SUCCESS),
-                    );
-                });
-            }
-            Some(Err(e)) => {
-                ui.horizontal(|ui| {
-                    dot(ui, DANGER, false);
-                    ui.add_space(3.0);
-                    ui.label(RichText::new(e).size(11.0).color(DANGER));
-                });
-            }
-        }
-
-        if !app.address_book.entries.is_empty() {
-            ui.add_space(10.0);
-            ui.label(RichText::new("Address book").size(11.0).color(TEXT_DIM));
-            ui.add_space(4.0);
-            let picks: Vec<(String, String)> = app
-                .address_book
-                .entries
-                .iter()
-                .map(|e| (e.name.clone(), e.address.clone()))
-                .collect();
-            ui.horizontal_wrapped(|ui| {
-                for (name, addr) in picks {
-                    if ghost_button(ui, &format!("  {name}  ")).clicked() {
-                        app.send_to = addr;
-                    }
-                }
-            });
-        }
-
-        ui.add_space(18.0);
-
-        // Amount
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Amount").size(12.0).color(TEXT_DIM));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("MAX").size(10.5).color(ACCENT_HI))
-                            .fill(Color32::TRANSPARENT)
-                            .stroke(Stroke::new(1.0_f32, ACCENT_DIM))
-                            .rounding(Rounding::same(999.0)),
-                    )
-                    .on_hover_text("Send everything, minus the fee")
-                    .clicked()
-                {
-                    let max = balances.available.saturating_sub(app.send_fee);
-                    app.send_amount = night(max).replace('\u{202F}', "");
-                }
-                ui.label(
-                    RichText::new(format!("Available {}", night(balances.available)))
-                        .size(11.0)
-                        .color(TEXT_FAINT),
-                );
-            });
-        });
-        ui.add_space(5.0);
-        ui.add(
-            egui::TextEdit::singleline(&mut app.send_amount)
-                .desired_width(f32::INFINITY)
-                .font(egui::TextStyle::Monospace)
-                .hint_text("0.00000000"),
-        );
-
-        let amount_state = parse_amount(&app.send_amount);
-        ui.add_space(5.0);
-        match &amount_state {
-            Ok(darks) => {
-                let total = darks.saturating_add(app.send_fee);
-                if total > balances.available {
-                    ui.label(
-                        RichText::new(format!(
-                            "Not enough — {} needed including fee",
-                            night(total)
-                        ))
-                        .size(11.0)
-                        .color(DANGER),
-                    );
-                } else {
-                    ui.label(
-                        RichText::new(format!("Total debit {} NIGHT", night(total)))
+                        RichText::new("Paste the nf1 address the recipient shared with you.")
                             .size(11.0)
                             .color(TEXT_FAINT),
                     );
                 }
-            }
-            Err(e) if app.send_amount.trim().is_empty() => {
-                let _ = e;
-                ui.label(RichText::new(" ").size(11.0));
-            }
-            Err(e) => {
-                ui.label(RichText::new(e).size(11.0).color(DANGER));
-            }
-        }
-
-        ui.add_space(18.0);
-
-        // Memo
-        ui.label(
-            RichText::new("Memo (encrypted, only the recipient can read it)")
-                .size(12.0)
-                .color(TEXT_DIM),
-        );
-        ui.add_space(5.0);
-        ui.add(
-            egui::TextEdit::singleline(&mut app.send_memo)
-                .desired_width(f32::INFINITY)
-                .char_limit(64)
-                .hint_text("optional"),
-        );
-        ui.add_space(3.0);
-        ui.label(
-            RichText::new(format!("{}/64 characters", app.send_memo.len()))
-                .size(10.0)
-                .color(TEXT_FAINT),
-        );
-
-        ui.add_space(18.0);
-
-        // Fee
-        ui.label(RichText::new("Network fee").size(12.0).color(TEXT_DIM));
-        ui.add_space(5.0);
-        ui.horizontal(|ui| {
-            for (label, value) in [
-                ("Economy", DEFAULT_FEE_DARKS / 10),
-                ("Standard", DEFAULT_FEE_DARKS),
-                ("Priority", DEFAULT_FEE_DARKS * 10),
-            ] {
-                let selected = app.send_fee == value;
-                let resp = ui.add(
-                    egui::Button::new(
-                        RichText::new(format!("{label}  {}", night(value)))
-                            .size(11.5)
-                            .color(if selected { ACCENT_HI } else { TEXT_DIM }),
-                    )
-                    .fill(if selected {
-                        ACCENT.gamma_multiply(0.16)
-                    } else {
-                        SURFACE_HI
-                    })
-                    .stroke(Stroke::new(1.0_f32, if selected { ACCENT } else { BORDER }))
-                    .rounding(Rounding::same(ROUND_SM)),
-                );
-                if resp.clicked() {
-                    app.send_fee = value;
+                Some(Ok(a)) => {
+                    ui.horizontal(|ui| {
+                        dot(ui, SUCCESS, false);
+                        ui.add_space(3.0);
+                        ui.label(
+                            RichText::new(format!("Valid address · {}", a.short()))
+                                .size(11.0)
+                                .color(SUCCESS),
+                        );
+                    });
+                }
+                Some(Err(e)) => {
+                    ui.horizontal(|ui| {
+                        dot(ui, DANGER, false);
+                        ui.add_space(3.0);
+                        ui.label(RichText::new(e).size(11.0).color(DANGER));
+                    });
                 }
             }
+
+            if !app.address_book.entries.is_empty() {
+                divider(ui);
+                ui.label(RichText::new("Address book").size(11.0).color(TEXT_DIM));
+                ui.add_space(6.0);
+                let picks: Vec<(String, String)> = app
+                    .address_book
+                    .entries
+                    .iter()
+                    .map(|e| (e.name.clone(), e.address.clone()))
+                    .collect();
+                ui.horizontal_wrapped(|ui| {
+                    for (name, addr) in picks {
+                        if ghost_button(ui, &format!("  {name}  ")).clicked() {
+                            app.send_to = addr;
+                        }
+                    }
+                });
+            }
         });
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new("The fee is destroyed, not paid to a miner. 100% burn.")
-                .size(10.5)
-                .color(TEXT_FAINT),
-        );
 
-        ui.add_space(22.0);
+        ui.add_space(14.0);
 
+        let mut amount_state = parse_amount(&app.send_amount);
+
+        titled_card(ui, "Amount", |ui| {
+            ui.set_width(ui.available_width());
+
+            // The MAX button and the available balance belong to the amount
+            // field, so they sit on its label row instead of floating above it.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("NIGHT to send").size(12.0).color(TEXT_DIM));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("MAX").size(10.5).color(ACCENT_HI))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::new(1.0_f32, ACCENT_DIM))
+                                .rounding(Rounding::same(999.0)),
+                        )
+                        .on_hover_text("Send everything, minus the fee")
+                        .clicked()
+                    {
+                        let max = balances.available.saturating_sub(app.send_fee);
+                        app.send_amount = night(max).replace('\u{202F}', "");
+                    }
+                    ui.label(
+                        RichText::new(format!("Available {}", night(balances.available)))
+                            .size(11.0)
+                            .color(TEXT_FAINT),
+                    );
+                });
+            });
+            ui.add_space(5.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut app.send_amount)
+                    .margin(FIELD_MARGIN)
+                    .desired_width(f32::INFINITY)
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text("0.00000000"),
+            );
+
+            amount_state = parse_amount(&app.send_amount);
+            ui.add_space(4.0);
+            // Only errors live here now. "Total debit" used to sit under the
+            // field, competing with the memo and the fee for the same glance;
+            // it belongs in the summary, where the reader is deciding.
+            let amount_error = match &amount_state {
+                Ok(darks) => {
+                    let total = darks.saturating_add(app.send_fee);
+                    (total > balances.available)
+                        .then(|| format!("Not enough — {} needed including fee", night(total)))
+                }
+                Err(_) if app.send_amount.trim().is_empty() => None,
+                Err(e) => Some(e.clone()),
+            };
+            message_slot(ui, |ui| {
+                if let Some(msg) = &amount_error {
+                    dot(ui, DANGER, false);
+                    ui.add_space(3.0);
+                    ui.label(RichText::new(msg).size(11.0).color(DANGER));
+                }
+            });
+
+            divider(ui);
+
+            // Memo
+            field_label(
+                ui,
+                "Memo",
+                Some(
+                    RichText::new(format!("{}/64", app.send_memo.len()))
+                        .size(10.5)
+                        .color(TEXT_FAINT),
+                ),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut app.send_memo)
+                    .margin(FIELD_MARGIN)
+                    .desired_width(f32::INFINITY)
+                    .char_limit(64)
+                    .hint_text("optional"),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Encrypted. Only the recipient can read it.")
+                    .size(10.5)
+                    .color(TEXT_FAINT),
+            );
+        });
+
+        ui.add_space(14.0);
+
+        // There is one fee, and it was never a choice.
+        //
+        // This card offered Economy, Standard and Priority. Nothing in the
+        // protocol tells them apart: the fee is burned rather than paid to a
+        // miner, and no part of the node orders the mempool by it. So
+        // "Priority" promised faster confirmation that nothing delivers, and
+        // "Economy" invited paying a tenth for exactly the same service —
+        // three buttons where the phone wallet and the command line each show
+        // one number. A choice that changes nothing is worse than no choice:
+        // it makes people think they got it wrong when a payment is slow.
+        app.send_fee = DEFAULT_FEE_DARKS;
+
+        // --- what is about to happen -------------------------------------------
+        //
+        // The numbers that decide the payment, gathered in one recessed block
+        // immediately above the button that commits it. Previously the total sat
+        // three fields further up, next to the amount, and the button sat alone
+        // under the fee chips — so the last thing read before pressing was the
+        // burn note, not the sum leaving the wallet.
         let ready = matches!(addr_state, Some(Ok(_)))
             && amount_state
                 .as_ref()
@@ -914,9 +905,58 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 .unwrap_or(false)
             && !app.send_busy;
 
-        if primary_button(ui, "Review payment", ready).clicked() {
-            app.send_confirm = true;
-        }
+        card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let amount = amount_state.as_ref().copied().unwrap_or(0);
+            let total = amount.saturating_add(app.send_fee);
+
+            well(ui, |ui| {
+                summary_row(ui, "Amount", RichText::new(night(amount)), false);
+                ui.add_space(6.0);
+                summary_row(
+                    ui,
+                    "Fee (burned)",
+                    RichText::new(night(app.send_fee)).color(WARN),
+                    false,
+                );
+                ui.add_space(8.0);
+                let w = ui.available_width();
+                let (r, _) = ui.allocate_exact_size(Vec2::new(w, 1.0), egui::Sense::hover());
+                ui.painter().hline(
+                    r.x_range(),
+                    r.center().y,
+                    Stroke::new(1.0_f32, BORDER.gamma_multiply(0.9)),
+                );
+                ui.add_space(8.0);
+                summary_row(
+                    ui,
+                    "Leaves your wallet",
+                    RichText::new(night(total)).strong().size(15.0),
+                    true,
+                );
+                if let Some(Ok(a)) = &addr_state {
+                    ui.add_space(6.0);
+                    summary_row(
+                        ui,
+                        "To",
+                        RichText::new(a.short()).color(TEXT_DIM).size(12.0),
+                        false,
+                    );
+                }
+            });
+
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("The fee is fixed and destroyed, not paid to a miner. 100% burn.")
+                    .size(10.5)
+                    .color(TEXT_FAINT),
+            );
+
+            ui.add_space(14.0);
+            if primary_button(ui, "Review payment", ready).clicked() {
+                app.send_confirm = true;
+            }
+        });
     });
 
     // --- confirmation modal ---
@@ -1015,57 +1055,110 @@ pub fn receive(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         .map(|w| w.address_string())
         .unwrap_or_default();
 
-    ui.set_max_width(660.0);
+    let (scanned, outputs) = app
+        .wallet
+        .lock()
+        .map(|w| (w.scanned_to(), w.outputs().len()))
+        .unwrap_or_default();
+    let tip = app.tip_height();
 
-    card(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.vertical_centered(|ui| {
-            egui::Frame::none()
-                .fill(Color32::WHITE)
-                .rounding(Rounding::same(10.0))
-                .inner_margin(egui::Margin::same(12.0))
-                .show(ui, |ui| {
-                    qr_code(ui, &address, 200.0);
+    // Two columns, because one narrow card against the left edge left two
+    // thirds of the window empty. The right column is not filler: everything
+    // in it is a question someone actually asks while waiting for a payment —
+    // has the wallet caught up, and can I hand this address out twice.
+    two_columns(
+        ui,
+        380.0,
+        |ui| {
+            card(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.vertical_centered(|ui| {
+                    egui::Frame::none()
+                        .fill(Color32::WHITE)
+                        .rounding(Rounding::same(10.0))
+                        .inner_margin(egui::Margin::same(12.0))
+                        .show(ui, |ui| {
+                            qr_code(ui, &address, 200.0);
+                        });
+                    ui.add_space(14.0);
+                    ui.label(
+                        RichText::new("Scan or copy to receive NIGHT")
+                            .size(12.5)
+                            .color(TEXT_DIM),
+                    );
                 });
-            ui.add_space(14.0);
-            ui.label(
-                RichText::new("Scan or copy to receive NIGHT")
-                    .size(12.5)
-                    .color(TEXT_DIM),
-            );
-        });
 
-        ui.add_space(18.0);
-        ui.label(RichText::new("Your address").size(12.0).color(TEXT_DIM));
-        ui.add_space(5.0);
-        if copyable(ui, &address, true) {
-            app.toasts.success(ctx, "Address copied");
-        }
-
-        ui.add_space(14.0);
-        egui::Frame::none()
-            .fill(SURFACE_HI)
-            .rounding(Rounding::same(ROUND_SM))
-            .inner_margin(egui::Margin::same(13.0))
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new("This address is safe to reuse")
-                        .size(12.5)
-                        .color(SUCCESS)
-                        .strong(),
-                );
-                ui.add_space(4.0);
+                divider(ui);
+                field_label(ui, "Your address", None);
+                if copyable(ui, &address, true) {
+                    app.toasts.success(ctx, "Address copied");
+                }
+            });
+        },
+        |ui| {
+            titled_card(ui, "Safe to reuse", |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    dot(ui, SUCCESS, false);
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("Hand this address out as often as you like")
+                            .size(12.5)
+                            .color(SUCCESS)
+                            .strong(),
+                    );
+                });
+                ui.add_space(6.0);
                 ui.label(
                     RichText::new(
                         "Every payment creates a fresh one-time key on chain. Two payments to \
-                         this address share no visible field, so nobody can link them — not even \
-                         the sender.",
+                         this address share no visible field, so nobody can link them — not \
+                         even the sender.",
                     )
                     .size(11.5)
                     .color(TEXT_DIM),
                 );
             });
-    });
+
+            ui.add_space(14.0);
+
+            titled_card(ui, "Will it arrive", |ui| {
+                ui.set_width(ui.available_width());
+                data_row(
+                    ui,
+                    "Chain tip",
+                    RichText::new(format_int(tip)).monospace(),
+                    false,
+                );
+                data_row(
+                    ui,
+                    "Wallet scanned to",
+                    RichText::new(format_int(scanned))
+                        .monospace()
+                        .color(if scanned + 2 >= tip { SUCCESS } else { WARN }),
+                    false,
+                );
+                data_row(
+                    ui,
+                    "Outputs found",
+                    RichText::new(format_int(outputs as u64)).monospace(),
+                    true,
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(if scanned + 2 >= tip {
+                        "The wallet is level with the chain. A payment shows up as soon as \
+                         it is in a block."
+                    } else {
+                        "The wallet is still reading older blocks. A payment that has already \
+                         arrived will appear once the scan catches up — nothing is lost."
+                    })
+                    .size(11.0)
+                    .color(TEXT_FAINT),
+                );
+            });
+        },
+    );
 }
 
 // -------------------------------------------------------------- activity ---
@@ -1077,9 +1170,41 @@ pub fn activity(app: &mut App, ui: &mut egui::Ui) {
         .map(|w| w.history().to_vec())
         .unwrap_or_default();
 
+    // A running total across the whole history, above the list.
+    //
+    // With no transactions this page was a filter box and one empty card on an
+    // otherwise blank screen. With transactions it was a list that never
+    // answered the first question anyone has about a list of payments: how
+    // much, in total, in each direction. Both are fixed by the same strip, and
+    // it is computed from the same entries the list draws, so it cannot
+    // disagree with them.
+    let (mut got, mut paid, mut mined, mut burned) = (0u64, 0u64, 0u64, 0u64);
+    for e in &entries {
+        match e.direction {
+            Direction::Received => got = got.saturating_add(e.amount),
+            Direction::Mined => mined = mined.saturating_add(e.amount),
+            Direction::Sent => {
+                paid = paid.saturating_add(e.amount);
+                burned = burned.saturating_add(e.fee);
+            }
+        }
+    }
+
+    card(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.columns(4, |c| {
+            stat(&mut c[0], "RECEIVED", &night_compact(got), SUCCESS);
+            stat(&mut c[1], "MINED", &night_compact(mined), ACCENT_HI);
+            stat(&mut c[2], "SENT", &night_compact(paid), TEXT);
+            stat(&mut c[3], "FEES BURNED", &night_compact(burned), WARN);
+        });
+    });
+    ui.add_space(14.0);
+
     ui.horizontal(|ui| {
         ui.add(
             egui::TextEdit::singleline(&mut app.activity_filter)
+                .margin(FIELD_MARGIN)
                 .desired_width(260.0)
                 .hint_text("Filter by memo, direction or txid"),
         );
@@ -1591,6 +1716,7 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut app.peer_input)
+                    .margin(FIELD_MARGIN)
                     .desired_width(280.0)
                     .font(egui::TextStyle::Monospace)
                     .hint_text("host:port"),
@@ -1685,6 +1811,7 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut app.proxy_input)
+                    .margin(FIELD_MARGIN)
                     .desired_width(280.0)
                     .font(egui::TextStyle::Monospace)
                     .hint_text("127.0.0.1:9050"),
@@ -1857,286 +1984,289 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 // -------------------------------------------------------------- settings ---
 
 pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
-    ui.set_max_width(700.0);
-
-    titled_card(ui, "Backup", |ui| {
-        ui.set_width(ui.available_width());
-        ui.label(
-            RichText::new(
-                "The 24 words are the wallet — the same phrase the phone and browser use. \
+    // Centred rather than pinned left. Seven cards in a 700px column against
+    // the left edge of a wide window is most of a screen of nothing.
+    narrow_column(ui, 760.0, |ui| {
+        titled_card(ui, "Backup", |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new(
+                    "The 24 words are the wallet — the same phrase the phone and browser use. \
                  Anyone who reads them owns the coins. Write them on paper. Never a screenshot, \
                  chat or cloud note. These words are not a Bitcoin seed.",
-            )
-            .size(12.0)
-            .color(TEXT_DIM),
-        );
-        ui.add_space(12.0);
+                )
+                .size(12.0)
+                .color(TEXT_DIM),
+            );
+            ui.add_space(12.0);
 
-        let seed_path = app
-            .wallet
-            .lock()
-            .map(|w| w.seed_path.display().to_string())
-            .unwrap_or_default();
-        kv(
-            ui,
-            "Seed file",
-            RichText::new(seed_path).monospace().size(11.0),
-        );
-        kv(
-            ui,
-            "Permissions",
-            RichText::new("0600 — owner only").color(SUCCESS),
-        );
-
-        ui.add_space(12.0);
-        if app.reveal_mnemonic {
-            let phrase = app
+            let seed_path = app
                 .wallet
                 .lock()
-                .map(|w| w.recovery_phrase())
+                .map(|w| w.seed_path.display().to_string())
                 .unwrap_or_default();
-            if copyable(ui, &phrase, true) {
-                app.toasts.info(ctx, "Phrase copied — handle with care");
-            }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ghost_button(ui, "Hide words").clicked() {
-                    app.reveal_mnemonic = false;
-                }
-                if !app.backup_acked && ghost_button(ui, "I wrote these words down").clicked() {
-                    app.ack_backup();
-                    app.toasts.success(ctx, "Backup acknowledged");
-                }
-            });
-        } else if ghost_button(ui, "Reveal 24 words").clicked() {
-            app.reveal_mnemonic = true;
-        }
-
-        ui.add_space(10.0);
-        if app.reveal_seed {
-            let seed = app.wallet.lock().map(|w| w.seed_hex()).unwrap_or_default();
-            ui.label(
-                RichText::new("Hex seed (same 32 bytes as the words)")
-                    .size(11.0)
-                    .color(TEXT_FAINT),
+            kv(
+                ui,
+                "Seed file",
+                RichText::new(seed_path).monospace().size(11.0),
             );
-            ui.add_space(4.0);
-            if copyable(ui, &seed, true) {
-                app.toasts.info(ctx, "Hex seed copied — handle with care");
-            }
-            ui.add_space(6.0);
-            if ghost_button(ui, "Hide hex").clicked() {
-                app.reveal_seed = false;
-            }
-        } else if ghost_button(ui, "Show hex seed").clicked() {
-            app.reveal_seed = true;
-        }
-    });
-
-    ui.add_space(14.0);
-
-    titled_card(ui, "View key", |ui| {
-        ui.set_width(ui.available_width());
-        ui.label(
-            RichText::new(
-                "A view key lets someone see every amount and memo you send or receive — an \
-                 accountant or auditor, for example. It cannot spend anything. To prove a \
-                 single payment instead, copy a Receipt from the Activity list.",
-            )
-            .size(12.0)
-            .color(TEXT_DIM),
-        );
-        ui.add_space(12.0);
-        if app.reveal_view_key {
-            let vk = app
-                .wallet
-                .lock()
-                .map(|w| w.view_key_string())
-                .unwrap_or_default();
-            if copyable(ui, &vk, true) {
-                app.toasts.success(ctx, "View key copied");
-            }
-            ui.add_space(6.0);
-            if ghost_button(ui, "Hide view key").clicked() {
-                app.reveal_view_key = false;
-            }
-        } else if ghost_button(ui, "Show view key").clicked() {
-            app.reveal_view_key = true;
-        }
-    });
-
-    ui.add_space(14.0);
-
-    titled_card(ui, "Wallet", |ui| {
-        ui.set_width(ui.available_width());
-        let (scanned, outputs) = app
-            .wallet
-            .lock()
-            .map(|w| (w.scanned_to(), w.outputs().len()))
-            .unwrap_or((0, 0));
-        kv(
-            ui,
-            "Scanned to block",
-            RichText::new(format_int(scanned)).monospace(),
-        );
-        kv(
-            ui,
-            "Known outputs",
-            RichText::new(outputs.to_string()).monospace(),
-        );
-        kv(
-            ui,
-            "Data folder",
-            RichText::new(app.datadir.display().to_string())
-                .monospace()
-                .size(11.0),
-        );
-
-        ui.add_space(12.0);
-        let pruned = app.status.as_ref().map(|s| s.pruned).unwrap_or(false);
-        let prune_height = app.status.as_ref().map(|s| s.prune_height).unwrap_or(0);
-        if pruned {
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new(format!(
-                    "This node is pruned. Bodies start at height {}. \
-                     Rescan from genesis needs an archive node or the phone/web light API.",
-                    format_int(prune_height)
-                ))
-                .size(11.5)
-                .color(WARN),
+            kv(
+                ui,
+                "Permissions",
+                RichText::new("0600 — owner only").color(SUCCESS),
             );
-        }
-        ui.add_space(12.0);
-        if ghost_button(ui, "Rescan from genesis").clicked() {
-            if let Some(node) = app.node.clone() {
-                let wallet = std::sync::Arc::clone(&app.wallet);
-                let signal = std::sync::Arc::clone(&app.sync_signal);
-                let syncing = std::sync::Arc::clone(&app.syncing);
-                syncing.store(true, std::sync::atomic::Ordering::SeqCst);
-                std::thread::spawn(move || {
-                    let result = wallet
-                        .lock()
-                        .map_err(|_| "wallet busy".to_string())
-                        .and_then(|mut w| w.rescan(&node).map_err(|e| e.to_string()));
-                    syncing.store(false, std::sync::atomic::Ordering::SeqCst);
-                    if let Ok(mut slot) = signal.lock() {
-                        *slot = Some(result);
+
+            ui.add_space(12.0);
+            if app.reveal_mnemonic {
+                let phrase = app
+                    .wallet
+                    .lock()
+                    .map(|w| w.recovery_phrase())
+                    .unwrap_or_default();
+                if copyable(ui, &phrase, true) {
+                    app.toasts.info(ctx, "Phrase copied — handle with care");
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ghost_button(ui, "Hide words").clicked() {
+                        app.reveal_mnemonic = false;
+                    }
+                    if !app.backup_acked && ghost_button(ui, "I wrote these words down").clicked() {
+                        app.ack_backup();
+                        app.toasts.success(ctx, "Backup acknowledged");
                     }
                 });
-                app.toasts.info(ctx, "Rescanning from genesis…");
+            } else if ghost_button(ui, "Reveal 24 words").clicked() {
+                app.reveal_mnemonic = true;
             }
-        }
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new("Use this if a balance looks wrong. It re-reads the whole chain.")
-                .size(10.5)
-                .color(TEXT_FAINT),
-        );
 
-        ui.add_space(16.0);
-        ui.label(
-            RichText::new(
-                "Resync the chain file if BLOCKS is frozen on a dead branch. \
-                 Wallet keys stay. Coinbase mined on the abandoned tip does not come back.",
-            )
-            .size(12.0)
-            .color(TEXT_DIM),
-        );
-        ui.add_space(8.0);
-        if app.resync_confirm {
+            ui.add_space(10.0);
+            if app.reveal_seed {
+                let seed = app.wallet.lock().map(|w| w.seed_hex()).unwrap_or_default();
+                ui.label(
+                    RichText::new("Hex seed (same 32 bytes as the words)")
+                        .size(11.0)
+                        .color(TEXT_FAINT),
+                );
+                ui.add_space(4.0);
+                if copyable(ui, &seed, true) {
+                    app.toasts.info(ctx, "Hex seed copied — handle with care");
+                }
+                ui.add_space(6.0);
+                if ghost_button(ui, "Hide hex").clicked() {
+                    app.reveal_seed = false;
+                }
+            } else if ghost_button(ui, "Show hex seed").clicked() {
+                app.reveal_seed = true;
+            }
+        });
+
+        ui.add_space(14.0);
+
+        titled_card(ui, "View key", |ui| {
+            ui.set_width(ui.available_width());
             ui.label(
+                RichText::new(
+                    "A view key lets someone see every amount and memo you send or receive — an \
+                 accountant or auditor, for example. It cannot spend anything. To prove a \
+                 single payment instead, copy a Receipt from the Activity list.",
+                )
+                .size(12.0)
+                .color(TEXT_DIM),
+            );
+            ui.add_space(12.0);
+            if app.reveal_view_key {
+                let vk = app
+                    .wallet
+                    .lock()
+                    .map(|w| w.view_key_string())
+                    .unwrap_or_default();
+                if copyable(ui, &vk, true) {
+                    app.toasts.success(ctx, "View key copied");
+                }
+                ui.add_space(6.0);
+                if ghost_button(ui, "Hide view key").clicked() {
+                    app.reveal_view_key = false;
+                }
+            } else if ghost_button(ui, "Show view key").clicked() {
+                app.reveal_view_key = true;
+            }
+        });
+
+        ui.add_space(14.0);
+
+        titled_card(ui, "Wallet", |ui| {
+            ui.set_width(ui.available_width());
+            let (scanned, outputs) = app
+                .wallet
+                .lock()
+                .map(|w| (w.scanned_to(), w.outputs().len()))
+                .unwrap_or((0, 0));
+            kv(
+                ui,
+                "Scanned to block",
+                RichText::new(format_int(scanned)).monospace(),
+            );
+            kv(
+                ui,
+                "Known outputs",
+                RichText::new(outputs.to_string()).monospace(),
+            );
+            kv(
+                ui,
+                "Data folder",
+                RichText::new(app.datadir.display().to_string())
+                    .monospace()
+                    .size(11.0),
+            );
+
+            ui.add_space(12.0);
+            let pruned = app.status.as_ref().map(|s| s.pruned).unwrap_or(false);
+            let prune_height = app.status.as_ref().map(|s| s.prune_height).unwrap_or(0);
+            if pruned {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!(
+                        "This node is pruned. Bodies start at height {}. \
+                     Rescan from genesis needs an archive node or the phone/web light API.",
+                        format_int(prune_height)
+                    ))
+                    .size(11.5)
+                    .color(WARN),
+                );
+            }
+            ui.add_space(12.0);
+            if ghost_button(ui, "Rescan from genesis").clicked() {
+                if let Some(node) = app.node.clone() {
+                    let wallet = std::sync::Arc::clone(&app.wallet);
+                    let signal = std::sync::Arc::clone(&app.sync_signal);
+                    let syncing = std::sync::Arc::clone(&app.syncing);
+                    syncing.store(true, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::spawn(move || {
+                        let result = wallet
+                            .lock()
+                            .map_err(|_| "wallet busy".to_string())
+                            .and_then(|mut w| w.rescan(&node).map_err(|e| e.to_string()));
+                        syncing.store(false, std::sync::atomic::Ordering::SeqCst);
+                        if let Ok(mut slot) = signal.lock() {
+                            *slot = Some(result);
+                        }
+                    });
+                    app.toasts.info(ctx, "Rescanning from genesis…");
+                }
+            }
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Use this if a balance looks wrong. It re-reads the whole chain.")
+                    .size(10.5)
+                    .color(TEXT_FAINT),
+            );
+
+            ui.add_space(16.0);
+            ui.label(
+                RichText::new(
+                    "Resync the chain file if BLOCKS is frozen on a dead branch. \
+                 Wallet keys stay. Coinbase mined on the abandoned tip does not come back.",
+                )
+                .size(12.0)
+                .color(TEXT_DIM),
+            );
+            ui.add_space(8.0);
+            if app.resync_confirm {
+                ui.label(
                 RichText::new(
                     "This moves blocks.jsonl aside and downloads the live chain. Minutes to hours.",
                 )
                 .size(11.5)
                 .color(WARN),
             );
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if primary_button(ui, "  Resync now  ", true).clicked() {
-                    app.resync_chain(ctx);
-                }
-                if ghost_button(ui, "Cancel").clicked() {
-                    app.resync_confirm = false;
-                }
-            });
-        } else if ghost_button(ui, "Resync chain, keep wallet").clicked() {
-            app.resync_confirm = true;
-        }
-    });
-
-    ui.add_space(14.0);
-
-    titled_card(ui, "Address book", |ui| {
-        ui.set_width(ui.available_width());
-        ui.label(
-            RichText::new("Local labels for nf1 addresses you send to. Never published.")
-                .size(12.0)
-                .color(TEXT_DIM),
-        );
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut app.book_name)
-                    .desired_width(140.0)
-                    .hint_text("Name"),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut app.book_addr)
-                    .desired_width(280.0)
-                    .font(egui::TextStyle::Monospace)
-                    .hint_text("nf1…"),
-            );
-            if ghost_button(ui, "Add").clicked() {
-                match app
-                    .address_book
-                    .add(app.book_name.clone(), app.book_addr.clone())
-                {
-                    Ok(()) => {
-                        let _ = app.address_book.save(&app.datadir);
-                        app.book_name.clear();
-                        app.book_addr.clear();
-                        app.toasts.success(ctx, "Contact saved");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if primary_button(ui, "  Resync now  ", true).clicked() {
+                        app.resync_chain(ctx);
                     }
-                    Err(e) => app.toasts.error(ctx, e),
-                }
+                    if ghost_button(ui, "Cancel").clicked() {
+                        app.resync_confirm = false;
+                    }
+                });
+            } else if ghost_button(ui, "Resync chain, keep wallet").clicked() {
+                app.resync_confirm = true;
             }
         });
-        ui.add_space(8.0);
-        let entries = app.address_book.entries.clone();
-        for e in entries {
+
+        ui.add_space(14.0);
+
+        titled_card(ui, "Address book", |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new("Local labels for nf1 addresses you send to. Never published.")
+                    .size(12.0)
+                    .color(TEXT_DIM),
+            );
+            ui.add_space(10.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new(&e.name).size(12.5));
-                ui.label(
-                    RichText::new(short_hex(&e.address))
-                        .monospace()
-                        .size(11.0)
-                        .color(TEXT_FAINT),
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.book_name)
+                        .margin(FIELD_MARGIN)
+                        .desired_width(140.0)
+                        .hint_text("Name"),
                 );
-                if ghost_button(ui, "Remove").clicked() {
-                    app.address_book.remove(&e.address);
-                    let _ = app.address_book.save(&app.datadir);
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.book_addr)
+                        .margin(FIELD_MARGIN)
+                        .desired_width(280.0)
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text("nf1…"),
+                );
+                if ghost_button(ui, "Add").clicked() {
+                    match app
+                        .address_book
+                        .add(app.book_name.clone(), app.book_addr.clone())
+                    {
+                        Ok(()) => {
+                            let _ = app.address_book.save(&app.datadir);
+                            app.book_name.clear();
+                            app.book_addr.clear();
+                            app.toasts.success(ctx, "Contact saved");
+                        }
+                        Err(e) => app.toasts.error(ctx, e),
+                    }
                 }
             });
-        }
-    });
-
-    ui.add_space(14.0);
-
-    titled_card(ui, "Storage", |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            let mut prune = app.prune;
-            if ui
-                .checkbox(&mut prune, "Prune old blocks — keep UTXO + last 500 bodies")
-                .changed()
-            {
-                app.set_prune(prune, ctx);
+            ui.add_space(8.0);
+            let entries = app.address_book.entries.clone();
+            for e in entries {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&e.name).size(12.5));
+                    ui.label(
+                        RichText::new(short_hex(&e.address))
+                            .monospace()
+                            .size(11.0)
+                            .color(TEXT_FAINT),
+                    );
+                    if ghost_button(ui, "Remove").clicked() {
+                        app.address_book.remove(&e.address);
+                        let _ = app.address_book.save(&app.datadir);
+                    }
+                });
             }
         });
-        ui.add_space(4.0);
-        ui.label(
+
+        ui.add_space(14.0);
+
+        titled_card(ui, "Storage", |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let mut prune = app.prune;
+                if ui
+                    .checkbox(&mut prune, "Prune old blocks — keep UTXO + last 500 bodies")
+                    .changed()
+                {
+                    app.set_prune(prune, ctx);
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(
             RichText::new(
                 "Laptop default for a chain that no longer fits in RAM. Seeds stay full archives. \
                  After prune you cannot rescan stealth outputs from genesis on this machine — \
@@ -2145,103 +2275,104 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             .size(11.0)
             .color(TEXT_FAINT),
         );
-        if let Some(s) = &app.status {
-            if s.pruned {
-                ui.add_space(6.0);
-                kv(
-                    ui,
-                    "Bodies from",
-                    RichText::new(format_int(s.prune_height)).monospace(),
-                );
-            }
-        }
-    });
-
-    ui.add_space(14.0);
-
-    titled_card(ui, "Window", |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            let mut tray = app.close_to_tray;
-            if ui
-                .checkbox(&mut tray, "Close to tray — mining keeps running")
-                .changed()
-            {
-                app.set_close_to_tray(tray);
+            if let Some(s) = &app.status {
+                if s.pruned {
+                    ui.add_space(6.0);
+                    kv(
+                        ui,
+                        "Bodies from",
+                        RichText::new(format_int(s.prune_height)).monospace(),
+                    );
+                }
             }
         });
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(
-                "On Windows the process looks gone if the window closes. Tray Show / Quit. \
-                 macOS keeps the dock icon either way.",
-            )
-            .size(11.0)
-            .color(TEXT_FAINT),
-        );
-    });
 
-    ui.add_space(14.0);
+        ui.add_space(14.0);
 
-    titled_card(ui, "About", |ui| {
-        ui.set_width(ui.available_width());
-        kv(
-            ui,
-            "Max supply",
-            RichText::new(format!("{} NIGHT", format_int(MAX_SUPPLY_NIGHT))).monospace(),
-        );
-        kv(ui, "Premine", RichText::new("0").monospace().color(SUCCESS));
-        kv(
-            ui,
-            "Fee model",
-            RichText::new("100% burned").monospace().color(WARN),
-        );
-        kv(
-            ui,
-            "Amount privacy",
-            RichText::new("Pedersen + Bulletproofs").color(SUCCESS),
-        );
-        kv(
-            ui,
-            "Recipient privacy",
-            RichText::new("one-time keys, unlinkable").color(SUCCESS),
-        );
-        kv(
-            ui,
-            "Graph privacy",
-            RichText::new("obscured by aggregation, not erased").color(WARN),
-        );
-        kv(
-            ui,
-            "Proof of work",
-            RichText::new("Nighthash-v2 · Argon2id 32 MiB").color(SUCCESS),
-        );
-
-        ui.add_space(12.0);
-        egui::Frame::none()
-            .fill(WARN.gamma_multiply(0.10))
-            .rounding(Rounding::same(ROUND_SM))
-            .inner_margin(egui::Margin::same(12.0))
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new("Not independently audited.")
-                        .size(12.0)
-                        .color(WARN)
-                        .strong(),
-                );
-                ui.add_space(3.0);
-                ui.label(
-                    RichText::new(
-                        "Amounts and addresses are hidden. The transaction graph is still \
-                         linkable. Do not treat NIGHT as money you can afford to lose.",
-                    )
-                    .size(11.0)
-                    .color(TEXT_DIM),
-                );
+        titled_card(ui, "Window", |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let mut tray = app.close_to_tray;
+                if ui
+                    .checkbox(&mut tray, "Close to tray — mining keeps running")
+                    .changed()
+                {
+                    app.set_close_to_tray(tray);
+                }
             });
-    });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "On Windows the process looks gone if the window closes. Tray Show / Quit. \
+                 macOS keeps the dock icon either way.",
+                )
+                .size(11.0)
+                .color(TEXT_FAINT),
+            );
+        });
 
-    ui.add_space(20.0);
+        ui.add_space(14.0);
+
+        titled_card(ui, "About", |ui| {
+            ui.set_width(ui.available_width());
+            kv(
+                ui,
+                "Max supply",
+                RichText::new(format!("{} NIGHT", format_int(MAX_SUPPLY_NIGHT))).monospace(),
+            );
+            kv(ui, "Premine", RichText::new("0").monospace().color(SUCCESS));
+            kv(
+                ui,
+                "Fee model",
+                RichText::new("100% burned").monospace().color(WARN),
+            );
+            kv(
+                ui,
+                "Amount privacy",
+                RichText::new("Pedersen + Bulletproofs").color(SUCCESS),
+            );
+            kv(
+                ui,
+                "Recipient privacy",
+                RichText::new("one-time keys, unlinkable").color(SUCCESS),
+            );
+            kv(
+                ui,
+                "Graph privacy",
+                RichText::new("obscured by aggregation, not erased").color(WARN),
+            );
+            kv(
+                ui,
+                "Proof of work",
+                RichText::new("Nighthash-v2 · Argon2id 32 MiB").color(SUCCESS),
+            );
+
+            ui.add_space(12.0);
+            egui::Frame::none()
+                .fill(WARN.gamma_multiply(0.10))
+                .rounding(Rounding::same(ROUND_SM))
+                .inner_margin(egui::Margin::same(12.0))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("Not independently audited.")
+                            .size(12.0)
+                            .color(WARN)
+                            .strong(),
+                    );
+                    ui.add_space(3.0);
+                    ui.label(
+                        RichText::new(
+                            "Amounts and addresses are hidden. The transaction graph is still \
+                         linkable. Do not treat NIGHT as money you can afford to lose.",
+                        )
+                        .size(11.0)
+                        .color(TEXT_DIM),
+                    );
+                });
+        });
+
+        ui.add_space(20.0);
+    });
     let _ = Amount::ZERO;
 }
 
@@ -2334,6 +2465,7 @@ pub fn onboarding(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 if let Some(Onboarding::Restore { phrase, .. }) = &mut app.onboarding {
                     ui.add(
                         egui::TextEdit::multiline(phrase)
+                            .margin(FIELD_MARGIN)
                             .desired_rows(4)
                             .desired_width(f32::INFINITY)
                             .hint_text("word1 word2 … word24"),

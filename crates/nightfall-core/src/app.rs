@@ -753,36 +753,50 @@ impl App {
                     ui.add_space(3.0);
                 }
 
-                // Bottom block: network + supply proof.
+                // Foot of the rail: which network, and whether the supply adds up.
+                //
+                // This was a filled, rounded box sitting inside a rail that has
+                // no other boxes in it, so it read as a widget someone had
+                // dropped there — and the network badge floated above it,
+                // unrelated to the thing it belongs with. Now it is one quiet
+                // block: a rule, the network, the supply state. No fill, because
+                // the rail is flat.
+                //
+                // The formula moved into the hover. It explains the line above
+                // it rather than reporting anything, and at 9.5px under a status
+                // it competed with the status for the same glance.
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     let loading = self.status.as_ref().map(|s| s.loading).unwrap_or(false);
                     let supply_ok = self.status.as_ref().map(|s| s.supply_ok).unwrap_or(false);
-                    egui::Frame::none()
-                        .fill(SURFACE_HI)
-                        .rounding(Rounding::same(ROUND_SM))
-                        .inner_margin(egui::Margin::same(11.0))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                let (label, ok) = if loading {
-                                    ("Supply — loading", true)
-                                } else if supply_ok {
-                                    ("Supply verified", true)
-                                } else {
-                                    ("Supply UNVERIFIED", false)
-                                };
-                                dot(ui, status_color(ok), loading);
-                                ui.add_space(4.0);
-                                ui.label(RichText::new(label).size(11.5).color(status_color(ok)));
-                            });
-                            ui.add_space(3.0);
-                            ui.label(
-                                RichText::new("Σ UTXO − Σ excess = supply")
-                                    .size(9.5)
-                                    .color(TEXT_FAINT),
-                            );
-                        });
 
-                    ui.add_space(8.0);
+                    // Colour follows the truth. While the chain loads nothing
+                    // has been checked yet, and the old code passed ok = true
+                    // for that case — a green dot and green lettering next to
+                    // the word "loading". Green here means the sum was
+                    // recomputed and balanced. Until it has been, this is dim.
+                    let (label, colour) = if loading {
+                        ("Checking supply…", TEXT_DIM)
+                    } else if supply_ok {
+                        ("Supply verified", SUCCESS)
+                    } else {
+                        ("Supply UNVERIFIED", DANGER)
+                    };
+
+                    ui.add_space(2.0);
+                    let resp = ui
+                        .horizontal(|ui| {
+                            dot(ui, colour, loading);
+                            ui.add_space(6.0);
+                            ui.label(RichText::new(label).size(11.5).color(colour))
+                        })
+                        .inner;
+                    resp.on_hover_text(
+                        "Σ UTXO − Σ excess = (minted − burned)·G\n\nEvery node recomputes this \
+                         over the whole UTXO set and refuses a block that breaks it. One coin \
+                         minted out of nowhere and the equation stops balancing.",
+                    );
+
+                    ui.add_space(9.0);
                     ui.horizontal(|ui| {
                         let net = self.network.as_str();
                         let color = match self.network {
@@ -792,11 +806,23 @@ impl App {
                         };
                         badge(ui, &net.to_uppercase(), color);
                         ui.label(
-                            RichText::new(format!("v{}", nightfall_types::PROTOCOL_VERSION))
-                                .size(10.0)
-                                .color(TEXT_FAINT),
+                            RichText::new(format!(
+                                "protocol v{}",
+                                nightfall_types::PROTOCOL_VERSION
+                            ))
+                            .size(10.0)
+                            .color(TEXT_FAINT),
                         );
                     });
+
+                    ui.add_space(12.0);
+                    let w = ui.available_width();
+                    let (r, _) = ui.allocate_exact_size(Vec2::new(w, 1.0), egui::Sense::hover());
+                    ui.painter().hline(
+                        r.x_range(),
+                        r.center().y,
+                        Stroke::new(1.0_f32, BORDER.gamma_multiply(0.8)),
+                    );
                 });
             });
     }
@@ -925,6 +951,13 @@ impl eframe::App for App {
                 bottom: 16.0,
             }))
             .show(ctx, |ui| {
+                // The lights go down first, over the panel's flat fill and
+                // under everything else. Painted at panel level rather than
+                // inside the scroll area on purpose: this is the lighting of
+                // the room, and it must not slide up and down with the
+                // content the way a background image would.
+                page_wash(ui.painter(), ui.clip_rect());
+
                 if let Some(err) = self.status_error.clone() {
                     egui::Frame::none()
                         .fill(DANGER.gamma_multiply(0.12))

@@ -1,6 +1,6 @@
 # NIGHT ↔ BTC swap — attacks we ran, and the ones we did not
 
-v0.9.0. This is the honesty sheet for the warning in the wallet.
+v0.9.1. This is the honesty sheet for the warning in the wallet.
 
 There is **no external cryptographic review** of the Ristretto DLEQ leaf
 in `nightfall_crypto::dleq`. Tests below are ours. That is weaker than a

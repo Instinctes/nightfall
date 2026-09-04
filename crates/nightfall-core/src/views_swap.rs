@@ -31,29 +31,32 @@ fn urgency_colour(u: logic::Urgency) -> Color32 {
 }
 
 pub fn swap(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
-    ui.set_max_width(760.0);
-
-    header(app, ui);
-    ui.add_space(14.0);
-
-    let gate = logic::availability(app.network);
-    if let logic::Availability::Locked { headline, detail } = &gate {
-        locked_notice(ui, headline, detail);
+    // Centred instead of pinned to the left edge. On a wide window this page
+    // was a column of cards hugging one side with the rest of the screen
+    // empty, which read as something failing to load.
+    crate::widgets::narrow_column(ui, 860.0, |ui| {
+        header(app, ui);
         ui.add_space(14.0);
-    }
 
-    warnings(ui);
-    ui.add_space(14.0);
+        let gate = logic::availability(app.network);
+        if let logic::Availability::Locked { headline, detail } = &gate {
+            locked_notice(ui, headline, detail);
+            ui.add_space(14.0);
+        }
 
-    if gate.is_enabled() {
-        start_form(app, ui, ctx);
+        warnings(ui);
         ui.add_space(14.0);
-    }
 
-    packets(app, ui, ctx);
-    ui.add_space(14.0);
+        if gate.is_enabled() {
+            start_form(app, ui, ctx);
+            ui.add_space(14.0);
+        }
 
-    swap_list(app, ui, ctx);
+        packets(app, ui, ctx);
+        ui.add_space(14.0);
+
+        swap_list(app, ui, ctx);
+    });
 }
 
 // ------------------------------------------------------------------ header ---
@@ -163,6 +166,7 @@ fn start_form(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 ui.add_space(4.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut app.swap_draft.night)
+                        .margin(FIELD_MARGIN)
                         .desired_width(180.0)
                         .font(egui::TextStyle::Monospace)
                         .hint_text("0.00000000"),
@@ -174,6 +178,7 @@ fn start_form(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 ui.add_space(4.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut app.swap_draft.btc)
+                        .margin(FIELD_MARGIN)
                         .desired_width(150.0)
                         .font(egui::TextStyle::Monospace)
                         .hint_text("200000"),
@@ -185,6 +190,7 @@ fn start_form(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 ui.add_space(4.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut app.swap_draft.btc_fee)
+                        .margin(FIELD_MARGIN)
                         .desired_width(110.0)
                         .font(egui::TextStyle::Monospace)
                         .hint_text("auto"),
@@ -238,6 +244,7 @@ fn start_form(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 );
                 ui.add(
                     egui::TextEdit::singleline(field)
+                        .margin(FIELD_MARGIN)
                         .desired_width(f32::INFINITY)
                         .font(egui::TextStyle::Monospace)
                         .hint_text(hint),
@@ -334,6 +341,7 @@ fn packets(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.add_space(6.0);
         ui.add(
             egui::TextEdit::multiline(&mut app.swap_packet_in)
+                .margin(FIELD_MARGIN)
                 .desired_rows(3)
                 .desired_width(f32::INFINITY)
                 .font(egui::TextStyle::Monospace)
@@ -654,6 +662,7 @@ fn lock_section(
                 );
                 ui.add(
                     egui::TextEdit::singleline(&mut app.swap_funding.txid)
+                        .margin(FIELD_MARGIN)
                         .desired_width(f32::INFINITY)
                         .font(egui::TextStyle::Monospace)
                         .hint_text("64 hex characters"),
@@ -668,6 +677,7 @@ fn lock_section(
                 );
                 ui.add(
                     egui::TextEdit::singleline(&mut app.swap_funding.vout)
+                        .margin(FIELD_MARGIN)
                         .desired_width(70.0)
                         .font(egui::TextStyle::Monospace)
                         .hint_text("0"),
@@ -676,6 +686,7 @@ fn lock_section(
                 ui.label(RichText::new("holds (sat)").size(11.5).color(TEXT_DIM));
                 ui.add(
                     egui::TextEdit::singleline(&mut app.swap_funding.value)
+                        .margin(FIELD_MARGIN)
                         .desired_width(120.0)
                         .font(egui::TextStyle::Monospace)
                         .hint_text("500000"),
@@ -690,6 +701,7 @@ fn lock_section(
                 );
                 ui.add(
                     egui::TextEdit::singleline(&mut app.swap_funding.change_address)
+                        .margin(FIELD_MARGIN)
                         .desired_width(f32::INFINITY)
                         .font(egui::TextStyle::Monospace)
                         .hint_text("leave empty only if there is no change"),
@@ -776,6 +788,7 @@ fn lock_section(
             ui.add_space(6.0);
             ui.add(
                 egui::TextEdit::multiline(&mut app.swap_signed_hex)
+                    .margin(FIELD_MARGIN)
                     .desired_rows(2)
                     .desired_width(f32::INFINITY)
                     .font(egui::TextStyle::Monospace)

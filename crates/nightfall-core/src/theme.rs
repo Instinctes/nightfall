@@ -22,6 +22,29 @@ pub const SURFACE_LOW: Color32 = Color32::from_rgb(0x1A, 0x15, 0x2C);
 pub const BORDER: Color32 = Color32::from_rgb(0x2E, 0x26, 0x48);
 pub const BORDER_HI: Color32 = Color32::from_rgb(0x45, 0x39, 0x68);
 
+// --- depth ----------------------------------------------------------------
+//
+// Almost none, on purpose.
+//
+// The first attempt gave cards a vertical gradient and a lit top edge. It did
+// make them look raised, and it was wrong: the phone wallet — the reference
+// for this style — draws flat cards, one fill, one hairline border, a large
+// radius, and nothing else. Against that, a highlight along every card's top
+// edge reads as a seam, and eight of them down a page read as a list of
+// seams. Removed.
+//
+// What stayed is the part that was actually missing: the page is lit. Two
+// wide, very faint radial washes across the top give the background somewhere
+// to be brighter and somewhere to be darker, so a flat card has something to
+// sit on. That is the phone's trick too — the glow behind its logo — and it
+// is the whole effect.
+
+/// The two lights on the page background: violet from the upper left, magenta
+/// from the upper right. Alpha is deliberately tiny — these must never be
+/// visible as shapes, only as a reason for the corners to be darker.
+pub const WASH_A: Color32 = Color32::from_rgba_premultiplied(0x22, 0x18, 0x48, 0xFF);
+pub const WASH_B: Color32 = Color32::from_rgba_premultiplied(0x2A, 0x12, 0x38, 0xFF);
+
 // --- text -----------------------------------------------------------------
 pub const TEXT: Color32 = Color32::from_rgb(0xF0, 0xEC, 0xFA);
 pub const TEXT_DIM: Color32 = Color32::from_rgb(0xA8, 0xA0, 0xC4);

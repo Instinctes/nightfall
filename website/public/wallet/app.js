@@ -27,7 +27,7 @@ const WARN =
   "This phone or browser trusts a node for what it shows. A hostile node can hide a payment or invent one on the screen. It cannot spend — the seed never leaves this device. Anyone who can run script on this page can read a saved wallet. The 24 words are the real backup.";
 
 const FEE = "0.001";
-const BUILD = "0.9.0";
+const BUILD = "0.9.1";
 
 let wasmReady = init();
 let state = null;

@@ -90,8 +90,25 @@ for (const m of app.matchAll(/nightfall_web\.js\?v=([a-z0-9-]+)/g)) vs.add(m[1])
 if (vs.size > 1) {
     note(`cache busters disagree: ${[...vs].join(", ")} — bump all of them together`);
 }
-if (!/const CACHE = "night-wallet-v\d+"/.test(sw)) {
-    note("sw.js has no versioned CACHE name — the old shell will survive a deploy");
+// The service worker's cache name has to carry the release, not a counter.
+//
+// It was "night-wallet-v16", hand-incremented, and this check only asked that
+// some number was there. So the 0.9.1 bump could — and on the first attempt
+// did — change BUILD in app.js while leaving the cache name alone: the new
+// shell is published, every returning wallet keeps serving the old one out of
+// its own cache, and nothing anywhere says so. Tying the name to the version
+// means the release bump cannot forget it, because this fails.
+const release = readFileSync(join(here, "..", "Cargo.toml"), "utf8").match(
+    /^version = "([^"]+)"/m,
+)?.[1];
+const swCache = (sw.match(/const CACHE = "([^"]+)"/) || [])[1];
+if (!swCache) {
+    note("sw.js has no CACHE name — the old shell will survive a deploy");
+} else if (release && !swCache.includes(release)) {
+    note(
+        `sw.js caches as "${swCache}" but this release is ${release} — ` +
+            `returning visitors would keep the old shell. Use "night-wallet-${release}".`,
+    );
 }
 
 // ------------------------------------------------------------------ build ---

@@ -1,4 +1,4 @@
-# NIGHT ↔ BTC atomic swap — operator notes (v0.9.0)
+# NIGHT ↔ BTC atomic swap — operator notes (v0.9.1)
 
 **Experimental. Not for real coins on mainnet.** The wallet will not start a
 swap on mainnet. Testnet and devnet are open.
@@ -18,7 +18,7 @@ cancel / refund / punish). NIGHT side: shared stealth address, spend
 
 ## What you need
 
-- NIGHTFALL Core 0.9.0 on **testnet** or **devnet**
+- NIGHTFALL Core 0.9.1 on **testnet** or **devnet**
 - bitcoind (same network as the swap) with **`-txindex=1`**, credentials in
   `{datadir}/bitcoin-rpc.conf` (mode 0600: `url=`, `user=`, `password=`)
 - Three Bitcoin addresses from *your* Bitcoin wallet (refund, redeem, punish)
@@ -45,5 +45,5 @@ Do not send seed phrases. Do not send `.secret` files.
 
 ## Builds
 
-This tree is 0.9.0. Binaries, checksums, website, seeds: the operator
+This tree is 0.9.1. Binaries, checksums, website, seeds: the operator
 builds and ships them. There is no deploy from this checkout.

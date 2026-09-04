@@ -62,14 +62,29 @@ for (const page of pages) {
     // different attribute: style.css sat at a hand-written ?v=live-7, so a CSS
     // fix reached nobody who had loaded the site before. Catching one and not
     // the other would have been the same mistake twice in an afternoon.
+    // The leading slash is optional. index.html loads the platform-detection
+    // script as src="js/main.js?v=v2-7" — relative, no slash — and the first
+    // version of this pattern required one, so that file was skipped in
+    // silence. It is the file that fills in the download buttons, which is
+    // exactly the thing that shipped broken in 0.8.3.
     const after = before.replace(
-        /((?:src|href)="\/((?:js|css)\/[a-z0-9-]+\.(?:js|css))\?v=)([^"]*)(")/g,
+        /((?:src|href)="\/?((?:js|css)\/[a-z0-9-]+\.(?:js|css))\?v=)([^"]*)(")/g,
         (whole, head, rel, current, tail) => {
             const want = fingerprint(rel);
             if (current !== want) stale.push(`${page}: ${rel} is stamped ?v=${current}, content is ${want}`);
             return head + want + tail;
         },
     );
+
+    // Anything else carrying a ?v= is a buster this script does not manage,
+    // which means it is maintained by hand and will drift. Say so rather than
+    // walking past it — being skipped quietly is how main.js kept a stale
+    // buster through three releases.
+    for (const m of after.matchAll(/(?:src|href)="([^"]*\?v=[^"]*)"/g)) {
+        if (!/\/?(?:js|css)\/[a-z0-9-]+\.(?:js|css)\?v=/.test(m[1])) {
+            stale.push(`${page}: ${m[1]} carries a ?v= this script does not manage`);
+        }
+    }
     if (after !== before) {
         if (!check) {
             writeFileSync(path, after);

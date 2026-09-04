@@ -6,7 +6,7 @@
  *      binaries. If someone could inject a script into it, they could swap a
  *      download link and drain everyone who trusted the domain.
  *   2. POST /wallet-api — a same-origin proxy onto the *light* node's HTTP
- *      API (Vultr / seed1). P2P doorbell is seed.nightfallcoin.org (Contabo).
+ *      API (Contabo / seed). One machine as of 30 Aug 2026 — Vultr is gone.
  *      The browser wallet is served over HTTPS and cannot speak
  *      `http://seed:17888` (mixed content). Cloudflare `fetch()` only
  *      reaches ports 80/443, so the light node forwards :80 → :17888.
@@ -25,17 +25,11 @@
  * widens who can lie to a screen, so the list stays short and ours.
  */
 const MOBILE_UPSTREAMS = [
-    // Two machines, two providers. seed1/seed2 are the same Vultr box;
-    // listing both would only add a timeout when that box is down.
-    //
-    // Contabo first since 23 Aug 2026. It answers `status` in 0.3 s; the
-    // Vultr box was taking 8.2 s under an account-wide CPU cap, which is
-    // past the timeout below — so every light request was paying six
-    // seconds to watch the first entry fail before the second one served
-    // it. Order the list by who actually answers, not by who is nominally
-    // the light node.
+    // One machine: Contabo. Vultr (seed1) was retired 30 Aug 2026 — CPU
+    // steal, swap, and a stalled fork that served phones a 2800-block-old
+    // tip. A second name that points at the same host is not redundancy.
+    // When a second operator exists, add them here.
     "http://seed.nightfallcoin.org/",
-    "http://seed1.nightfallcoin.org/",
 ];
 const UPSTREAM_TIMEOUT_MS = 6000;
 

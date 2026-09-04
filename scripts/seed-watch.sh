@@ -32,7 +32,11 @@ LOG=/var/log/nightfall-watch.log
 STATE=/var/lib/nightfall-watch.state
 WEBHOOK_FILE=/etc/nightfall-watch-webhook
 
-SEEDS=("seed.nightfallcoin.org" "seed1.nightfallcoin.org")
+# One live seed as of 30 Aug 2026 (Contabo). seed1 was Vultr; the box is gone.
+# A second name that resolved to a dead IP made this script alert every five
+# minutes about an outage we had already chosen. When a second machine exists,
+# add it here — not a second DNS name on the same host.
+SEEDS=("seed.nightfallcoin.org")
 
 # A light request must beat the website Worker's own timeout, or phones fail
 # over. Anything slower is broken even if it eventually answers.
@@ -114,7 +118,9 @@ PY
     mv "$STATE.tmp" "$STATE"
 done
 
-if [ "${heights[0]}" -gt 0 ] 2>/dev/null && [ "${heights[1]}" -gt 0 ] 2>/dev/null; then
+if [ "${#heights[@]}" -ge 2 ] \
+    && [ "${heights[0]}" -gt 0 ] 2>/dev/null \
+    && [ "${heights[1]}" -gt 0 ] 2>/dev/null; then
     drift=$(( heights[0] - heights[1] ))
     [ "$drift" -lt 0 ] && drift=$(( -drift ))
     if [ "$drift" -gt "$MAX_DRIFT" ]; then
@@ -123,7 +129,7 @@ if [ "${heights[0]}" -gt 0 ] 2>/dev/null && [ "${heights[1]}" -gt 0 ] 2>/dev/nul
 fi
 
 if [ ${#problems[@]} -eq 0 ]; then
-    log "ok  ${SEEDS[0]}=${heights[0]}  ${SEEDS[1]}=${heights[1]}"
+    log "ok  ${SEEDS[0]}=${heights[0]}"
     exit 0
 fi
 

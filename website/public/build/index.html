@@ -51,7 +51,7 @@
     <h2>1. Get the source</h2>
     <pre><code>git clone https://github.com/Instinctes/nightfall
 cd nightfall
-git checkout v0.9.0   # or the tag printed next to the download
+git checkout v0.9.1   # or the tag printed next to the download
 rustc --version</code></pre>
     <p>
       Use a current stable Rust. The lockfile pins crates; it does not pin
@@ -74,22 +74,22 @@ cargo build --release -p nightfall-node</code></pre>
 
     <h2>3. Check a downloaded file</h2>
     <p>macOS / Linux:</p>
-    <pre><code>shasum -a 256 NIGHTFALLCOIN-Core-0.9.0-macOS-arm64.dmg
-grep NIGHTFALLCOIN-Core-0.9.0-macOS-arm64.dmg SHA256SUMS-0.9.0.txt</code></pre>
+    <pre><code>shasum -a 256 NIGHTFALLCOIN-Core-0.9.1-macOS-arm64.dmg
+grep NIGHTFALLCOIN-Core-0.9.1-macOS-arm64.dmg SHA256SUMS-0.9.1.txt</code></pre>
     <p>Windows (PowerShell):</p>
-    <pre><code>Get-FileHash .\\nightfall-core-0.9.0-windows-x64.exe -Algorithm SHA256
-Get-Content .\\SHA256SUMS-0.9.0-windows.txt</code></pre>
+    <pre><code>Get-FileHash .\\nightfall-core-0.9.1-windows-x64.exe -Algorithm SHA256
+Get-Content .\\SHA256SUMS-0.9.1-windows.txt</code></pre>
     <p>
       The two lines must match. Checksums for the current desktop release:
-      <a href="/downloads/SHA256SUMS-0.9.0.txt">SHA256SUMS-0.9.0.txt</a>,
-      <a href="/downloads/SHA256SUMS-0.9.0-windows.txt">SHA256SUMS-0.9.0-windows.txt</a>,
-      <a href="/downloads/SHA256SUMS-0.9.0-linux.txt">SHA256SUMS-0.9.0-linux.txt</a>.
+      <a href="/downloads/SHA256SUMS-0.9.1.txt">SHA256SUMS-0.9.1.txt</a>,
+      <a href="/downloads/SHA256SUMS-0.9.1-windows.txt">SHA256SUMS-0.9.1-windows.txt</a>,
+      <a href="/downloads/SHA256SUMS-0.9.1-linux.txt">SHA256SUMS-0.9.1-linux.txt</a>.
     </p>
     <p>
       The headless node and the command-line wallet are published for Windows
       as well, if you want a node without the GUI:
-      <a href="/downloads/nightfalld-0.9.0-windows-x64.exe"><code>nightfalld-0.9.0-windows-x64.exe</code></a>,
-      <a href="/downloads/nightfall-wallet-0.9.0-windows-x64.exe"><code>nightfall-wallet-0.9.0-windows-x64.exe</code></a>.
+      <a href="/downloads/nightfalld-0.9.1-windows-x64.exe"><code>nightfalld-0.9.1-windows-x64.exe</code></a>,
+      <a href="/downloads/nightfall-wallet-0.9.1-windows-x64.exe"><code>nightfall-wallet-0.9.1-windows-x64.exe</code></a>.
     </p>
     <p>
       This site carries the current release only. Every earlier version, with
@@ -116,11 +116,11 @@ sudo bash install-node.sh          # relay only
 sudo bash install-node.sh --mine   # also mines; holds a key</code></pre>
     <p>
       Prebuilt binaries, if you would rather not compile:
-      <a href="/downloads/nightfalld-0.9.0-linux-x64"><code>nightfalld-0.9.0-linux-x64</code></a>,
-      <a href="/downloads/nightfall-wallet-0.9.0-linux-x64"><code>nightfall-wallet-0.9.0-linux-x64</code></a>,
-      <a href="/downloads/nightfall-core-0.9.0-linux-x64"><code>nightfall-core-0.9.0-linux-x64</code></a>
+      <a href="/downloads/nightfalld-0.9.1-linux-x64"><code>nightfalld-0.9.1-linux-x64</code></a>,
+      <a href="/downloads/nightfall-wallet-0.9.1-linux-x64"><code>nightfall-wallet-0.9.1-linux-x64</code></a>,
+      <a href="/downloads/nightfall-core-0.9.1-linux-x64"><code>nightfall-core-0.9.1-linux-x64</code></a>
       (Core needs GTK). Check
-      <a href="/downloads/SHA256SUMS-0.9.0-linux.txt">SHA256SUMS-0.9.0-linux.txt</a>.
+      <a href="/downloads/SHA256SUMS-0.9.1-linux.txt">SHA256SUMS-0.9.1-linux.txt</a>.
     </p>
     <p>
       A public seed (always-on, no keys, TCP 17891 open) uses
