@@ -81,17 +81,55 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
                             .strong(),
                     );
                 });
-                ui.add_space(6.0);
+                ui.add_space(10.0);
+
+                // A count with no denominator is not progress, it is a number
+                // that keeps changing. This load takes many minutes on a full
+                // chain, and for that whole time the old panel said only how
+                // far it had got — no total, no fraction, no idea whether that
+                // meant nearly done or barely started. People reasonably
+                // concluded the wallet had hung.
+                let total = app.status.as_ref().map(|s| s.loading_total).unwrap_or(0);
+
+                if total > 0 {
+                    let frac = (blocks as f32 / total as f32).clamp(0.0, 1.0);
+                    progress(
+                        ui,
+                        frac,
+                        &format!(
+                            "{} of {} blocks · {:.0}%",
+                            format_int(blocks),
+                            format_int(total),
+                            frac * 100.0
+                        ),
+                    );
+                    ui.add_space(8.0);
+                    if let Some(left) = app.load_eta(blocks, total) {
+                        ui.label(
+                            RichText::new(format!("about {left} left"))
+                                .size(12.0)
+                                .color(TEXT_DIM),
+                        );
+                        ui.add_space(6.0);
+                    }
+                } else {
+                    ui.label(
+                        RichText::new(format!("{} blocks read", format_int(blocks)))
+                            .size(12.5)
+                            .color(TEXT_DIM),
+                    );
+                    ui.add_space(6.0);
+                }
+
                 ui.label(
-                    RichText::new(format!(
-                        "Reading the chain file from this computer (last tip {}). \
-                         This is not a network sync. Peers stay closed so this node \
-                         does not advertise genesis. Several minutes at this height \
-                         is normal — your coins are already on disk.",
-                        format_int(blocks)
-                    ))
-                    .size(12.5)
-                    .color(TEXT_DIM),
+                    RichText::new(
+                        "Every proof of work in the file is being re-derived. This is not \
+                         a network sync and nothing is being downloaded — peers stay \
+                         closed so this node does not advertise genesis. Your coins are \
+                         already on disk.",
+                    )
+                    .size(12.0)
+                    .color(TEXT_FAINT),
                 );
             });
         ui.add_space(14.0);

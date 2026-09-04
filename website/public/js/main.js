@@ -104,8 +104,8 @@
                 key: "windows",
                 os: "Windows",
                 req: "64-bit · Windows 10+",
-                href: "downloads/nightfall-core-0.9.1-windows-x64.exe",
-                cta: "Download 0.9.1",
+                href: "downloads/nightfall-core-0.9.2-windows-x64.exe",
+                cta: "Download 0.9.2",
             };
         }
         if (/Mac/i.test(plat) || /Mac OS X/i.test(ua)) {
@@ -129,15 +129,15 @@
                       key: "mac-arm",
                       os: "macOS · Apple Silicon",
                       req: "M1 – M4 · macOS 11+",
-                      href: "downloads/NIGHTFALLCOIN-Core-0.9.1-macOS-arm64.dmg",
-                      cta: "Download 0.9.1",
+                      href: "downloads/NIGHTFALLCOIN-Core-0.9.2-macOS-arm64.dmg",
+                      cta: "Download 0.9.2",
                   }
                 : {
                       key: "mac-intel",
                       os: "macOS · Intel",
                       req: "macOS 10.15 Catalina+",
-                      href: "downloads/NIGHTFALLCOIN-Core-0.9.1-macOS-intel.dmg",
-                      cta: "Download 0.9.1",
+                      href: "downloads/NIGHTFALLCOIN-Core-0.9.2-macOS-intel.dmg",
+                      cta: "Download 0.9.2",
                   };
         }
         if (/Linux/i.test(plat) || /Linux/i.test(ua)) {
@@ -145,7 +145,7 @@
                 key: "linux",
                 os: "Linux · x64",
                 req: "Debian / Ubuntu · or any systemd box",
-                href: "downloads/nightfalld-0.9.1-linux-x64",
+                href: "downloads/nightfalld-0.9.2-linux-x64",
                 cta: "Download nightfalld",
             };
         }

@@ -159,6 +159,10 @@ pub struct NodeInner {
     /// Replay from disk is still running. P2P waits; RPC/light already answer.
     pub(crate) loading: bool,
     pub(crate) preview_blocks: u64,
+    /// Blocks the loader expects in total, from the stored block count.
+    /// Zero when unknown — a progress bar with no denominator is worse
+    /// than a plain counter, so the UI falls back rather than guessing.
+    pub(crate) preview_total: u64,
     pub(crate) preview_tip: String,
     pub(crate) last_dial_error: Option<String>,
     /// Next height a catch-up page should request, so two peers do not
@@ -550,6 +554,9 @@ fn spawn_dandelion_fluff(state: SharedState) {
 #[derive(Clone)]
 pub struct StatusSnap {
     pub blocks: u64,
+    /// While `loading`, how many blocks the file is expected to hold.
+    /// Zero if the stored count is unknown.
+    pub loading_total: u64,
     pub tip: String,
     pub peers: usize,
     pub mempool: usize,
@@ -750,6 +757,7 @@ impl NodeHandle {
             reachable_listen: HashSet::new(),
             loading: need_slow_replay,
             preview_blocks,
+            preview_total: 0,
             preview_tip,
             last_dial_error: None,
             ibd_from: 0,
@@ -836,10 +844,11 @@ impl NodeHandle {
                 tracing::info!("loading chain from disk — RPC and the light API are already up");
                 let progress = {
                     let st = Arc::clone(&st);
-                    move |done: u64, _total: u64| {
+                    move |done: u64, total: u64| {
                         if let Ok(mut g) = st.lock() {
                             if g.loading {
                                 g.preview_blocks = done.max(1);
+                                g.preview_total = total;
                             }
                         }
                     }
@@ -1070,6 +1079,7 @@ impl NodeHandle {
         let mining_on = g.mining_enabled.load(Ordering::SeqCst);
         Ok(StatusSnap {
             blocks,
+            loading_total: g.preview_total,
             tip,
             peers: g.peer_addrs.len(),
             mempool: g.mempool.len(),

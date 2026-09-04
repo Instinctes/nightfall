@@ -168,6 +168,14 @@ pub struct App {
     /// transaction. The id is text so this crate needs no uuid dependency.
     pub swap_confirm: Option<(String, nightfall_swap::ui::Action)>,
 
+    /// First observation of the chain load: (when, how many blocks).
+    ///
+    /// The estimate is built from what this machine is actually doing, not
+    /// from a constant. Verification speed depends on the CPU and on how
+    /// memory-hard the proof of work is, and a hard-coded "about 15 minutes"
+    /// is wrong on most machines and insulting on a slow one.
+    pub load_started: Option<(Instant, u64)>,
+
     pub onboarding: Option<Onboarding>,
     tray: Option<Tray>,
     pending_chain_check: Option<Arc<Mutex<Option<ChainCheck>>>>,
@@ -268,6 +276,7 @@ impl App {
             swap_import_error: None,
             swap_start_error: None,
             swap_confirm: None,
+            load_started: None,
             onboarding: if has_seed {
                 None
             } else {
@@ -1009,6 +1018,37 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Rough time left on the chain load, phrased as a person would say it.
+    ///
+    /// Measured, not assumed: the first sighting of the load is remembered,
+    /// and the rate since then is extrapolated. Returns `None` until there is
+    /// enough of a sample to be worth showing — an estimate from two seconds
+    /// of data swings between "1 minute" and "3 hours" and teaches people to
+    /// ignore the number.
+    pub fn load_eta(&mut self, done: u64, total: u64) -> Option<String> {
+        if total == 0 || done >= total {
+            return None;
+        }
+        let (started, from) = *self.load_started.get_or_insert((Instant::now(), done));
+        let elapsed = started.elapsed().as_secs_f64();
+        let progressed = done.saturating_sub(from);
+        if elapsed < 20.0 || progressed < 200 {
+            return None;
+        }
+        let per_sec = progressed as f64 / elapsed;
+        if per_sec <= 0.0 {
+            return None;
+        }
+        let secs = (total - done) as f64 / per_sec;
+        Some(if secs < 90.0 {
+            "a minute".to_string()
+        } else if secs < 5400.0 {
+            format!("{} minutes", (secs / 60.0).round() as u64)
+        } else {
+            format!("{:.1} hours", secs / 3600.0)
+        })
+    }
+
     fn handle_tray(&mut self, ctx: &egui::Context) {
         if self.tray.is_none() {
             self.tray = Tray::new();
