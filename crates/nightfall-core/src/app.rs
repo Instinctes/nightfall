@@ -160,6 +160,13 @@ pub struct App {
     pub swap_signed_hex: String,
     pub swap_lock_note: Option<Result<String, String>>,
 
+    /// Last driver pass. Open swaps are ticked on this cadence, not every frame.
+    pub last_swap_tick: Option<Instant>,
+    /// Last driver error, shown on the swap tab.
+    pub swap_tick_note: Option<String>,
+    pub swap_job: Option<std::thread::JoinHandle<crate::swap_worker::Report>>,
+    pub swap_report: crate::swap_worker::Report,
+
     /// A destructive button was pressed once; it asks before it acts.
     ///
     /// The action itself is kept, not its wording. Recovering it from the
@@ -261,7 +268,7 @@ impl App {
             book_name: String::new(),
             book_addr: String::new(),
             swap_draft: nightfall_swap::ui::Draft {
-                give_night: true,
+                give_night: false,
                 ..Default::default()
             },
             swap_sessions: std::collections::HashMap::new(),
@@ -276,6 +283,10 @@ impl App {
             swap_import_error: None,
             swap_start_error: None,
             swap_confirm: None,
+            last_swap_tick: None,
+            swap_tick_note: None,
+            swap_job: None,
+            swap_report: Default::default(),
             load_started: None,
             onboarding: if has_seed {
                 None
@@ -297,17 +308,27 @@ impl App {
         let cfg = NodeConfig {
             network: self.network,
             datadir: self.datadir.clone(),
-            p2p_listen: format!("0.0.0.0:{}", self.network.default_p2p_port()),
-            rpc_listen: format!("127.0.0.1:{}", self.network.default_rpc_port()),
-            connect: std::env::var("SEED_NODE")
-                .ok()
-                .map(|s| {
-                    s.split(',')
-                        .map(|x| x.trim().to_string())
-                        .filter(|x| !x.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default(),
+            p2p_listen: arg_or(
+                "--listen",
+                format!("0.0.0.0:{}", self.network.default_p2p_port()),
+            ),
+            rpc_listen: arg_or(
+                "--rpc-listen",
+                format!("127.0.0.1:{}", self.network.default_rpc_port()),
+            ),
+            connect: {
+                let mut v = args_all("--connect");
+                if v.is_empty() {
+                    if let Ok(s) = std::env::var("SEED_NODE") {
+                        v = s
+                            .split(',')
+                            .map(|x| x.trim().to_string())
+                            .filter(|x| !x.is_empty())
+                            .collect();
+                    }
+                }
+                v
+            },
             // Mining starts off. The user turns it on deliberately.
             mine: false,
             miner,
@@ -383,6 +404,9 @@ impl App {
     }
 
     pub fn set_prune(&mut self, on: bool, ctx: &egui::Context) {
+        if on && !self.swap_maintenance_allowed(ctx) {
+            return;
+        }
         if !on && self.prune {
             if let Some(s) = &self.status {
                 if s.pruned {
@@ -418,6 +442,9 @@ impl App {
     }
 
     pub fn resync_chain(&mut self, ctx: &egui::Context) {
+        if !self.swap_maintenance_allowed(ctx) {
+            return;
+        }
         let Some(node) = self.node.clone() else {
             self.toasts.error(ctx, "Node is not running");
             return;
@@ -693,7 +720,7 @@ impl App {
 
     fn sidebar(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("nav")
-            .exact_width(232.0)
+            .exact_width(246.0)
             .frame(
                 egui::Frame::none()
                     .fill(RAIL)
@@ -723,6 +750,14 @@ impl App {
                     let w = ui.available_width();
                     let (rect, resp) =
                         ui.allocate_exact_size(Vec2::new(w, 42.0), egui::Sense::click());
+                    resp.widget_info(|| {
+                        egui::WidgetInfo::selected(
+                            egui::WidgetType::SelectableLabel,
+                            true,
+                            selected,
+                            label,
+                        )
+                    });
 
                     if selected {
                         gradient_rect(ui.painter(), rect, ROUND_SM, Vec2::new(1.0, 0.0), |t| {
@@ -745,19 +780,35 @@ impl App {
                     }
 
                     let fg = if selected { TEXT } else { TEXT_DIM };
+                    nav_icon(
+                        ui.painter(),
+                        view,
+                        egui::pos2(rect.min.x + 15.0, rect.center().y - 11.0),
+                        fg,
+                    );
                     let galley = ui.painter().layout_no_wrap(
                         label.to_string(),
                         egui::FontId::proportional(14.0),
                         fg,
                     );
                     ui.painter().galley(
-                        egui::pos2(rect.min.x + 18.0, rect.center().y - galley.size().y / 2.0),
+                        egui::pos2(rect.min.x + 50.0, rect.center().y - galley.size().y / 2.0),
                         galley,
                         fg,
                     );
 
+                    if resp.has_focus() {
+                        ui.painter().rect_stroke(
+                            rect,
+                            Rounding::same(ROUND_SM),
+                            Stroke::new(2.0, ACCENT_HI),
+                        );
+                    }
                     if resp.clicked() {
                         self.view = view;
+                        self.reveal_seed = false;
+                        self.reveal_mnemonic = false;
+                        self.reveal_view_key = false;
                     }
                     ui.add_space(3.0);
                 }
@@ -929,6 +980,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply(ctx);
         self.poll_status();
+        self.tick_swaps(ctx);
         self.drain_sync_signal(ctx);
         self.handle_tray(ctx);
 
@@ -980,6 +1032,7 @@ impl eframe::App for App {
                 }
 
                 egui::ScrollArea::vertical()
+                    .id_salt(("page-scroll", self.view as u8))
                     .auto_shrink([false, false])
                     // Always reserve the bar. With the default the bar appears
                     // only once the page overflows, which takes ~10px of width
@@ -998,15 +1051,18 @@ impl eframe::App for App {
                             ui.allocate_ui_with_layout(
                                 Vec2::new(avail - pad * 2.0, 0.0),
                                 egui::Layout::top_down(egui::Align::LEFT),
-                                |ui| match self.view {
-                                    View::Dashboard => views::dashboard(self, ui),
-                                    View::Send => views::send(self, ui, ctx),
-                                    View::Receive => views::receive(self, ui, ctx),
-                                    View::Activity => views::activity(self, ui),
-                                    View::Mining => views::mining(self, ui),
-                                    View::Network => views::network(self, ui, ctx),
-                                    View::Swap => crate::views_swap::swap(self, ui, ctx),
-                                    View::Settings => views::settings(self, ui, ctx),
+                                |ui| {
+                                    views::page_intro(self.view, ui);
+                                    match self.view {
+                                        View::Dashboard => views::dashboard(self, ui),
+                                        View::Send => views::send(self, ui, ctx),
+                                        View::Receive => views::receive(self, ui, ctx),
+                                        View::Activity => views::activity(self, ui),
+                                        View::Mining => views::mining(self, ui),
+                                        View::Network => views::network(self, ui, ctx),
+                                        View::Swap => crate::views_swap::swap(self, ui, ctx),
+                                        View::Settings => views::settings(self, ui, ctx),
+                                    }
                                 },
                             );
                         });
@@ -1164,6 +1220,28 @@ fn fetch_public_tip() -> Result<(String, u64, String), String> {
         return Err("nightfallcoin.org returned no tip".into());
     }
     Ok((tip, height, genesis))
+}
+
+fn arg_or(flag: &str, default: String) -> String {
+    args_all(flag).into_iter().next().unwrap_or(default)
+}
+
+fn args_all(flag: &str) -> Vec<String> {
+    let args: Vec<String> = std::env::args().collect();
+    let eq = format!("{flag}=");
+    let mut out = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        if a == flag {
+            if let Some(v) = args.get(i + 1) {
+                if !v.starts_with('-') {
+                    out.push(v.clone());
+                }
+            }
+        } else if let Some(v) = a.strip_prefix(&eq) {
+            out.push(v.to_string());
+        }
+    }
+    out
 }
 
 fn save_proxy(datadir: &std::path::Path, value: &str) {

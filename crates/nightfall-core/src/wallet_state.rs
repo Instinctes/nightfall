@@ -113,6 +113,76 @@ impl WalletState {
         }
     }
 
+    pub fn reserve_commits(&mut self, hexes: &[String]) -> anyhow::Result<()> {
+        match self.inner.as_mut() {
+            Some(w) => w.reserve_commits(hexes),
+            None => anyhow::bail!("wallet not initialised"),
+        }
+    }
+
+    pub fn pick_commit_hexes_at(
+        &self,
+        target: u64,
+        tip: u64,
+        maturity: u64,
+    ) -> anyhow::Result<Vec<String>> {
+        let w = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("wallet not initialised"))?;
+        w.pick_commit_hexes_at(target, tip, maturity)
+    }
+
+    /// Pay `to` from specific outputs (including reserved swap coins).
+    pub fn prepare_from_commits(
+        &mut self,
+        node: &NodeHandle,
+        commits: &[String],
+        to: &Address,
+        amount_darks: u64,
+        fee_darks: u64,
+        memo: &str,
+    ) -> anyhow::Result<Transaction> {
+        let Some(wallet) = self.inner.as_mut() else {
+            anyhow::bail!("wallet not initialised");
+        };
+        let (tip, maturity) = {
+            let shared = node.shared();
+            let guard = shared
+                .lock()
+                .map_err(|_| anyhow::anyhow!("node state lock poisoned"))?;
+            (
+                guard.chain.tip_height().map(|h| h.0).unwrap_or(0),
+                guard.chain.ledger.coinbase_maturity,
+            )
+        };
+        let tx = wallet.create_payment_from_commits_at(
+            commits,
+            to,
+            amount_darks,
+            fee_darks,
+            memo,
+            tip,
+            maturity,
+        )?;
+        Ok(tx)
+    }
+
+    pub fn record_swap_payment(&mut self, tx: &Transaction, amount: u64) -> anyhow::Result<()> {
+        let wallet = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("wallet not initialised"))?;
+        if !wallet
+            .history()
+            .iter()
+            .any(|h| h.txid == tx.txid().to_hex())
+        {
+            wallet.record_send(tx, amount, "swap-lock".into())?;
+        }
+        Ok(())
+    }
+
     pub fn output_count(&self) -> usize {
         self.wallet().map(|w| w.spendable_count()).unwrap_or(0)
     }
@@ -183,7 +253,15 @@ impl WalletState {
         let Ok(mut guard) = shared.lock() else {
             return;
         };
-        for (_txid, tx) in pending {
+        for (txid, tx) in pending {
+            // Swap locks have deadlines; only the swap worker may retry them.
+            if wallet
+                .history()
+                .iter()
+                .any(|h| h.txid == txid && h.memo == "swap-lock")
+            {
+                continue;
+            }
             let _ = guard.submit_tx(tx);
         }
     }
@@ -238,6 +316,17 @@ impl WalletState {
     }
 
     pub fn rescan(&mut self, node: &NodeHandle) -> anyhow::Result<u32> {
+        // A rescan clears reservations. Never unlock coins belonging to an
+        // unfinished trade, or another payment could invalidate its recovery.
+        let datadir = self
+            .seed_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Wallet folder unavailable"))?;
+        let swaps = nightfall_swap::persist::list(datadir)?;
+        anyhow::ensure!(
+            !swaps.iter().any(|s| !s.is_finished()),
+            "Finish or safely close active swaps before rescanning the wallet."
+        );
         if let Some(w) = self.inner.as_mut() {
             w.reset_scan()?;
         }

@@ -35,6 +35,6 @@ fn running_sum_versus_walking_the_set() {
     let fast = t.elapsed().as_secs_f64() / 50.0;
 
     println!("  entries............ {N}");
-    println!("  commitment_sum..... {:.6} s per call", fast);
+    println!("  commitment_sum..... {fast:.6} s per call");
     println!("  per 100k blocks.... {:.1} s", fast * 100_000.0);
 }

@@ -1,7 +1,7 @@
 //! Claiming a swap lock — the one supported way to spend a shared output.
 //!
-//! **Experimental. Not wired into any wallet.** See `docs/SWAP-SPEC-DRAFT.md`
-//! v0.2.
+//! **Experimental.** Core on testnet/devnet drives this through
+//! `nightfall-swap`. See `docs/SWAP-SPEC-DRAFT.md` v0.3.
 //!
 //! # Where the safety actually lives
 //!

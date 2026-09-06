@@ -26,6 +26,7 @@
  * type or download — have to name the current version.
  */
 import { readFileSync } from "node:fs";
+import { releaseChannels, RELEASE_VERSION } from "./release-channels.mjs";
 
 const ROOT = new URL("../", import.meta.url).pathname;
 
@@ -40,13 +41,11 @@ if (!version) {
 /* Files a reader follows, and the patterns that name a downloadable file.
  * Each pattern must match the current version wherever it appears. */
 const FILES = ["README.md", "docs/MAINNET.md", "docs/MOBILE.md", "wallets/README.md"];
+const allowedVersions = releaseChannels(ROOT, version);
 
 const PATTERNS = [
-    /SHA256SUMS-(\d+\.\d+\.\d+)/g,
-    /nightfall-core-(\d+\.\d+\.\d+)/g,
-    /nightfall-wallet-(\d+\.\d+\.\d+)/g,
-    /nightfalld-(\d+\.\d+\.\d+)/g,
-    /NIGHTFALLCOIN-Core-(\d+\.\d+\.\d+)/g,
+    ...["SHA256SUMS", "nightfall-core", "nightfall-wallet", "nightfalld", "NIGHTFALLCOIN-Core", "NIGHTFALL-Dev"]
+        .map(prefix => new RegExp(`${prefix}-(${RELEASE_VERSION})`, "g")),
 ];
 
 const problems = [];
@@ -62,7 +61,7 @@ for (const file of FILES) {
     for (const pattern of PATTERNS) {
         for (const [i, line] of lines.entries()) {
             for (const m of line.matchAll(pattern)) {
-                if (m[1] !== version) {
+                if (!allowedVersions.has(m[1])) {
                     problems.push(
                         `${file}:${i + 1} names ${m[0]} but this tree is ${version}\n` +
                             `    ${line.trim()}`,
@@ -82,4 +81,4 @@ if (problems.length) {
     process.exit(1);
 }
 
-console.log(`docs version ok — every download instruction names ${version}`);
+console.log(`docs versions ok — published channels ${[...allowedVersions].join(", ")}`);

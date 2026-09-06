@@ -12,9 +12,12 @@ fi
 
 # wasm-release: no LTO, opt-level s. See Cargo.toml.
 cargo build --profile wasm-release --target wasm32-unknown-unknown -p nightfall-web
+WEB_BINDINGS="$(mktemp -d "$ROOT/target/web-bindings-XXXXXX")"
 wasm-bindgen --target web \
-  --out-dir website/public/wallet/pkg \
+  --out-dir "$WEB_BINDINGS" \
   target/wasm32-unknown-unknown/wasm-release/nightfall_web.wasm
+mkdir -p website/public/wallet/pkg
+cp "$WEB_BINDINGS/nightfall_web.js" "$WEB_BINDINGS/nightfall_web_bg.wasm" website/public/wallet/pkg/
 
 echo "wrote website/public/wallet/pkg/"
 ls -lh website/public/wallet/pkg

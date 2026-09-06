@@ -1,4 +1,4 @@
-//! The seven views.
+//! The eight Core views, sharing the web wallet's visual hierarchy.
 
 use crate::app::{parse_amount, App, Onboarding, View, DEFAULT_FEE_DARKS};
 use crate::theme::*;
@@ -9,6 +9,32 @@ use nightfall_node::SyncHold;
 use nightfall_storage::now_unix;
 use nightfall_types::{Amount, DARKS_PER_NIGHT, MAX_SUPPLY_NIGHT, TARGET_BLOCK_TIME_SECS};
 use nightfall_wallet::Direction;
+
+pub fn page_intro(view: View, ui: &mut egui::Ui) {
+    let description = match view {
+        View::Dashboard => "Your balance, recent activity and network health at a glance.",
+        View::Send => "Choose a recipient, enter an amount and review the total before sending.",
+        View::Receive => "Share your address or QR code to receive NIGHT into this wallet.",
+        View::Activity => "Review payments, mining rewards and confirmation status.",
+        View::Mining => "Manage CPU usage and follow your mining performance.",
+        View::Network => "Check connectivity, synchronization and network privacy.",
+        View::Swap => {
+            "Exchange NIGHT and Bitcoin. Follow each step and keep Core running until completion."
+        }
+        View::Settings => "Manage backups, privacy and wallet maintenance.",
+    };
+    let width = match view {
+        View::Send => 660.0,
+        View::Settings => 760.0,
+        View::Swap => 860.0,
+        _ => 1180.0,
+    };
+    narrow_column(ui, width, |ui| {
+        ui.add_space(8.0);
+        ui.label(RichText::new(description).size(14.0).color(TEXT_DIM));
+        ui.add_space(18.0);
+    });
+}
 
 fn night(darks: u64) -> String {
     let whole = darks / DARKS_PER_NIGHT;
@@ -276,7 +302,7 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
                 ui.label(
                     RichText::new("TOTAL BALANCE")
                         .size(11.0)
-                        .color(Color32::from_white_alpha(215))
+                        .color(INK)
                         .strong(),
                 );
                 ui.add_space(4.0);
@@ -284,16 +310,11 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
                     ui.label(
                         RichText::new(night(balances.available))
                             .size(40.0)
-                            .color(Color32::WHITE)
+                            .color(INK)
                             .strong(),
                     );
                     ui.add_space(8.0);
-                    ui.label(
-                        RichText::new("NIGHT")
-                            .size(16.0)
-                            .color(Color32::from_white_alpha(225))
-                            .strong(),
-                    );
+                    ui.label(RichText::new("NIGHT").size(16.0).color(INK).strong());
                 });
 
                 ui.add_space(12.0);
@@ -431,8 +452,9 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
     // `ui.columns` gives each cell its own top-down layout. Using
     // `allocate_ui` inside a horizontal layout makes the children horizontal
     // too, which is what staggered the cards diagonally.
-    ui.columns(4, |cols| {
-        let cells = [
+    metric_grid(
+        ui,
+        &[
             ("BLOCKS", format_int(blocks), TEXT),
             (
                 "PEERS",
@@ -441,13 +463,9 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
             ),
             ("MEMPOOL", mempool.to_string(), TEXT),
             ("DIFFICULTY", format_int(difficulty), TEXT),
-        ];
-        for (i, (label, value, color)) in cells.into_iter().enumerate() {
-            card(&mut cols[i], |ui| {
-                stat(ui, label, &value, color);
-            });
-        }
-    });
+        ],
+        true,
+    );
 
     ui.add_space(14.0);
 
@@ -497,19 +515,16 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
         None => ("—".to_string(), TEXT_DIM),
     };
 
-    ui.columns(4, |cols| {
-        let cells = [
+    metric_grid(
+        ui,
+        &[
             ("LAST BLOCK", last_block, last_color),
             ("NETWORK HASH", net_label, TEXT),
             ("YOUR SHARE", share_label, share_color),
             ("NEXT UNLOCK", unlock_label, unlock_color),
-        ];
-        for (i, (label, value, color)) in cells.into_iter().enumerate() {
-            card(&mut cols[i], |ui| {
-                stat(ui, label, &value, color);
-            });
-        }
-    });
+        ],
+        true,
+    );
 
     ui.add_space(8.0);
     ui.label(
@@ -749,251 +764,255 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     // head — who, how much, what it costs — and the summary at the end states
     // the consequence before the irreversible button.
     narrow_column(ui, 660.0, |ui| {
-        let mut addr_state = None;
+        ui.add_enabled_ui(!app.send_confirm, |ui| {
+            let mut addr_state = None;
 
-        titled_card(ui, "Recipient", |ui| {
-            ui.set_width(ui.available_width());
+            titled_card(ui, "Recipient", |ui| {
+                ui.set_width(ui.available_width());
 
-            field_label(ui, "Address", None);
-            ui.add(
-                egui::TextEdit::multiline(&mut app.send_to)
-                    .margin(FIELD_MARGIN)
-                    .desired_rows(2)
-                    .desired_width(f32::INFINITY)
-                    .font(egui::TextStyle::Monospace)
-                    .hint_text("nf1…"),
-            );
+                field_label(ui, "Address", None);
+                ui.add(
+                    egui::TextEdit::multiline(&mut app.send_to)
+                        .margin(FIELD_MARGIN)
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY)
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text("nf1…"),
+                );
 
-            // Live validation — a wrong address must never reach a signature.
-            // Untouched by the redesign: this is the check that stands between a
-            // typo and a payment that cannot come back.
-            let trimmed = app.send_to.trim().to_string();
-            addr_state = if trimmed.is_empty() {
-                None
-            } else if trimmed == own_address {
-                Some(Err("This is your own address".to_string()))
-            } else {
-                Some(Address::decode(&trimmed).map_err(|e| e.to_string()))
-            };
+                // Live validation — a wrong address must never reach a signature.
+                // Untouched by the redesign: this is the check that stands between a
+                // typo and a payment that cannot come back.
+                let trimmed = app.send_to.trim().to_string();
+                addr_state = if trimmed.is_empty() {
+                    None
+                } else if trimmed == own_address {
+                    Some(Err("This is your own address".to_string()))
+                } else {
+                    Some(Address::decode(&trimmed).map_err(|e| e.to_string()))
+                };
 
-            ui.add_space(5.0);
-            match &addr_state {
-                None => {
-                    ui.label(
-                        RichText::new("Paste the nf1 address the recipient shared with you.")
-                            .size(11.0)
-                            .color(TEXT_FAINT),
-                    );
-                }
-                Some(Ok(a)) => {
-                    ui.horizontal(|ui| {
-                        dot(ui, SUCCESS, false);
-                        ui.add_space(3.0);
+                ui.add_space(5.0);
+                match &addr_state {
+                    None => {
                         ui.label(
-                            RichText::new(format!("Valid address · {}", a.short()))
+                            RichText::new("Paste the nf1 address the recipient shared with you.")
                                 .size(11.0)
-                                .color(SUCCESS),
+                                .color(TEXT_FAINT),
+                        );
+                    }
+                    Some(Ok(a)) => {
+                        ui.horizontal(|ui| {
+                            dot(ui, SUCCESS, false);
+                            ui.add_space(3.0);
+                            ui.label(
+                                RichText::new(format!("Valid address · {}", a.short()))
+                                    .size(11.0)
+                                    .color(SUCCESS),
+                            );
+                        });
+                    }
+                    Some(Err(e)) => {
+                        ui.horizontal(|ui| {
+                            dot(ui, DANGER, false);
+                            ui.add_space(3.0);
+                            ui.label(RichText::new(e).size(11.0).color(DANGER));
+                        });
+                    }
+                }
+
+                if !app.address_book.entries.is_empty() {
+                    divider(ui);
+                    ui.label(RichText::new("Address book").size(11.0).color(TEXT_DIM));
+                    ui.add_space(6.0);
+                    let picks: Vec<(String, String)> = app
+                        .address_book
+                        .entries
+                        .iter()
+                        .map(|e| (e.name.clone(), e.address.clone()))
+                        .collect();
+                    ui.horizontal_wrapped(|ui| {
+                        for (name, addr) in picks {
+                            if ghost_button(ui, &format!("  {name}  ")).clicked() {
+                                app.send_to = addr;
+                            }
+                        }
+                    });
+                }
+            });
+
+            ui.add_space(14.0);
+
+            let mut amount_state = parse_amount(&app.send_amount);
+
+            titled_card(ui, "Amount", |ui| {
+                ui.set_width(ui.available_width());
+
+                // The MAX button and the available balance belong to the amount
+                // field, so they sit on its label row instead of floating above it.
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("NIGHT to send").size(12.0).color(TEXT_DIM));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("MAX").size(10.5).color(ACCENT_HI))
+                                    .fill(Color32::TRANSPARENT)
+                                    .stroke(Stroke::new(1.0_f32, ACCENT_DIM))
+                                    .rounding(Rounding::same(999.0)),
+                            )
+                            .on_hover_text("Send everything, minus the fee")
+                            .clicked()
+                        {
+                            let max = balances.available.saturating_sub(app.send_fee);
+                            app.send_amount = night(max).replace('\u{202F}', "");
+                        }
+                        ui.label(
+                            RichText::new(format!("Available {}", night(balances.available)))
+                                .size(11.0)
+                                .color(TEXT_FAINT),
                         );
                     });
-                }
-                Some(Err(e)) => {
-                    ui.horizontal(|ui| {
+                });
+                ui.add_space(5.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.send_amount)
+                        .margin(FIELD_MARGIN)
+                        .desired_width(f32::INFINITY)
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text("0.00000000"),
+                );
+
+                amount_state = parse_amount(&app.send_amount);
+                ui.add_space(4.0);
+                // Only errors live here now. "Total debit" used to sit under the
+                // field, competing with the memo and the fee for the same glance;
+                // it belongs in the summary, where the reader is deciding.
+                let amount_error = match &amount_state {
+                    Ok(darks) => {
+                        let total = darks.saturating_add(app.send_fee);
+                        (total > balances.available)
+                            .then(|| format!("Not enough — {} needed including fee", night(total)))
+                    }
+                    Err(_) if app.send_amount.trim().is_empty() => None,
+                    Err(e) => Some(e.clone()),
+                };
+                message_slot(ui, |ui| {
+                    if let Some(msg) = &amount_error {
                         dot(ui, DANGER, false);
                         ui.add_space(3.0);
-                        ui.label(RichText::new(e).size(11.0).color(DANGER));
-                    });
-                }
-            }
+                        ui.label(RichText::new(msg).size(11.0).color(DANGER));
+                    }
+                });
 
-            if !app.address_book.entries.is_empty() {
                 divider(ui);
-                ui.label(RichText::new("Address book").size(11.0).color(TEXT_DIM));
-                ui.add_space(6.0);
-                let picks: Vec<(String, String)> = app
-                    .address_book
-                    .entries
-                    .iter()
-                    .map(|e| (e.name.clone(), e.address.clone()))
-                    .collect();
-                ui.horizontal_wrapped(|ui| {
-                    for (name, addr) in picks {
-                        if ghost_button(ui, &format!("  {name}  ")).clicked() {
-                            app.send_to = addr;
-                        }
-                    }
-                });
-            }
-        });
 
-        ui.add_space(14.0);
-
-        let mut amount_state = parse_amount(&app.send_amount);
-
-        titled_card(ui, "Amount", |ui| {
-            ui.set_width(ui.available_width());
-
-            // The MAX button and the available balance belong to the amount
-            // field, so they sit on its label row instead of floating above it.
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("NIGHT to send").size(12.0).color(TEXT_DIM));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("MAX").size(10.5).color(ACCENT_HI))
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::new(1.0_f32, ACCENT_DIM))
-                                .rounding(Rounding::same(999.0)),
-                        )
-                        .on_hover_text("Send everything, minus the fee")
-                        .clicked()
-                    {
-                        let max = balances.available.saturating_sub(app.send_fee);
-                        app.send_amount = night(max).replace('\u{202F}', "");
-                    }
-                    ui.label(
-                        RichText::new(format!("Available {}", night(balances.available)))
-                            .size(11.0)
+                // Memo
+                field_label(
+                    ui,
+                    "Memo",
+                    Some(
+                        RichText::new(format!("{}/64", app.send_memo.len()))
+                            .size(10.5)
                             .color(TEXT_FAINT),
-                    );
-                });
-            });
-            ui.add_space(5.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut app.send_amount)
-                    .margin(FIELD_MARGIN)
-                    .desired_width(f32::INFINITY)
-                    .font(egui::TextStyle::Monospace)
-                    .hint_text("0.00000000"),
-            );
-
-            amount_state = parse_amount(&app.send_amount);
-            ui.add_space(4.0);
-            // Only errors live here now. "Total debit" used to sit under the
-            // field, competing with the memo and the fee for the same glance;
-            // it belongs in the summary, where the reader is deciding.
-            let amount_error = match &amount_state {
-                Ok(darks) => {
-                    let total = darks.saturating_add(app.send_fee);
-                    (total > balances.available)
-                        .then(|| format!("Not enough — {} needed including fee", night(total)))
-                }
-                Err(_) if app.send_amount.trim().is_empty() => None,
-                Err(e) => Some(e.clone()),
-            };
-            message_slot(ui, |ui| {
-                if let Some(msg) = &amount_error {
-                    dot(ui, DANGER, false);
-                    ui.add_space(3.0);
-                    ui.label(RichText::new(msg).size(11.0).color(DANGER));
-                }
-            });
-
-            divider(ui);
-
-            // Memo
-            field_label(
-                ui,
-                "Memo",
-                Some(
-                    RichText::new(format!("{}/64", app.send_memo.len()))
+                    ),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.send_memo)
+                        .margin(FIELD_MARGIN)
+                        .desired_width(f32::INFINITY)
+                        .char_limit(64)
+                        .hint_text("optional"),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Encrypted. Only the recipient can read it.")
                         .size(10.5)
                         .color(TEXT_FAINT),
-                ),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut app.send_memo)
-                    .margin(FIELD_MARGIN)
-                    .desired_width(f32::INFINITY)
-                    .char_limit(64)
-                    .hint_text("optional"),
-            );
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new("Encrypted. Only the recipient can read it.")
-                    .size(10.5)
-                    .color(TEXT_FAINT),
-            );
-        });
-
-        ui.add_space(14.0);
-
-        // There is one fee, and it was never a choice.
-        //
-        // This card offered Economy, Standard and Priority. Nothing in the
-        // protocol tells them apart: the fee is burned rather than paid to a
-        // miner, and no part of the node orders the mempool by it. So
-        // "Priority" promised faster confirmation that nothing delivers, and
-        // "Economy" invited paying a tenth for exactly the same service —
-        // three buttons where the phone wallet and the command line each show
-        // one number. A choice that changes nothing is worse than no choice:
-        // it makes people think they got it wrong when a payment is slow.
-        app.send_fee = DEFAULT_FEE_DARKS;
-
-        // --- what is about to happen -------------------------------------------
-        //
-        // The numbers that decide the payment, gathered in one recessed block
-        // immediately above the button that commits it. Previously the total sat
-        // three fields further up, next to the amount, and the button sat alone
-        // under the fee chips — so the last thing read before pressing was the
-        // burn note, not the sum leaving the wallet.
-        let ready = matches!(addr_state, Some(Ok(_)))
-            && amount_state
-                .as_ref()
-                .map(|d| d.saturating_add(app.send_fee) <= balances.available)
-                .unwrap_or(false)
-            && !app.send_busy;
-
-        card(ui, |ui| {
-            ui.set_width(ui.available_width());
-            let amount = amount_state.as_ref().copied().unwrap_or(0);
-            let total = amount.saturating_add(app.send_fee);
-
-            well(ui, |ui| {
-                summary_row(ui, "Amount", RichText::new(night(amount)), false);
-                ui.add_space(6.0);
-                summary_row(
-                    ui,
-                    "Fee (burned)",
-                    RichText::new(night(app.send_fee)).color(WARN),
-                    false,
                 );
-                ui.add_space(8.0);
-                let w = ui.available_width();
-                let (r, _) = ui.allocate_exact_size(Vec2::new(w, 1.0), egui::Sense::hover());
-                ui.painter().hline(
-                    r.x_range(),
-                    r.center().y,
-                    Stroke::new(1.0_f32, BORDER.gamma_multiply(0.9)),
-                );
-                ui.add_space(8.0);
-                summary_row(
-                    ui,
-                    "Leaves your wallet",
-                    RichText::new(night(total)).strong().size(15.0),
-                    true,
-                );
-                if let Some(Ok(a)) = &addr_state {
+            });
+
+            ui.add_space(14.0);
+
+            // There is one fee, and it was never a choice.
+            //
+            // This card offered Economy, Standard and Priority. Nothing in the
+            // protocol tells them apart: the fee is burned rather than paid to a
+            // miner, and no part of the node orders the mempool by it. So
+            // "Priority" promised faster confirmation that nothing delivers, and
+            // "Economy" invited paying a tenth for exactly the same service —
+            // three buttons where the phone wallet and the command line each show
+            // one number. A choice that changes nothing is worse than no choice:
+            // it makes people think they got it wrong when a payment is slow.
+            app.send_fee = DEFAULT_FEE_DARKS;
+
+            // --- what is about to happen -------------------------------------------
+            //
+            // The numbers that decide the payment, gathered in one recessed block
+            // immediately above the button that commits it. Previously the total sat
+            // three fields further up, next to the amount, and the button sat alone
+            // under the fee chips — so the last thing read before pressing was the
+            // burn note, not the sum leaving the wallet.
+            let ready = matches!(addr_state, Some(Ok(_)))
+                && amount_state
+                    .as_ref()
+                    .map(|d| d.saturating_add(app.send_fee) <= balances.available)
+                    .unwrap_or(false)
+                && !app.send_busy;
+
+            card(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let amount = amount_state.as_ref().copied().unwrap_or(0);
+                let total = amount.saturating_add(app.send_fee);
+
+                well(ui, |ui| {
+                    summary_row(ui, "Amount", RichText::new(night(amount)), false);
                     ui.add_space(6.0);
                     summary_row(
                         ui,
-                        "To",
-                        RichText::new(a.short()).color(TEXT_DIM).size(12.0),
+                        "Fee (burned)",
+                        RichText::new(night(app.send_fee)).color(WARN),
                         false,
                     );
-                }
-            });
+                    ui.add_space(8.0);
+                    let w = ui.available_width();
+                    let (r, _) = ui.allocate_exact_size(Vec2::new(w, 1.0), egui::Sense::hover());
+                    ui.painter().hline(
+                        r.x_range(),
+                        r.center().y,
+                        Stroke::new(1.0_f32, BORDER.gamma_multiply(0.9)),
+                    );
+                    ui.add_space(8.0);
+                    summary_row(
+                        ui,
+                        "Leaves your wallet",
+                        RichText::new(night(total)).strong().size(15.0),
+                        true,
+                    );
+                    if let Some(Ok(a)) = &addr_state {
+                        ui.add_space(6.0);
+                        summary_row(
+                            ui,
+                            "To",
+                            RichText::new(a.short()).color(TEXT_DIM).size(12.0),
+                            false,
+                        );
+                    }
+                });
 
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new("The fee is fixed and destroyed, not paid to a miner. 100% burn.")
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "The fee is fixed and destroyed, not paid to a miner. 100% burn.",
+                    )
                     .size(10.5)
                     .color(TEXT_FAINT),
-            );
+                );
 
-            ui.add_space(14.0);
-            if primary_button(ui, "Review payment", ready).clicked() {
-                app.send_confirm = true;
-            }
+                ui.add_space(14.0);
+                if primary_button(ui, "Review payment", ready).clicked() {
+                    app.send_confirm = true;
+                }
+            });
         });
     });
 
@@ -1001,7 +1020,7 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     if app.send_confirm {
         let amount = parse_amount(&app.send_amount).unwrap_or(0);
         let mut do_send = false;
-        let mut cancel = false;
+        let mut cancel = ctx.input(|i| i.key_pressed(egui::Key::Escape));
 
         egui::Window::new("Confirm payment")
             .collapsible(false)
@@ -1028,10 +1047,10 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                         .strong(),
                 );
                 ui.add_space(14.0);
-                kv(
-                    ui,
-                    "To",
-                    RichText::new(short_hex(app.send_to.trim())).monospace(),
+                field_label(ui, "Recipient — verify the full address", None);
+                ui.add(
+                    egui::Label::new(RichText::new(app.send_to.trim()).monospace().size(12.0))
+                        .wrap(),
                 );
                 kv(
                     ui,
@@ -1111,13 +1130,7 @@ pub fn receive(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             card(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.vertical_centered(|ui| {
-                    egui::Frame::none()
-                        .fill(Color32::WHITE)
-                        .rounding(Rounding::same(10.0))
-                        .inner_margin(egui::Margin::same(12.0))
-                        .show(ui, |ui| {
-                            qr_code(ui, &address, 200.0);
-                        });
+                    qr_code(ui, &address, 224.0);
                     ui.add_space(14.0);
                     ui.label(
                         RichText::new("Scan or copy to receive NIGHT")
@@ -1150,8 +1163,8 @@ pub fn receive(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 ui.label(
                     RichText::new(
                         "Every payment creates a fresh one-time key on chain. Two payments to \
-                         this address share no visible field, so nobody can link them — not \
-                         even the sender.",
+                         this address do not publish the shared receiving address. Keep in mind \
+                         that a sender still knows the payments they made to you.",
                     )
                     .size(11.5)
                     .color(TEXT_DIM),
@@ -1160,7 +1173,7 @@ pub fn receive(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 
             ui.add_space(14.0);
 
-            titled_card(ui, "Will it arrive", |ui| {
+            titled_card(ui, "Receiving status", |ui| {
                 ui.set_width(ui.available_width());
                 data_row(
                     ui,
@@ -1230,12 +1243,16 @@ pub fn activity(app: &mut App, ui: &mut egui::Ui) {
 
     card(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.columns(4, |c| {
-            stat(&mut c[0], "RECEIVED", &night_compact(got), SUCCESS);
-            stat(&mut c[1], "MINED", &night_compact(mined), ACCENT_HI);
-            stat(&mut c[2], "SENT", &night_compact(paid), TEXT);
-            stat(&mut c[3], "FEES BURNED", &night_compact(burned), WARN);
-        });
+        metric_grid(
+            ui,
+            &[
+                ("RECEIVED · NIGHT", night_compact(got), SUCCESS),
+                ("MINED · NIGHT", night_compact(mined), ACCENT_HI),
+                ("SENT · NIGHT", night_compact(paid), TEXT),
+                ("FEES · NIGHT", night_compact(burned), WARN),
+            ],
+            false,
+        );
     });
     ui.add_space(14.0);
 
@@ -1340,8 +1357,15 @@ pub fn activity(app: &mut App, ui: &mut egui::Ui) {
                 } else {
                     "Nothing matches that filter"
                 },
-                "Mining rewards and incoming payments appear here automatically.",
+                if entries.is_empty() {
+                    "Mining rewards and incoming payments appear here automatically."
+                } else {
+                    "Try a shorter memo, a transaction ID or another direction."
+                },
             );
+            if !entries.is_empty() && ghost_button(ui, "Clear filter").clicked() {
+                app.activity_filter.clear();
+            }
         } else {
             let now = now_unix();
             // Measured once, outside the loop. Inside it, `available_width`
@@ -1418,8 +1442,9 @@ pub fn mining(app: &mut App, ui: &mut egui::Ui) {
 
         ui.add_space(16.0);
         let lifetime = lifetime_mined(app);
-        ui.columns(4, |cols| {
-            let cells = [
+        metric_grid(
+            ui,
+            &[
                 (
                     "HASHRATE",
                     format_hashrate(app.hashrate.current),
@@ -1428,11 +1453,9 @@ pub fn mining(app: &mut App, ui: &mut egui::Ui) {
                 ("THIS SESSION", format_int(blocks_found), SUCCESS),
                 ("LIFETIME MINED", night_compact(lifetime), TEXT),
                 ("TOTAL HASHES", format_int(hashes_total), TEXT),
-            ];
-            for (i, (label, value, color)) in cells.into_iter().enumerate() {
-                stat(&mut cols[i], label, &value, color);
-            }
-        });
+            ],
+            false,
+        );
 
         // Hashrate sparkline
         if app.hashrate.history.len() > 2 {
@@ -1738,7 +1761,7 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 } else if s.map(|s| s.loading).unwrap_or(false) {
                     "No peers — chain still loading".to_string()
                 } else {
-                    "No peers — mining solo".to_string()
+                    "No peers — disconnected".to_string()
                 })
                 .size(16.0)
                 .strong(),
@@ -2213,7 +2236,7 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             if app.resync_confirm {
                 ui.label(
                 RichText::new(
-                    "This moves blocks.jsonl aside and downloads the live chain. Minutes to hours.",
+                    "This backs up the chain file and downloads it again. Wallet keys stay. This can take minutes to hours.",
                 )
                 .size(11.5)
                 .color(WARN),
@@ -2229,6 +2252,47 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 });
             } else if ghost_button(ui, "Resync chain, keep wallet").clicked() {
                 app.resync_confirm = true;
+            }
+        });
+
+        ui.add_space(14.0);
+
+        titled_card(ui, "Bitcoin node (atomic swaps)", |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new(
+                    "bitcoind JSON-RPC. Mode 0600, three lines: url=, user=, password=. \
+                     Needs -txindex=1. This wallet never holds Bitcoin keys.",
+                )
+                .size(12.0)
+                .color(TEXT_DIM),
+            );
+            ui.add_space(10.0);
+            kv(
+                ui,
+                "Config",
+                RichText::new(app.btc_rpc_path().display().to_string())
+                    .monospace()
+                    .size(11.0),
+            );
+            ui.add_space(8.0);
+            if app.bitcoin_rpc_configured() {
+                ui.label(
+                    RichText::new("Configuration saved. Connection and network checks are shown on the Swap page.")
+                        .size(11.5)
+                        .color(TEXT_DIM),
+                );
+                if ghost_button(ui, "Check swap connection").clicked() {
+                    app.view = View::Swap;
+                    app.reveal_seed = false;
+                    app.reveal_mnemonic = false;
+                    app.reveal_view_key = false;
+                }
+            } else if ghost_button(ui, "Write credential template").clicked() {
+                match app.write_bitcoin_rpc_template() {
+                    Ok(msg) => app.toasts.success(ctx, msg),
+                    Err(e) => app.toasts.error(ctx, e),
+                }
             }
         });
 

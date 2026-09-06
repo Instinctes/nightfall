@@ -41,6 +41,8 @@ pub struct Session {
     /// Raw hex the actor would send for each kind. Tests inject; a live
     /// wallet fills these from pre-signed transactions.
     pub raw: std::collections::HashMap<SendKind, (String, String)>, // kind -> (txid, hex)
+    /// Agreed transaction IDs, including transactions only the peer can sign.
+    pub watched: std::collections::HashMap<SendKind, String>,
 }
 
 impl Session {
@@ -50,6 +52,7 @@ impl Session {
             depths,
             datadir: datadir.to_path_buf(),
             raw: std::collections::HashMap::new(),
+            watched: std::collections::HashMap::new(),
         }
     }
 
@@ -86,6 +89,75 @@ impl Session {
         };
         let _ = (btc_h, night_h);
 
+        // Read ALL peer observations before mutating anything. A partial RPC
+        // outage cannot invent either a successful settlement or a safe exit.
+        let mut seen = std::collections::HashMap::new();
+        for (kind, id) in &self.watched {
+            let chain: &dyn ChainWatch = if *kind == SendKind::NightClaim {
+                night
+            } else {
+                btc
+            };
+            seen.insert(*kind, chain.confirmations(&TxRef { id: id.clone() })?);
+        }
+        let id = self.stored.state.id();
+        let role = self.stored.state.role();
+        let confirmed = |kind| {
+            seen.get(&kind).copied().flatten().is_some_and(|n| {
+                n >= if kind == SendKind::NightClaim {
+                    self.depths.night
+                } else {
+                    u64::from(self.depths.bitcoin)
+                }
+            })
+        };
+        if confirmed(SendKind::Refund) {
+            self.stored.state = SwapState::Refunded { id, role };
+            if self
+                .stored
+                .pending
+                .as_ref()
+                .is_some_and(|p| p.kind != SendKind::NightClaim)
+            {
+                self.stored.pending = None;
+            }
+        } else if confirmed(SendKind::Punish) {
+            self.stored.state = SwapState::Punished { id, role };
+            self.stored.pending = None;
+        } else if confirmed(SendKind::Cancel) {
+            // Actual chain evidence overrides a local intention to redeem.
+            if !matches!(self.stored.state, SwapState::Cancelled { .. }) {
+                self.stored.state = SwapState::Cancelled { id, role };
+                self.stored.pending = None;
+            }
+        } else if seen.get(&SendKind::Redeem).copied().flatten().is_some() {
+            // Even a mempool redeem exposes s_a. Never send a cancel after it.
+            self.stored.state = SwapState::Redeeming { id, role };
+        }
+        if confirmed(SendKind::NightClaim) {
+            if matches!(self.stored.state, SwapState::Redeeming { .. })
+                && confirmed(SendKind::Redeem)
+            {
+                self.stored.state = SwapState::Done { id, role };
+                self.stored.pending = None;
+            } else if matches!(
+                self.stored.state,
+                SwapState::Refunded {
+                    role: Role::Alice,
+                    ..
+                }
+            ) {
+                self.stored.night_recovered = true;
+                self.stored.pending = None;
+            }
+        }
+        if self.stored.state != before || self.stored.night_recovered {
+            self.persist()?;
+        }
+        if self.stored.is_finished() {
+            return Ok(Tick::Idle);
+        }
+
         // Lock depths are read at most once per tick. A pending *cancel*
         // must still be re-offered if the lock lookup is down — so this is
         // filled lazily, not before the pending branch.
@@ -94,13 +166,25 @@ impl Session {
         let mut locks_loaded = false;
 
         if let Some(p) = self.stored.pending.clone() {
-            match btc.confirmations(&TxRef { id: p.txid.clone() }) {
-                Ok(Some(_)) => {
+            let pending_watch: &dyn ChainWatch = if p.kind == SendKind::NightClaim {
+                night
+            } else {
+                btc
+            };
+            match pending_watch.confirmations(&TxRef { id: p.txid.clone() }) {
+                Ok(Some(n))
+                    if n >= if p.kind == SendKind::NightClaim {
+                        self.depths.night
+                    } else {
+                        u64::from(self.depths.bitcoin)
+                    } =>
+                {
                     self.stored.pending = None;
                     self.apply_send_confirmed(p.kind);
                     self.persist()?;
                     return Ok(Tick::Advanced);
                 }
+                Ok(Some(_)) => return Ok(Tick::Idle),
                 Ok(None) => {
                     // Still unknown. Re-offering it is right for the abort
                     // transactions — we want those to land — but not for the
@@ -117,7 +201,8 @@ impl Session {
                     // Found by `a_block_arriving_between_ticks_withdraws_the_redeem`,
                     // which is the whole reason regtest is not enough: there
                     // the chain never moves unless a test moves it.
-                    if p.kind == SendKind::Redeem {
+                    let exposed = matches!(self.stored.state, SwapState::Redeeming { .. });
+                    if p.kind == SendKind::Redeem && !exposed {
                         self.load_lock_confs(
                             btc,
                             night,
@@ -126,15 +211,33 @@ impl Session {
                         )?;
                         locks_loaded = true;
                     }
-                    if p.kind == SendKind::Redeem && !self.redeem_still_allowed(btc_lock_confs) {
+                    if p.kind == SendKind::Redeem
+                        && !exposed
+                        && !self.redeem_still_allowed(btc_lock_confs)
+                    {
                         self.stored.pending = None;
                         self.persist()?;
                         // Fall through: the fresh depth below turns this into
                         // MustCancel rather than leaving the swap idle.
-                    } else if let Some((txid, hex)) = self.raw.get(&p.kind).cloned() {
+                    } else if let Some(hex) =
+                        self.stored.outgoing.get(&p.kind).cloned().or_else(|| {
+                            self.raw
+                                .get(&p.kind)
+                                .filter(|(id, _)| id == &p.txid)
+                                .map(|(_, raw)| raw.clone())
+                        })
+                    {
+                        if p.kind == SendKind::Redeem && !exposed {
+                            self.stored.state = SwapState::Redeeming {
+                                id: self.stored.state.id(),
+                                role: self.stored.state.role(),
+                            };
+                            self.stored.outgoing.insert(p.kind, hex.clone());
+                            self.persist()?;
+                        }
                         return Ok(Tick::Broadcast {
                             kind: p.kind,
-                            txid,
+                            txid: p.txid,
                             raw_hex: hex,
                         });
                     } else {
@@ -158,7 +261,20 @@ impl Session {
             }
         }
 
-        if let Some(tick) = self.maybe_intend_send(btc_lock_confs.map(|c| c as u32))? {
+        if matches!(
+            self.stored.state,
+            SwapState::ReadyToRedeem {
+                role: Role::Alice,
+                ..
+            }
+        ) && (night_lock_confs.is_none_or(|n| n < self.depths.night)
+            || btc_lock_confs.is_none_or(|n| n < u64::from(self.depths.bitcoin)))
+        {
+            return Ok(Tick::Idle);
+        }
+        if let Some(tick) =
+            self.maybe_intend_send(btc_lock_confs.map(|c| c.min(u64::from(u32::MAX)) as u32))?
+        {
             return Ok(tick);
         }
         Ok(Tick::Idle)
@@ -191,7 +307,7 @@ impl Session {
     /// after the id was lost from disk.
     fn redeem_still_allowed(&self, lock_confs: Option<u64>) -> bool {
         match lock_confs {
-            Some(c) => self.depths.may_redeem(c as u32),
+            Some(c) => self.depths.may_redeem(c.min(u64::from(u32::MAX)) as u32),
             None => false,
         }
     }
@@ -202,7 +318,20 @@ impl Session {
         night_lock: Option<u64>,
     ) -> Option<SwapEvent> {
         match &self.stored.state {
-            SwapState::BtcLocked { .. } => btc_lock.map(|n| SwapEvent::BtcConf(n as u32)),
+            SwapState::Setup { .. } => btc_lock.and(Some(SwapEvent::BobPublishedLock)),
+            SwapState::BtcLocked { lock_confirms, .. } => {
+                let n = btc_lock?.min(u64::from(u32::MAX)) as u32;
+                // Fresh Bitcoin depth must precede NIGHT discovery. Otherwise
+                // a restart after both locks loops on a cached depth of zero.
+                if n != *lock_confirms || !self.depths.may_redeem(n) {
+                    return Some(SwapEvent::BtcConf(n));
+                }
+                if night_lock.is_some() && n >= self.depths.bitcoin {
+                    Some(SwapEvent::AlicePublishedNightLock)
+                } else {
+                    btc_lock.map(|c| SwapEvent::BtcConf(c as u32))
+                }
+            }
             SwapState::NightLocked { .. } => match (night_lock, btc_lock) {
                 (Some(n), Some(b)) => Some(SwapEvent::NightConf {
                     night: n,
@@ -218,6 +347,18 @@ impl Session {
     }
 
     fn apply_send_confirmed(&mut self, kind: SendKind) {
+        if kind == SendKind::NightClaim
+            && matches!(
+                self.stored.state,
+                SwapState::Refunded {
+                    role: Role::Alice,
+                    ..
+                }
+            )
+        {
+            self.stored.night_recovered = true;
+            return;
+        }
         let ev = match kind {
             SendKind::Redeem => SwapEvent::AliceRedeemed,
             SendKind::Cancel => SwapEvent::CancelConfirmed,
@@ -259,6 +400,11 @@ impl Session {
             (SwapState::Cancelled { .. }, Role::Bob) => SendKind::Refund,
             (SwapState::Cancelled { .. }, Role::Alice) => SendKind::Punish,
             (SwapState::Redeeming { .. }, Role::Bob) => SendKind::NightClaim,
+            (SwapState::Refunded { .. }, Role::Alice)
+                if self.stored.night_lock_id.is_some() && !self.stored.night_recovered =>
+            {
+                SendKind::NightClaim
+            }
             _ => return Ok(None),
         };
         let Some((txid, hex)) = self.raw.get(&kind).cloned() else {
@@ -268,6 +414,15 @@ impl Session {
             kind,
             txid: txid.clone(),
         });
+        self.stored.outgoing.insert(kind, hex.clone());
+        if kind == SendKind::Redeem {
+            // Persist potential exposure BEFORE returning bytes to the caller.
+            // After a crash we cannot know whether those bytes reached a peer.
+            self.stored.state = SwapState::Redeeming {
+                id: self.stored.state.id(),
+                role: self.stored.state.role(),
+            };
+        }
         self.persist()?;
         Ok(Some(Tick::Broadcast {
             kind,
@@ -317,6 +472,24 @@ mod tests {
     use crate::state::Role;
     use crate::watch::FakeWatch;
     use uuid::Uuid;
+
+    #[test]
+    fn restart_after_both_locks_refreshes_bitcoin_before_night_discovery() {
+        let (mut s, _) = session(Role::Bob);
+        s.stored.state = SwapState::BtcLocked {
+            id: s.stored.state.id(),
+            role: Role::Bob,
+            lock_confirms: 0,
+        };
+        s.stored.btc_lock_txid = Some("lock".into());
+        s.stored.night_lock_id = Some("night".into());
+        let mut btc = FakeWatch::new(10);
+        btc.set_confs("lock", 5);
+        let mut night = FakeWatch::new(10);
+        night.set_confs("night", 2);
+        s.tick(&btc, &night).unwrap();
+        assert!(matches!(s.stored.state, SwapState::MustCancel { .. }));
+    }
 
     fn session(role: Role) -> (Session, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("nf-drv-{}", Uuid::new_v4()));
@@ -480,7 +653,10 @@ mod tests {
             "precondition: one confirmation is inside the redeem window"
         );
 
-        let tick = s.tick(&btc, &FakeWatch::new(10)).unwrap();
+        s.stored.night_lock_id = Some("night-lock".into());
+        let mut night = FakeWatch::new(10);
+        night.set_confs("night-lock", s.depths.night);
+        let tick = s.tick(&btc, &night).unwrap();
         match tick {
             Tick::Broadcast { kind, txid, .. } => {
                 assert_eq!(kind, SendKind::Redeem);
@@ -518,7 +694,7 @@ mod tests {
     /// The driver must re-read and re-decide on every tick. Entering
     /// `ReadyToRedeem` once must not license a redeem forever.
     #[test]
-    fn a_block_arriving_between_ticks_withdraws_the_redeem() {
+    fn a_potentially_published_redeem_never_turns_into_a_cancel() {
         let (mut s, dir) = session(Role::Alice);
         let d = s.depths;
         s.stored.state = s.stored.state.apply(SwapEvent::BobPublishedLock, d);
@@ -558,27 +734,22 @@ mod tests {
         assert!(!d.may_redeem(inside), "precondition: now it is too late");
         btc.set_confs("lock", u64::from(inside));
 
-        // Tick two must withdraw the offer, not repeat it.
+        // The first tick returned broadcastable bytes. They may have reached
+        // a peer even if our node now reports "unknown". Do not give BTC back.
         let after = s.tick(&btc, &night).unwrap();
         assert!(
-            !matches!(
+            matches!(
                 after,
                 Tick::Broadcast {
                     kind: SendKind::Redeem,
                     ..
                 }
             ),
-            "the driver offered a redeem after the window closed: {after:?}"
+            "the driver abandoned an already exposed redeem: {after:?}"
         );
         assert!(
-            matches!(
-                s.stored.state,
-                SwapState::MustCancel {
-                    reason: crate::AbortReason::RedeemTooCloseToH1,
-                    ..
-                }
-            ),
-            "and it must abort rather than sit still; got {:?}",
+            matches!(s.stored.state, SwapState::Redeeming { .. }),
+            "a potential exposure must stay irreversible; got {:?}",
             s.stored.state
         );
         let _ = std::fs::remove_dir_all(dir);
@@ -711,6 +882,74 @@ mod tests {
                 }
             ),
             "maybe_intend_send must not offer a redeem on an unread lock: {out:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_seen_bitcoin_lock_leaves_setup() {
+        let (mut s, dir) = session(Role::Bob);
+        s.stored.btc_lock_txid = Some("lock".into());
+        let mut btc = FakeWatch::new(10);
+        btc.confs.insert("lock".into(), 1);
+        let night = FakeWatch::new(100);
+        s.tick(&btc, &night).unwrap();
+        assert!(
+            matches!(s.stored.state, SwapState::BtcLocked { .. }),
+            "got {:?}",
+            s.stored.state
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_night_claim_confirmation_finishes_the_swap() {
+        let (mut s, dir) = session(Role::Bob);
+        let d = s.depths;
+        s.stored.state = s.stored.state.apply(SwapEvent::BobPublishedLock, d);
+        s.stored.state = s.stored.state.apply(SwapEvent::BtcConf(d.bitcoin), d);
+        s.stored.state = s.stored.state.apply(SwapEvent::AlicePublishedNightLock, d);
+        s.stored.state = s
+            .stored
+            .state
+            .apply(SwapEvent::NightConf { night: 2, btc: 1 }, d);
+        s.stored.state = s.stored.state.apply(SwapEvent::AliceRedeemed, d);
+        s.stored.pending = Some(PendingSend {
+            kind: SendKind::NightClaim,
+            txid: "claim".into(),
+        });
+        let btc = FakeWatch::new(10);
+        let mut night = FakeWatch::new(100);
+        night.confs.insert("claim".into(), 0);
+        s.tick(&btc, &night).unwrap();
+        assert!(!s.stored.is_finished(), "mempool is not settlement");
+        night.confs.insert("claim".into(), d.night);
+        s.tick(&btc, &night).unwrap();
+        assert!(
+            matches!(s.stored.state, SwapState::Done { .. }),
+            "got {:?}",
+            s.stored.state
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_seen_night_lock_leaves_btc_locked_once_bitcoin_is_deep_enough() {
+        let (mut s, dir) = session(Role::Alice);
+        let d = s.depths;
+        s.stored.state = s.stored.state.apply(SwapEvent::BobPublishedLock, d);
+        s.stored.state = s.stored.state.apply(SwapEvent::BtcConf(d.bitcoin), d);
+        s.stored.btc_lock_txid = Some("lock".into());
+        s.stored.night_lock_id = Some("nlock".into());
+        let mut btc = FakeWatch::new(10);
+        btc.confs.insert("lock".into(), d.bitcoin as u64);
+        let mut night = FakeWatch::new(100);
+        night.confs.insert("nlock".into(), 1);
+        s.tick(&btc, &night).unwrap();
+        assert!(
+            matches!(s.stored.state, SwapState::NightLocked { .. }),
+            "got {:?}",
+            s.stored.state
         );
         let _ = std::fs::remove_dir_all(dir);
     }

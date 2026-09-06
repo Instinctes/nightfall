@@ -54,6 +54,15 @@ pub struct StoredSwap {
     /// spend them as a normal payment.
     #[serde(default)]
     pub reserved_commits: Vec<String>,
+    /// Exact bytes survive retries and restarts (especially randomized NIGHT proofs).
+    #[serde(default)]
+    pub outgoing: std::collections::HashMap<SendKind, String>,
+    #[serde(default)]
+    pub night_lock_tx: Option<nightfall_ledger::Transaction>,
+    #[serde(default)]
+    pub bitcoin_lock_hex: Option<String>,
+    #[serde(default)]
+    pub night_recovered: bool,
 }
 
 impl StoredSwap {
@@ -71,7 +80,34 @@ impl StoredSwap {
             btc_lock_txid: None,
             night_lock_id: None,
             reserved_commits: vec![],
+            outgoing: Default::default(),
+            night_lock_tx: None,
+            bitcoin_lock_hex: None,
+            night_recovered: false,
         }
+    }
+
+    pub fn from_session(session: &crate::session::Session) -> Self {
+        Self::new(
+            SwapState::Setup {
+                id: session.id,
+                role: session.role,
+            },
+            session.amounts.night_darks,
+            session.amounts.btc_sats,
+        )
+    }
+
+    pub fn is_finished(&self) -> bool {
+        crate::ui::is_finished(&self.state)
+            && !(matches!(
+                self.state,
+                SwapState::Refunded {
+                    role: crate::Role::Alice,
+                    ..
+                }
+            ) && self.night_lock_id.is_some()
+                && !self.night_recovered)
     }
 }
 
@@ -95,10 +131,10 @@ pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), PersistError> 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("secret.tmp");
+    let tmp = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
     {
         let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -127,6 +163,10 @@ pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), PersistError> 
     // tmp file, both of which `overwriting_a_loose_secret_file_tightens_it_again`
     // does anchor.
     fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -144,12 +184,8 @@ pub fn read_secret_file(path: &Path) -> Result<Vec<u8>, PersistError> {
 }
 
 pub fn save(datadir: &Path, stored: &StoredSwap) -> Result<(), PersistError> {
-    fs::create_dir_all(dir(datadir))?;
-    let tmp = path(datadir, stored.state.id()).with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(stored)?;
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, path(datadir, stored.state.id()))?;
-    Ok(())
+    write_secret_file(&path(datadir, stored.state.id()), &bytes)
 }
 
 pub fn load(datadir: &Path, id: Uuid) -> Result<StoredSwap, PersistError> {

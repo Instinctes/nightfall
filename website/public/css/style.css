@@ -1394,7 +1394,12 @@ footer {
     margin: 0 0 14px;
 }
 
-.foot-col a:not(.btn) {
+/* List links only. `.nav-icon` is a circle, not a row in this list — if this
+   rule also matches it, `display: block` beats `.nav-icon`'s `inline-flex`
+   (0,2,1 vs 0,1,0) and the 20px glyph sits at the top-left of the circle.
+   Happened twice. The `:not(.nav-icon)` is the same exclusion the header
+   already uses. */
+.foot-col a:not(.btn):not(.nav-icon) {
     display: block;
     color: var(--text-dim);
     margin-bottom: 9px;
@@ -1408,12 +1413,9 @@ footer {
     margin-top: 16px;
 }
 
-/* `.foot-col a` above sets `display: block` and outranks `.nav-icon`, which is
-   where the centring went: with `display: block` the flex alignment on
-   `.nav-icon` has nothing to align, so the 20px glyph sat at the top-left of a
-   38px circle. Restated here, along with the list item's bottom margin, which
-   these are not. */
-.foot-social .nav-icon {
+/* Extra classes so a future `.foot-col a` cannot steal `display` again.
+   Specificity (0, 3, 1) vs the list rule's (0, 3, 1) with `:not(.nav-icon)`. */
+.foot-col .foot-social a.nav-icon {
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -1425,7 +1427,7 @@ footer {
     border: 1px solid var(--border);
 }
 
-.foot-social .nav-icon:hover {
+.foot-col .foot-social a.nav-icon:hover {
     color: var(--text);
     background: rgba(124, 92, 255, 0.14);
     border-color: var(--border-hi);

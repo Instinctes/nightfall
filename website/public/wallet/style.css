@@ -1,42 +1,37 @@
 /* NIGHTFALLCOIN — browser wallet
  *
- * Rewritten for 0.8.1 to use the same palette and shapes as the Core wallet
- * and nightfallcoin.org. It used to run its own colours (#07060f, #c14ee0),
- * which made the browser wallet look like a different product from the one
- * people had just downloaded.
- *
- * One layout, two shapes: a phone gets the bottom bar it had; from 860px the
- * same markup becomes a centred desktop app with the navigation on top. No
- * separate desktop build, no second set of templates to keep in sync.
- *
- * Class names are unchanged on purpose — app.js renders the same DOM.
+ * Shared 0.9.4 development design: soft violet surfaces and pastel accents.
+ * One responsive app: bottom navigation on mobile, sidebar from 860px.
+ * Dark ink on pastel cards; light text on dark surfaces. No external assets.
  */
 
 :root {
-    /* Site palette, verbatim from website/public/css/style.css */
-    --bg: #0e0b18;
-    --bg-2: #141022;
-    --surface: #1a1430;
-    --surface-2: #221a3c;
-    --border: #2e2648;
-    --border-hi: #45396a;
+    /* Shared wallet palette: crates/nightfall-core/src/theme.rs. */
+    --bg: #423858;
+    --bg-2: #403657;
+    --surface: #302747;
+    --surface-2: #4b4064;
+    --border: #554870;
+    --border-hi: #806d9e;
 
-    --text: #f2eefc;
-    --text-dim: #a89fc6;
-    --text-faint: #6f668f;
+    --text: #f6f2ff;
+    --text-dim: #d4c9e4;
+    --text-faint: #c8bcdb;
 
-    --violet: #7c5cff;
-    --violet-hi: #9b83ff;
-    --magenta: #b845d8;
-    --teal: #35a3c4;
+    --violet: #bda2ff;
+    --violet-hi: #dec4ff;
+    --magenta: #e79cef;
+    --teal: #78dbec;
     --success: #4ae0a8;
     --warn: #ffc85c;
     --danger: #ff6b8a;
 
-    --grad: linear-gradient(110deg, #5633c4 0%, #8e31b2 48%, #276f8e 100%);
+    --grad: linear-gradient(110deg, #bda2ff 0%, #e79cef 48%, #78dbec 100%);
+    --ink: #251c3a;
+    --rail: #332c4d;
     --grad-bright: linear-gradient(110deg, #7c5cff 0%, #b845d8 48%, #35a3c4 100%);
 
-    --r-lg: 24px;
+    --r-lg: 28px;
     --r-md: 16px;
     --r-sm: 12px;
     --r-pill: 999px;
@@ -52,7 +47,7 @@
     --bad: var(--danger);
     --in: var(--success);
     --out: var(--text);
-    --nav: rgba(14, 11, 24, 0.94);
+    --nav: rgba(51, 44, 77, 0.97);
 
     --safe-top: env(safe-area-inset-top, 0px);
     --safe-bot: env(safe-area-inset-bottom, 0px);
@@ -1301,111 +1296,110 @@ label {
     background: rgba(124, 92, 255, 0.1);
 }
 
-/* ====================================================== desktop shape === */
-
+/* Shared violet-glass design: native Core, desktop web and mobile web. */
+body { background: #211b32; }
+#app { background: radial-gradient(ellipse at 94% 0, #503865, transparent 65%), var(--bg); }
+.view { scrollbar-gutter: stable; }
+.card, .glass, .set-group {
+    box-shadow: 0 12px 32px rgba(20, 12, 35, .16);
+}
+.card, .glass, .section { padding: 24px; }
+.glass .glass, .section .glass { box-shadow: none; border: 0; padding: 0; background: transparent; }
+.sky { background: transparent; padding-bottom: 8px; }
+.brand-wrap { margin: 6px 0 14px; }
+.brand-wrap img { width: 48px; height: 48px; filter: none; }
+.brand-wrap .word { color: var(--text); font-size: .8rem; letter-spacing: .14em; }
+.nav-brand, .nav-foot { display: none; }
+.nav button.on { color: var(--text); background: var(--surface); box-shadow: inset 3px 0 var(--teal); }
+.nav button { color: var(--text-dim); }
+.balance-card {
+    position: relative; isolation: isolate; overflow: hidden;
+    background: var(--grad); color: var(--ink); padding: 28px;
+    border-color: rgba(255,255,255,.24);
+    box-shadow: 0 14px 38px rgba(20, 12, 35, .2);
+}
+.balance-card::before {
+    content: ""; position: absolute; z-index: -1; inset: 0; pointer-events: none;
+    background: repeating-radial-gradient(ellipse at 110% 150%, transparent 0 12px, rgba(70,27,105,.14) 13px 14px, transparent 15px 22px);
+    mask-image: linear-gradient(90deg, transparent 45%, #000);
+}
+.balance-card .num { background: none; color: var(--ink); font-size: clamp(2rem, 4vw, 3.4rem); overflow-wrap: anywhere; }
+.balance-card .kicker, .balance-card .tick, .balance-card .sub, .balance-card .linkish { color: var(--ink); }
+.balance-card .pill { color: var(--ink); background: rgba(255,255,255,.35); border-color: rgba(37,28,58,.18); }
+.balance-card .dot { background: var(--ink); box-shadow: none; }
+.balance-card .actions button { color: var(--text); background: var(--ink); border-color: transparent; }
+.balance-card .actions .recv { background: rgba(255,255,255,.45); border-color: rgba(37,28,58,.2); color: var(--ink); }
+.primary, .send { color: var(--ink); background: var(--grad); font-weight: 700; border-radius: 18px; }
+.primary:hover, .send:hover { filter: brightness(1.04); }
+button:disabled { opacity: .5; cursor: not-allowed; transform: none; filter: none; }
+button:focus-visible, a:focus-visible, summary:focus-visible {
+    outline: 3px solid var(--teal); outline-offset: 4px;
+}
+input::placeholder, textarea::placeholder { color: var(--text-faint); opacity: 1; }
+.row h2 { font-size: .94rem; text-transform: none; letter-spacing: 0; color: var(--text); }
+.kicker, label { font-size: .78rem; letter-spacing: .08em; }
+.linkish { min-height: 44px; }
+.iconbtn { border-radius: 18px; background: var(--surface); }
+.screen { max-width: 760px; padding: 28px 20px 40px; }
+.screen > h1, .page-head h1 { font-size: 1.9rem; }
+.screen > .field { background: var(--surface); border: 1px solid var(--border); padding: 20px; border-radius: var(--r-lg); }
+.set-row .ico { background: var(--surface-2); border-color: var(--border); }
+.tx { background: var(--surface-2); }
+.tx .amt { white-space: normal; overflow-wrap: anywhere; }
+.stat, .kv, .summary .line { border-color: var(--border); }
+.wrap > .network-card, .wrap > .recent-card { margin-top: 18px; }
+.onboard { padding-top: 56px; }
+.onboard h1 { font-size: 2rem; }
+.onboard .logo { filter: drop-shadow(0 8px 18px rgba(20,12,35,.28)); }
+@media (max-width: 480px) {
+    .wrap { padding: 16px; }
+    .balance-card { padding: 22px; }
+    .balance-card .row { align-items: flex-start; flex-wrap: wrap; }
+    .balance-card .num { font-size: clamp(1.8rem, 8vw, 2.6rem); }
+    .card, .glass, .section { padding: 18px; }
+    .tx { grid-template-columns: 30px minmax(0,1fr); gap: 8px; padding: 12px; }
+    .tx .amt { grid-column: 2; text-align: left; }
+    .set-row { gap: 10px; padding: 14px; }
+}
 @media (min-width: 860px) {
-    /* The bar is the last element in the DOM; `order` puts it on top without
-       a second template. */
-    .nav {
-        order: -1;
-        max-width: 980px;
-        margin: 0 auto 18px;
-        grid-template-columns: repeat(3, minmax(0, 160px));
-        justify-content: center;
-        gap: 8px;
-        padding: 10px;
-        border-top: 0;
-        border-bottom: 1px solid var(--border);
-        border-radius: 0 0 var(--r-md) var(--r-md);
+    #app.wallet-shell {
+        display: grid; grid-template-columns: 232px minmax(0,1fr);
+        max-width: 1600px; margin: 28px auto;
+        width: calc(100% - 56px); height: calc(100dvh - 56px);
+        border: 1px solid var(--border); border-radius: 36px; overflow: hidden;
+        box-shadow: 0 28px 80px rgba(10,6,22,.3);
     }
-
-    .nav button {
-        flex-direction: row;
-        gap: 8px;
-        min-height: 44px;
-        font-size: 0.84rem;
+    .wallet-shell > .view { grid-column: 2; grid-row: 1; min-width: 0; }
+    .wallet-shell > .nav {
+        grid-column: 1; grid-row: 1; order: 0;
+        display: flex; flex-direction: column; justify-content: flex-start;
+        gap: 12px; margin: 0; padding: 34px 20px; max-width: none;
+        border: 0; border-right: 1px solid rgba(255,255,255,.035);
+        border-radius: 0; background: var(--rail); backdrop-filter: none;
     }
-
-    .sky {
-        padding-bottom: 20px;
-    }
-
-    .brand-wrap img {
-        width: 54px;
-        height: 54px;
-    }
-
-    /* Balance and network side by side instead of stacked — on a wide screen
-       the stacked version left two thirds of the row empty. */
-    .wrap {
-        display: grid;
-        grid-template-columns: 1.25fr 1fr;
-        grid-template-areas:
-            "balance network"
-            "recent  recent";
-        gap: 16px;
-        align-items: start;
-        padding: 16px 16px 32px;
-    }
-
-    .wrap > .glass:first-of-type {
-        grid-area: balance;
-    }
-
-    .wrap > .section:nth-of-type(1) {
-        grid-area: network;
-        margin-top: 0;
-    }
-
-    .wrap > .section:nth-of-type(2) {
-        grid-area: recent;
-        margin-top: 0;
-    }
-
-    .actions {
-        grid-template-columns: repeat(2, minmax(0, 200px));
-    }
-
-    /* auto-fit already picks the column count; the seed screen just gets more
-       room to spread into than a send form needs. */
-    .onboard.onboard-wide {
-        max-width: 760px;
-    }
-
-    /* A settings list does not get better by being 980px wide — it gets
-       harder to pair a label on the left with a value on the right. */
-    .page-head,
-    .group-label,
-    .set-group,
-    .note,
-    .foot-link {
-        max-width: 640px;
-        margin-left: auto;
-        margin-right: auto;
-    }
-
-    .set-row {
-        min-height: 62px;
-    }
-
-    .tx {
-        grid-template-columns: 34px minmax(0, 1fr) 190px;
-        padding: 13px 16px;
-    }
+    .nav-brand { display: flex; gap: 12px; align-items: center; color: var(--text); margin: 0 4px 48px; font-size: .98rem; font-weight: 650; }
+    .nav-brand img { width: 38px; height: 38px; }
+    .nav-brand small { display: block; color: var(--text-dim); font-size: .62rem; letter-spacing: .14em; margin-top: 4px; }
+    .nav button { flex-direction: row; justify-content: flex-start; gap: 15px; padding: 14px 18px; min-height: 54px; font-size: .9rem; border-radius: 18px; }
+    .nav button.on { box-shadow: inset 3px 0 var(--teal), 0 8px 18px rgba(20,12,35,.15); }
+    .nav-foot { display: block; margin-top: auto; padding: 20px 6px 0; border-top: 1px solid var(--border); color: var(--text); font-size: .78rem; }
+    .nav-foot small { display: block; color: var(--text-dim); font-size: .72rem; margin-top: 8px; line-height: 1.5; }
+    .sky { padding: 30px 32px 4px; }
+    .sky .topbar { padding: 0; }
+    .sky .brand-wrap { display: none; }
+    .sky .topbar::before { content: "Your wallet"; font-size: 1.65rem; font-weight: 650; }
+    #to-settings { display: none; }
+    .wrap { display: grid; grid-template-columns: minmax(0,1fr); gap: 22px; max-width: 1160px; padding: 24px 32px 40px; }
+    .wrap > .network-card, .wrap > .recent-card { margin: 0; }
+    .screen { padding: 40px 32px; }
+    .onboard.onboard-wide { max-width: 760px; }
 }
-
-@media (min-width: 1120px) {
-    .wrap,
-    .screen,
-    .nav,
-    .topbar {
-        max-width: 1060px;
-    }
+@media (min-width: 1240px) {
+    .wrap { grid-template-columns: minmax(0,1.2fr) minmax(0,1fr); grid-template-areas: "balance network" "recent recent"; align-items: start; }
+    .balance-card { grid-area: balance; min-height: 310px; display: flex; flex-direction: column; justify-content: center; }
+    .network-card { grid-area: network; }
+    .recent-card { grid-area: recent; }
 }
-
 @media (prefers-reduced-motion: reduce) {
-    * {
-        transition: none !important;
-        animation: none !important;
-    }
+    *, *::before, *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
 }

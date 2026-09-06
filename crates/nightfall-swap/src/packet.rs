@@ -84,6 +84,9 @@ impl Packet {
     }
 
     pub fn decode(s: &str) -> Result<Self, PacketError> {
+        if s.len() > 1_048_576 {
+            return Err(PacketError::Malformed);
+        }
         serde_json::from_str(s).map_err(|_| PacketError::Malformed)
     }
 

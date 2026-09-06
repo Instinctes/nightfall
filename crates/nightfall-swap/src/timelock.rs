@@ -72,7 +72,9 @@ impl Depths {
     /// Spec §9.2: do not begin phase 3 if the remaining cancel window is
     /// thinner than the margin.
     pub fn may_redeem(&self, lock_confirmations: u32) -> bool {
-        lock_confirmations + self.btc_redeem_margin < self.cancel
+        lock_confirmations
+            .checked_add(self.btc_redeem_margin)
+            .is_some_and(|n| n < self.cancel)
     }
 
     /// Alice's check on Bob's opening depths. He chooses them; she can

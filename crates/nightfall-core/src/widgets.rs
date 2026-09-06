@@ -25,6 +25,84 @@ pub const FIELD_MARGIN: egui::Margin = egui::Margin {
     bottom: 8.0,
 };
 
+/// Native vector icons: no font-dependent glyphs or bitmap scaling.
+pub fn nav_icon(
+    painter: &egui::Painter,
+    view: crate::app::View,
+    origin: egui::Pos2,
+    color: Color32,
+) {
+    use crate::app::View;
+    let stroke = Stroke::new(1.6, color);
+    let line = |pts: &[(f32, f32)]| {
+        painter.add(egui::Shape::line(
+            pts.iter()
+                .map(|(x, y)| origin + Vec2::new(*x, *y))
+                .collect(),
+            stroke,
+        ))
+    };
+    match view {
+        View::Dashboard => {
+            painter.rect_stroke(
+                Rect::from_min_size(origin + Vec2::new(2.0, 4.0), Vec2::new(18.0, 14.0)),
+                Rounding::same(3.0),
+                stroke,
+            );
+            line(&[
+                (15.0, 10.0),
+                (20.0, 10.0),
+                (20.0, 14.0),
+                (15.0, 14.0),
+                (15.0, 10.0),
+            ]);
+        }
+        View::Send => {
+            line(&[(4.0, 18.0), (18.0, 4.0), (9.0, 4.0)]);
+            line(&[(18.0, 4.0), (18.0, 13.0)]);
+        }
+        View::Receive => {
+            line(&[(18.0, 4.0), (4.0, 18.0), (13.0, 18.0)]);
+            line(&[(4.0, 18.0), (4.0, 9.0)]);
+        }
+        View::Activity => {
+            line(&[(2.0, 16.0), (7.0, 10.0), (11.0, 13.0), (19.0, 5.0)]);
+        }
+        View::Mining => {
+            painter.rect_stroke(
+                Rect::from_min_size(origin + Vec2::splat(5.0), Vec2::splat(12.0)),
+                Rounding::same(2.0),
+                stroke,
+            );
+            for p in [7.0, 11.0, 15.0] {
+                line(&[(p, 2.0), (p, 5.0)]);
+                line(&[(p, 17.0), (p, 20.0)]);
+                line(&[(2.0, p), (5.0, p)]);
+                line(&[(17.0, p), (20.0, p)]);
+            }
+        }
+        View::Network => {
+            for (x, y) in [(11.0, 3.0), (3.0, 18.0), (19.0, 18.0)] {
+                painter.circle_stroke(origin + Vec2::new(x, y), 2.5, stroke);
+            }
+            line(&[(10.0, 6.0), (4.0, 15.0)]);
+            line(&[(12.0, 6.0), (18.0, 15.0)]);
+            line(&[(6.0, 18.0), (16.0, 18.0)]);
+        }
+        View::Swap => {
+            line(&[(3.0, 7.0), (19.0, 7.0), (15.0, 3.0)]);
+            line(&[(19.0, 15.0), (3.0, 15.0), (7.0, 19.0)]);
+        }
+        View::Settings => {
+            for (y, x) in [(5.0, 8.0), (11.0, 15.0), (17.0, 6.0)] {
+                line(&[(2.0, y), (x - 2.0, y)]);
+                line(&[(x + 2.0, y), (20.0, y)]);
+                painter.circle_stroke(origin + Vec2::new(x, y), 2.0, stroke);
+            }
+        }
+    }
+}
+
 // ------------------------------------------------------------------ logo ---
 
 /// Decode the bundled logo once and hand back a texture.
@@ -218,6 +296,23 @@ pub fn gradient_card<R>(ui: &mut egui::Ui, height: f32, add: impl FnOnce(&mut eg
         Vec2::new(1.0, 0.55),
         brand_gradient,
     );
+    // Contour detail stays on the right, behind content and clipped to the hero.
+    let painter = ui.painter().with_clip_rect(rect.shrink(10.0));
+    for line in 0..12 {
+        let points = (0..60)
+            .map(|i| {
+                let x = i as f32 / 59.0;
+                egui::pos2(
+                    rect.right() - rect.width() * 0.36 + x * rect.width() * 0.44,
+                    rect.bottom() - 12.0 - line as f32 * 8.0 - (x * 5.0).sin() * 20.0,
+                )
+            })
+            .collect();
+        painter.add(egui::Shape::line(
+            points,
+            Stroke::new(1.0, INK.gamma_multiply(0.13)),
+        ));
+    }
 
     let inner = rect.shrink(22.0);
     let mut child = ui.new_child(
@@ -244,6 +339,12 @@ pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
         .stroke(Stroke::new(1.0_f32, BORDER))
         .rounding(Rounding::same(ROUND))
         .inner_margin(egui::Margin::same(20.0))
+        .shadow(egui::epaint::Shadow {
+            offset: Vec2::new(0.0, 8.0),
+            blur: 24.0,
+            spread: 0.0,
+            color: Color32::from_black_alpha(28),
+        })
         .show(ui, |ui| {
             ui.set_width(width - 40.0);
             add(ui)
@@ -309,6 +410,7 @@ pub fn two_columns<A, B>(
     }
     let col = (avail - GAP) / 2.0;
     ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = GAP;
         ui.allocate_ui_with_layout(
             Vec2::new(col, 0.0),
             egui::Layout::top_down(egui::Align::LEFT),
@@ -317,7 +419,6 @@ pub fn two_columns<A, B>(
                 left(ui);
             },
         );
-        ui.add_space(GAP);
         ui.allocate_ui_with_layout(
             Vec2::new(col, 0.0),
             egui::Layout::top_down(egui::Align::LEFT),
@@ -503,6 +604,30 @@ pub fn summary_row(ui: &mut egui::Ui, key: &str, value: RichText, strong: bool) 
 }
 
 /// Small label above a value.
+pub fn metric_grid(ui: &mut egui::Ui, cells: &[(&str, String, Color32)], separate_cards: bool) {
+    let columns = if ui.available_width() >= 880.0 {
+        4
+    } else if ui.available_width() >= 390.0 {
+        2
+    } else {
+        1
+    };
+    for (row, chunk) in cells.chunks(columns).enumerate() {
+        if row > 0 {
+            ui.add_space(12.0);
+        }
+        ui.columns(columns, |cols| {
+            for (i, (label, value, color)) in chunk.iter().enumerate() {
+                if separate_cards {
+                    card(&mut cols[i], |ui| stat(ui, label, value, *color));
+                } else {
+                    stat(&mut cols[i], label, value, *color);
+                }
+            }
+        });
+    }
+}
+
 pub fn stat(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
     ui.vertical(|ui| {
         ui.set_min_height(46.0);
@@ -584,22 +709,25 @@ pub fn dot(ui: &mut egui::Ui, color: Color32, animate: bool) {
 
 /// Primary action button — a gradient pill.
 pub fn primary_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
-    let galley = ui.painter().layout_no_wrap(
-        text.to_string(),
-        egui::FontId::proportional(14.0),
-        Color32::WHITE,
-    );
+    let enabled = enabled && ui.is_enabled();
+    let fg = if enabled { INK } else { TEXT_FAINT };
+    let galley =
+        ui.painter()
+            .layout_no_wrap(text.to_string(), egui::FontId::proportional(14.0), fg);
     let size = Vec2::new(galley.size().x + 44.0, 42.0);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let (rect, resp) = ui
+        .add_enabled_ui(enabled, |ui| ui.allocate_exact_size(size, Sense::click()))
+        .inner;
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, text));
 
     if enabled {
         let hot = resp.hovered();
         gradient_rect(ui.painter(), rect, ROUND_PILL, Vec2::new(1.0, 0.0), |t| {
             let c = brand_gradient(t * 0.7);
             if hot {
-                c
+                lerp_color(c, Color32::WHITE, 0.07)
             } else {
-                c.gamma_multiply(0.88)
+                c
             }
         });
     } else {
@@ -607,7 +735,13 @@ pub fn primary_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Res
             .rect_filled(rect, Rounding::same(ROUND_PILL), SURFACE_HI);
     }
 
-    let fg = if enabled { Color32::WHITE } else { TEXT_FAINT };
+    if resp.has_focus() {
+        ui.painter().rect_stroke(
+            rect.expand(3.0),
+            Rounding::same(ROUND_PILL),
+            Stroke::new(2.0, ACCENT_HI),
+        );
+    }
     let pos = rect.center() - galley.size() / 2.0;
     ui.painter().galley(pos, galley, fg);
 
@@ -632,7 +766,7 @@ pub fn on_gradient_chip(ui: &mut egui::Ui, text: &str) {
     ui.painter().rect(
         rect,
         Rounding::same(ROUND_PILL),
-        Color32::from_black_alpha(85),
+        INK,
         Stroke::new(1.0_f32, Color32::from_white_alpha(45)),
     );
     ui.painter()
@@ -716,7 +850,7 @@ pub fn qr_code(ui: &mut egui::Ui, data: &str, size: f32) {
         return;
     };
     let width = code.width();
-    let quiet = 2usize;
+    let quiet = 4usize;
     let modules = width + quiet * 2;
     let scale = size / modules as f32;
 
@@ -878,5 +1012,87 @@ pub fn ago(ts: u64, now: u64) -> String {
         60..=3599 => format!("{} min ago", d / 60),
         3600..=86399 => format!("{} h ago", d / 3600),
         _ => format!("{} d ago", d / 86400),
+    }
+}
+
+#[cfg(test)]
+mod interaction_tests {
+    use super::*;
+
+    fn click_primary(enabled: bool, parent_enabled: bool) -> bool {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut rect = Rect::NOTHING;
+        let mut clicked = false;
+        for phase in 0..3 {
+            let mut input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(700.0, 400.0),
+                )),
+                ..Default::default()
+            };
+            if phase > 0 {
+                input.events.push(egui::Event::PointerMoved(rect.center()));
+                input.events.push(egui::Event::PointerButton {
+                    pos: rect.center(),
+                    button: egui::PointerButton::Primary,
+                    pressed: phase == 1,
+                    modifiers: Default::default(),
+                });
+            }
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add_enabled_ui(parent_enabled, |ui| {
+                        let response = primary_button(ui, "Confirm", enabled);
+                        rect = response.rect;
+                        clicked |= response.clicked();
+                    });
+                });
+            });
+        }
+        clicked
+    }
+
+    #[test]
+    fn disabled_primary_never_dispatches_a_click() {
+        assert!(click_primary(true, true));
+        assert!(!click_primary(false, true));
+        assert!(!click_primary(true, false));
+    }
+
+    #[test]
+    fn two_columns_fit_the_allocated_width() {
+        for width in [660.0, 900.0, 1180.0] {
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(width, 700.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let right_edge = ui.max_rect().right();
+                    two_columns(
+                        ui,
+                        280.0,
+                        |ui| {
+                            card(ui, |ui| {
+                                ui.label("Left");
+                            });
+                        },
+                        |ui| {
+                            card(ui, |ui| {
+                                ui.label("Right");
+                            });
+                            assert!(ui.min_rect().right() <= right_edge + 1.0);
+                        },
+                    );
+                });
+            });
+        }
     }
 }

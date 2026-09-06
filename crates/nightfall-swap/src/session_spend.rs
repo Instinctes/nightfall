@@ -26,6 +26,42 @@ use crate::state::Role;
 use bitcoin::consensus::serialize;
 
 impl Session {
+    /// Recover the peer share from the exact agreed Bitcoin transaction.
+    /// Redeem exposes Bob's decrypted signature; refund exposes Alice's.
+    pub fn recover_peer_from_transaction(
+        &self,
+        tx: &bitcoin::Transaction,
+    ) -> Result<curve25519_dalek::scalar::Scalar, SessionError> {
+        let (a, b) = self.spend_keys()?;
+        let (expected, signer) = match self.role {
+            Role::Bob => (self.tx_redeem()?.tx.compute_txid(), b),
+            Role::Alice => {
+                let cancel = self.tx_cancel()?;
+                (self.tx_refund(&cancel)?.tx.compute_txid(), a)
+            }
+        };
+        if tx.compute_txid() != expected {
+            return Err(SessionError::LockMismatch);
+        }
+        let published = crate::bitcoin_tx::signature_from_witness(tx, &a, &b, &signer)
+            .ok_or(SessionError::MissingSignature("published adaptor"))?;
+        let recovered = match self.role {
+            Role::Bob => self.recover_from_redeem(&published),
+            Role::Alice => {
+                let packet = self
+                    .last_packet()
+                    .filter(|p| p.seq == 3)
+                    .ok_or(SessionError::MissingSignature("original refund adaptor"))?;
+                let message: crate::messages::Message3 =
+                    serde_json::from_value(packet.body.clone())
+                        .map_err(|_| SessionError::WrongBody)?;
+                let enc = message.tx_refund_encsig;
+                self.recover_from_refund(&published, &enc)
+            }
+        };
+        recovered.ok_or(SessionError::BadKey)
+    }
+
     /// TX_cancel, signed by both. Either side may broadcast it once H₁ has
     /// passed; the BIP68 sequence is what stops it before then.
     pub fn signed_cancel_hex(&self) -> Result<String, SessionError> {

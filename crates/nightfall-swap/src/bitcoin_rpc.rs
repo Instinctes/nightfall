@@ -76,16 +76,29 @@ impl RpcAuth {
                 password = Some(v.trim().to_string());
             }
         }
+        let url = url
+            .filter(|s| !s.is_empty())
+            .ok_or(RpcSetupError::Missing("url"))?;
+        if (!url.starts_with("http://") && !url.starts_with("https://")) || url.contains('@') {
+            return Err(RpcSetupError::Missing(
+                "a HTTP(S) URL without embedded credentials",
+            ));
+        }
         Ok(Self {
-            url: url.ok_or(RpcSetupError::Missing("url"))?,
-            user: user.ok_or(RpcSetupError::Missing("user"))?,
-            password: password.ok_or(RpcSetupError::Missing("password"))?,
+            url,
+            user: user
+                .filter(|s| !s.is_empty())
+                .ok_or(RpcSetupError::Missing("user"))?,
+            password: password
+                .filter(|s| !s.is_empty())
+                .ok_or(RpcSetupError::Missing("password"))?,
         })
     }
 }
 
 pub struct BitcoinRpc {
     auth: RpcAuth,
+    agent: ureq::Agent,
 }
 
 /// HTTP basic auth, so the password never reaches a URL or an error string.
@@ -204,7 +217,18 @@ pub fn confirmations_from_rpc(
     result: Result<Value, WatchError>,
 ) -> Result<Option<u64>, WatchError> {
     match result {
-        Ok(v) => Ok(v.get("confirmations").and_then(|c| c.as_u64()).or(Some(0))),
+        Ok(v) => match v.get("confirmations") {
+            Some(c) => c
+                .as_i64()
+                .map(|n| if n < 0 { None } else { Some(n as u64) })
+                .ok_or_else(|| {
+                    WatchError::Unavailable("Invalid Bitcoin confirmation count".into())
+                }),
+            None if v.is_object() => Ok(Some(0)),
+            None => Err(WatchError::Unavailable(
+                "Invalid Bitcoin transaction response".into(),
+            )),
+        },
         Err(WatchError::Unavailable(m)) if tx_lookup_unknown(&m) => Ok(None),
         Err(e) => Err(e),
     }
@@ -212,7 +236,57 @@ pub fn confirmations_from_rpc(
 
 impl BitcoinRpc {
     pub fn new(auth: RpcAuth) -> Self {
-        Self { auth }
+        Self {
+            auth,
+            agent: ureq::AgentBuilder::new()
+                .timeout_connect(std::time::Duration::from_secs(2))
+                .timeout(std::time::Duration::from_secs(5))
+                .redirects(0)
+                .build(),
+        }
+    }
+
+    pub fn check_network(&self, network: nightfall_types::NetworkId) -> Result<String, WatchError> {
+        let info = self.call("getblockchaininfo", json!([]))?;
+        let expected = match network {
+            nightfall_types::NetworkId::Mainnet => "main",
+            nightfall_types::NetworkId::Testnet => "test",
+            nightfall_types::NetworkId::Devnet => "regtest",
+        };
+        if info.get("chain").and_then(Value::as_str) != Some(expected) {
+            return Err(WatchError::Unavailable(format!(
+                "Wrong Bitcoin network. This wallet needs {expected}."
+            )));
+        }
+        if info.get("initialblockdownload").and_then(Value::as_bool) != Some(false) {
+            return Err(WatchError::Loading);
+        }
+        let index = self.call("getindexinfo", json!(["txindex"]))?;
+        if index.pointer("/txindex/synced").and_then(Value::as_bool) != Some(true) {
+            return Err(WatchError::NeedsTxIndex);
+        }
+        Ok(format!("Bitcoin {expected} · transaction index ready"))
+    }
+
+    /// Who spent this outpoint, if anyone. Needs Bitcoin Core 24+ (`gettxspendingprevout`).
+    pub fn spending_txid(&self, txid: &str, vout: u32) -> Result<Option<String>, WatchError> {
+        let v = self.call(
+            "gettxspendingprevout",
+            json!([[{"txid": txid, "vout": vout}]]),
+        )?;
+        let first = v.get(0).cloned().unwrap_or(Value::Null);
+        Ok(first
+            .get("spendingtxid")
+            .and_then(|s| s.as_str())
+            .map(str::to_string))
+    }
+
+    /// Raw transaction hex. `verbose=false` so the body is the hex, not an object.
+    pub fn raw_tx_hex(&self, txid: &str) -> Result<String, WatchError> {
+        let v = self.call("getrawtransaction", json!([txid, false]))?;
+        v.as_str()
+            .map(str::to_string)
+            .ok_or_else(|| WatchError::Unavailable("getrawtransaction did not return hex".into()))
     }
 
     /// Remove the password if it ever appears, without throwing the rest
@@ -253,7 +327,9 @@ impl BitcoinRpc {
         // taking `e.to_string()` here throws the body away and leaves us with
         // "status code 500" — which matches none of our patterns, so a node
         // without `-txindex` looked like a flaky connection. Read the body.
-        let resp = match ureq::post(&self.auth.url)
+        let resp = match self
+            .agent
+            .post(&self.auth.url)
             .set("content-type", "application/json")
             .set("authorization", &basic_auth(&self.auth))
             .send_string(&body.to_string())

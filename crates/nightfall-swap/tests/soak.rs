@@ -7,7 +7,9 @@
 //! `NF_SOAK=long cargo test -p nightfall-swap --test soak -- --ignored --nocapture`
 //! stretches the same loop. The invariant never changes: after every step
 //! the swap is in a named state, or the tick returned an error. Never a
-//! redeem after the window has closed. Never a silent no-op that pretends
+//! first exposure after the window has closed. An already exposed redeem
+//! must instead keep retrying the exact bytes, never switch to cancel.
+//! Never a silent no-op that pretends
 //! to have decided.
 
 use nightfall_swap::driver::{Session, Tick};
@@ -103,6 +105,8 @@ fn run(steps: u32, seed: u64) {
         }
 
         let lock_confs = btc.confs.get("lock").copied().unwrap_or(0);
+        let was_exposed = matches!(s.stored.state, SwapState::Redeeming { .. });
+        let exposed_bytes = s.stored.outgoing.get(&SendKind::Redeem).cloned();
         let out = s.tick(&btc, &night);
         if btc.confs_outage.is_some() {
             assert!(out.is_err(), "step {i}: an outage must not look like idle");
@@ -111,16 +115,29 @@ fn run(steps: u32, seed: u64) {
             continue;
         }
         let out = out.expect("step {i} tick");
-        if matches!(
-            out,
-            Tick::Broadcast {
-                kind: SendKind::Redeem,
-                ..
+        if let Tick::Broadcast { kind, raw_hex, .. } = &out {
+            if *kind == SendKind::Redeem {
+                if was_exposed {
+                    assert_eq!(
+                        Some(raw_hex),
+                        exposed_bytes.as_ref(),
+                        "step {i}: a retry changed the exposed redeem"
+                    );
+                } else {
+                    assert!(
+                        d.may_redeem(lock_confs as u32),
+                        "step {i}: first redeem exposure after the safe window"
+                    );
+                }
+                let disk = nightfall_swap::persist::load(&dir, s.stored.state.id()).unwrap();
+                assert!(
+                    matches!(disk.state, SwapState::Redeeming { .. }),
+                    "exposure must be durable before returning bytes"
+                );
             }
-        ) {
             assert!(
-                d.may_redeem(lock_confs as u32),
-                "step {i}: redeem offered at lock_confs={lock_confs} past the window"
+                !was_exposed || *kind != SendKind::Cancel,
+                "step {i}: exposed redeem turned into cancel"
             );
         }
         invariant(&s, &Ok(out));
@@ -129,7 +146,7 @@ fn run(steps: u32, seed: u64) {
 }
 
 #[test]
-fn a_few_hundred_ticks_never_redeem_past_the_window() {
+fn a_few_hundred_ticks_never_first_expose_past_the_window_or_cancel_after_exposure() {
     run(200, 0x4e49_4748);
 }
 

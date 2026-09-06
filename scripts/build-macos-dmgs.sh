@@ -20,7 +20,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/wallets"
-WORK="$ROOT/target/macos-bundle"
+mkdir -p "$ROOT/target"
+WORK="$(mktemp -d "$ROOT/target/macos-release-XXXXXX")"
 # Per-architecture minimums, because they are not the same question.
 #
 # Intel goes back to Catalina (10.15). Nothing in this app needs anything newer
@@ -36,6 +37,16 @@ MIN_MACOS_ARM=11.0
 VERSION="$(grep -m1 '^version' "$ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
 BUNDLE_ID="cash.nightfall.core"
 APP_NAME="NIGHTFALLCOIN Core"
+if [[ "$VERSION" == *-* ]]; then
+    echo "Use build-macos-dev-app.sh for prereleases." >&2
+    exit 1
+fi
+for NAME in "NIGHTFALLCOIN-Core-${VERSION}-macOS-arm64.dmg" "NIGHTFALLCOIN-Core-${VERSION}-macOS-intel.dmg" "SHA256SUMS-${VERSION}.txt"; do
+    if [[ -e "$OUT/$NAME" ]]; then
+        echo "Refusing to overwrite existing release artifact: $OUT/$NAME" >&2
+        exit 1
+    fi
+done
 
 echo "==> NIGHTFALLCOIN Core ${VERSION} — macOS bundles"
 
@@ -55,7 +66,7 @@ build_target() {
     # Set per invocation rather than once at the top: the two architectures have
     # different floors, and a stale value from the previous build would silently
     # bake the wrong minimum into the binary.
-    (cd "$ROOT" && MACOSX_DEPLOYMENT_TARGET="$MIN" cargo build --release --target "$TRIPLE" \
+    (cd "$ROOT" && MACOSX_DEPLOYMENT_TARGET="$MIN" cargo build --offline --locked --release --target "$TRIPLE" \
         -p nightfall-core -p nightfall-node -p nightfall-wallet)
 
     # Confirm what the binary actually declares, rather than what we asked for.
@@ -79,7 +90,6 @@ make_app() {
     local APP="$WORK/$LABEL/$APP_NAME.app"
     local BIN="$ROOT/target/$TRIPLE/release"
 
-    rm -rf "$WORK/$LABEL"
     mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
     # The GUI is the bundle's executable; the CLI tools ride along so a user who
@@ -125,6 +135,9 @@ LAUNCH
 PLIST
 
     printf 'APPL????' > "$APP/Contents/PkgInfo"
+    plutil -lint "$APP/Contents/Info.plist"
+    codesign --force --deep --sign - "$APP"
+    codesign --verify --deep --strict "$APP"
     echo "    bundled $LABEL"
 }
 
@@ -134,7 +147,6 @@ make_dmg() {
     local STAGE="$WORK/$LABEL/stage"
     local DMG="$OUT/$OUTNAME"
 
-    rm -rf "$STAGE"
     mkdir -p "$STAGE"
     cp -R "$WORK/$LABEL/$APP_NAME.app" "$STAGE/"
     ln -s /Applications "$STAGE/Applications"
@@ -157,9 +169,9 @@ This is pre-launch software that has not been audited by anyone outside the
 project. Do not put value on it you cannot afford to lose.
 TXT
 
-    rm -f "$DMG"
     hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" \
-        -ov -format UDZO "$DMG" >/dev/null
+        -format UDZO "$DMG" >/dev/null
+    hdiutil verify "$DMG" >/dev/null
     echo "    $(basename "$DMG")  $(du -h "$DMG" | cut -f1)"
 }
 

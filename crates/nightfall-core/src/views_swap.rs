@@ -44,18 +44,25 @@ pub fn swap(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             ui.add_space(14.0);
         }
 
-        warnings(ui);
+        bitcoin_node_card(app, ui, ctx);
         ui.add_space(14.0);
-
-        if gate.is_enabled() {
-            start_form(app, ui, ctx);
+        if let Some(note) = &app.swap_tick_note {
+            ui.label(RichText::new(note).size(12.0).color(WARN));
             ui.add_space(14.0);
         }
-
-        packets(app, ui, ctx);
-        ui.add_space(14.0);
-
         swap_list(app, ui, ctx);
+        ui.add_space(14.0);
+        ui.add_enabled_ui(gate.is_enabled() && app.swap_job.is_none(), |ui| {
+            egui::CollapsingHeader::new("Start or join a trade")
+                .default_open(true)
+                .show(ui, |ui| {
+                    warnings(ui);
+                    ui.add_space(14.0);
+                    start_form(app, ui, ctx);
+                    ui.add_space(14.0);
+                    packets(app, ui, ctx);
+                });
+        });
     });
 }
 
@@ -96,6 +103,80 @@ fn locked_notice(ui: &mut egui::Ui, headline: &str, detail: &str) {
             ui.add_space(6.0);
             ui.label(RichText::new(detail).size(12.0).color(TEXT));
         });
+}
+
+fn bitcoin_node_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
+    titled_card(ui, "Bitcoin node", |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal_wrapped(|ui| {
+            if app.swap_job.is_some() {
+                ui.spinner();
+            }
+            match &app.swap_report.bitcoin {
+                crate::swap_worker::ResultLabel::Checking => {
+                    ui.label(RichText::new("Checking connection…").color(TEXT_DIM));
+                }
+                crate::swap_worker::ResultLabel::Ready(msg) => {
+                    ui.label(RichText::new(msg).color(SUCCESS));
+                }
+                crate::swap_worker::ResultLabel::Error(msg) => {
+                    ui.label(RichText::new(msg).color(WARN));
+                }
+            }
+            if let Some(t) = app.last_swap_tick {
+                ui.label(
+                    RichText::new(format!("Checked {}s ago", t.elapsed().as_secs()))
+                        .size(11.0)
+                        .color(TEXT_FAINT),
+                );
+            }
+        });
+        ui.add_space(6.0);
+        ui.label(RichText::new("Keep Core running until the trade finishes. Closing to the tray keeps the watcher active.").size(11.5).color(TEXT_DIM));
+        ui.add_space(8.0);
+        let path = app.btc_rpc_path();
+        if app.bitcoin_rpc_configured() {
+            ui.label(
+                RichText::new(format!(
+                    "Credentials: {}. The driver talks to this node every few seconds.",
+                    path.display()
+                ))
+                .size(12.0)
+                .color(TEXT),
+            );
+        } else {
+            ui.label(
+                RichText::new(
+                    "Atomic swaps need a local bitcoind with -txindex=1. \
+                     This wallet holds no Bitcoin keys — it only watches and broadcasts.",
+                )
+                .size(12.0)
+                .color(TEXT),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!("Missing {}", path.display()))
+                    .size(11.5)
+                    .color(WARN),
+            );
+            ui.add_space(8.0);
+            if ghost_button(ui, "Write credential template").clicked() {
+                match app.write_bitcoin_rpc_template() {
+                    Ok(msg) => app.toasts.success(ctx, msg),
+                    Err(e) => app.toasts.error(ctx, e),
+                }
+            }
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(
+                    "Devnet talks to Bitcoin regtest on 127.0.0.1:18443. \
+                     Fill in user= and password= after the template is written.",
+                )
+                .size(11.0)
+                .color(TEXT_FAINT),
+            );
+        }
+    });
 }
 
 fn warnings(ui: &mut egui::Ui) {
@@ -152,8 +233,8 @@ fn start_form(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 "You lock NIGHT and receive Bitcoin. If the other side vanishes \
                  after the cancel, your NIGHT is stuck — there is no NIGHT refund."
             } else {
-                "You lock Bitcoin and receive NIGHT. Your Bitcoin can always be \
-                 cancelled and refunded."
+                "You lock Bitcoin and receive NIGHT. If the trade aborts, refund \
+                 promptly after cancel confirms, before the other side can claim compensation."
             })
             .size(11.5)
             .color(TEXT_FAINT),
@@ -236,6 +317,9 @@ fn start_form(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 "where the Bitcoin goes if the other side stalls after a cancel",
             ),
         ] {
+            if (label == "Refund to") == app.swap_draft.give_night {
+                continue;
+            }
             ui.horizontal(|ui| {
                 ui.add_sized(
                     [90.0, 20.0],
@@ -292,7 +376,12 @@ fn start_form(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         }
 
         ui.add_space(14.0);
-        if primary_button(ui, "Create swap", checked.is_ok()).clicked() {
+        if app.swap_draft.give_night {
+            ui.label(RichText::new("To give NIGHT, review and accept the Bitcoin seller's offer in the packet box below.").color(TEXT));
+        }
+        if !app.swap_draft.give_night
+            && primary_button(ui, "Create Bitcoin offer", checked.is_ok()).clicked()
+        {
             if let Ok(amounts) = checked {
                 match app.create_swap(logic::role_of(&app.swap_draft.clone()), amounts) {
                     Ok(id) => {
@@ -301,6 +390,14 @@ fn start_form(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                             .success(ctx, format!("Swap {id} created. Nothing is locked yet."));
                         app.swap_draft.night.clear();
                         app.swap_draft.btc.clear();
+                        if let Ok(stored) = nightfall_swap::persist::load(
+                            &app.datadir,
+                            id.parse().expect("session id"),
+                        ) {
+                            if let Ok(packet) = app.export_packet(&stored) {
+                                app.swap_packet_out = packet;
+                            }
+                        }
                     }
                     Err(e) => app.swap_start_error = Some(e),
                 }
@@ -348,6 +445,22 @@ fn packets(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 .hint_text("{\"version\":1,…}"),
         );
         ui.add_space(8.0);
+        if let Ok(p) = nightfall_swap::packet::Packet::decode(app.swap_packet_in.trim()) {
+            ui.label(
+                RichText::new(format!(
+                    "Offer {} · {} · packet {} of 5",
+                    short_hex(&p.swap_id.to_string()),
+                    p.network.as_str(),
+                    p.seq
+                ))
+                .color(TEXT_DIM),
+            );
+            if p.seq == 0 {
+                ui.label(RichText::new(format!("You lock {} NIGHT + the NIGHT fee; receive {} sat after the {} sat Bitcoin redeem fee.",
+                    night(p.amounts.night_darks), format_int(p.amounts.btc_sats.saturating_sub(p.amounts.btc_fee_sats)), format_int(p.amounts.btc_fee_sats))).color(TEXT));
+                ui.label(RichText::new("Importing this opening offer accepts these amounts and reserves your NIGHT. Check them with your counterparty first.").color(WARN));
+            }
+        }
         ui.horizontal(|ui| {
             if ghost_button(ui, "  Check and import  ").clicked() {
                 match app.import_packet() {
@@ -412,7 +525,9 @@ fn swap_list(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     }
 
     for stored in list {
-        swap_card(app, ui, ctx, &stored);
+        ui.push_id(stored.state.id().to_string(), |ui| {
+            swap_card(app, ui, ctx, &stored);
+        });
         ui.add_space(14.0);
     }
 }
@@ -439,7 +554,7 @@ fn swap_card(
                     .color(TEXT_DIM),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let (text, colour) = if logic::is_finished(state) {
+                let (text, colour) = if stored.is_finished() {
                     ("Settled", SUCCESS)
                 } else if tl.track == logic::Track::Abort {
                     ("Unwinding", WARN)
@@ -476,6 +591,39 @@ fn swap_card(
         });
 
         ui.add_space(10.0);
+        if let Some(snap) = app.swap_report.swaps.get(&id) {
+            if let Some(e) = &snap.error {
+                ui.label(RichText::new(e).color(WARN));
+                ui.add_space(8.0);
+            }
+        }
+        if let Some(pending) = &stored.pending {
+            ui.label(
+                RichText::new(format!(
+                    "{:?} submitted · waiting for confirmations",
+                    pending.kind
+                ))
+                .color(ACCENT_HI),
+            );
+        }
+        if matches!(
+            state,
+            nightfall_swap::SwapState::Refunded {
+                role: nightfall_swap::Role::Alice,
+                ..
+            }
+        ) {
+            ui.label(
+                RichText::new(if stored.night_recovered {
+                    "Your NIGHT has been recovered on chain."
+                } else if stored.night_lock_id.is_some() {
+                    "Bitcoin refunded. Recovering your NIGHT automatically…"
+                } else {
+                    "Bitcoin refunded. You had not locked NIGHT."
+                })
+                .color(TEXT),
+            );
+        }
         ui.label(
             RichText::new(next_action_text(state))
                 .size(12.5)
@@ -505,19 +653,58 @@ fn swap_card(
 
         // Bob's side of the Bitcoin lock: fund it, hand it over for signing,
         // check what comes back.
-        if state.role() == nightfall_swap::Role::Bob && !logic::is_finished(state) {
+        if state.role() == nightfall_swap::Role::Bob
+            && matches!(state, nightfall_swap::SwapState::Setup { .. })
+        {
             ui.add_space(4.0);
             ui.separator();
             ui.add_space(10.0);
-            lock_section(app, ui, ctx, stored);
+            ui.add_enabled_ui(app.swap_job.is_none(), |ui| {
+                lock_section(app, ui, ctx, stored)
+            });
         }
 
-        let actions = logic::actions(state);
+        if state.role() == nightfall_swap::Role::Alice
+            && matches!(state, nightfall_swap::SwapState::BtcLocked { .. })
+            && stored.night_lock_id.is_none()
+        {
+            ui.add_space(4.0);
+            ui.separator();
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new("Bitcoin is locked. Send the NIGHT now.")
+                    .size(13.0)
+                    .color(TEXT),
+            );
+            ui.add_space(8.0);
+            let btc_ready = app
+                .btc_lock_confirms(stored)
+                .is_some_and(|n| n >= depths.bitcoin && depths.may_redeem(n));
+            if primary_button(
+                ui,
+                "Check & lock NIGHT",
+                app.swap_job.is_none() && btc_ready,
+            )
+            .clicked()
+            {
+                match app.lock_night(stored) {
+                    Ok(msg) => app.toasts.success(ctx, msg),
+                    Err(e) => app.toasts.error(ctx, e),
+                }
+            }
+        }
+
+        let mut actions = logic::actions(state);
+        if !stored.is_finished() {
+            actions.retain(|a| *a != logic::Action::Forget);
+        }
         if !actions.is_empty() {
             ui.add_space(4.0);
             ui.separator();
             ui.add_space(10.0);
-            action_row(app, ui, ctx, &id, &actions, stored);
+            ui.add_enabled_ui(app.swap_job.is_none(), |ui| {
+                action_row(app, ui, ctx, &id, &actions, stored)
+            });
         }
     });
 }
@@ -537,9 +724,12 @@ fn action_row(
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ghost_button(ui, "  Yes, do it  ").clicked() {
-                    let msg = app.run_swap_action(id, &act);
+                    let result = app.run_swap_action(id, &act);
                     app.swap_confirm = None;
-                    app.toasts.success(ctx, msg);
+                    match result {
+                        Ok(msg) => app.toasts.success(ctx, msg),
+                        Err(e) => app.toasts.error(ctx, e),
+                    }
                 }
                 if ghost_button(ui, "  Keep waiting  ").clicked() {
                     app.swap_confirm = None;
@@ -570,10 +760,10 @@ fn action_row(
                     logic::Action::CancelNow | logic::Action::Recover => {
                         app.swap_confirm = Some((id.to_string(), *a));
                     }
-                    logic::Action::Forget => {
-                        let msg = app.run_swap_action(id, a);
-                        app.toasts.success(ctx, msg);
-                    }
+                    logic::Action::Forget => match app.run_swap_action(id, a) {
+                        Ok(msg) => app.toasts.success(ctx, msg),
+                        Err(e) => app.toasts.error(ctx, e),
+                    },
                     logic::Action::SendRefund | logic::Action::SendPunish => {
                         app.swap_confirm = Some((id.to_string(), *a));
                     }
@@ -795,7 +985,7 @@ fn lock_section(
                     .hint_text("0200000000010…"),
             );
             ui.add_space(8.0);
-            if ghost_button(ui, "  Check it is the right one  ").clicked() {
+            if ghost_button(ui, "  Verify & broadcast Bitcoin lock  ").clicked() {
                 app.swap_lock_note = Some(app.confirm_lock(stored));
             }
             ui.add_space(4.0);

@@ -19,6 +19,7 @@
  * present, the stronger both-directions check runs as well.
  */
 import { readFileSync, readdirSync, existsSync } from "node:fs";
+import { releaseChannels, RELEASE_VERSION } from "./release-channels.mjs";
 
 const ROOT = new URL("../", import.meta.url).pathname;
 const PUB = ROOT + "website/public/";
@@ -33,6 +34,9 @@ if (!version) {
 }
 
 const sources = [];
+const allowedVersions = releaseChannels(ROOT, version);
+const archivedVersions = new Set(JSON.parse(readFileSync(PUB + "releases.json", "utf8")).archived || []);
+if ([...archivedVersions].some(v => !/^\d+\.\d+\.\d+$/.test(v))) throw new Error("Invalid archived release");
 const walk = (dir) => {
     for (const e of readdirSync(dir, { withFileTypes: true })) {
         if (e.name === "downloads" || e.name === "pkg") continue;
@@ -54,8 +58,8 @@ for (const file of sources) {
         referenced.add(name);
         // Only files whose name carries a version are our business. A link to
         // something unversioned is a different kind of mistake.
-        const found = name.match(/\d+\.\d+\.\d+/);
-        if (found && found[0] !== version) {
+        const found = name.match(new RegExp(RELEASE_VERSION));
+        if (found && !allowedVersions.has(found[0])) {
             problems.push(
                 `${file.slice(PUB.length)} links downloads/${name}, but this release is ${version}`,
             );
@@ -69,7 +73,10 @@ if (existsSync(DL)) {
         if (!have.has(name)) problems.push(`downloads/${name} is linked but not present`);
     }
     for (const f of have) {
-        if (!referenced.has(f)) problems.push(`downloads/${f} is present but nothing links to it`);
+        const oldVersion = f.match(new RegExp(RELEASE_VERSION))?.[0];
+        const retainedRelease = /^(?:NIGHTFALLCOIN-Core-|nightfall-core-|nightfall-wallet-|nightfalld-|SHA256SUMS-)/.test(f)
+            && archivedVersions.has(oldVersion);
+        if (!referenced.has(f) && !retainedRelease) problems.push(`downloads/${f} is present but nothing links to it`);
     }
 } else {
     console.log("downloads/ not present (it is gitignored) — checking versions only");
@@ -107,4 +114,4 @@ if (problems.length) {
     for (const p of problems) console.error("  - " + p);
     process.exit(1);
 }
-console.log(`download links ok — ${referenced.size} referenced, all at ${version}`);
+console.log(`download links ok — ${referenced.size} referenced, channels ${[...allowedVersions].join(", ")}`);

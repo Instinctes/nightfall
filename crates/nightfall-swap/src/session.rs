@@ -128,6 +128,7 @@ impl Secrets {
 }
 
 /// One side of one swap, mid-handshake.
+#[derive(Clone)]
 pub struct Session {
     pub id: Uuid,
     pub role: Role,
@@ -387,6 +388,9 @@ impl Session {
         change_spk: Option<ScriptBuf>,
     ) -> Result<Message2, SessionError> {
         self.need(Role::Bob)?;
+        if self.lock.is_some() {
+            return Err(SessionError::LockMismatch);
+        }
         let (a, b) = self.keys()?;
         let lock = TxLock::from_prevout(
             prev,
@@ -549,8 +553,13 @@ impl Session {
     }
 
     /// `(alice_key, bob_key)`, the order `complete` expects.
-    pub(crate) fn spend_keys(&self) -> Result<(Point, Point), SessionError> {
+    pub fn spend_keys(&self) -> Result<(Point, Point), SessionError> {
         self.keys()
+    }
+
+    /// This side's NIGHT half. Needed to claim; never put it in a packet.
+    pub fn own_night_secret(&self) -> curve25519_dalek::scalar::Scalar {
+        self.secrets.share.secret()
     }
 
     pub(crate) fn lock_script(&self) -> Result<ScriptBuf, SessionError> {
@@ -641,6 +650,15 @@ impl Session {
         let enc = self.redeem_encsig.as_ref()?;
         let t_a = point(&self.peer_offer.as_ref()?.t).ok()?;
         adaptor::recover(&t_a, published, enc)
+    }
+
+    pub(crate) fn recover_from_refund(
+        &self,
+        published: &Signature,
+        enc: &EncryptedSignature,
+    ) -> Option<Scalar> {
+        let t_b = point(&self.peer_offer.as_ref()?.t).ok()?;
+        adaptor::recover(&t_b, published, enc)
     }
 
     /// Bob's copy of the redeem adaptor, kept so he can recover from it.
@@ -737,6 +755,11 @@ impl Session {
         };
         let body = body.map_err(|_| SessionError::WrongBody)?;
         let packet = Packet::new(self.network, self.id, seq, self.amounts.clone(), body);
+        let adaptor_before = self.redeem_encsig.clone();
+        if seq == 5 {
+            let message: MessageRedeemEnc = from(packet.body.clone())?;
+            self.remember_redeem_enc(&message);
+        }
         let emit_before = self.emit;
         let last_before = self.last_packet.clone();
         // Written out rather than computed. The two sides do not alternate —
@@ -759,6 +782,7 @@ impl Session {
         if let Err(e) = self.checkpoint() {
             self.emit = emit_before;
             self.last_packet = last_before;
+            self.redeem_encsig = adaptor_before;
             return Err(e);
         }
         Ok(packet)
@@ -797,6 +821,15 @@ impl Session {
     /// error says which one — a user who pasted the wrong window's text
     /// should be told that, not handed "invalid".
     pub fn accept_packet(&mut self, p: &Packet) -> Result<Accepted, SessionError> {
+        let before = self.clone();
+        let result = self.accept_packet_inner(p);
+        if result.is_err() {
+            *self = before;
+        }
+        result
+    }
+
+    fn accept_packet_inner(&mut self, p: &Packet) -> Result<Accepted, SessionError> {
         p.verify_open(self.id, self.network, self.expect, &self.amounts)?;
         let body = p.body.clone();
         let out = match p.seq {

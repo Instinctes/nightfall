@@ -139,8 +139,10 @@ jobs:
           # the tag did, which looks the same until you read the error.
           # Create it if it is missing; --verify-tag so a typo in the tag
           # cannot invent a release for a commit nobody tagged.
+          RELEASE_FLAGS=()
+          if [[ "$TAG" == *-* ]]; then RELEASE_FLAGS=(--prerelease --latest=false); fi
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag "${RELEASE_FLAGS[@]}" \
               --title "NIGHTFALLCOIN Core ${TAG#v}" \
               --notes "Binaries built by this workflow. Verify the SHA256 before running anything."
           fi
@@ -209,8 +211,10 @@ jobs:
           TAG="${INPUT_TAG:-${GITHUB_REF_NAME}}"
           # Same guard as the Windows job — see the comment there. Whichever
           # of the two finishes first creates the release; the other finds it.
+          RELEASE_FLAGS=()
+          if [[ "$TAG" == *-* ]]; then RELEASE_FLAGS=(--prerelease --latest=false); fi
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag "${RELEASE_FLAGS[@]}" \
               --title "NIGHTFALLCOIN Core ${TAG#v}" \
               --notes "Binaries built by this workflow. Verify the SHA256 before running anything." \
               || true

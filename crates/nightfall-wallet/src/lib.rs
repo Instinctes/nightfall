@@ -981,6 +981,66 @@ impl Wallet {
         self.save()
     }
 
+    /// Commit hexes of the coins a swap of `target` darks would consume.
+    pub fn pick_commit_hexes_at(
+        &self,
+        target: u64,
+        tip_height: u64,
+        maturity: u64,
+    ) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .select_coins_at(target, tip_height, maturity)?
+            .into_iter()
+            .map(|s| s.commit.to_hex())
+            .collect())
+    }
+
+    /// Spend specific outputs, including ones currently reserved for a swap.
+    // Explicit chain height and maturity keep reserved-output spending on the
+    // same validation path as ordinary payments.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_payment_from_commits_at(
+        &self,
+        commits: &[String],
+        to: &Address,
+        amount: u64,
+        fee: u64,
+        memo: &str,
+        tip_height: u64,
+        maturity: u64,
+    ) -> anyhow::Result<Transaction> {
+        let wanted: BTreeSet<String> = commits.iter().cloned().collect();
+        let mut inputs = Vec::new();
+        let mut total = 0u64;
+        for o in &self.db.outputs {
+            if o.spent || !wanted.contains(&o.commit.to_hex()) {
+                continue;
+            }
+            if maturity != 0 && o.is_coinbase && tip_height < o.height.saturating_add(maturity) {
+                bail!("a reserved coinbase is still immature");
+            }
+            total = total.saturating_add(o.value);
+            inputs.push(o.to_spendable(&self.keys)?);
+        }
+        let target = amount.checked_add(fee).context("amount overflow")?;
+        if total < target {
+            bail!("reserved outputs cover {total}, need {target}");
+        }
+        Ok(build_transfer(
+            &self.keys,
+            &inputs,
+            &[Payment {
+                to: *to,
+                amount,
+                memo: memo.to_string(),
+            }],
+            fee,
+            &self.address(),
+            0,
+            self.network.proof_context(),
+        )?)
+    }
+
     #[cfg(test)]
     pub fn test_insert_output(&mut self, o: OwnedOutput) {
         self.db.outputs.push(o);
@@ -1458,6 +1518,59 @@ mod tests {
         // After release the selector sees the coin. Building the tx still
         // needs a real spend secret; we only assert selection succeeds.
         assert!(w.select_coins(1).is_ok());
+        let picked = w.pick_commit_hexes_at(1, 0, 0).unwrap();
+        assert_eq!(picked, vec![commit.to_hex()]);
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_reserved_coin_can_still_fund_the_swap_lock() {
+        let d = tmpdir("reserved-lock");
+        let mut w = Wallet::open(&d, NetworkId::Devnet, "w.seed").unwrap();
+        let ctx = NetworkId::Devnet.proof_context();
+        let reward = 20 * DARKS_PER_NIGHT;
+        let cb = build_coinbase(&w.address(), reward, 0, ctx).unwrap();
+        let body = BlockBody::aggregate(&[cb]);
+        let mut ledger = LedgerState::genesis();
+        ledger.apply_block(&body, Height(0), reward, ctx).unwrap();
+        let block = Block {
+            header: nightfall_consensus::BlockHeader {
+                version: nightfall_types::PROTOCOL_VERSION,
+                height: Height(0),
+                prev_hash: nightfall_types::Hash256::ZERO,
+                utxo_root: ledger.utxo_root(),
+                kernel_sum: ledger.kernel_sum(),
+                body_root: body.hash(),
+                timestamp_unix: 1,
+                difficulty: 1,
+                nonce: 0,
+                reward_darks: reward,
+            },
+            body,
+        };
+        assert_eq!(w.scan_blocks(std::slice::from_ref(&block)).unwrap(), 1);
+        let commit = w.outputs()[0].commit.to_hex();
+        w.reserve_commits(&[commit.clone()]).unwrap();
+        let e = w.create_payment(&w.address(), 1, 1, "").unwrap_err();
+        assert!(
+            e.to_string().contains("insufficient funds"),
+            "ordinary spend must not take the reserved coin: {e}"
+        );
+        let to = WalletKeys::generate().address();
+        let fee = DARKS_PER_NIGHT / 1_000;
+        let amount = reward - fee;
+        let tx = w
+            .create_payment_from_commits_at(
+                &[commit.clone()],
+                &to,
+                amount,
+                fee,
+                "swap-lock",
+                20,
+                10,
+            )
+            .expect("reserved coin must still fund the lock");
+        assert!(tx.inputs.iter().any(|i| i.commit.to_hex() == commit));
         fs::remove_dir_all(&d).ok();
     }
 

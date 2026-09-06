@@ -13,7 +13,7 @@ import init, {
   wallet_history,
   build_send,
   probe_crypto,
-} from "./pkg/nightfall_web.js?v=090";
+} from "./pkg/nightfall_web.js?v=094";
 
 const STORE = "nf-web-wallet-v1";
 const NODE_STORE = "nf-web-node";
@@ -27,7 +27,7 @@ const WARN =
   "This phone or browser trusts a node for what it shows. A hostile node can hide a payment or invent one on the screen. It cannot spend — the seed never leaves this device. Anyone who can run script on this page can read a saved wallet. The 24 words are the real backup.";
 
 const FEE = "0.001";
-const BUILD = "0.9.2";
+const BUILD = "0.9.4";
 
 let wasmReady = init();
 let state = null;
@@ -149,7 +149,10 @@ async function rpc(method, params = {}) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ method, params, id: 1 }),
   });
-  const j = await r.json();
+  if (!r.ok) throw new Error(`Node connection unavailable (HTTP ${r.status}). Try Sync again shortly.`);
+  let j;
+  try { j = await r.json(); }
+  catch (_) { throw new Error("The node returned an unreadable response. Try Sync again shortly."); }
   if (j.error) throw new Error(typeof j.error === "string" ? j.error : JSON.stringify(j.error));
   return j.result;
 }
@@ -162,7 +165,9 @@ function escapeHtml(s) {
   return String(s)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function wasmCall(fn, ...args) {
@@ -220,6 +225,9 @@ function screen(html) {
   app.innerHTML = `<div class="view">${html}</div>`;
   const bar = app.querySelector(".view > .nav");
   if (bar) app.appendChild(bar);
+  else if (state && !phrasePending) app.insertAdjacentHTML("beforeend", nav());
+  app.classList.toggle("wallet-shell", !!app.querySelector(".nav"));
+  bindNav();
 }
 
 function icons() {
@@ -232,10 +240,12 @@ function icons() {
 
 function nav() {
   const i = icons();
-  return `<nav class="nav">
-    <button data-tab="wallet" class="${tab === "wallet" ? "on" : ""}">${i.wallet}Wallet</button>
-    <button data-tab="activity" class="${tab === "activity" ? "on" : ""}">${i.activity}Activity</button>
-    <button data-tab="settings" class="${tab === "settings" ? "on" : ""}">${i.settings}Settings</button>
+  return `<nav class="nav" aria-label="Wallet navigation">
+    <div class="nav-brand"><img src="/assets/logo-128.png" alt=""><span>NIGHTFALL<small>WEB WALLET</small></span></div>
+    <button data-tab="wallet" aria-current="${tab === "wallet" ? "page" : "false"}" class="${tab === "wallet" ? "on" : ""}">${i.wallet}Wallet</button>
+    <button data-tab="activity" aria-current="${tab === "activity" ? "page" : "false"}" class="${tab === "activity" ? "on" : ""}">${i.activity}Activity</button>
+    <button data-tab="settings" aria-current="${tab === "settings" ? "page" : "false"}" class="${tab === "settings" ? "on" : ""}">${i.settings}Settings</button>
+    <div class="nav-foot">Keys on this device<small>Never share your recovery phrase.</small></div>
   </nav>`;
 }
 
@@ -411,7 +421,7 @@ function renderHome() {
       <div class="mountains"></div>
     </header>
     <div class="wrap">
-      <section class="glass">
+      <section class="glass balance-card">
         <div class="row">
           <span class="kicker">Total balance <button class="linkish" id="hide">${hideBal ? "show" : "hide"}</button></span>
           <span class="pill"><span class="dot"></span> Nightfall</span>
@@ -426,7 +436,7 @@ function renderHome() {
           <button class="send" id="send">↗ Send</button>
         </div>
       </section>
-      <section class="section glass" style="margin-top:14px">
+      <section class="section glass network-card">
         <div class="row"><h2>Network</h2></div>
         <div class="stat"><span class="dim">Tip</span><span>${lastTip || lastBal?.tip || "—"}</span></div>
         <div class="stat"><span class="dim">Scanned to</span><span>${lastBal?.scanned_to ?? "—"}</span></div>
@@ -434,7 +444,7 @@ function renderHome() {
         <div class="stat"><span class="dim">Build</span><span>${BUILD}</span></div>
         <p class="status-line" id="status">${status}</p>
       </section>
-      <section class="section">
+      <section class="section recent-card">
         <div class="row">
           <h2>Recent</h2>
           <button class="linkish" id="all-tx">See all</button>
@@ -872,6 +882,8 @@ function renderSend() {
     // proofs have already been built.
     $("#s-rest-line").classList.toggle("short", ok && rest < 0);
     $("#err-amt").textContent = ok && rest < 0 ? "More than you can spend, fee included." : "";
+    const recipient = $to.value.trim();
+    $("#go").disabled = !(ok && rest >= 0 && recipient.startsWith("nf1") && recipient.length >= 20);
   }
 
   $amt.oninput = recompute;
@@ -890,6 +902,7 @@ function renderSend() {
   $to.oninput = () => {
     $("#err-to").textContent = "";
     refreshSaveBtn();
+    recompute();
   };
   refreshSaveBtn();
 
@@ -898,6 +911,7 @@ function renderSend() {
       $to.value = book[Number(c.dataset.i)].addr;
       $("#err-to").textContent = "";
       refreshSaveBtn();
+      recompute();
       $amt.focus();
     };
   });
@@ -946,7 +960,7 @@ function renderSend() {
       $amt.focus();
       return;
     }
-    if (!confirm(`Send ${fmtAmt(trim(v))} NIGHT to\n${shortAddr(to)}\n\nFee ${FEE} NIGHT, burned.\nLeaves your wallet: ${fmtAmt(trim(v + fee))} NIGHT`)) return;
+    if (!confirm(`Send ${fmtAmt(trim(v))} NIGHT to\n${to}\n\nFee ${FEE} NIGHT, burned.\nLeaves your wallet: ${fmtAmt(trim(v + fee))} NIGHT`)) return;
     doSend(to, amt, memo);
   };
 }

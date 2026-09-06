@@ -74,9 +74,44 @@ fn handshake() -> (Session, Session) {
     // 5 — the redeem adaptor. Now the swap can complete.
     let p5 = bob.next_packet().unwrap();
     assert_eq!(alice.accept_packet(&p5).unwrap(), Accepted::RedeemAdaptor);
-    bob.remember_redeem_enc(&serde_json::from_value(p5.body).unwrap());
 
     (alice, bob)
+}
+
+#[test]
+fn both_claim_directions_recover_from_the_actual_witness_after_restart() {
+    let (alice, bob) = handshake();
+    let root = std::env::temp_dir().join(format!("nf-bidirectional-{}", alice.id));
+    alice.save(&root.join("alice")).unwrap();
+    bob.save(&root.join("bob")).unwrap();
+    let alice = Session::load(&root.join("alice"), alice.id).unwrap();
+    let bob = Session::load(&root.join("bob"), bob.id).unwrap();
+    let decode = |raw: String| {
+        bitcoin::consensus::deserialize::<bitcoin::Transaction>(&hex::decode(raw).unwrap()).unwrap()
+    };
+    let redeem = decode(alice.signed_redeem_hex().unwrap());
+    assert_eq!(
+        bob.recover_peer_from_transaction(&redeem).unwrap(),
+        alice.own_night_secret()
+    );
+    let refund = decode(bob.signed_refund_hex().unwrap());
+    assert_eq!(
+        alice.recover_peer_from_transaction(&refund).unwrap(),
+        bob.own_night_secret()
+    );
+    assert!(bob.recover_peer_from_transaction(&refund).is_err());
+    assert!(alice.recover_peer_from_transaction(&redeem).is_err());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn status_and_secret_files_share_the_protocol_id() {
+    let (alice, bob) = handshake();
+    for session in [alice, bob] {
+        let stored = nightfall_swap::StoredSwap::from_session(&session);
+        assert_eq!(stored.state.id(), session.id);
+        assert_eq!(stored.state.role(), session.role);
+    }
 }
 
 #[test]

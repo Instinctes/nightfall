@@ -10,6 +10,7 @@ pub mod bitcoin_tx;
 pub mod driver;
 pub mod fees;
 pub mod messages;
+pub mod night_observe;
 pub mod night_watch;
 pub mod packet;
 pub mod persist;

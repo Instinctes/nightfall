@@ -126,10 +126,12 @@ impl App {
             .ok_or("No open session for this swap.")?;
 
         match session.verify_confirmed_lock_hex(&raw) {
-            Ok(()) => Ok(format!(
-                "This is the lock we built ({}). Safe to broadcast.",
-                short(&session.lock_txid().unwrap_or_default())
-            )),
+            Ok(()) => {
+                session.signed_cancel_hex().map_err(|e| e.to_string())?;
+                session.signed_refund_hex().map_err(|e| e.to_string())?;
+                self.queue_swap_job(crate::swap_worker::Job::BroadcastLock(id, raw))?;
+                Ok("Checking the signed Bitcoin lock before broadcast…".into())
+            }
             Err(SessionError::LockMismatch) => Err(
                 "That is not the transaction this swap built. Its id or its \
                  locked output differs, which means every signature the other \
@@ -154,10 +156,32 @@ impl App {
     }
 }
 
-fn short(s: &str) -> String {
-    if s.len() <= 16 {
-        s.to_string()
-    } else {
-        format!("{}…{}", &s[..8], &s[s.len() - 8..])
+impl crate::swap_worker::SwapWorker {
+    pub fn broadcast_lock(&mut self, stored: &StoredSwap, raw: &str) -> Result<String, String> {
+        use nightfall_swap::watch::{Broadcaster, MempoolAccept};
+        let id = stored.state.id().to_string();
+        self.ensure_session(&id)?;
+        let session = &self.swap_sessions[&id];
+        if session.role != nightfall_swap::Role::Bob
+            || !matches!(stored.state, nightfall_swap::SwapState::Setup { .. })
+        {
+            return Err("The Bitcoin lock can only be funded once, by the Bitcoin seller.".into());
+        }
+        session
+            .verify_confirmed_lock_hex(raw)
+            .map_err(|e| e.to_string())?;
+        session.signed_cancel_hex().map_err(|e| e.to_string())?;
+        session.signed_refund_hex().map_err(|e| e.to_string())?;
+        let rpc = self.btc_rpc()?;
+        rpc.check_network(self.network).map_err(|e| e.to_string())?;
+        if let MempoolAccept::Reject { reason } = rpc.test_accept(raw).map_err(|e| e.to_string())? {
+            return Err(format!("Bitcoin rejected this signed lock: {reason}"));
+        }
+        let mut rec = stored.clone();
+        rec.btc_lock_txid = Some(session.lock_txid().map_err(|e| e.to_string())?);
+        rec.bitcoin_lock_hex = Some(raw.into());
+        nightfall_swap::persist::save(&self.datadir, &rec).map_err(|e| e.to_string())?;
+        rpc.broadcast(raw).map_err(|e| e.to_string())?;
+        Ok("Bitcoin lock submitted. The wallet is watching its confirmations.".into())
     }
 }

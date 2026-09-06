@@ -9,10 +9,17 @@
 mod address_book;
 mod app;
 mod app_swap;
+mod app_swap_drive;
 mod app_swap_lock;
+mod app_swap_night;
 mod app_swap_send;
+#[cfg(test)]
+mod swap_live_tests;
+mod swap_worker;
 mod theme;
 mod tray;
+#[cfg(test)]
+mod view_layout_tests;
 mod views;
 mod views_swap;
 mod wallet_state;
@@ -140,7 +147,21 @@ fn parse_network_arg() -> NetworkId {
             };
         }
     }
-    NetworkId::Mainnet
+    default_network(env!("CARGO_PKG_VERSION"))
+}
+
+fn default_network(version: &str) -> NetworkId {
+    if version.contains('-') {
+        NetworkId::Devnet
+    } else {
+        NetworkId::Mainnet
+    }
+}
+
+#[test]
+fn prereleases_default_to_isolated_devnet() {
+    assert_eq!(default_network("0.9.4-dev.2"), NetworkId::Devnet);
+    assert_eq!(default_network("0.9.2"), NetworkId::Mainnet);
 }
 
 fn parse_datadir_arg() -> Option<PathBuf> {

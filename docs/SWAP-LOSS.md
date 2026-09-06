@@ -4,7 +4,10 @@
 proof is reviewed outside this project. This page is the loss list the
 interface has to name, not a promise that any of it is safe.
 
-There is no NIGHT refund. v0.1 claimed one; it was broken; it is withdrawn.
+There is no independent timed NIGHT refund. Alice can reclaim her NIGHT after
+Bob publishes his Bitcoin refund, which reveals the required share. That is
+conditional recovery, not a timeout she can enforce on NIGHT. v0.1 claimed an
+independent refund; it was broken and is withdrawn.
 
 ## While nothing is locked
 

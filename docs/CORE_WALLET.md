@@ -1,79 +1,53 @@
-# NIGHTFALLCOIN Core Wallet
+# NIGHTFALLCOIN Core Wallet 0.9.4
 
-User-friendly desktop app: **mine**, **receive**, **send** — no terminal required after build.
-
-## Build
-
-```bash
-cd nightfall
-cargo build --release -p nightfall-core
-```
-
-Binary: `target/release/nightfall-core`
-
-## Start
+A mainnet full node, miner and wallet in one desktop application. Download
+[v0.9.4](https://github.com/Instinctes/nightfall/releases/tag/v0.9.4) or build:
 
 ```bash
-# Mainnet (default)
+cargo build --locked --release -p nightfall-core
 ./target/release/nightfall-core --network mainnet
-
-# Devnet (faster mining, for testing)
-./target/release/nightfall-core --network devnet
-
-# Join someone’s node while mining
-SEED_NODE=1.2.3.4:17891 ./target/release/nightfall-core --network mainnet
 ```
 
-Or: `./scripts/start-core-wallet.sh mainnet`
+Verify the platform checksum list before installation. Quit Core completely
+before replacing its application; closing to the tray can leave it running.
+Keep your data directory and back up the 24 recovery words. No reset or data
+migration is required from 0.9.2.
 
-## What you see
+## Pages
 
-| Tab | Use |
-|-----|-----|
-| **Home** | Balance, Sync, quick actions |
-| **Receive** | Payment ID + Copy button |
-| **Send** | Paste Payment ID, amount in NIGHT, Send |
-| **Mine & Network** | Mining ON/OFF, peers, blocks, tip |
+| Page | Use |
+|---|---|
+| Dashboard | Balance, recent movements and node health |
+| Send | Recipient address, NIGHT amount, memo and full-address review |
+| Receive | Share an nf1 address or QR code |
+| Activity | Payments, mining rewards, confirmations and receipts |
+| Mining | Start/stop mining and set CPU threads |
+| Network | Peers, connectivity, Tor and relay information |
+| Swap | Experimental NIGHT/BTC trades; disabled on mainnet |
+| Settings | Backups, view key, address book and maintenance |
 
-Top right: **Start / Stop Mining**.
+Core scans automatically. Mined coins unlock after 1,440 blocks; the standard
+wallet payment fee is 0.001 NIGHT, burned while subsidy remains. An outgoing
+connection is sufficient to sync; inbound mainnet peers use TCP 17891.
 
-## Files (important)
+## Wallet data
 
-Under your data folder (macOS mainnet example):
+The active chain writes to `nightfall/mainnet/n8/` under the platform data root.
+On macOS this is `~/Library/Application Support/nightfall/mainnet/n8/`.
+`core.seed` is key material: back it up offline and never share it. Keep other
+wallet state files during updates. Blockchain storage uses `blocks.bin`.
+Maintenance operations may require a rescan; do not delete data to upgrade.
 
-`~/Library/Application Support/nightfall/mainnet/`
+A view key (`nfview1…`) can read amounts and memos but cannot spend. Use
+Settings → Show view key, or `nightfall-wallet --network mainnet export-view-key`.
+To prove only one payment, prefer its Receipt in Activity. Never share a seed
+phrase or swap `.secret` file in a bug report.
 
-| File | Meaning |
-|------|---------|
-| `core.seed` | **Master key — backup offline** |
-| `core.addr.json` | Payment ID / address |
-| `core.notes.json` | Local note cache |
-| `chain.json` | Blockchain |
+## Experimental swap boundary
 
-## Tips
-
-1. Leave the app open while mining.  
-2. After receiving coins: wait for a block → **Sync**.  
-3. Fee is **0.01 NIGHT** (burned).  
-4. Open **firewall port 17891** (mainnet) so others can connect.  
-5. Share only **Payment ID**, never `core.seed`.
-
-## View key and receipts
-
-A view key is `nfview1…`. It finds every payment and opens amounts and
-memos. It cannot spend. Settings → **Show view key**. CLI:
-`nightfall-wallet --network mainnet export-view-key`.
-
-To prove **one** payment without handing over the view key, copy a
-**Receipt** from the Activity list, or:
-
-```bash
-nightfall-wallet --network mainnet export-receipt --txid <prefix> > payment.json
-nightfall-wallet verify-receipt --file payment.json
-```
-
-Longer write-up: <https://nightfallcoin.org/view-key/>.
-
-## CLI still available
-
-Advanced users: `nightfalld` + `nightfall-wallet` (see MAINNET.md).
+Use explicit `--network devnet` or `--network testnet` only with test coins.
+Mainnet swaps stay blocked. There is no independent timed NIGHT refund; if Bob
+never publishes his Bitcoin refund, Alice's NIGHT can remain locked permanently.
+Back up per-swap secrets as well as the seed, and keep Core and both nodes online
+until settlement/recovery finishes. See [operator notes](SWAP.md) and
+[loss cases](SWAP-LOSS.md). The web wallet does not implement atomic swaps.

@@ -13,11 +13,29 @@ use nightfall_swap::packet::Packet;
 use nightfall_swap::session::Session;
 use nightfall_swap::state::Role;
 use nightfall_swap::timelock::Depths;
-use nightfall_swap::{StoredSwap, SwapState};
+use nightfall_swap::StoredSwap;
 use nightfall_types::NetworkId;
 use std::str::FromStr;
 
 impl App {
+    /// Historical lock outputs remain necessary until recovery is complete.
+    pub(crate) fn swap_maintenance_allowed(&mut self, ctx: &eframe::egui::Context) -> bool {
+        let result = nightfall_swap::persist::list(&self.datadir);
+        let error = match result {
+            Ok(swaps) if swaps.iter().any(|s| !s.is_finished()) || self.swap_job.is_some() => Some(
+                "Finish active swaps and wait for the current check before changing chain storage."
+                    .to_string(),
+            ),
+            Ok(_) => None,
+            Err(e) => Some(format!("Cannot verify saved swaps: {e}")),
+        };
+        if let Some(error) = error {
+            self.toasts.error(ctx, error);
+            false
+        } else {
+            true
+        }
+    }
     /// Depths matched to the network. Testdrive numbers never reach a user
     /// on testnet; they do on devnet, because those blocks are instant and
     /// a 12-block CSV is seconds, not hours.
@@ -71,7 +89,7 @@ impl App {
         // discipline is structural, not the caller's memory.
         session.persist_to(&self.datadir);
         session.save(&self.datadir).map_err(|e| e.to_string())?;
-        let stored = StoredSwap::new(SwapState::new(role), amounts.night_darks, amounts.btc_sats);
+        let stored = StoredSwap::from_session(&session);
         nightfall_swap::persist::save(&self.datadir, &stored).map_err(|e| e.to_string())?;
         self.swap_sessions.insert(id.clone(), session);
         Ok(id)
@@ -112,6 +130,9 @@ impl App {
     /// Every refusal names its reason. A user who pasted the wrong window's
     /// text should be told that, not handed "invalid".
     pub fn import_packet(&mut self) -> Result<String, String> {
+        if !nightfall_swap::ui::availability(self.network).is_enabled() {
+            return Err("Swaps are disabled on this network.".into());
+        }
         let text = self.swap_packet_in.trim();
         if text.is_empty() {
             return Err("Nothing pasted.".into());
@@ -119,7 +140,10 @@ impl App {
         let packet = Packet::decode(text).map_err(|e| e.to_string())?;
         let id = packet.swap_id.to_string();
 
-        if self.ensure_session(&id).is_ok() {
+        let has_session = self.swap_sessions.contains_key(&id)
+            || nightfall_swap::persist::secret_path(&self.datadir, packet.swap_id).exists();
+        if has_session {
+            self.ensure_session(&id)?;
             if let Some(session) = self.swap_sessions.get_mut(&id) {
                 let what = session.accept_packet(&packet).map_err(|e| e.to_string())?;
                 session.save(&self.datadir).map_err(|e| e.to_string())?;
@@ -152,14 +176,19 @@ impl App {
         )
         .map_err(|e| e.to_string())?;
         let mut session = session;
+        let night_darks = session.amounts.night_darks;
+        if session.depths != self.swap_depths() {
+            return Err("The offer uses unsupported confirmation depths for this network.".into());
+        }
+        if night_darks <= crate::app::DEFAULT_FEE_DARKS {
+            return Err("The NIGHT amount must exceed the claim fee.".into());
+        }
+        let reserved = self.reserve_for_alice(night_darks)?;
         session.persist_to(&self.datadir);
         session.save(&self.datadir).map_err(|e| e.to_string())?;
         let id = session.id.to_string();
-        let stored = StoredSwap::new(
-            SwapState::new(Role::Alice),
-            session.amounts.night_darks,
-            session.amounts.btc_sats,
-        );
+        let mut stored = StoredSwap::from_session(&session);
+        stored.reserved_commits = reserved;
         nightfall_swap::persist::save(&self.datadir, &stored).map_err(|e| e.to_string())?;
         let msg = nightfall_swap::session::Accepted::Opening
             .describe()
@@ -191,50 +220,46 @@ impl App {
                 session.save(&self.datadir).map_err(|e| e.to_string())?;
                 Ok(packet.encode())
             }
-            Err(_) => session.last_packet().map(|p| p.encode()).ok_or_else(|| {
-                "Nothing to copy yet. If you are Bob, the Bitcoin lock is \
+            Err(nightfall_swap::session::SessionError::WrongRole) => {
+                session.last_packet().map(|p| p.encode()).ok_or_else(|| {
+                    "Nothing to copy yet. If you are Bob, the Bitcoin lock is \
                      exported separately once you have a funding outpoint."
-                    .into()
-            }),
+                        .into()
+                })
+            }
+            Err(e) => Err(e.to_string()),
         }
     }
 
     /// Buttons that change a swap. Deliberately narrow: the driver moves
     /// swaps, a human only aborts or gives up on one.
-    pub fn run_swap_action(&mut self, id: &str, action: &nightfall_swap::ui::Action) -> String {
+    pub fn run_swap_action(
+        &mut self,
+        id: &str,
+        action: &nightfall_swap::ui::Action,
+    ) -> Result<String, String> {
+        use crate::{app_swap_send::SendWhat, swap_worker::Job};
         use nightfall_swap::ui::Action;
         match action {
-            Action::Forget => match self.forget_swap(id) {
-                Ok(()) => "Swap removed.".into(),
-                Err(e) => e,
-            },
-            Action::CancelNow => match self.stored_by_id(id) {
-                Ok(stored) => {
-                    match self.send_swap_tx(&stored, crate::app_swap_send::SendWhat::Cancel) {
-                        Ok(msg) => msg,
-                        Err(e) => e,
-                    }
-                }
-                Err(e) => e,
-            },
-            Action::SendRefund | Action::SendPunish => match self.stored_by_id(id) {
-                Ok(stored) => {
-                    let what = if matches!(action, Action::SendRefund) {
-                        crate::app_swap_send::SendWhat::Refund
-                    } else {
-                        crate::app_swap_send::SendWhat::Punish
-                    };
-                    match self.send_swap_tx(&stored, what) {
-                        Ok(msg) => msg,
-                        Err(e) => e,
-                    }
-                }
-                Err(e) => e,
-            },
-            Action::Recover => "Recovery is manual for now: the swap file is in your data \
-                 directory under swaps/."
-                .into(),
-            _ => String::new(),
+            Action::Forget => {
+                self.forget_swap(id)?;
+                Ok("Swap removed.".into())
+            }
+            Action::CancelNow | Action::SendRefund | Action::SendPunish => {
+                let what = match action {
+                    Action::CancelNow => SendWhat::Cancel,
+                    Action::SendRefund => SendWhat::Refund,
+                    _ => SendWhat::Punish,
+                };
+                self.queue_swap_job(Job::Send(id.into(), what))?;
+                Ok("Checking and submitting the requested transaction…".into())
+            }
+            Action::Recover => {
+                self.ensure_session(id)?;
+                self.queue_swap_job(Job::Tick)?;
+                Ok("Reloading saved progress and checking both chains…".into())
+            }
+            _ => Err("Use the packet controls for this action.".into()),
         }
     }
 
@@ -250,6 +275,10 @@ impl App {
 
     fn forget_swap(&mut self, id: &str) -> Result<(), String> {
         let uuid = id.parse().map_err(|_| "Not a swap id".to_string())?;
+        let stored = self.stored_by_id(id)?;
+        if !stored.is_finished() {
+            return Err("An active swap cannot be removed. Finish recovery first.".into());
+        }
         let path = nightfall_swap::persist::path(&self.datadir, uuid);
         // Release the coins first: a removed file with reserved coins would
         // strand them, and nothing would ever release them again.
@@ -270,12 +299,29 @@ impl App {
     /// `None` is not zero. The view renders it as "unreachable", never as a
     /// calm nearly-full window — the same rule the driver follows, and the
     /// mistake a swallowed error would make.
-    pub fn btc_lock_confirms(&self, _stored: &StoredSwap) -> Option<u32> {
-        // No Bitcoin node is wired to the wallet yet.
-        None
+    pub fn btc_lock_confirms(&self, stored: &StoredSwap) -> Option<u32> {
+        self.swap_report
+            .swaps
+            .get(&stored.state.id().to_string())?
+            .btc_depth
     }
 
-    pub fn night_lock_confirms(&self, _stored: &StoredSwap) -> Option<u64> {
-        None
+    pub fn night_lock_confirms(&self, stored: &StoredSwap) -> Option<u64> {
+        self.swap_report
+            .swaps
+            .get(&stored.state.id().to_string())?
+            .night_depth
+    }
+
+    fn reserve_for_alice(&mut self, night_darks: u64) -> Result<Vec<String>, String> {
+        let fee = crate::app::DEFAULT_FEE_DARKS;
+        let tip = self.tip_height();
+        let maturity = self.maturity();
+        let mut w = self.wallet.lock().map_err(|e| e.to_string())?;
+        let hexes = w
+            .pick_commit_hexes_at(night_darks.saturating_add(fee), tip, maturity)
+            .map_err(|e| format!("Not enough NIGHT to lock: {e}"))?;
+        w.reserve_commits(&hexes).map_err(|e| e.to_string())?;
+        Ok(hexes)
     }
 }

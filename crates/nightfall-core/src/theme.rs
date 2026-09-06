@@ -8,61 +8,40 @@ use eframe::egui::{self, Color32, FontFamily, FontId, Rounding, Stroke, TextStyl
 // --- surfaces -------------------------------------------------------------
 /// Page background. Not black — a desaturated violet reads warmer and lets the
 /// accent gradients sit on it without vibrating.
-pub const BG: Color32 = Color32::from_rgb(0x14, 0x10, 0x22);
+pub const BG: Color32 = Color32::from_rgb(0x42, 0x38, 0x58);
 /// Navigation rail, one step darker than the page.
-pub const RAIL: Color32 = Color32::from_rgb(0x18, 0x13, 0x28);
+pub const RAIL: Color32 = Color32::from_rgb(0x33, 0x2C, 0x4D);
 /// Card fill.
-pub const SURFACE: Color32 = Color32::from_rgb(0x20, 0x1A, 0x35);
+pub const SURFACE: Color32 = Color32::from_rgb(0x30, 0x27, 0x47);
 /// Raised element inside a card.
-pub const SURFACE_HI: Color32 = Color32::from_rgb(0x28, 0x21, 0x40);
-pub const SURFACE_HOVER: Color32 = Color32::from_rgb(0x32, 0x2A, 0x4E);
+pub const SURFACE_HI: Color32 = Color32::from_rgb(0x4B, 0x40, 0x64);
+pub const SURFACE_HOVER: Color32 = Color32::from_rgb(0x54, 0x47, 0x70);
 /// Sunken element: text fields, code blocks.
-pub const SURFACE_LOW: Color32 = Color32::from_rgb(0x1A, 0x15, 0x2C);
+pub const SURFACE_LOW: Color32 = Color32::from_rgb(0x40, 0x36, 0x57);
 
-pub const BORDER: Color32 = Color32::from_rgb(0x2E, 0x26, 0x48);
-pub const BORDER_HI: Color32 = Color32::from_rgb(0x45, 0x39, 0x68);
+pub const BORDER: Color32 = Color32::from_rgb(0x55, 0x48, 0x70);
+pub const BORDER_HI: Color32 = Color32::from_rgb(0x80, 0x6D, 0x9E);
 
 // --- depth ----------------------------------------------------------------
-//
-// Almost none, on purpose.
-//
-// The first attempt gave cards a vertical gradient and a lit top edge. It did
-// make them look raised, and it was wrong: the phone wallet — the reference
-// for this style — draws flat cards, one fill, one hairline border, a large
-// radius, and nothing else. Against that, a highlight along every card's top
-// edge reads as a seam, and eight of them down a page read as a list of
-// seams. Removed.
-//
-// What stayed is the part that was actually missing: the page is lit. Two
-// wide, very faint radial washes across the top give the background somewhere
-// to be brighter and somewhere to be darker, so a flat card has something to
-// sit on. That is the phone's trick too — the glow behind its logo — and it
-// is the whole effect.
-
-/// The two lights on the page background: violet from the upper left, magenta
-/// from the upper right. Alpha is deliberately tiny — these must never be
-/// visible as shapes, only as a reason for the corners to be darker.
-pub const WASH_A: Color32 = Color32::from_rgba_premultiplied(0x22, 0x18, 0x48, 0xFF);
-pub const WASH_B: Color32 = Color32::from_rgba_premultiplied(0x2A, 0x12, 0x38, 0xFF);
+// Softer, layered violet surfaces based on the user's visual reference.
+pub const WASH_A: Color32 = Color32::from_rgb(0x4A, 0x40, 0x65);
+pub const WASH_B: Color32 = Color32::from_rgb(0x50, 0x38, 0x65);
 
 // --- text -----------------------------------------------------------------
-pub const TEXT: Color32 = Color32::from_rgb(0xF0, 0xEC, 0xFA);
-pub const TEXT_DIM: Color32 = Color32::from_rgb(0xA8, 0xA0, 0xC4);
-pub const TEXT_FAINT: Color32 = Color32::from_rgb(0x74, 0x6C, 0x94);
+pub const TEXT: Color32 = Color32::from_rgb(0xF6, 0xF2, 0xFF);
+pub const TEXT_DIM: Color32 = Color32::from_rgb(0xD4, 0xC9, 0xE4);
+pub const TEXT_FAINT: Color32 = Color32::from_rgb(0xC8, 0xBC, 0xDB);
 
 // --- accents --------------------------------------------------------------
-pub const ACCENT: Color32 = Color32::from_rgb(0x8B, 0x5C, 0xF6);
-pub const ACCENT_HI: Color32 = Color32::from_rgb(0xB4, 0x9B, 0xFF);
-pub const ACCENT_DIM: Color32 = Color32::from_rgb(0x4A, 0x2F, 0x8C);
+pub const ACCENT: Color32 = Color32::from_rgb(0x76, 0x50, 0xD8);
+pub const ACCENT_HI: Color32 = Color32::from_rgb(0xDE, 0xC4, 0xFF);
+pub const ACCENT_DIM: Color32 = Color32::from_rgb(0x58, 0x40, 0x7B);
 
-/// The signature gradient: violet into magenta into teal.
-///
-/// Deliberately dark. The first attempt used pastel tones and white text on
-/// them was barely legible — a balance you cannot read is a broken balance.
-/// Every stop here keeps a contrast ratio above 4.5:1 against white.
-pub const GRAD_A: Color32 = Color32::from_rgb(0x56, 0x33, 0xC4);
-pub const PINK: Color32 = Color32::from_rgb(0x8E, 0x31, 0xB2);
-pub const CYAN: Color32 = Color32::from_rgb(0x27, 0x6F, 0x8E);
+/// Pastel brand gradient. Always pair with INK, never white text.
+pub const INK: Color32 = Color32::from_rgb(0x25, 0x1C, 0x3A);
+pub const GRAD_A: Color32 = Color32::from_rgb(0xBD, 0xA2, 0xFF);
+pub const PINK: Color32 = Color32::from_rgb(0xE7, 0x9C, 0xEF);
+pub const CYAN: Color32 = Color32::from_rgb(0x78, 0xDB, 0xEC);
 
 pub const SUCCESS: Color32 = Color32::from_rgb(0x4A, 0xE0, 0xA8);
 pub const WARN: Color32 = Color32::from_rgb(0xFF, 0xC8, 0x5C);
@@ -71,9 +50,9 @@ pub const DANGER: Color32 = Color32::from_rgb(0xFF, 0x7B, 0x8A);
 // --- geometry -------------------------------------------------------------
 /// Cards. Matches the web wallet's `--r-lg`, so the two surfaces read as
 /// one product rather than two that happen to share a palette.
-pub const ROUND: f32 = 24.0;
+pub const ROUND: f32 = 28.0;
 /// Buttons, inputs, chips.
-pub const ROUND_SM: f32 = 12.0;
+pub const ROUND_SM: f32 = 16.0;
 /// Fully rounded pills.
 pub const ROUND_PILL: f32 = 999.0;
 
@@ -146,7 +125,7 @@ pub fn apply(ctx: &egui::Context) {
     style.spacing.item_spacing = egui::vec2(12.0, 12.0);
     style.spacing.button_padding = egui::vec2(16.0, 9.0);
     style.spacing.window_margin = egui::Margin::same(18.0);
-    style.spacing.interact_size.y = 32.0;
+    style.spacing.interact_size.y = 38.0;
     style.spacing.scroll.bar_width = 8.0;
 
     ctx.set_style(style);
@@ -180,5 +159,36 @@ pub fn brand_gradient(t: f32) -> Color32 {
         lerp_color(GRAD_A, PINK, t / 0.55)
     } else {
         lerp_color(PINK, CYAN, (t - 0.55) / 0.45)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn luminance(c: Color32) -> f64 {
+        let channel = |v: u8| {
+            let n = f64::from(v) / 255.0;
+            if n <= 0.04045 {
+                n / 12.92
+            } else {
+                ((n + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
+    }
+    #[test]
+    fn pastel_gradient_uses_readable_dark_ink() {
+        for step in 0..=100 {
+            let background = brand_gradient(step as f32 / 100.0);
+            assert!((luminance(background) + 0.05) / (luminance(INK) + 0.05) >= 4.5);
+        }
+    }
+    #[test]
+    fn readable_text_tokens_meet_normal_text_contrast() {
+        for text in [TEXT, TEXT_DIM, TEXT_FAINT] {
+            for surface in [BG, RAIL, SURFACE, SURFACE_HI, SURFACE_LOW] {
+                assert!((luminance(text) + 0.05) / (luminance(surface) + 0.05) >= 4.5);
+            }
+        }
     }
 }

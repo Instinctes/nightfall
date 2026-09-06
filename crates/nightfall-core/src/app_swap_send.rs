@@ -10,6 +10,7 @@
 //! same rule as everywhere else.
 
 use crate::app::App;
+use crate::swap_worker::SwapWorker;
 use nightfall_swap::bitcoin_rpc::{BitcoinRpc, RpcAuth};
 use nightfall_swap::watch::{BroadcastResult, Broadcaster, WatchError};
 use nightfall_swap::StoredSwap;
@@ -32,7 +33,7 @@ impl SendWhat {
         }
     }
 
-    fn kind(self) -> nightfall_swap::SendKind {
+    pub(crate) fn kind(self) -> nightfall_swap::SendKind {
         match self {
             Self::Cancel => nightfall_swap::SendKind::Cancel,
             Self::Refund => nightfall_swap::SendKind::Refund,
@@ -47,12 +48,46 @@ impl App {
         self.datadir.join("bitcoin-rpc.conf")
     }
 
+    pub fn bitcoin_rpc_configured(&self) -> bool {
+        self.btc_rpc_path().exists()
+    }
+
+    /// Owner-only template. The password stays empty until the user fills it.
+    pub fn write_bitcoin_rpc_template(&self) -> Result<String, String> {
+        let path = self.btc_rpc_path();
+        if path.exists() {
+            return Err(format!(
+                "{} already exists. Edit it by hand.",
+                path.display()
+            ));
+        }
+        let port = match self.network {
+            nightfall_types::NetworkId::Mainnet => 8332,
+            nightfall_types::NetworkId::Testnet => 18332,
+            nightfall_types::NetworkId::Devnet => 18443,
+        };
+        let body = format!(
+            "# bitcoind JSON-RPC for atomic swaps. Readable only by you.\n\
+             # Devnet talks to Bitcoin regtest. Restart bitcoind with -txindex=1.\n\
+             url=http://127.0.0.1:{port}\n\
+             user=nightfall\n\
+             password=\n"
+        );
+        nightfall_storage::write_secret_file(&path, &body).map_err(|e| e.to_string())?;
+        Ok(format!(
+            "Wrote {}. Put the bitcoind password on the password= line.",
+            path.display()
+        ))
+    }
+}
+
+impl SwapWorker {
     /// Connect, or say precisely why not.
     ///
     /// Deliberately re-read each time rather than cached: a user who fixes
     /// their config should not have to restart the wallet to find out.
     pub fn btc_rpc(&self) -> Result<BitcoinRpc, String> {
-        let path = self.btc_rpc_path();
+        let path = self.datadir.join("bitcoin-rpc.conf");
         if !path.exists() {
             return Err(format!(
                 "No Bitcoin node configured. Create {} with url=, user= and \
@@ -73,6 +108,14 @@ impl App {
         let id = stored.state.id().to_string();
         self.ensure_session(&id)?;
         let rpc = self.btc_rpc()?;
+        rpc.check_network(self.network).map_err(|e| e.to_string())?;
+        if !nightfall_swap::ui::actions(&stored.state).contains(&match what {
+            SendWhat::Cancel => nightfall_swap::ui::Action::CancelNow,
+            SendWhat::Refund => nightfall_swap::ui::Action::SendRefund,
+            SendWhat::Punish => nightfall_swap::ui::Action::SendPunish,
+        }) {
+            return Err("This action is no longer available. Refresh the swap.".into());
+        }
 
         let raw = {
             let session = self
@@ -98,6 +141,20 @@ impl App {
             Ok(_) => {}
         }
 
+        let mut record = stored.clone();
+        record.outgoing.insert(what.kind(), raw.clone());
+        record.pending = Some(nightfall_swap::PendingSend {
+            kind: what.kind(),
+            txid: crate::app_swap_drive::btc_txid_of(&raw)?,
+        });
+        if matches!(what, SendWhat::Cancel) {
+            record.state = nightfall_swap::SwapState::MustCancel {
+                id: record.state.id(),
+                role: record.state.role(),
+                reason: nightfall_swap::AbortReason::CounterpartyGone,
+            };
+        }
+        nightfall_swap::persist::save(&self.datadir, &record).map_err(|e| e.to_string())?;
         match rpc.broadcast(&raw) {
             Ok(BroadcastResult::Accepted { txid }) => {
                 Ok(format!("{} broadcast: {txid}", what.label()))
