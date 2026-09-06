@@ -1,13 +1,13 @@
 {
   "network": "mainnet",
-  "height": 114412,
-  "tip": "b5bd2b73693ae23226aeea6c5f3d1b271c6b6fc2648079b4a38ed92520c4157b",
+  "height": 122249,
+  "tip": "4433014b2d1bbf4f804ded951f3841fabede188abab25555cc174ab498adf280",
   "genesis": "061a052d49607ff8f4b306c75d622ebd230cff4ec3a45a6dffc2f7738d4b20de",
-  "taken_utc": "2026-09-05T10:03:17Z",
-  "archive": "nightfall-chain-114412-2026-09-05.bin",
-  "archive_bytes": 186005866,
-  "blocks_bin_sha256": "d11a50ce4cc3832486ebe18e2d007921e792a5af2eda3d6c604a3391aa8d27e9",
+  "taken_utc": "2026-09-06T18:57:13Z",
+  "archive": "nightfall-chain-122249-2026-09-06.bin",
+  "archive_bytes": 196454387,
+  "blocks_bin_sha256": "e072a807b1bb1e048fbd26aebffc835c98e766fe8fec1974b31ba0f81c5d5558",
   "verified_on_import": true,
   "note": "Contains blocks only. Your node re-checks every proof of work; this archive replaces the download, not the verification.",
-  "url": "https://github.com/Instinctes/nightfall/releases/download/chain-bootstrap/nightfall-chain-114412-2026-09-05.bin"
+  "url": "https://github.com/Instinctes/nightfall/releases/download/chain-bootstrap/nightfall-chain-122249-2026-09-06.bin"
 }
