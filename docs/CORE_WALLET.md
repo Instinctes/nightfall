@@ -1,7 +1,7 @@
-# NIGHTFALLCOIN Core Wallet 0.9.4
+# NIGHTFALLCOIN Core Wallet 0.9.5
 
 A mainnet full node, miner and wallet in one desktop application. Download
-[v0.9.4](https://github.com/Instinctes/nightfall/releases/tag/v0.9.4) or build:
+[v0.9.5](https://github.com/Instinctes/nightfall/releases/tag/v0.9.5) or build:
 
 ```bash
 cargo build --locked --release -p nightfall-core

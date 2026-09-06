@@ -1550,7 +1550,7 @@ mod tests {
         };
         assert_eq!(w.scan_blocks(std::slice::from_ref(&block)).unwrap(), 1);
         let commit = w.outputs()[0].commit.to_hex();
-        w.reserve_commits(&[commit.clone()]).unwrap();
+        w.reserve_commits(std::slice::from_ref(&commit)).unwrap();
         let e = w.create_payment(&w.address(), 1, 1, "").unwrap_err();
         assert!(
             e.to_string().contains("insufficient funds"),
@@ -1561,7 +1561,7 @@ mod tests {
         let amount = reward - fee;
         let tx = w
             .create_payment_from_commits_at(
-                &[commit.clone()],
+                std::slice::from_ref(&commit),
                 &to,
                 amount,
                 fee,

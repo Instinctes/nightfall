@@ -801,7 +801,7 @@ impl App {
                         ui.painter().rect_stroke(
                             rect,
                             Rounding::same(ROUND_SM),
-                            Stroke::new(2.0, ACCENT_HI),
+                            Stroke::new(2.0_f32, ACCENT_HI),
                         );
                     }
                     if resp.clicked() {

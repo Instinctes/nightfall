@@ -33,7 +33,7 @@ pub fn nav_icon(
     color: Color32,
 ) {
     use crate::app::View;
-    let stroke = Stroke::new(1.6, color);
+    let stroke = Stroke::new(1.6_f32, color);
     let line = |pts: &[(f32, f32)]| {
         painter.add(egui::Shape::line(
             pts.iter()
@@ -310,7 +310,7 @@ pub fn gradient_card<R>(ui: &mut egui::Ui, height: f32, add: impl FnOnce(&mut eg
             .collect();
         painter.add(egui::Shape::line(
             points,
-            Stroke::new(1.0, INK.gamma_multiply(0.13)),
+            Stroke::new(1.0_f32, INK.gamma_multiply(0.13)),
         ));
     }
 
@@ -739,7 +739,7 @@ pub fn primary_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Res
         ui.painter().rect_stroke(
             rect.expand(3.0),
             Rounding::same(ROUND_PILL),
-            Stroke::new(2.0, ACCENT_HI),
+            Stroke::new(2.0_f32, ACCENT_HI),
         );
     }
     let pos = rect.center() - galley.size() / 2.0;
