@@ -44,12 +44,15 @@ jobs:
       # markup that does not exist. A human found all three by squinting at a
       # phone; this finds them in a second. See scripts/check-web-wallet.mjs.
       - name: Browser wallet, static checks
+        # Website deployment files are maintained outside this repository.
+        if: ${{ hashFiles('website/wrangler.toml') != '' }}
         run: node scripts/check-web-wallet.mjs
 
       # Same class of bug, same one-second check, for the chain view: an id the
       # script reaches for that the page never renders, a class with no rule,
       # an inline script the CSP will block, a missing Worker route.
       - name: Chain page, static checks
+        if: ${{ hashFiles('website/wrangler.toml') != '' }}
         run: node scripts/check-chain-page.mjs
 
       # The 0.8.3 bump updated every .html and left js/main.js pointing at
@@ -57,6 +60,7 @@ jobs:
       # device" button was a 404 and a person found it in a screenshot. This
       # compares the links against the directory listing, both directions.
       - name: Download links, static checks
+        if: ${{ hashFiles('website/wrangler.toml') != '' }}
         run: node scripts/check-download-links.mjs
 
       # The site had a checker and was right every release; README had none
@@ -65,6 +69,8 @@ jobs:
       # downloads page. Someone following our own instructions would have hit
       # a missing file while doing the careful thing.
       - name: Documentation versions, static checks
+        # This check reads the website's release-channel manifest.
+        if: ${{ hashFiles('website/wrangler.toml') != '' }}
         run: node scripts/check-docs-version.mjs
 
       # The weekly archive script decides which old archives to delete. It
@@ -83,6 +89,7 @@ jobs:
       # is fixed between releases. A mobile fix went live on 3 Sep, correct on
       # the server, and ran nowhere that had loaded the page that day.
       - name: Cache busters match file contents
+        if: ${{ hashFiles('website/wrangler.toml') != '' }}
         run: node scripts/stamp-cache-busters.mjs --check
 
       # `.container a` is (0,1,1) and outranks `.btn-primary` at (0,1,0), so a
@@ -91,6 +98,7 @@ jobs:
       # Download button in --text-dim on every page, and it survived that long
       # because a button with unreadable text still looks like a button.
       - name: Button colours survive container link rules
+        if: ${{ hashFiles('website/wrangler.toml') != '' }}
         run: node scripts/check-button-colours.mjs
 
       # The whole point of the project. Every test in this suite is the
