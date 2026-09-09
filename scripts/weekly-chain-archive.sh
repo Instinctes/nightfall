@@ -6,6 +6,8 @@
 # Builds a fresh archive from the node's data folder, puts it on the GitHub
 # release in place of last week's, points the website at it, deploys, and then
 # checks the live site actually serves what it just published.
+# Website source is ROOT/website, never the separate GitHub mirror. This
+# workflow uploads bootstrap release assets but makes no Git commits or pushes.
 #
 # Only the copy needs the wallet closed, and that takes seconds. The script
 # waits for you to close it and tells you the moment you can start it again —
@@ -52,7 +54,7 @@ while [ $# -gt 0 ]; do
 done
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-MIRROR="$ROOT/github"
+SITE="$ROOT/website"
 PAGE_REL="website/public/chain/bootstrap.json"
 
 say()  { printf '\n\033[1m%s\033[0m\n' "$*"; }
@@ -108,7 +110,7 @@ fi
 # evening.
 say "==> preflight"
 
-[ -d "$MIRROR/.git" ] || die "no git mirror at $MIRROR"
+[ -f "$SITE/wrangler.toml" ] || die "no website configuration at $SITE"
 [ -f "$DATADIR/blocks.bin" ] || die "no blocks.bin in $DATADIR — wrong data folder?"
 step "data folder... $DATADIR"
 
@@ -122,19 +124,19 @@ if [ "$DEPLOY" = "1" ]; then
     # not exist on this machine: the variable came out empty, wrangler fell
     # back to that stored login, and the deploy worked for a reason entirely
     # unlike the one written down. So it is checked for what it actually uses.
-    if ! ( cd "$MIRROR/website" && npx wrangler whoami >/dev/null 2>&1 ); then
-        die "wrangler is not logged in — run: cd github/website && npx wrangler login"
+    command -v node >/dev/null || die "node is not installed"
+    node "$ROOT/scripts/stamp-cache-busters.mjs" --check
+    node "$ROOT/scripts/check-site-design.mjs"
+    node "$ROOT/scripts/check-download-links.mjs"
+    if ! ( cd "$SITE" && npx wrangler whoami >/dev/null 2>&1 ); then
+        die "wrangler is not logged in — run: cd website && npx wrangler login"
     fi
     step "cloudflare... logged in"
 fi
 
-# A stray edit to this file in the mirror would be swept into the commit
-# below. Only bootstrap.json is committed, but if someone left an unrelated
-# change in exactly that file, better to say so now.
-if ! git -C "$MIRROR" diff --quiet -- "$PAGE_REL" 2>/dev/null; then
-    die "$PAGE_REL already has uncommitted changes in the mirror — resolve that first"
-fi
-step "mirror....... clean"
+# The publish mirror is intentionally not synchronized: website-only changes
+# belong to the current workspace and the operator forbids automatic Git pushes.
+step "website...... $SITE (no Git push)"
 
 if [ "$CHECK_ONLY" = "1" ]; then
     say "preflight passed. Nothing was changed."
@@ -328,28 +330,12 @@ m["url"] = sys.argv[2]
 json.dump(m, sys.stdout, indent=2)
 print()
 PY
-cp -p "$ROOT/$PAGE_REL" "$MIRROR/$PAGE_REL"
 
 HEIGHT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["height"])' "$MANIFEST")"
 
-say "==> updating the mirror"
-# Only this one file. `git add -A` here would sweep in whatever else happens
-# to be sitting in the mirror.
-git -C "$MIRROR" add "$PAGE_REL"
-if git -C "$MIRROR" diff --cached --quiet; then
-    step "nothing changed — same archive as last time"
-else
-    git -C "$MIRROR" commit -q -m "Chain archive: height $HEIGHT
-
-Weekly rebuild. The page reads this manifest, so the height, size and
-checksum it shows come from the archive itself."
-    git -C "$MIRROR" push -q origin main
-    step "pushed $(git -C "$MIRROR" rev-parse --short HEAD)"
-fi
-
 if [ "$DEPLOY" = "1" ]; then
     say "==> deploying the website"
-    ( cd "$MIRROR/website" && npx wrangler deploy 2>&1 | tail -3 | sed 's/^/    /' )
+    ( cd "$SITE" && npx wrangler deploy 2>&1 | tail -3 | sed 's/^/    /' )
 fi
 
 # -------------------------------------------------------------------- verify ---
@@ -360,8 +346,14 @@ fi
 # reads the live site the way a stranger would.
 if [ "$DEPLOY" = "1" ]; then
     say "==> checking the live site"
-    sleep 3
-    LIVE="$(curl -fsS --max-time 30 "https://nightfallcoin.org/chain/bootstrap.json")" \
+    step "waiting 60 seconds for the website deployment to propagate"
+    sleep 60
+    LOCAL_SITE_SHA="$(shasum -a 256 "$SITE/public/index.html" | cut -d' ' -f1)"
+    LIVE_SITE_SHA="$(curl -fsS --max-time 30 "https://nightfallcoin.org/?bootstrap=$HEIGHT" | shasum -a 256 | cut -d' ' -f1)" \
+        || die "could not verify the live homepage"
+    [ "$LIVE_SITE_SHA" = "$LOCAL_SITE_SHA" ] || die "live homepage does not match $SITE/public/index.html — another deployment or stale assets?"
+    step "website...... current homepage verified byte for byte"
+    LIVE="$(curl -fsS --max-time 30 "https://nightfallcoin.org/chain/bootstrap.json?height=$HEIGHT")" \
         || die "the site does not serve /chain/bootstrap.json"
     LIVE_H="$(printf '%s' "$LIVE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["height"])')"
     LIVE_U="$(printf '%s' "$LIVE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])')"
