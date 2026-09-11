@@ -57,11 +57,12 @@ impl BrowserVault {
         birth_height: f64,
     ) -> Result<BrowserVault, JsError> {
         let birth = height(birth_height)?;
-        if phrase.len() > 1024 {
-            return Err(err("Invalid recovery phrase."));
-        }
-        let keys =
-            WalletKeys::from_mnemonic(phrase).map_err(|_| err("Invalid recovery phrase."))?;
+        // The same road in as Core and as the words check on the create screen.
+        // This used to say "Invalid recovery phrase." while the create screen
+        // said the words were incomplete and Core said the checksum was wrong —
+        // three wordings for one typo, none of which told the owner which of
+        // their 24 words to look at.
+        let keys = nightfall_wallet::recovery::keys_from_phrase(phrase).map_err(err)?;
         let wallet = Wallet::in_memory(NetworkId::Mainnet, keys, birth);
         Ok(Self {
             inner: Vault::create(&wallet, password).map_err(err)?,

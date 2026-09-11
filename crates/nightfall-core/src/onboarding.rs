@@ -110,13 +110,9 @@ impl Setup {
             "The passwords do not match."
         );
         nightfall_wallet::vault::Vault::validate_password(&self.password)?;
-        anyhow::ensure!(
-            self.phrase.len() <= 1024,
-            "Enter the complete 24 recovery words."
-        );
-        WalletKeys::from_mnemonic(&self.phrase).map_err(|_| {
-            anyhow::anyhow!("Enter valid 24 recovery words with a correct checksum.")
-        })?;
+        // One road in, so a 23-word phrase and a mistyped word are told apart
+        // here exactly as they are in the web wallet.
+        nightfall_wallet::recovery::keys_from_phrase(&self.phrase)?;
         let request = ProvisionRequest {
             // One zeroizing worker copy, never a per-frame display clone.
             source: ProvisionSource::Words(self.phrase.clone()),

@@ -117,13 +117,7 @@ impl WalletState {
         nightfall_wallet::vault::Vault::validate_password(password)?;
         let wallet = match source {
             ProvisionSource::Words(phrase) => {
-                anyhow::ensure!(
-                    phrase.len() <= 1024,
-                    "Enter the complete 24 recovery words."
-                );
-                let keys = nightfall_crypto::WalletKeys::from_mnemonic(&phrase).map_err(|_| {
-                    anyhow::anyhow!("Enter valid 24 recovery words with a correct checksum.")
-                })?;
+                let keys = nightfall_wallet::recovery::keys_from_phrase(&phrase)?;
                 Wallet::in_memory(network, keys, 0)
             }
             ProvisionSource::Restored(wallet) => {
