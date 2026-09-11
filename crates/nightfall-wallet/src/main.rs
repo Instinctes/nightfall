@@ -133,14 +133,26 @@ fn main() -> anyhow::Result<()> {
         Commands::VerifyReceipt { file } => {
             let raw = std::fs::read_to_string(&file)?;
             let receipt: nightfall_wallet::PaymentReceipt = serde_json::from_str(&raw)?;
-            nightfall_wallet::verify_receipt(&receipt)?;
-            println!("receipt ok");
-            println!("kind........... {}", receipt.kind);
-            println!("address........ {}", receipt.address);
-            println!("amount......... {}", Amount(receipt.amount_darks));
-            println!("height......... {}", receipt.height);
-            if !receipt.memo.is_empty() {
-                println!("memo........... {}", receipt.memo);
+            // Print the report, never the raw fields. The fields are what the
+            // document claims; the report is what was checked, and on an older
+            // receipt those are not the same set.
+            let proof = nightfall_wallet::verify_receipt(&receipt)?;
+            println!("signature ok");
+            println!("kind........... {}", proof.kind.as_str());
+            println!("address........ {}", proof.address);
+            println!("amount......... {}", Amount(proof.amount_darks));
+            println!("height......... {}", proof.height);
+            if !proof.memo.is_empty() {
+                println!("memo........... {}", proof.memo);
+            }
+            println!("version........ {}", proof.version);
+            println!();
+            println!("what this proves");
+            println!("  {}", proof.summary());
+            println!();
+            println!("what it does not");
+            for line in proof.not_established() {
+                println!("  - {line}");
             }
             return Ok(());
         }

@@ -143,6 +143,13 @@ pub struct App {
     // Activity filter
     pub activity_filter: String,
 
+    // Proof Card. `proof_input` holds a receipt someone pasted, or the one
+    // this wallet just produced — the owner is shown the same card the person
+    // receiving it will see, because "show exactly what is revealed" means
+    // showing it before it is handed over, not after.
+    pub proof_input: String,
+    pub proof_result: Option<Result<nightfall_wallet::ReceiptProof, String>>,
+
     // Network
     pub peer_input: String,
     pub proxy_input: String,
@@ -312,6 +319,8 @@ impl App {
             want_quit: false,
             window_hidden: false,
             activity_filter: String::new(),
+            proof_input: String::new(),
+            proof_result: None,
             peer_input: String::new(),
             proxy_input,
             chain_check: None,
@@ -1268,6 +1277,11 @@ impl App {
         self.reveal_mnemonic = false;
         self.reveal_view_key = false;
         self.recovery_studio.clear();
+        // A Proof Card names an address, an amount and a memo. None of them is
+        // a key, and all of them are this wallet's business rather than the
+        // next person's at the same screen.
+        self.proof_input.zeroize();
+        self.proof_result = None;
         self.send_to.zeroize();
         self.send_amount.zeroize();
         self.send_memo.zeroize();

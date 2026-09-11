@@ -7,7 +7,13 @@ use eframe::egui::{self, Color32, RichText, Rounding, Stroke, Vec2};
 use nightfall_crypto::Address;
 use nightfall_node::SyncHold;
 use nightfall_storage::now_unix;
-use nightfall_types::{Amount, DARKS_PER_NIGHT, MAX_SUPPLY_NIGHT, TARGET_BLOCK_TIME_SECS};
+use nightfall_types::{
+    Amount, NetworkId, DARKS_PER_NIGHT, MAX_SUPPLY_NIGHT, TARGET_BLOCK_TIME_SECS,
+};
+// Not to be confused with `vault_ui::PaymentRequest`, which is a job handed to
+// the payment worker — a payment this wallet is about to make. This one is what
+// somebody else asked for, before anyone has agreed to it.
+use nightfall_wallet::payment_request::{self, PaymentRequest};
 use nightfall_wallet::Direction;
 
 pub fn page_intro(view: View, ui: &mut egui::Ui) {
@@ -753,6 +759,180 @@ fn activity_row(ui: &mut egui::Ui, e: &nightfall_wallet::HistoryEntry, now: u64)
 
 // ------------------------------------------------------------------ send ---
 
+/// Show a pasted payment request, and return it only if the owner applies it.
+///
+/// Returns `None` when the field holds anything other than a request — an
+/// ordinary address goes straight to the validator above and never reaches
+/// here. A request that cannot be paid is still *shown*, with the reason: a
+/// wallet that merely refuses to understand a testnet request leaves its owner
+/// guessing, and the guess they are most likely to make is that the address is
+/// wrong.
+/// A Proof Card: what a receipt establishes, and what it leaves open.
+///
+/// The three questions are kept visually apart because they are three
+/// different strengths of claim, and the commonest way to be misled by a
+/// receipt is to read a signed sentence as a settled payment. What is proven
+/// comes first, what is not comes immediately after, and neither is a footnote.
+///
+/// The wording is [`nightfall_wallet::ReceiptProof`]'s, not this screen's, so
+/// the desktop wallet and the command line cannot describe one document in two
+/// ways.
+pub fn proof_card(ui: &mut egui::Ui, proof: &nightfall_wallet::ReceiptProof) {
+    use nightfall_wallet::ReceiptKind;
+
+    let (label, tone) = match proof.kind {
+        ReceiptKind::Received => ("Received", SUCCESS),
+        ReceiptKind::Mined => ("Mined", SUCCESS),
+        // A sent receipt is the signer's own account of a payment. It is not
+        // worthless, and it is not proof of an amount; the colour says so
+        // before any of the text is read.
+        ReceiptKind::Sent => ("Sent — the signer's own account", WARN),
+        ReceiptKind::Other => ("Unrecognised kind", DANGER),
+    };
+    ui.horizontal(|ui| {
+        badge(ui, label, tone);
+        if proof.version < nightfall_wallet::RECEIPT_VERSION {
+            badge(ui, &format!("older format (v{})", proof.version), WARN);
+        }
+    });
+    ui.add_space(10.0);
+
+    // Monospace for the address, for the same reason as everywhere else: the
+    // only defence against a swapped address is a person comparing characters.
+    kv(
+        ui,
+        "Signed by",
+        RichText::new(&proof.address).monospace().size(11.5),
+    );
+    kv(
+        ui,
+        "Amount",
+        RichText::new(format!("{}", Amount(proof.amount_darks)))
+            .color(if proof.amount_proven { TEXT } else { WARN }),
+    );
+    if !proof.memo.is_empty() {
+        kv(ui, "Memo", RichText::new(&proof.memo));
+    }
+    kv(ui, "Height", RichText::new(proof.height.to_string()));
+    kv(
+        ui,
+        if proof.amount_proven {
+            "Commitment"
+        } else {
+            "Transaction"
+        },
+        RichText::new(&proof.reference).monospace().size(11.0),
+    );
+
+    ui.add_space(12.0);
+    kicker(ui, "WHAT THIS PROVES");
+    ui.add_space(4.0);
+    ui.colored_label(if proof.amount_proven { SUCCESS } else { WARN }, proof.summary());
+
+    ui.add_space(12.0);
+    kicker(ui, "WHAT IT DOES NOT");
+    ui.add_space(4.0);
+    for line in proof.not_established() {
+        ui.colored_label(TEXT_DIM, format!("• {line}"));
+        ui.add_space(3.0);
+    }
+}
+
+/// Verify a pasted receipt and remember the answer.
+///
+/// Kept out of the rendering so the card can be shown for a receipt this
+/// wallet just produced as well as one that arrived from somebody else.
+pub fn check_receipt(app: &mut App) {
+    let text = app.proof_input.trim();
+    if text.is_empty() {
+        app.proof_result = None;
+        return;
+    }
+    app.proof_result = Some(
+        serde_json::from_str::<nightfall_wallet::PaymentReceipt>(text)
+            .map_err(|e| format!("This is not a receipt this wallet can read: {e}"))
+            .and_then(|receipt| {
+                nightfall_wallet::verify_receipt(&receipt).map_err(|e| e.to_string())
+            }),
+    );
+}
+
+pub fn payment_request_card(
+    ui: &mut egui::Ui,
+    field: &str,
+    network: NetworkId,
+) -> Option<PaymentRequest> {
+    let text = field.trim();
+    // Cheap gate: only text that claims to be a request gets parsed at all.
+    if !text
+        .split_once(':')
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case(payment_request::SCHEME))
+    {
+        return None;
+    }
+
+    let mut applied = None;
+    divider(ui);
+    ui.label(RichText::new("Payment request").size(11.0).color(TEXT_DIM));
+    ui.add_space(6.0);
+
+    match PaymentRequest::parse(text) {
+        Err(error) => {
+            ui.colored_label(DANGER, error.to_string());
+        }
+        Ok(request) => {
+            let payable = request.require_network(network);
+            // Monospace, because the only defence against a swapped address is a
+            // person comparing it character by character.
+            kv(
+                ui,
+                "Pays to",
+                RichText::new(request.address.encode())
+                    .monospace()
+                    .size(11.5),
+            );
+            kv(ui, "Amount", RichText::new(request.amount_text()));
+            if !request.memo.is_empty() {
+                kv(ui, "Memo", RichText::new(&request.memo));
+            }
+            if !request.invoice.is_empty() {
+                kv(ui, "Their reference", RichText::new(&request.invoice));
+            }
+            kv(ui, "Network", RichText::new(request.network.as_str()));
+
+            if let Err(error) = &payable {
+                ui.add_space(6.0);
+                ui.colored_label(DANGER, error.to_string());
+            } else {
+                // Shown, never enforced. A payment made after a payee's own
+                // deadline is perfectly valid on the chain; whether they still
+                // honour it is between the two of them, and saying otherwise
+                // would be inventing a consensus rule that does not exist.
+                if request.is_expired(now_unix()) {
+                    ui.add_space(6.0);
+                    ui.colored_label(
+                        WARN,
+                        "The payee's own deadline for this request has passed. The \
+                         chain does not care and the payment would still go through — \
+                         but they may no longer treat it as settling this invoice. \
+                         Ask before paying.",
+                    );
+                }
+                ui.add_space(8.0);
+                if primary_button(ui, "Use this request", true).clicked() {
+                    applied = Some(request);
+                }
+                ui.label(
+                    RichText::new("Fills in the address and amount below. Nothing is sent yet.")
+                        .size(11.0)
+                        .color(TEXT_FAINT),
+                );
+            }
+        }
+    }
+    applied
+}
+
 pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     let tip = app.tip_height();
     let maturity = app.maturity();
@@ -830,6 +1010,23 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                             ui.add_space(3.0);
                             ui.label(RichText::new(e).size(11.0).color(DANGER));
                         });
+                    }
+                }
+
+                // A pasted payment request is read here and applied only when
+                // the owner presses the button.
+                //
+                // Nothing fills itself in. A request is someone else's
+                // statement of what they want, and the gap between reading it
+                // and acting on it is where a person gets to notice that the
+                // address is not the one they expected.
+                if let Some(applied) = payment_request_card(ui, &app.send_to, app.network) {
+                    app.send_to = applied.address.encode();
+                    if let Some(darks) = applied.amount_darks {
+                        app.send_amount = Amount(darks).decimal_string();
+                    }
+                    if !applied.memo.is_empty() {
+                        app.send_memo = applied.memo.clone();
                     }
                 }
 
@@ -1488,16 +1685,86 @@ pub fn activity(app: &mut App, ui: &mut egui::Ui) {
                             .and_then(|w| w.receipt_json(&e.txid).ok())
                         {
                             Some(json) => {
-                                ui.ctx().copy_text(json);
+                                ui.ctx().copy_text(json.clone());
+                                // Put it through the same check the recipient
+                                // will run, and show the same card. Handing
+                                // over a disclosure without seeing what it
+                                // discloses is how people reveal more than
+                                // they meant to.
+                                app.proof_input = json;
+                                check_receipt(app);
                                 app.toasts.success(
                                     ui.ctx(),
-                                    "Receipt copied — proves this one payment, not the whole wallet",
+                                    "Receipt copied — see the Proof Card below for what it proves",
                                 );
                             }
                             None => app.toasts.error(ui.ctx(), "Could not build a receipt"),
                         }
                     }
                 });
+            }
+        }
+    });
+
+    ui.add_space(14.0);
+
+    titled_card(ui, "Proof Card", |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(
+            RichText::new(
+                "Check a receipt — one you were given, or one you are about to give. A \
+                 receipt discloses a single payment without handing over the view key \
+                 that would show every other one.",
+            )
+            .size(12.0)
+            .color(TEXT_DIM),
+        );
+        ui.add_space(10.0);
+        field_label(ui, "Receipt", None);
+        let changed = ui
+            .add(
+                egui::TextEdit::multiline(&mut app.proof_input)
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Paste the receipt JSON"),
+            )
+            .changed();
+        // Re-check as it is typed, and — the part that matters — throw the old
+        // answer away the moment the text changes. A verdict left standing
+        // beside a different receipt is a verdict about the wrong document.
+        if changed {
+            check_receipt(app);
+        }
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if ghost_button(ui, "Check").clicked() {
+                check_receipt(app);
+            }
+            if ghost_button(ui, "Clear").clicked() {
+                app.proof_input.clear();
+                app.proof_result = None;
+            }
+        });
+        match &app.proof_result {
+            None => {}
+            Some(Err(problem)) => {
+                ui.add_space(10.0);
+                ui.colored_label(DANGER, problem);
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Nothing about this document has been established. Do not treat \
+                         it as evidence of anything.",
+                    )
+                    .size(12.0)
+                    .color(TEXT_DIM),
+                );
+            }
+            Some(Ok(proof)) => {
+                ui.add_space(12.0);
+                divider(ui);
+                ui.add_space(10.0);
+                proof_card(ui, proof);
             }
         }
     });
