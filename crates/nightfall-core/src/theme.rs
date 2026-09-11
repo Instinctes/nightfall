@@ -237,6 +237,52 @@ mod tests {
         };
         0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
     }
+
+    /// The elevation ladder only goes one way.
+    ///
+    /// It did not. `SURFACE` — the card fill — was darker than `BG`, the page
+    /// it sits on, for the whole life of this theme. A dark interface reads a
+    /// card that catches *less* light than its background as a hole rather
+    /// than an object, and that single inversion is why every screen looked
+    /// flat no matter how its contents were arranged.
+    ///
+    /// It is not visible in the source: `BG` and `SURFACE` are two names, and
+    /// nothing says which should be lighter. This says it.
+    #[test]
+    fn surfaces_get_lighter_as_they_come_closer() {
+        let ladder = [
+            ("BG", BG),
+            ("RAIL", RAIL),
+            ("SURFACE", SURFACE),
+            ("SURFACE_HI", SURFACE_HI),
+            ("SURFACE_HOVER", SURFACE_HOVER),
+        ];
+        for pair in ladder.windows(2) {
+            let (lower, upper) = (pair[0], pair[1]);
+            assert!(
+                luminance(upper.1) > luminance(lower.1),
+                "{} must be lighter than {} — a card darker than its page reads \
+                 as a hole, not as a card",
+                upper.0,
+                lower.0,
+            );
+            // …and by enough to see. Two surfaces a rounding error apart are
+            // one surface with two names.
+            assert!(
+                luminance(upper.1) - luminance(lower.1) > 0.004,
+                "{} and {} are too close to tell apart",
+                upper.0,
+                lower.0,
+            );
+        }
+
+        // The one thing that goes down: a field is something you put
+        // something into, so it is sunk below the card that holds it.
+        assert!(
+            luminance(SURFACE_LOW) < luminance(SURFACE),
+            "a text field must read as sunk into its card, not raised off it",
+        );
+    }
     #[test]
     fn pastel_gradient_uses_readable_dark_ink() {
         for step in 0..=100 {
