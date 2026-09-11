@@ -157,6 +157,104 @@ fn the_payment_request_card_fits_supported_content_widths() {
     });
 }
 
+/// The till's invoice rows, at every width and in every state.
+///
+/// The candidate warning is the longest sentence this screen can produce and
+/// the one that must never be pushed off: it is what stands between a
+/// merchant and treating an unidentified payment as settlement.
+#[test]
+fn the_till_rows_fit_supported_content_widths() {
+    use crate::views::invoice_row;
+    use nightfall_wallet::counter::{status, Incoming, Invoice, InvoiceState};
+
+    let ctx = egui::Context::default();
+    crate::theme::apply(&ctx);
+
+    let base = Invoice {
+        reference: "R".repeat(nightfall_wallet::counter::MAX_REFERENCE),
+        amount_darks: Some(1_234_567_890),
+        description: "d".repeat(nightfall_wallet::counter::MAX_DESCRIPTION),
+        created_unix: 1_000,
+        expires_unix: Some(2_000),
+        closed_note: None,
+    };
+    let quoting = |amount: u64, at: u64| Incoming {
+        amount_darks: amount,
+        memo: base.reference.clone(),
+        height: Some(1),
+        timestamp: at,
+        reference_id: "c".into(),
+    };
+    let anonymous = Incoming {
+        amount_darks: 1_234_567_890,
+        memo: String::new(),
+        height: Some(1),
+        timestamp: 1_500,
+        reference_id: "d".into(),
+    };
+
+    let mut closed = base.clone();
+    closed.closed_note = Some("n".repeat(nightfall_wallet::counter::MAX_DESCRIPTION));
+
+    let cases = [
+        // open, and with an unidentified payment sitting next to it
+        (base.clone(), vec![anonymous.clone()], 1_500u64),
+        (base.clone(), vec![], 9_999), // expired
+        (base.clone(), vec![quoting(1_234_567_890, 1_500)], 1_600), // paid
+        (base.clone(), vec![quoting(1_234_567_890, 9_000)], 9_999), // paid late
+        (base.clone(), vec![quoting(1, 1_500), anonymous.clone()], 1_600), // short + candidate
+        (base.clone(), vec![quoting(9_999_999_999, 1_500)], 1_600), // overpaid
+        (closed, vec![], 1_600),
+        (
+            Invoice { amount_darks: None, ..base.clone() },
+            vec![quoting(7, 1_500)],
+            1_600,
+        ),
+    ];
+
+    let mut seen = Vec::new();
+    for width in [620.0, 884.0, 1180.0] {
+        for (invoice, payments, now) in &cases {
+            let state = status(invoice, payments, *now);
+            if width == 620.0 {
+                seen.push(state.state.clone());
+            }
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(width, 900.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let right = ui.max_rect().right();
+                    invoice_row(ui, invoice, &state);
+                    assert!(
+                        ui.min_rect().right() <= right + 1.0,
+                        "invoice row overflow at {width}px for {:?}",
+                        state.state,
+                    );
+                });
+            });
+        }
+    }
+
+    // Every state the till can be in was actually drawn, so this test cannot
+    // quietly stop covering one when the cases above are edited.
+    for expected in [
+        InvoiceState::Open,
+        InvoiceState::Expired,
+        InvoiceState::Closed,
+        InvoiceState::Paid { late: false },
+        InvoiceState::Paid { late: true },
+    ] {
+        assert!(seen.contains(&expected), "{expected:?} was never drawn");
+    }
+    assert!(seen.iter().any(|s| matches!(s, InvoiceState::Underpaid { .. })));
+    assert!(seen.iter().any(|s| matches!(s, InvoiceState::Overpaid { .. })));
+}
+
 /// The state behind the Proof Card: a verdict must never outlive the document
 /// it was about.
 ///

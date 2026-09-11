@@ -23,6 +23,7 @@ pub use receipt::{
 };
 /// The payment request: what a payee asks for, as one checkable line.
 pub mod amount_input;
+pub mod counter;
 pub mod payment_request;
 pub mod recovery;
 pub mod vault;
@@ -258,6 +259,19 @@ struct WalletFile {
     /// current block hash. A fresh birth-height-only wallet may start normally.
     #[serde(default)]
     scanned_tip: String,
+    /// The till's open and settled invoices. See [`crate::counter`].
+    ///
+    /// They live inside the wallet's encrypted snapshot rather than beside it,
+    /// because a shop's references, amounts and descriptions are its business
+    /// and a plaintext file of them next to an encrypted vault would undo the
+    /// point of the vault. Nothing here is a key, and none of it is needed to
+    /// spend: a till reads it with a view key.
+    ///
+    /// `default` for the same reason as the fields above, and with the same
+    /// consequence: a wallet file written by this version cannot be read by
+    /// one that predates the field, because this struct denies unknown fields.
+    #[serde(default)]
+    invoices: Vec<counter::Invoice>,
 }
 
 /// Balance split by what the user can actually do with it.
@@ -1186,6 +1200,103 @@ impl Wallet {
 
     pub fn has_reservations(&self) -> bool {
         !self.db.reserved.is_empty()
+    }
+
+    // ------------------------------------------------------------- the till ---
+    //
+    // Everything below reads only what a view key can see. Nothing here
+    // touches a key, signs anything, or moves a coin: a till that could spend
+    // is a spending machine left on a shop counter.
+
+    pub fn invoices(&self) -> &[counter::Invoice] {
+        &self.db.invoices
+    }
+
+    /// Record a new invoice.
+    ///
+    /// The reference must be new. Two invoices sharing one reference would be
+    /// settled by the same payment, which is the ambiguity the whole matching
+    /// rule exists to avoid — so it is refused at the point where it can still
+    /// be corrected rather than discovered at the counter.
+    pub fn add_invoice(&mut self, mut invoice: counter::Invoice) -> anyhow::Result<()> {
+        invoice.reference = invoice.reference.trim().to_owned();
+        invoice.description = invoice.description.trim().to_owned();
+        invoice.check().map_err(|e| anyhow::anyhow!(e))?;
+        anyhow::ensure!(
+            !self
+                .db
+                .invoices
+                .iter()
+                .any(|i| i.reference == invoice.reference),
+            "This till already has an invoice with the reference {}. Two invoices \
+             sharing one reference would both be settled by the same payment.",
+            invoice.reference,
+        );
+        anyhow::ensure!(
+            self.db.invoices.len() < counter::MAX_INVOICES,
+            "This till is holding {} invoices, which is as many as it keeps. \
+             Remove some that are settled.",
+            counter::MAX_INVOICES,
+        );
+        self.db.invoices.push(invoice);
+        self.save()
+    }
+
+    /// Close an invoice by hand, with the merchant's reason.
+    ///
+    /// Does not invent a payment: `received_darks` stays at whatever really
+    /// arrived, and the takings total ignores it.
+    pub fn close_invoice(&mut self, reference: &str, note: &str) -> anyhow::Result<()> {
+        let note = note.trim();
+        anyhow::ensure!(
+            !note.is_empty(),
+            "Say why this is closed. A till with unexplained closures cannot be \
+             reconciled at the end of the day."
+        );
+        let invoice = self
+            .db
+            .invoices
+            .iter_mut()
+            .find(|i| i.reference == reference.trim())
+            .context("no invoice with that reference")?;
+        invoice.closed_note = Some(note.to_owned());
+        self.save()
+    }
+
+    pub fn remove_invoice(&mut self, reference: &str) -> anyhow::Result<()> {
+        let before = self.db.invoices.len();
+        self.db.invoices.retain(|i| i.reference != reference.trim());
+        anyhow::ensure!(
+            self.db.invoices.len() < before,
+            "no invoice with that reference"
+        );
+        self.save()
+    }
+
+    /// Incoming payments as a till sees them.
+    fn incoming(&self) -> Vec<counter::Incoming> {
+        self.db
+            .history
+            .iter()
+            .filter(|e| e.direction == Direction::Received)
+            .map(|e| counter::Incoming {
+                amount_darks: e.amount,
+                memo: e.memo.clone(),
+                height: e.height,
+                timestamp: e.timestamp,
+                reference_id: e.txid.clone(),
+            })
+            .collect()
+    }
+
+    /// Where every invoice stands, in the order they were written.
+    pub fn till(&self, now_unix: u64) -> Vec<(counter::Invoice, counter::InvoiceStatus)> {
+        let payments = self.incoming();
+        self.db
+            .invoices
+            .iter()
+            .map(|i| (i.clone(), counter::status(i, &payments, now_unix)))
+            .collect()
     }
 
     /// Spendable outputs, respecting coinbase maturity.
@@ -2285,6 +2396,60 @@ mod tests {
         let other = WalletKeys::generate().address();
         let e = w.create_payment(&other, 1_000, 10, "").unwrap_err();
         assert!(e.to_string().contains("insufficient funds"), "got: {e}");
+        fs::remove_dir_all(&d).ok();
+    }
+
+    /// The till survives a restart, and refuses the one thing that would make
+    /// its matching ambiguous.
+    #[test]
+    fn invoices_persist_and_a_reference_is_never_reused() {
+        use crate::counter::{Invoice, InvoiceState};
+
+        let d = tmpdir("till");
+        let invoice = |reference: &str| Invoice {
+            reference: reference.into(),
+            amount_darks: Some(500),
+            description: "two coffees".into(),
+            created_unix: 1_000,
+            expires_unix: Some(2_000),
+            closed_note: None,
+        };
+
+        {
+            let mut w = Wallet::open(&d, NetworkId::Devnet, "w.seed").unwrap();
+            w.add_invoice(invoice("  A-17  ")).unwrap();
+            // Trimmed on the way in, so the stored reference is the one a memo
+            // will be compared against.
+            assert_eq!(w.invoices()[0].reference, "A-17");
+
+            let again = w.add_invoice(invoice("A-17")).unwrap_err().to_string();
+            assert!(again.contains("already has an invoice"), "{again}");
+            assert!(again.contains("same payment"), "{again}");
+            assert_eq!(w.invoices().len(), 1, "a refused invoice must not be stored");
+
+            let empty = w.add_invoice(invoice("   ")).unwrap_err().to_string();
+            assert!(empty.contains("reference"), "{empty}");
+
+            w.add_invoice(invoice("B-18")).unwrap();
+            assert!(w.close_invoice("B-18", "  ").is_err(), "a closure needs a reason");
+            w.close_invoice("B-18", "paid in cash").unwrap();
+        }
+
+        // A new process, reading the file back.
+        let mut w = Wallet::open(&d, NetworkId::Devnet, "w.seed").unwrap();
+        assert_eq!(w.invoices().len(), 2);
+        let till = w.till(1_500);
+        assert_eq!(till[0].1.state, InvoiceState::Open);
+        assert_eq!(till[1].1.state, InvoiceState::Closed);
+        assert_eq!(
+            till[1].1.received_darks, 0,
+            "closing by hand must not invent money"
+        );
+
+        assert!(w.remove_invoice("nope").is_err());
+        w.remove_invoice("A-17").unwrap();
+        assert_eq!(w.invoices().len(), 1);
+
         fs::remove_dir_all(&d).ok();
     }
 

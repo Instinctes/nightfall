@@ -1426,6 +1426,254 @@ pub fn receive(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             });
         },
     );
+
+    ui.add_space(14.0);
+    counter_card(app, ui, ctx, &address);
+}
+
+/// One invoice as the till shows it.
+///
+/// Separate from the card so it can be measured at every width with content
+/// that is actually long — the candidate warning is the longest thing this
+/// screen can say, and it is the sentence that must never be pushed off.
+pub fn invoice_row(
+    ui: &mut egui::Ui,
+    invoice: &nightfall_wallet::counter::Invoice,
+    state: &nightfall_wallet::counter::InvoiceStatus,
+) {
+    use nightfall_wallet::counter::InvoiceState;
+
+    ui.horizontal_wrapped(|ui| {
+        let tone = match state.state {
+            InvoiceState::Paid { late: false } => SUCCESS,
+            InvoiceState::Paid { late: true } | InvoiceState::Overpaid { .. } => WARN,
+            InvoiceState::Closed => TEXT_DIM,
+            InvoiceState::Open => TEXT_FAINT,
+            InvoiceState::Underpaid { .. } | InvoiceState::Expired => DANGER,
+        };
+        badge(ui, &state.headline(), tone);
+        ui.label(RichText::new(&invoice.reference).monospace().size(12.0));
+        ui.label(
+            RichText::new(match invoice.amount_darks {
+                Some(darks) => format!("{}", Amount(darks)),
+                None => "any amount".to_owned(),
+            })
+            .size(12.0),
+        );
+        if !invoice.description.is_empty() {
+            ui.label(
+                RichText::new(&invoice.description)
+                    .size(12.0)
+                    .color(TEXT_DIM),
+            );
+        }
+    });
+    if let Some(note) = &invoice.closed_note {
+        ui.label(
+            RichText::new(format!("Closed by you: {note}"))
+                .size(11.0)
+                .color(TEXT_FAINT),
+        );
+    }
+    // Candidates are the honest part of this screen: money that arrived for
+    // the right figure without saying what it was for. Named, counted, and
+    // applied to nothing.
+    if !state.candidates.is_empty() {
+        ui.label(
+            RichText::new(format!(
+                "{} payment(s) for this amount arrived without quoting the \
+                 reference. They have not been applied to anything — check them \
+                 in Activity before treating this as paid.",
+                state.candidates.len()
+            ))
+            .size(11.0)
+            .color(WARN),
+        );
+    }
+}
+
+/// The till: invoices this wallet asked to be paid, and where each one stands.
+///
+/// Matching lives in `nightfall_wallet::counter` and the rule it enforces is
+/// worth repeating here, because this screen is where it would be tempting to
+/// relax it: an invoice is never settled by an amount. A payment settles an
+/// invoice only when it quotes that invoice's reference. Anything else is
+/// shown as a candidate and left for the merchant to decide, because a till
+/// that guesses will one day ask a customer to pay twice.
+fn counter_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, address: &str) {
+    use nightfall_wallet::counter::Invoice;
+
+    let now = now_unix();
+    let till = app
+        .wallet
+        .lock()
+        .map(|w| w.till(now))
+        .unwrap_or_default();
+
+    titled_card(ui, "Counter", |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(
+            RichText::new(
+                "Ask to be paid for something specific, then watch for it. A payment \
+                 settles an invoice when it quotes that invoice's reference — never \
+                 by amount alone, because two customers owing the same figure would \
+                 otherwise settle each other's bills.",
+            )
+            .size(12.0)
+            .color(TEXT_DIM),
+        );
+
+        divider(ui);
+        ui.horizontal_wrapped(|ui| {
+            ui.allocate_ui_with_layout(
+                Vec2::new(170.0, 0.0),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    field_label(ui, "Reference", None);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut app.till_reference)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("A-17"),
+                    );
+                },
+            );
+            ui.allocate_ui_with_layout(
+                Vec2::new(150.0, 0.0),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    field_label(ui, "Amount (optional)", None);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut app.till_amount)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("1.50"),
+                    );
+                },
+            );
+            ui.allocate_ui_with_layout(
+                Vec2::new(220.0, 0.0),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    field_label(ui, "What for (optional)", None);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut app.till_description)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("Two coffees"),
+                    );
+                },
+            );
+        });
+        ui.add_space(10.0);
+        if primary_button(ui, "Add invoice", true).clicked() {
+            let amount = app.till_amount.trim();
+            let parsed = if amount.is_empty() {
+                Ok(None)
+            } else {
+                parse_amount(amount).map(Some)
+            };
+            match parsed {
+                Err(problem) => app.toasts.error(ctx, problem),
+                Ok(amount_darks) => {
+                    let invoice = Invoice {
+                        reference: app.till_reference.clone(),
+                        amount_darks,
+                        description: app.till_description.clone(),
+                        created_unix: now,
+                        expires_unix: None,
+                        closed_note: None,
+                    };
+                    let added = app
+                        .wallet
+                        .lock()
+                        .map(|mut w| w.add_invoice(invoice))
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("wallet is busy")));
+                    match added {
+                        Ok(()) => {
+                            app.till_reference.clear();
+                            app.till_amount.clear();
+                            app.till_description.clear();
+                            app.toasts.success(ctx, "Invoice added");
+                        }
+                        Err(problem) => app.toasts.error(ctx, problem.to_string()),
+                    }
+                }
+            }
+        }
+
+        if till.is_empty() {
+            return;
+        }
+
+        divider(ui);
+        let takings: u64 = till
+            .iter()
+            .map(|(_, s)| {
+                if s.is_settled() {
+                    s.received_darks
+                } else {
+                    0
+                }
+            })
+            .fold(0, u64::saturating_add);
+        kv(
+            ui,
+            "Taken in (settled invoices only)",
+            RichText::new(format!("{}", Amount(takings))).color(SUCCESS),
+        );
+        ui.add_space(8.0);
+
+        let mut close: Option<String> = None;
+        let mut remove: Option<String> = None;
+        for (invoice, state) in &till {
+            hairline(ui);
+            ui.add_space(6.0);
+            invoice_row(ui, invoice, state);
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ghost_button(ui, "Copy request").clicked() {
+                    let request = nightfall_wallet::counter::request_for(
+                        invoice,
+                        match Address::decode(address) {
+                            Ok(a) => a,
+                            Err(_) => return,
+                        },
+                        app.network,
+                    );
+                    ctx.copy_text(request.to_uri());
+                    app.toasts
+                        .success(ctx, "Request copied — it carries this invoice's reference");
+                }
+                if invoice.closed_note.is_none() && ghost_button(ui, "Close by hand").clicked() {
+                    close = Some(invoice.reference.clone());
+                }
+                if ghost_button(ui, "Remove").clicked() {
+                    remove = Some(invoice.reference.clone());
+                }
+            });
+            ui.add_space(4.0);
+        }
+
+        if let Some(reference) = close {
+            let done = app
+                .wallet
+                .lock()
+                .map(|mut w| w.close_invoice(&reference, "closed at the counter"))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("wallet is busy")));
+            match done {
+                Ok(()) => app.toasts.success(ctx, "Invoice closed — no payment was invented"),
+                Err(problem) => app.toasts.error(ctx, problem.to_string()),
+            }
+        }
+        if let Some(reference) = remove {
+            let done = app
+                .wallet
+                .lock()
+                .map(|mut w| w.remove_invoice(&reference))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("wallet is busy")));
+            if let Err(problem) = done {
+                app.toasts.error(ctx, problem.to_string());
+            }
+        }
+    });
 }
 
 // -------------------------------------------------------------- activity ---

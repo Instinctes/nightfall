@@ -150,6 +150,12 @@ pub struct App {
     pub proof_input: String,
     pub proof_result: Option<Result<nightfall_wallet::ReceiptProof, String>>,
 
+    // Counter — the till's "add an invoice" form. The invoices themselves live
+    // in the wallet's encrypted snapshot, not here.
+    pub till_reference: String,
+    pub till_amount: String,
+    pub till_description: String,
+
     // Network
     pub peer_input: String,
     pub proxy_input: String,
@@ -321,6 +327,9 @@ impl App {
             activity_filter: String::new(),
             proof_input: String::new(),
             proof_result: None,
+            till_reference: String::new(),
+            till_amount: String::new(),
+            till_description: String::new(),
             peer_input: String::new(),
             proxy_input,
             chain_check: None,
@@ -1282,6 +1291,9 @@ impl App {
         // next person's at the same screen.
         self.proof_input.zeroize();
         self.proof_result = None;
+        self.till_reference.zeroize();
+        self.till_amount.zeroize();
+        self.till_description.zeroize();
         self.send_to.zeroize();
         self.send_amount.zeroize();
         self.send_memo.zeroize();

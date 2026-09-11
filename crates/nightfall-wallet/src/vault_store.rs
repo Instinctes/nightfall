@@ -711,6 +711,14 @@ fn parse_database(bytes: &[u8]) -> anyhow::Result<WalletFile> {
         /// current build does contain it.
         #[serde(default)]
         scanned_tip: String,
+        /// The till's invoices, for exactly the reason given above: a wallet
+        /// saved by a current build carries them, and this parser rejects
+        /// unknown fields. Leaving it out made migration fail outright on any
+        /// wallet that had used Counter — caught by
+        /// `core_reopens_vault_locked_without_starting_a_node`, which is what
+        /// that comment was put there to prevent and did not.
+        #[serde(default)]
+        invoices: Vec<crate::counter::Invoice>,
     }
     let db: Database = serde_json::from_slice(bytes)
         .context("Invalid or unsupported legacy database; original preserved")?;
@@ -725,6 +733,13 @@ fn parse_database(bytes: &[u8]) -> anyhow::Result<WalletFile> {
         // anchor from the node's current block at that height would assert
         // exactly the thing the anchor exists to prove.
         scanned_tip: db.scanned_tip,
+        // Carried, not dropped. The first version of this line assumed a
+        // legacy database predates the till and could not hold invoices —
+        // which is wrong: the legacy backend is a *current* build writing a
+        // plaintext file, so it holds whatever the shop has entered. Dropping
+        // them would have lost a merchant's open invoices at the moment they
+        // encrypted their wallet.
+        invoices: db.invoices,
     })
 }
 
@@ -1217,6 +1232,45 @@ mod tests {
         assert!(reopened.is_locked());
         reopened.unlock(PASSWORD).unwrap();
         assert!(same_wallet(&original, reopened.wallet().unwrap()).unwrap());
+    }
+
+    /// A merchant's open invoices must survive the day they encrypt their
+    /// wallet.
+    ///
+    /// The legacy database is not an old format left behind by an old build —
+    /// it is a *current* build writing a plaintext file, so it carries
+    /// whatever the till holds. The first version of the migration reader
+    /// assumed otherwise and dropped the invoices on the floor; worse, the
+    /// strict field list meant a wallet that had used Counter could not be
+    /// migrated at all. Both are pinned here.
+    #[test]
+    fn migration_carries_the_tills_invoices_across() {
+        use crate::counter::Invoice;
+
+        let f = Fixture::new();
+        let mut legacy = f.legacy();
+        legacy.db.invoices.push(Invoice {
+            reference: "A-17".into(),
+            amount_darks: Some(500),
+            description: "two coffees".into(),
+            created_unix: 1_000,
+            expires_unix: None,
+            closed_note: None,
+        });
+        // Written to the plaintext file the way a current build writes one —
+        // which is the whole point: this file is not an artefact of an old
+        // version, it is what an unencrypted wallet saves today.
+        fs::write(f.db(), serde_json::to_vec_pretty(&legacy.db).unwrap()).unwrap();
+        drop(legacy);
+
+        let mut store = f.open();
+        store.migrate_legacy(PASSWORD).unwrap();
+        store.finish_legacy_retirement(PASSWORD).unwrap();
+        store.unlock(PASSWORD).unwrap();
+        let carried = store.wallet().unwrap().invoices();
+        assert_eq!(carried.len(), 1, "the till was dropped by the migration");
+        assert_eq!(carried[0].reference, "A-17");
+        assert_eq!(carried[0].amount_darks, Some(500));
     }
 
     #[cfg(unix)] // symlinks / permission bits

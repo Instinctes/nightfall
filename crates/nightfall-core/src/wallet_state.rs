@@ -351,6 +351,41 @@ impl WalletState {
             .unwrap_or_else(|| "(no wallet)".into())
     }
 
+    // The till. Every one of these needs an unlocked wallet, because the
+    // invoices live inside the encrypted snapshot — a till's references and
+    // amounts are the shop's business and do not belong in a plaintext file.
+    // None of them needs a spend key; see `nightfall_wallet::counter`.
+
+    pub fn till(
+        &self,
+        now_unix: u64,
+    ) -> Vec<(
+        nightfall_wallet::counter::Invoice,
+        nightfall_wallet::counter::InvoiceStatus,
+    )> {
+        self.wallet().map(|w| w.till(now_unix)).unwrap_or_default()
+    }
+
+    // Through `update`, like every other change: for a Vault wallet that is
+    // what writes the new ciphertext and adopts it only once it is stored.
+    // Writing the invoice into the in-memory wallet and calling save directly
+    // would leave the till one crash away from disagreeing with itself.
+
+    pub fn add_invoice(
+        &mut self,
+        invoice: nightfall_wallet::counter::Invoice,
+    ) -> anyhow::Result<()> {
+        self.update(|w| w.add_invoice(invoice))
+    }
+
+    pub fn close_invoice(&mut self, reference: &str, note: &str) -> anyhow::Result<()> {
+        self.update(|w| w.close_invoice(reference, note))
+    }
+
+    pub fn remove_invoice(&mut self, reference: &str) -> anyhow::Result<()> {
+        self.update(|w| w.remove_invoice(reference))
+    }
+
     pub fn receipt_json(&self, txid_or_commit: &str) -> anyhow::Result<String> {
         let w = self.require_wallet()?;
         let r = w
