@@ -57,9 +57,15 @@ jobs:
       # on every real run, before anything is uploaded or deleted. A check that
       # guards a deletion belongs next to the deletion.
       #
-      # Documentation versions stays: it reads docs/ and README.md, both here.
-      - name: Documentation versions, static checks
-        run: node scripts/check-docs-version.mjs
+      # Documentation versions was kept here at first, on the grounds that it
+      # reads docs/ and README.md. It does — and it also imports
+      # release-channels.mjs, which reads website/public/releases.json. The
+      # dependency is one level down, so grepping the file itself for
+      # "website/" found nothing and the step failed on the next run anyway.
+      # Worth remembering: what a check reads is its imports' business too.
+      #
+      # No node-based check remains in this workflow. Every one of them now
+      # runs in scripts/deploy-website.sh, before each publication.
 
       # The whole point of the project. Every test in this suite is the
       # inverse of an exploit that once worked against a real build.
