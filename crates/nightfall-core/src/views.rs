@@ -1,6 +1,6 @@
 //! The eight Core views, sharing the web wallet's visual hierarchy.
 
-use crate::app::{parse_amount, App, Onboarding, View, DEFAULT_FEE_DARKS};
+use crate::app::{parse_amount, App, View, DEFAULT_FEE_DARKS};
 use crate::theme::*;
 use crate::widgets::*;
 use eframe::egui::{self, Color32, RichText, Rounding, Stroke, Vec2};
@@ -336,7 +336,13 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
     // of the gradient is nearly invisible.
     ui.add_space(14.0);
     ui.horizontal(|ui| {
-        if primary_button(ui, "Send", balances.available > 0).clicked() {
+        if primary_button(
+            ui,
+            "Send",
+            balances.available > 0 && app.wallet_sync_error.is_none(),
+        )
+        .clicked()
+        {
             app.view = View::Send;
         }
         if ghost_button(ui, "  Receive  ").clicked() {
@@ -369,6 +375,12 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
                 SUCCESS,
                 false,
                 format!("In sync · block {}", format_int(scanned)),
+            )
+        } else if crate::app::IS_DEV_BUILD {
+            (
+                TEXT_DIM,
+                false,
+                format!("Local Devnet · block {}", format_int(scanned)),
             )
         } else {
             (
@@ -957,7 +969,8 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                     .as_ref()
                     .map(|d| d.saturating_add(app.send_fee) <= balances.available)
                     .unwrap_or(false)
-                && !app.send_busy;
+                && !app.send_busy
+                && app.wallet_sync_error.is_none();
 
             card(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -1085,7 +1098,13 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
-                    if primary_button(ui, "  Send now  ", !app.send_busy).clicked() {
+                    if primary_button(
+                        ui,
+                        "  Send now  ",
+                        !app.send_busy && app.wallet_sync_error.is_none(),
+                    )
+                    .clicked()
+                    {
                         do_send = true;
                     }
                     if ghost_button(ui, "  Cancel  ").clicked() {
@@ -1214,6 +1233,76 @@ pub fn receive(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 
 // -------------------------------------------------------------- activity ---
 
+/// Payments a restored backup carried in, which this wallet is withholding.
+///
+/// They are deliberately kept out of the stuck-payment notice further down.
+/// A withheld payment is pending and almost always older than half an hour,
+/// so that notice would describe it as a payment this wallet made and lost —
+/// which is exactly what it is not. This wallet never sent it; it read it out
+/// of a file and is refusing to put it back on the wire.
+///
+/// Returns true when the owner asked for the rescan screen.
+pub fn withheld_notice(
+    ui: &mut egui::Ui,
+    entries: &[nightfall_wallet::HistoryEntry],
+    now: u64,
+) -> bool {
+    let withheld: Vec<_> = entries
+        .iter()
+        .filter(|e| e.direction == Direction::Sent && e.needs_owner_decision())
+        .collect();
+    let Some(oldest) = withheld.iter().min_by_key(|e| e.timestamp) else {
+        return false;
+    };
+    let n = withheld.len();
+    let mut rescan = false;
+    egui::Frame::none()
+        .fill(DANGER.gamma_multiply(0.10))
+        .stroke(Stroke::new(1.0_f32, DANGER.gamma_multiply(0.5)))
+        .rounding(Rounding::same(ROUND_SM))
+        .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                dot(ui, DANGER, true);
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(if n == 1 {
+                        "One payment from your backup is unresolved".to_string()
+                    } else {
+                        format!("{n} payments from your backup are unresolved")
+                    })
+                    .size(13.0)
+                    .strong(),
+                );
+            });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!(
+                    "Recorded {} in the backup you restored, and held back since. This \
+                     wallet will not broadcast them on its own. A backup is a photograph \
+                     of one moment: by now each of these may have confirmed, expired, or \
+                     had its coins spent another way, and the file cannot tell you which. \
+                     Check each against the chain before you spend.",
+                    ago(oldest.timestamp, now)
+                ))
+                .size(11.5)
+                .color(TEXT_DIM),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                rescan = ghost_button(ui, "Open Settings → Rescan").clicked();
+                ui.label(
+                    RichText::new("rebuilds this wallet from the chain the node has")
+                        .size(11.0)
+                        .color(TEXT_FAINT),
+                );
+            });
+        });
+    ui.add_space(12.0);
+    rescan
+}
+
 pub fn activity(app: &mut App, ui: &mut egui::Ui) {
     let entries: Vec<_> = app
         .wallet
@@ -1279,11 +1368,17 @@ pub fn activity(app: &mut App, ui: &mut egui::Ui) {
     // only way to find out what that meant was to read the source.
     let now_for_stuck = now_unix();
     const STUCK_AFTER_SECS: u64 = 30 * 60;
+
+    if withheld_notice(ui, &entries, now_for_stuck) {
+        app.view = View::Settings;
+    }
+
     let stuck: Vec<_> = entries
         .iter()
         .filter(|e| {
             e.direction == Direction::Sent
                 && e.is_pending()
+                && !e.quarantined
                 && now_for_stuck.saturating_sub(e.timestamp) > STUCK_AFTER_SECS
         })
         .collect();
@@ -1672,6 +1767,9 @@ fn peers_zero_reason(app: &App, peers: usize, blocks: u64) -> Option<String> {
     if peers > 0 {
         return None;
     }
+    if crate::app::IS_DEV_BUILD {
+        return Some("Local test build: zero peers is expected. Start mining to create Devnet test coins; this app does not sync Mainnet and test coins have no value.".into());
+    }
     let s = app.status.as_ref()?;
     if s.loading {
         return Some(format!(
@@ -1760,6 +1858,8 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                     format!("Connected to {peers} peer(s)")
                 } else if s.map(|s| s.loading).unwrap_or(false) {
                     "No peers — chain still loading".to_string()
+                } else if crate::app::IS_DEV_BUILD {
+                    "Local Devnet — isolated test node".to_string()
                 } else {
                     "No peers — disconnected".to_string()
                 })
@@ -2048,7 +2148,15 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     // Centred rather than pinned left. Seven cards in a 700px column against
     // the left edge of a wide window is most of a screen of nothing.
     narrow_column(ui, 760.0, |ui| {
-        titled_card(ui, "Backup", |ui| {
+        app.show_vault_settings(ui, ctx);
+        if app.vault_ui.busy() {
+            return;
+        }
+        ui.add_space(14.0);
+        let address = app.wallet.lock().ok().and_then(|wallet| wallet.address());
+        app.recovery_studio.show(ui, address.as_ref());
+        ui.add_space(14.0);
+        titled_card(ui, "Recovery words", |ui| {
             ui.set_width(ui.available_width());
             ui.label(
                 RichText::new(
@@ -2061,20 +2169,38 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             );
             ui.add_space(12.0);
 
-            let seed_path = app
+            let (storage_path, encrypted) = app
                 .wallet
                 .lock()
-                .map(|w| w.seed_path.display().to_string())
+                .map(|w| {
+                    if w.is_vault() {
+                        (
+                            w.seed_path
+                                .with_file_name("core.seed.vault")
+                                .join("wallet.nfv")
+                                .display()
+                                .to_string(),
+                            true,
+                        )
+                    } else {
+                        (w.seed_path.display().to_string(), false)
+                    }
+                })
                 .unwrap_or_default();
             kv(
                 ui,
-                "Seed file",
-                RichText::new(seed_path).monospace().size(11.0),
+                "Wallet storage",
+                RichText::new(storage_path).monospace().size(11.0),
             );
             kv(
                 ui,
-                "Permissions",
-                RichText::new("0600 — owner only").color(SUCCESS),
+                "Protection",
+                RichText::new(if encrypted {
+                    "Encrypted Vault"
+                } else {
+                    "Legacy seed — not encrypted"
+                })
+                .color(if encrypted { SUCCESS } else { WARN }),
             );
 
             ui.add_space(12.0);
@@ -2202,12 +2328,24 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                     let wallet = std::sync::Arc::clone(&app.wallet);
                     let signal = std::sync::Arc::clone(&app.sync_signal);
                     let syncing = std::sync::Arc::clone(&app.syncing);
+                    let access = std::sync::Arc::clone(&app.wallet_scan_access);
+                    let paused = std::sync::Arc::clone(&app.wallet_paused);
                     syncing.store(true, std::sync::atomic::Ordering::SeqCst);
                     std::thread::spawn(move || {
+                        let Ok(_access) = access.lock() else {
+                            syncing.store(false, std::sync::atomic::Ordering::SeqCst);
+                            return;
+                        };
                         let result = wallet
                             .lock()
                             .map_err(|_| "wallet busy".to_string())
-                            .and_then(|mut w| w.rescan(&node).map_err(|e| e.to_string()));
+                            .and_then(|mut w| {
+                                if paused.load(std::sync::atomic::Ordering::SeqCst) || !w.can_scan()
+                                {
+                                    return Err("Rescan cancelled: wallet is being secured.".into());
+                                }
+                                w.rescan(&node).map_err(|e| e.to_string())
+                            });
                         syncing.store(false, std::sync::atomic::Ordering::SeqCst);
                         if let Ok(mut slot) = signal.lock() {
                             *slot = Some(result);
@@ -2218,7 +2356,7 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             }
             ui.add_space(4.0);
             ui.label(
-                RichText::new("Use this if a balance looks wrong. It re-reads the whole chain.")
+                RichText::new("Re-reads the chain and replaces local history; notes/receipts may be lost. Export a backup first. Blocked while payments or reservations are pending.")
                     .size(10.5)
                     .color(TEXT_FAINT),
             );
@@ -2481,121 +2619,7 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 // ----------------------------------------------------------- onboarding ---
 
 pub fn onboarding(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
-    ui.set_max_width(560.0);
-    ui.vertical_centered(|ui| {
-        logo(ui, 56.0);
-        ui.add_space(12.0);
-        ui.label(RichText::new("NIGHTFALL").size(22.0).color(TEXT).strong());
-        ui.label(RichText::new("Core wallet").size(13.0).color(ACCENT_HI));
-    });
-    ui.add_space(22.0);
-
-    match &app.onboarding {
-        Some(Onboarding::Choice) => {
-            titled_card(ui, "This computer has no wallet yet", |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(
-                    RichText::new(
-                        "Create a new wallet, or restore the same 24 words you wrote down \
-                         on a phone or in the browser. The words are BIP-39; Nightfall \
-                         derives keys differently, so they do not open a Bitcoin wallet.",
-                    )
-                    .size(13.0)
-                    .color(TEXT_DIM),
-                );
-                ui.add_space(16.0);
-                if primary_button(ui, "  Create a new wallet  ", true).clicked() {
-                    app.begin_create_wallet();
-                }
-                ui.add_space(8.0);
-                if ghost_button(ui, "  I already have 24 words  ").clicked() {
-                    app.onboarding = Some(Onboarding::Restore {
-                        phrase: String::new(),
-                        error: None,
-                    });
-                }
-            });
-        }
-        Some(Onboarding::Create { phrase, written }) => {
-            let phrase = phrase.clone();
-            let written = *written;
-            titled_card(ui, "Write these 24 words down", |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(
-                    RichText::new(
-                        "This is the only backup. Anyone who sees them can spend. \
-                         Paper, offline. Not a screenshot.",
-                    )
-                    .size(13.0)
-                    .color(TEXT_DIM),
-                );
-                ui.add_space(12.0);
-                if copyable(ui, &phrase, true) {
-                    app.toasts.info(ctx, "Copied — still write them on paper");
-                }
-                ui.add_space(12.0);
-                let mut ack = written;
-                if ui
-                    .checkbox(&mut ack, "I wrote these 24 words down")
-                    .changed()
-                {
-                    if let Some(Onboarding::Create { written, .. }) = &mut app.onboarding {
-                        *written = ack;
-                    }
-                }
-                ui.add_space(12.0);
-                if primary_button(ui, "  Open the wallet  ", written).clicked() && written {
-                    if let Err(e) = app.finish_create_wallet(&phrase) {
-                        app.toasts.error(ctx, e.to_string());
-                    }
-                }
-            });
-        }
-        Some(Onboarding::Restore { phrase: _, error }) => {
-            let err = error.clone();
-            titled_card(ui, "Restore from 24 words", |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(
-                    RichText::new(
-                        "Paste the phrase. Whitespace and case do not matter. \
-                         A bad checksum is caught before anything is written.",
-                    )
-                    .size(13.0)
-                    .color(TEXT_DIM),
-                );
-                ui.add_space(10.0);
-                if let Some(Onboarding::Restore { phrase, .. }) = &mut app.onboarding {
-                    ui.add(
-                        egui::TextEdit::multiline(phrase)
-                            .margin(FIELD_MARGIN)
-                            .desired_rows(4)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("word1 word2 … word24"),
-                    );
-                }
-                if let Some(e) = err {
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(e).size(12.0).color(DANGER));
-                }
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    if primary_button(ui, "  Restore  ", true).clicked() {
-                        let phrase = match &app.onboarding {
-                            Some(Onboarding::Restore { phrase, .. }) => phrase.clone(),
-                            _ => String::new(),
-                        };
-                        if let Err(e) = app.finish_restore_wallet(&phrase) {
-                            if let Some(Onboarding::Restore { error, .. }) = &mut app.onboarding {
-                                *error = Some(e.to_string());
-                            }
-                        }
-                    }
-                    if ghost_button(ui, "Back").clicked() {
-                        app.onboarding = Some(Onboarding::Choice);
-                    }
-                });
-            });
-        }
-        None => {}
-    }
+    ui.label(format!("NIGHTFALL · {}", app.network));
+    ui.add_space(16.0);
+    app.show_onboarding(ui, ctx);
 }

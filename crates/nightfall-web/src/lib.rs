@@ -5,6 +5,7 @@ use nightfall_types::{Amount, NetworkId, DARKS_PER_NIGHT};
 use nightfall_wallet::{LightOutput, Wallet};
 use serde_json::json;
 use wasm_bindgen::prelude::*;
+mod vault;
 
 const MATURITY: u64 = 1_440;
 const DEFAULT_FEE: u64 = DARKS_PER_NIGHT / 1_000;
@@ -63,21 +64,21 @@ fn parse_amount(s: &str) -> Result<u64, JsError> {
 fn lights_from_json(raw: &str) -> Result<Vec<LightOutput>, JsError> {
     let arr: Vec<serde_json::Value> =
         serde_json::from_str(raw).map_err(|e| err(format!("outputs: {e}")))?;
-    Ok(arr
-        .into_iter()
-        .filter_map(|o| {
+    arr.into_iter()
+        .map(|o| {
             Some(LightOutput {
                 height: o.get("height")?.as_u64()?,
                 timestamp: o.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0),
                 commit: o.get("commit")?.as_str()?.to_string(),
                 ephemeral_pk: o.get("ephemeral_pk")?.as_str()?.to_string(),
                 output_pk: o.get("output_pk")?.as_str()?.to_string(),
-                view_tag: o.get("view_tag")?.as_u64()? as u8,
+                view_tag: u8::try_from(o.get("view_tag")?.as_u64()?).ok()?,
                 payload: o.get("payload")?.as_str()?.to_string(),
                 coinbase: o.get("coinbase").and_then(|v| v.as_bool()).unwrap_or(false),
             })
         })
-        .collect())
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| err("Invalid scan output. The scan position was not advanced."))
 }
 
 fn load(state: &str) -> Result<Wallet, JsError> {

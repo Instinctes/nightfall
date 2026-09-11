@@ -888,6 +888,9 @@ pub struct Toasts {
 }
 
 impl Toasts {
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
     pub fn push(&mut self, ctx: &egui::Context, text: impl Into<String>, color: Color32) {
         self.items.push(Toast {
             text: text.into(),

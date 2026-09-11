@@ -31,6 +31,16 @@ fn urgency_colour(u: logic::Urgency) -> Color32 {
 }
 
 pub fn swap(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
+    if app
+        .wallet
+        .lock()
+        .map(|wallet| wallet.is_vault())
+        .unwrap_or(true)
+    {
+        ui.heading("Swaps remain a separate research track");
+        ui.label("Experimental swap secrets and recovery deadlines are not integrated with Vault. Swap actions are disabled for Vault wallets.");
+        return;
+    }
     // Centred instead of pinned to the left edge. On a wide window this page
     // was a column of cards hugging one side with the rest of the screen
     // empty, which read as something failing to load.

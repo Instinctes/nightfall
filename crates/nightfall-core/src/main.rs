@@ -13,11 +13,17 @@ mod app_swap_drive;
 mod app_swap_lock;
 mod app_swap_night;
 mod app_swap_send;
+mod backup_recovery;
+mod onboarding;
+mod recovery_studio;
 #[cfg(test)]
 mod swap_live_tests;
 mod swap_worker;
 mod theme;
 mod tray;
+#[cfg(all(test, unix))]
+mod vault_node_tests;
+mod vault_ui;
 #[cfg(test)]
 mod view_layout_tests;
 mod views;
@@ -38,7 +44,18 @@ fn main() -> eframe::Result<()> {
         .init();
 
     let network = parse_network_arg();
-    let datadir = parse_datadir_arg().unwrap_or_else(|| default_data_dir(network));
+    if app::IS_DEV_BUILD && network != NetworkId::Devnet {
+        eprintln!("This development build only supports devnet. No wallet was opened.");
+        std::process::exit(2);
+    }
+    let datadir = parse_datadir_arg().unwrap_or_else(|| {
+        let path = default_data_dir(network);
+        if app::IS_DEV_BUILD {
+            path.join("wallet-1.0-dev")
+        } else {
+            path
+        }
+    });
 
     tracing::info!("{COIN_NAME} Core — {network} — {}", datadir.display());
 
@@ -49,8 +66,8 @@ fn main() -> eframe::Result<()> {
     // same `blocks.bin`. Two writers produce a chain file neither of them
     // wrote. The guard is held for the whole run — binding it to `_` would
     // drop it here and lock nothing.
-    let _dir_lock = match nightfall_storage::dirlock::acquire(&datadir) {
-        Ok(lock) => lock,
+    let dir_lock = match nightfall_storage::dirlock::acquire(&datadir) {
+        Ok(lock) => std::sync::Arc::new(lock),
         Err(e) => {
             tracing::error!("{e}");
             already_running_dialog(&e.to_string());
@@ -63,7 +80,10 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1180.0, 780.0])
             .with_min_inner_size([940.0, 620.0])
             .with_icon(load_window_icon())
-            .with_title(format!("{COIN_NAME} Core — {network}")),
+            .with_title(format!(
+                "{COIN_NAME} Core {} — {network}",
+                app::WALLET_VERSION
+            )),
         ..Default::default()
     };
 
@@ -72,7 +92,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
-            Ok(Box::new(App::new(network, datadir)))
+            Ok(Box::new(App::with_data_lock(network, dir_lock)))
         }),
     )
 }
@@ -147,7 +167,7 @@ fn parse_network_arg() -> NetworkId {
             };
         }
     }
-    default_network(env!("CARGO_PKG_VERSION"))
+    default_network(app::WALLET_VERSION)
 }
 
 fn default_network(version: &str) -> NetworkId {
