@@ -16,30 +16,25 @@ use nightfall_types::{
 use nightfall_wallet::payment_request::{self, PaymentRequest};
 use nightfall_wallet::Direction;
 
-pub fn page_intro(view: View, ui: &mut egui::Ui) {
-    let description = match view {
+/// One line saying what a page is for. Rendered as the topbar's subtitle.
+pub fn page_description(view: View) -> &'static str {
+    match view {
         View::Dashboard => "Your balance, recent activity and network health at a glance.",
         View::Send => "Choose a recipient, enter an amount and review the total before sending.",
-        View::Receive => "Share your address or QR code to receive NIGHT into this wallet.",
-        View::Activity => "Review payments, mining rewards and confirmation status.",
+        View::Receive => "Your address, and the invoices you are waiting to be paid.",
+        View::Activity => "Payments, mining rewards, confirmation status and receipts.",
         View::Mining => "Manage CPU usage and follow your mining performance.",
         View::Network => "Check connectivity, synchronization and network privacy.",
         View::Swap => {
             "Exchange NIGHT and Bitcoin. Follow each step and keep Core running until completion."
         }
         View::Settings => "Manage backups, privacy and wallet maintenance.",
-    };
-    let width = match view {
-        View::Send => 660.0,
-        View::Settings => 760.0,
-        View::Swap => 860.0,
-        _ => 1180.0,
-    };
-    narrow_column(ui, width, |ui| {
-        ui.add_space(8.0);
-        ui.label(RichText::new(description).size(14.0).color(TEXT_DIM));
-        ui.add_space(18.0);
-    });
+    }
+}
+
+/// Kept for the layout test, which measures the description at each width.
+pub fn page_intro(view: View, ui: &mut egui::Ui) {
+    let _ = (page_description(view), ui);
 }
 
 fn night(darks: u64) -> String {
@@ -340,19 +335,18 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
 
     // Actions live below the gradient, not on it: a white pill on the light end
     // of the gradient is nearly invisible.
-    ui.add_space(14.0);
+    ui.add_space(GAP_MD);
     ui.horizontal(|ui| {
-        if primary_button(
+        // One width for both. "Send" at 75 points beside "Receive" at 92 was
+        // two sizes for one pair of equally important choices — and the
+        // padding hack that produced it (`"  Receive  "`) is exactly the kind
+        // of thing that stops working the moment the label changes.
+        if let Some(index) = button_row(
             ui,
-            "Send",
-            balances.available > 0 && app.wallet_sync_error.is_none(),
-        )
-        .clicked()
-        {
-            app.view = View::Send;
-        }
-        if ghost_button(ui, "  Receive  ").clicked() {
-            app.view = View::Receive;
+            &["Send", "Receive"],
+            true,
+        ) {
+            app.view = if index == 0 { View::Send } else { View::Receive };
         }
 
         // The wallet syncs itself every few seconds; this is a status readout,
@@ -824,18 +818,50 @@ pub fn proof_card(ui: &mut egui::Ui, proof: &nightfall_wallet::ReceiptProof) {
         RichText::new(&proof.reference).monospace().size(11.0),
     );
 
-    ui.add_space(12.0);
-    kicker(ui, "WHAT THIS PROVES");
-    ui.add_space(4.0);
-    ui.colored_label(if proof.amount_proven { SUCCESS } else { WARN }, proof.summary());
+    // The two halves as two blocks, not as one column of bullets. What a
+    // receipt proves and what it leaves open are different kinds of statement,
+    // and a reader who has to work out which paragraph is which will read the
+    // reassuring one and stop.
+    ui.add_space(GAP_MD);
+    let tone = if proof.amount_proven { SUCCESS } else { WARN };
+    // A framed block's own margins come out of the parent's width, so asking
+    // for the full available width *inside* it adds them back and pushes the
+    // block past its container. Take them off first.
+    let inner = (ui.available_width() - 28.0).max(80.0);
+    egui::Frame::none()
+        .fill(tone.gamma_multiply(0.10))
+        .stroke(Stroke::new(1.0_f32, tone.gamma_multiply(0.35)))
+        .rounding(Rounding::same(ROUND_FIELD))
+        .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+        .show(ui, |ui| {
+            ui.set_width(inner);
+            kicker(ui, "WHAT THIS PROVES");
+            ui.add_space(GAP_XS);
+            ui.colored_label(tone, proof.summary());
+        });
 
-    ui.add_space(12.0);
-    kicker(ui, "WHAT IT DOES NOT");
-    ui.add_space(4.0);
-    for line in proof.not_established() {
-        ui.colored_label(TEXT_DIM, format!("• {line}"));
-        ui.add_space(3.0);
-    }
+    ui.add_space(GAP_SM);
+    egui::Frame::none()
+        .fill(SURFACE_LOW)
+        .stroke(Stroke::new(1.0_f32, BORDER))
+        .rounding(Rounding::same(ROUND_FIELD))
+        .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+        .show(ui, |ui| {
+            ui.set_width(inner);
+            kicker(ui, "WHAT IT DOES NOT");
+            ui.add_space(GAP_XS);
+            // One label, not a dash beside a label: a horizontal layout does
+            // not wrap its children, so the long v1 warning ran straight off
+            // the right edge of the card. The dash goes in the string.
+            for line in proof.not_established() {
+                ui.label(
+                    RichText::new(format!("—  {line}"))
+                        .color(TEXT_DIM)
+                        .size(12.5),
+                );
+                ui.add_space(GAP_XS);
+            }
+        });
 }
 
 /// Verify a pasted receipt and remember the answer.
@@ -1524,45 +1550,45 @@ fn counter_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, address: 
         );
 
         divider(ui);
-        ui.horizontal_wrapped(|ui| {
-            ui.allocate_ui_with_layout(
-                Vec2::new(170.0, 0.0),
-                egui::Layout::top_down(egui::Align::LEFT),
-                |ui| {
-                    field_label(ui, "Reference", None);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut app.till_reference)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("A-17"),
-                    );
-                },
-            );
-            ui.allocate_ui_with_layout(
-                Vec2::new(150.0, 0.0),
-                egui::Layout::top_down(egui::Align::LEFT),
-                |ui| {
-                    field_label(ui, "Amount (optional)", None);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut app.till_amount)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("1.50"),
-                    );
-                },
-            );
-            ui.allocate_ui_with_layout(
-                Vec2::new(220.0, 0.0),
-                egui::Layout::top_down(egui::Align::LEFT),
-                |ui| {
-                    field_label(ui, "What for (optional)", None);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut app.till_description)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("Two coffees"),
-                    );
-                },
-            );
+        // Three fields on one line, sharing the width and sitting on the same
+        // baseline. They were three fixed-width columns inside a wrapping row,
+        // which gave each one a different top edge — the labels stepped
+        // downwards across the form and nothing lined up with anything.
+        let columns: [(&str, &str, &mut String); 3] = [
+            ("Reference", "A-17", &mut app.till_reference),
+            ("Amount in NIGHT", "1.50", &mut app.till_amount),
+            ("What for", "Two coffees", &mut app.till_description),
+        ];
+        let gap = GAP_SM;
+        let each = ((ui.available_width() - gap * 2.0) / 3.0).max(120.0);
+        ui.horizontal_top(|ui| {
+            // egui inserts `item_spacing.x` between items on top of anything
+            // added by hand. Adding a gap as well made the row exactly two
+            // spacings wider than the space it was given — which the layout
+            // test caught as a 20-point overflow at 620 points.
+            ui.spacing_mut().item_spacing.x = 0.0;
+            for (index, (label, hint, value)) in columns.into_iter().enumerate() {
+                if index > 0 {
+                    ui.add_space(gap);
+                }
+                ui.allocate_ui_with_layout(
+                    Vec2::new(each, 0.0),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        ui.set_width(each);
+                        ui.label(RichText::new(label).size(11.5).color(TEXT_FAINT));
+                        ui.add_space(5.0);
+                        ui.add(
+                            egui::TextEdit::singleline(value)
+                                .desired_width(f32::INFINITY)
+                                .margin(egui::Margin::symmetric(12.0, 9.0))
+                                .hint_text(RichText::new(hint).color(TEXT_FAINT)),
+                        );
+                    },
+                );
+            }
         });
-        ui.add_space(10.0);
+        ui.add_space(GAP_MD);
         if primary_button(ui, "Add invoice", true).clicked() {
             let amount = app.till_amount.trim();
             let parsed = if amount.is_empty() {
@@ -1941,9 +1967,14 @@ pub fn activity(app: &mut App, ui: &mut egui::Ui) {
                                 // they meant to.
                                 app.proof_input = json;
                                 check_receipt(app);
+                                // …and take the owner to it. The card is below
+                                // the whole history list, so on a wallet with
+                                // any history at all "see the card below" was
+                                // an instruction to go looking.
+                                app.proof_scroll = true;
                                 app.toasts.success(
                                     ui.ctx(),
-                                    "Receipt copied — see the Proof Card below for what it proves",
+                                    "Receipt copied — the Proof Card below shows what it proves",
                                 );
                             }
                             None => app.toasts.error(ui.ctx(), "Could not build a receipt"),
@@ -1958,6 +1989,9 @@ pub fn activity(app: &mut App, ui: &mut egui::Ui) {
 
     titled_card(ui, "Proof Card", |ui| {
         ui.set_width(ui.available_width());
+        if std::mem::take(&mut app.proof_scroll) {
+            ui.scroll_to_cursor(Some(egui::Align::Min));
+        }
         ui.label(
             RichText::new(
                 "Check a receipt — one you were given, or one you are about to give. A \
@@ -3134,7 +3168,8 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 // ----------------------------------------------------------- onboarding ---
 
 pub fn onboarding(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
-    ui.label(format!("NIGHTFALL · {}", app.network));
-    ui.add_space(16.0);
+    // The mark and the network now live in `screen_header`, which the caller
+    // draws. A second copy of them here was the same fact stated twice, one
+    // line apart, in two different sizes.
     app.show_onboarding(ui, ctx);
 }

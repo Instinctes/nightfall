@@ -528,7 +528,9 @@ pub fn well<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
 /// different sizes and two different colours across one form.
 pub fn field_label(ui: &mut egui::Ui, label: &str, note: Option<RichText>) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(label).size(12.0).color(TEXT_DIM));
+        // Same size and colour as the label `text_field` draws, so a form
+        // built from both does not have two kinds of field label in it.
+        ui.label(RichText::new(label).size(11.5).color(TEXT_FAINT));
         if let Some(note) = note {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(note);
@@ -547,6 +549,15 @@ pub fn field_label(ui: &mut egui::Ui, label: &str, note: Option<RichText>) {
 /// load rather than as a deliberately narrow form.
 pub fn narrow_column<R>(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let avail = ui.available_width();
+    // Grow with the window, up to a point.
+    //
+    // Every full-window screen asked for 620 points regardless of how much
+    // space there was, so on a 1180-point window a form sat in the middle with
+    // 280 points of nothing on either side — the single biggest reason these
+    // screens read as empty. A line of text still should not run the full
+    // width of a wide window, so it grows to 820 and stops: wide enough to
+    // stop looking abandoned, narrow enough to stay readable.
+    let width = width.max((avail * 0.72).min(820.0));
     let pad = ((avail - width) / 2.0).max(0.0);
     let mut out = None;
     ui.horizontal(|ui| {
@@ -714,7 +725,18 @@ pub fn primary_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Res
     let galley =
         ui.painter()
             .layout_no_wrap(text.to_string(), egui::FontId::proportional(14.0), fg);
-    let size = Vec2::new(galley.size().x + 44.0, 42.0);
+    // One height for every button in the product. This was 42 while
+    // `ghost_button` was 38, so any row holding one of each — the lock screen,
+    // for one — sat four pixels out of line and read as unfinished.
+    //
+    // The width is clamped to the room available, because a button sized
+    // purely from its own label ignores the box it was put in: `button_row`
+    // allocated a shared width and this happily drew past it, which is how a
+    // clamped row still overflowed a 320-point card.
+    let size = Vec2::new(
+        (galley.size().x + 44.0).min(ui.available_width().max(72.0)),
+        CONTROL_H,
+    );
     let (rect, resp) = ui
         .add_enabled_ui(enabled, |ui| ui.allocate_exact_size(size, Sense::click()))
         .inner;
@@ -780,8 +802,201 @@ pub fn ghost_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
             .fill(SURFACE_HI)
             .stroke(Stroke::new(1.0_f32, BORDER))
             .rounding(Rounding::same(ROUND_PILL))
-            .min_size(Vec2::new(0.0, 38.0)),
+            .min_size(Vec2::new(0.0, CONTROL_H)),
     )
+}
+
+/// A row of buttons that share one width.
+///
+/// Two buttons side by side whose widths come from their own labels look like
+/// two unrelated controls that happen to be adjacent — "Unlock wallet" at 127
+/// points beside "Clear password fields" at 161 was the clearest example. When
+/// the choices belong together, they get the same box.
+///
+/// Returns the index of the button pressed, if any. The first is the primary.
+pub fn button_row(ui: &mut egui::Ui, labels: &[&str], enabled: bool) -> Option<usize> {
+    let mut clicked = None;
+    let widest = labels
+        .iter()
+        .map(|label| {
+            ui.painter()
+                .layout_no_wrap((*label).to_string(), egui::FontId::proportional(14.0), TEXT)
+                .size()
+                .x
+        })
+        .fold(0.0_f32, f32::max);
+    // …but never wider than the space there is. A shared width taken purely
+    // from the longest label pushed a two-button row off a 320-point card,
+    // which is a narrower window than this wallet supports but exactly the
+    // width the layout tests check — and they were right to.
+    let spacing = ui.spacing().item_spacing.x;
+    let count = labels.len().max(1) as f32;
+    let room = (ui.available_width() - spacing * (count - 1.0)) / count;
+    let width = (widest + 44.0).min(room.max(72.0));
+    ui.horizontal(|ui| {
+        for (index, label) in labels.iter().enumerate() {
+            let pressed = if index == 0 {
+                ui.allocate_ui(Vec2::new(width, CONTROL_H), |ui| {
+                    primary_button(ui, label, enabled)
+                })
+                .inner
+                .clicked()
+            } else {
+                ui.add_enabled(
+                    enabled,
+                    egui::Button::new(RichText::new(*label).color(TEXT))
+                        .fill(SURFACE_HI)
+                        .stroke(Stroke::new(1.0_f32, BORDER))
+                        .rounding(Rounding::same(ROUND_PILL))
+                        // `min_size` is a floor, not a ceiling: a long label
+                        // grew the button straight past the width this row
+                        // had agreed on. Truncating holds the row together.
+                        .wrap_mode(egui::TextWrapMode::Truncate)
+                        .min_size(Vec2::new(width, CONTROL_H)),
+                )
+                .clicked()
+            };
+            if pressed {
+                clicked = Some(index);
+            }
+        }
+    });
+    clicked
+}
+
+/// A labelled text field.
+///
+/// Every input in the wallet used to be a bare capsule carrying its own
+/// question as placeholder text — which disappears the moment anyone types, so
+/// a half-filled form is a column of anonymous boxes and the only way to find
+/// out what one is for is to empty it. The label stays.
+///
+/// `hint` is then free to do the job placeholders are actually good at:
+/// showing the shape of a valid answer rather than repeating the label.
+pub fn text_field(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: &str,
+    hint: &str,
+    value: &mut String,
+    password: bool,
+) -> egui::Response {
+    field_label(ui, label, None);
+    let response = ui.add(
+        egui::TextEdit::singleline(value)
+            .id_salt(id)
+            .password(password)
+            .char_limit(4096)
+            .desired_width(ui.available_width())
+            .margin(egui::Margin::symmetric(12.0, 9.0))
+            .hint_text(RichText::new(hint).color(TEXT_FAINT)),
+    );
+    ui.add_space(GAP_SM);
+    response
+}
+
+/// A full-width choice: a label, and one line saying what it is for.
+///
+/// For a set of alternatives that are one decision. They share a width so the
+/// set reads as a set, and each carries its own explanation so the difference
+/// between them does not have to be inferred from the verb.
+pub fn choice_button(ui: &mut egui::Ui, label: &str, note: &str, primary: bool) -> bool {
+    let width = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 58.0), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    let hot = resp.hovered();
+    let fill = if primary {
+        if hot {
+            lerp_color(GRAD_A, Color32::WHITE, 0.08)
+        } else {
+            GRAD_A
+        }
+    } else if hot {
+        SURFACE_HOVER
+    } else {
+        SURFACE_HI
+    };
+    ui.painter().rect(
+        rect,
+        Rounding::same(ROUND_SM),
+        fill,
+        Stroke::new(1.0_f32, if primary { GRAD_A } else { BORDER }),
+    );
+    if resp.has_focus() {
+        ui.painter().rect_stroke(
+            rect.expand(3.0),
+            Rounding::same(ROUND_SM),
+            Stroke::new(2.0_f32, ACCENT_HI),
+        );
+    }
+    let (title_colour, note_colour) = if primary {
+        (INK, Color32::from_rgb(0x4A, 0x3A, 0x6E))
+    } else {
+        (TEXT, TEXT_FAINT)
+    };
+    let left = rect.left() + 18.0;
+    ui.painter().text(
+        egui::pos2(left, rect.top() + 17.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(14.5),
+        title_colour,
+    );
+    ui.painter().text(
+        egui::pos2(left, rect.top() + 39.0),
+        egui::Align2::LEFT_CENTER,
+        note,
+        egui::FontId::proportional(11.5),
+        note_colour,
+    );
+    if hot {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.clicked()
+}
+
+/// The bar every full-window screen starts with.
+///
+/// The lock, migration, onboarding and scan screens each used to open with a
+/// bare `ui.label("NIGHTFALL · devnet")` in the top-left corner and then a
+/// single card floating in an otherwise empty window — more than half the
+/// surface carrying nothing. A window that is mostly nothing reads as a
+/// program that has not finished loading.
+///
+/// This gives those screens the same frame the main window has: the mark, the
+/// network, and one line of state on the right that is true whether or not a
+/// wallet is open. It is deliberately not a card — it is the window's edge.
+pub fn screen_header(ui: &mut egui::Ui, network: &str, right: &[(&str, Color32)]) {
+    egui::Frame::none()
+        .fill(RAIL)
+        .inner_margin(egui::Margin::symmetric(GAP_LG, GAP_SM + 2.0))
+        .rounding(Rounding {
+            nw: ROUND_SM,
+            ne: ROUND_SM,
+            sw: 0.0,
+            se: 0.0,
+        })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                logo(ui, 18.0);
+                ui.add_space(GAP_SM);
+                ui.label(
+                    RichText::new("NIGHTFALL")
+                        .size(13.0)
+                        .color(TEXT)
+                        .extra_letter_spacing(1.4),
+                );
+                ui.add_space(GAP_XS);
+                badge(ui, network, CYAN);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    for (text, colour) in right.iter().rev() {
+                        ui.label(RichText::new(*text).size(11.5).color(*colour));
+                        ui.add_space(GAP_MD);
+                    }
+                });
+            });
+        });
 }
 
 /// A monospace value with a copy button. Returns true when copied.

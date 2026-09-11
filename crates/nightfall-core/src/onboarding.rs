@@ -190,19 +190,41 @@ impl Onboarding {
                 Self::Choice => {
                     ui.heading("Your wallet. Protected from the start.");
                     ui.label("Create a wallet or restore your Nightfall 24-word backup. The seed, outputs and history are encrypted before they reach disk.");
-                    ui.add_space(16.0);
-                    if primary_button(ui, "Create an encrypted wallet", true).clicked() {
-                        next = Some(Self::Setup(Box::new(Setup::create(WalletKeys::generate()))));
-                    }
-                    ui.add_space(8.0);
-                    if ghost_button(ui, "Restore my 24 words").clicked() {
-                        next = Some(Self::Setup(Box::new(Setup::restore(false))));
-                    }
-                    ui.add_space(8.0);
-                    if ghost_button(ui, "Recover from encrypted backup").clicked() {
-                        next = Some(Self::Backup(Box::new(
-                            crate::backup_recovery::BackupRecovery::new(false),
-                        )));
+                    ui.add_space(GAP_MD);
+                    // Three choices, three widths taken from three labels, was
+                    // three unrelated-looking controls. They are one decision,
+                    // so they get one column — and each says what it is for,
+                    // because "restore" and "recover" are the same word to
+                    // most people and the difference decides what they need
+                    // to have in their hand.
+                    for (index, (label, note)) in [
+                        (
+                            "Create an encrypted wallet",
+                            "New 24 words, written down by you before anything is saved.",
+                        ),
+                        (
+                            "Restore my 24 words",
+                            "You have the words on paper.",
+                        ),
+                        (
+                            "Recover from encrypted backup",
+                            "You have a .nfv file and the password it was exported with.",
+                        ),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let pressed = choice_button(ui, label, note, index == 0);
+                        if pressed {
+                            next = Some(match index {
+                                0 => Self::Setup(Box::new(Setup::create(WalletKeys::generate()))),
+                                1 => Self::Setup(Box::new(Setup::restore(false))),
+                                _ => Self::Backup(Box::new(
+                                    crate::backup_recovery::BackupRecovery::new(false),
+                                )),
+                            });
+                        }
+                        ui.add_space(GAP_SM);
                     }
                 }
                 Self::Setup(setup) => {
@@ -269,45 +291,52 @@ impl Onboarding {
                     ui.add_space(16.0);
                     ui.label("2 · Choose your Vault password");
                     ui.label("At least 12 characters. Use a unique, long passphrase. Spaces are preserved exactly.");
-                    secret_field(
-                        ui,
-                        &mut setup.password,
-                        "setup-password",
-                        "New Vault password",
-                    );
+                    secret_field(ui, &mut setup.password, "setup-password", "Vault password");
                     secret_field(
                         ui,
                         &mut setup.confirmation,
                         "setup-confirmation",
-                        "Repeat Vault password",
+                        "Vault password again",
                     );
                     ui.checkbox(&mut setup.acknowledged, "I have an offline copy of my words and understand there is no password reset.");
                     if let Some(error) = &setup.error {
+                        ui.add_space(GAP_SM);
                         ui.colored_label(DANGER, error);
                     }
-                    ui.add_space(12.0);
-                    if primary_button(
-                        ui,
-                        "Save encrypted wallet",
-                        setup.expected.is_none() || setup.verified,
-                    )
-                    .clicked()
-                    {
-                        match setup.request() {
-                            Ok(value) => {
-                                setup.error = None;
-                                request = Some(value);
+                    ui.add_space(GAP_MD);
+                    // The two ends of the same decision, in one row at one
+                    // width. "Save encrypted wallet" and "Cancel setup —
+                    // discard unsaved input" were stacked at 178 and 265
+                    // points, and on an 812-point window the second one fell
+                    // off the bottom edge entirely.
+                    let labels: &[&str] = if setup.interrupted {
+                        &["Save encrypted wallet"]
+                    } else {
+                        &["Save encrypted wallet", "Cancel setup"]
+                    };
+                    match button_row(ui, labels, true) {
+                        Some(0) => {
+                            if setup.expected.is_some() && !setup.verified {
+                                setup.error = Some(
+                                    "Type your written words back first. Nothing is saved until \
+                                     this wallet can be recovered from them."
+                                        .into(),
+                                );
+                            } else {
+                                match setup.request() {
+                                    Ok(value) => {
+                                        setup.error = None;
+                                        request = Some(value);
+                                    }
+                                    Err(error) => setup.error = Some(error.to_string()),
+                                }
                             }
-                            Err(error) => setup.error = Some(error.to_string()),
                         }
+                        Some(1) => next = Some(Self::Choice),
+                        _ => {}
                     }
-                    if !setup.interrupted {
-                        ui.add_space(8.0);
-                        if ghost_button(ui, "Cancel setup — discard unsaved input").clicked() {
-                            next = Some(Self::Choice);
-                        }
-                    }
-                    ui.label("Saving ends with a locked wallet. Unlock separately to start the node. Nothing is broadcast during setup.");
+                    ui.add_space(GAP_SM);
+                    ui.label(egui::RichText::new("Cancelling discards everything typed here. Saving ends with a locked wallet; unlock separately to start the node. Nothing is broadcast during setup.").size(11.5).color(TEXT_FAINT));
                 }
             }
         });
@@ -318,16 +347,13 @@ impl Onboarding {
     }
 }
 
-fn secret_field(ui: &mut egui::Ui, text: &mut Zeroizing<String>, id: &str, hint: &str) {
-    ui.add(
-        egui::TextEdit::singleline(&mut **text)
-            .id_salt(id)
-            .password(true)
-            .char_limit(1024)
-            .margin(FIELD_MARGIN)
-            .desired_width(ui.available_width())
-            .hint_text(hint),
-    );
+/// A hidden field with a label that stays.
+///
+/// The label used to be the placeholder, so a filled-in setup form was three
+/// identical rows of dots with nothing saying which was the phrase, which the
+/// password and which the repeat.
+fn secret_field(ui: &mut egui::Ui, text: &mut Zeroizing<String>, id: &str, label: &str) {
+    crate::widgets::text_field(ui, id, label, "", &mut **text, true);
 }
 
 #[cfg(test)]

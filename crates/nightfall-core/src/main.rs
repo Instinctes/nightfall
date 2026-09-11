@@ -44,18 +44,29 @@ fn main() -> eframe::Result<()> {
         .init();
 
     let network = parse_network_arg();
-    if app::IS_DEV_BUILD && network != NetworkId::Devnet {
+    if app::IS_DEV_BUILD && !app::IS_DEV_MAINNET && network != NetworkId::Devnet {
         eprintln!("This development build only supports devnet. No wallet was opened.");
         std::process::exit(2);
     }
     let datadir = parse_datadir_arg().unwrap_or_else(|| {
         let path = default_data_dir(network);
-        if app::IS_DEV_BUILD {
+        // A mainnet development build uses the real directory on purpose —
+        // opening the operator's own wallet is the whole reason it exists — so
+        // it must not be sent to the `wallet-1.0-dev` sandbox, which would
+        // silently present an empty wallet instead.
+        if app::IS_DEV_BUILD && !app::IS_DEV_MAINNET {
             path.join("wallet-1.0-dev")
         } else {
             path
         }
     });
+    if app::IS_DEV_MAINNET {
+        eprintln!(
+            "Development build with mainnet enabled. Once this saves, the released \
+             0.9.5 app can no longer read this wallet file — restore an encrypted \
+             backup if you need to go back."
+        );
+    }
 
     tracing::info!("{COIN_NAME} Core — {network} — {}", datadir.display());
 
@@ -182,6 +193,31 @@ fn default_network(version: &str) -> NetworkId {
 fn prereleases_default_to_isolated_devnet() {
     assert_eq!(default_network("0.9.4-dev.2"), NetworkId::Devnet);
     assert_eq!(default_network("0.9.2"), NetworkId::Mainnet);
+}
+
+/// The mainnet permission belongs to a build, not to a command line.
+///
+/// An ordinary development build must refuse `--network mainnet` however it is
+/// spelled, so a copy that leaves the operator's machine cannot be talked onto
+/// the real network by an argument. Only a binary compiled with
+/// `NIGHTFALL_DEV_MAINNET` may, and that one says so on every page.
+#[test]
+fn a_development_build_opens_mainnet_only_when_it_was_built_to() {
+    // This test binary is itself built without the flag, which is the ordinary
+    // case and the one worth pinning.
+    assert!(
+        !app::IS_DEV_MAINNET,
+        "the default build must not carry the mainnet permission",
+    );
+    // …and the gate is written in terms of that constant, not of an argument.
+    let gate = |is_dev: bool, dev_mainnet: bool, network: NetworkId| {
+        is_dev && !dev_mainnet && network != NetworkId::Devnet
+    };
+    assert!(gate(true, false, NetworkId::Mainnet), "dev build must refuse mainnet");
+    assert!(gate(true, false, NetworkId::Testnet), "dev build must refuse testnet");
+    assert!(!gate(true, false, NetworkId::Devnet));
+    assert!(!gate(true, true, NetworkId::Mainnet), "an opted-in build may");
+    assert!(!gate(false, false, NetworkId::Mainnet), "a release build may");
 }
 
 fn parse_datadir_arg() -> Option<PathBuf> {

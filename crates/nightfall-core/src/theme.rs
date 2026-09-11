@@ -6,26 +6,72 @@
 use eframe::egui::{self, Color32, FontFamily, FontId, Rounding, Stroke, TextStyle};
 
 // --- surfaces -------------------------------------------------------------
+//
+// # Elevation, and the bug that lived here
+//
+// These used to run the wrong way. `BG` was #423858 and `SURFACE` — the card
+// fill — was #302747, *darker* than the page it sat on. In a dark interface a
+// card is expected to catch more light than its background; when it catches
+// less, the eye reads it as a hole rather than an object, and every screen
+// looks flat and unfinished no matter how the contents are arranged. It was
+// the single biggest reason the wallet looked like a prototype.
+//
+// The ladder now only goes one way, and each step is a real step (roughly 6–8
+// points of lightness, enough to see without banding):
+//
+//   BG        the page, darkest
+//   RAIL      navigation, between the page and a card
+//   SURFACE   a card, clearly above the page
+//   SURFACE_HI a control on a card
+//   SURFACE_HOVER the same control under the pointer
+//
+// `SURFACE_LOW` is the one thing that goes *down*: a text field is a hole you
+// put something into, and it should read as sunk below the card.
+
 /// Page background. Not black — a desaturated violet reads warmer and lets the
 /// accent gradients sit on it without vibrating.
-pub const BG: Color32 = Color32::from_rgb(0x42, 0x38, 0x58);
-/// Navigation rail, one step darker than the page.
-pub const RAIL: Color32 = Color32::from_rgb(0x33, 0x2C, 0x4D);
-/// Card fill.
-pub const SURFACE: Color32 = Color32::from_rgb(0x30, 0x27, 0x47);
+pub const BG: Color32 = Color32::from_rgb(0x24, 0x1D, 0x36);
+/// Navigation rail. Between the page and a card, so the rail reads as part of
+/// the window's frame rather than as a very wide card.
+pub const RAIL: Color32 = Color32::from_rgb(0x2B, 0x23, 0x40);
+/// Card fill. Above the page — see the note above.
+pub const SURFACE: Color32 = Color32::from_rgb(0x36, 0x2D, 0x50);
 /// Raised element inside a card.
-pub const SURFACE_HI: Color32 = Color32::from_rgb(0x4B, 0x40, 0x64);
-pub const SURFACE_HOVER: Color32 = Color32::from_rgb(0x54, 0x47, 0x70);
-/// Sunken element: text fields, code blocks.
-pub const SURFACE_LOW: Color32 = Color32::from_rgb(0x40, 0x36, 0x57);
+pub const SURFACE_HI: Color32 = Color32::from_rgb(0x44, 0x3A, 0x62);
+pub const SURFACE_HOVER: Color32 = Color32::from_rgb(0x51, 0x45, 0x73);
+/// Sunken element: text fields, code blocks. Below the card on purpose.
+pub const SURFACE_LOW: Color32 = Color32::from_rgb(0x29, 0x21, 0x3D);
 
-pub const BORDER: Color32 = Color32::from_rgb(0x55, 0x48, 0x70);
+pub const BORDER: Color32 = Color32::from_rgb(0x4A, 0x3F, 0x6B);
 pub const BORDER_HI: Color32 = Color32::from_rgb(0x80, 0x6D, 0x9E);
 
 // --- depth ----------------------------------------------------------------
-// Softer, layered violet surfaces based on the user's visual reference.
-pub const WASH_A: Color32 = Color32::from_rgb(0x4A, 0x40, 0x65);
-pub const WASH_B: Color32 = Color32::from_rgb(0x50, 0x38, 0x65);
+// The page wash. Kept close to BG now that the page is the dark end of the
+// ladder: a wash that is much lighter than its page competes with the cards
+// standing on it, which is what made the old background feel busy and the
+// cards feel weak at the same time.
+pub const WASH_A: Color32 = Color32::from_rgb(0x2C, 0x24, 0x42);
+pub const WASH_B: Color32 = Color32::from_rgb(0x31, 0x23, 0x45);
+
+// --- spacing --------------------------------------------------------------
+//
+// One scale, so that "a gap" is always one of five numbers rather than
+// whatever looked right in the moment. The old code used 4, 6, 8, 10, 12, 14,
+// 18, 22 and 28 interchangeably, which is why nothing lined up between cards.
+/// Inside a row: label to value, icon to text.
+pub const GAP_XS: f32 = 6.0;
+/// Between related lines in a card.
+pub const GAP_SM: f32 = 10.0;
+/// Between a heading and its body, and between rows.
+pub const GAP_MD: f32 = 16.0;
+/// Between cards.
+pub const GAP_LG: f32 = 24.0;
+/// Between sections of a page.
+pub const GAP_XL: f32 = 36.0;
+
+/// Every button is this tall. Three heights for one kind of control is what
+/// made the lock screen's two buttons look ragged.
+pub const CONTROL_H: f32 = 38.0;
 
 // --- text -----------------------------------------------------------------
 pub const TEXT: Color32 = Color32::from_rgb(0xF6, 0xF2, 0xFF);
@@ -55,6 +101,13 @@ pub const ROUND: f32 = 28.0;
 pub const ROUND_SM: f32 = 16.0;
 /// Fully rounded pills.
 pub const ROUND_PILL: f32 = 999.0;
+/// Text fields and other things you put something *into*.
+///
+/// Separate from `ROUND_SM` because a 32-point field at radius 16 is a
+/// capsule, and a capsule reads as a button. Every input in the wallet looked
+/// like a pill you could press, which is why the lock screen's password field
+/// competed with the button under it instead of leading to it.
+pub const ROUND_FIELD: f32 = 10.0;
 
 pub fn apply(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
@@ -93,39 +146,47 @@ pub fn apply(ctx: &egui::Context) {
     v.selection.stroke = Stroke::new(1.0_f32, ACCENT_HI);
     v.hyperlink_color = ACCENT_HI;
 
+    // Text fields inherit these. Buttons override with a pill of their own, so
+    // the radius here is the field radius — see `ROUND_FIELD`.
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = SURFACE;
     w.noninteractive.weak_bg_fill = SURFACE;
     w.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
     w.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT_DIM);
-    w.noninteractive.rounding = Rounding::same(ROUND_SM);
+    w.noninteractive.rounding = Rounding::same(ROUND_FIELD);
 
-    w.inactive.bg_fill = SURFACE_HI;
-    w.inactive.weak_bg_fill = SURFACE_HI;
+    // A field is sunk into the card, not raised off it. It used to be filled
+    // with SURFACE_HI — lighter than the card — so an empty input was the
+    // brightest object on the screen and pulled the eye away from whatever the
+    // screen was actually asking.
+    w.inactive.bg_fill = SURFACE_LOW;
+    w.inactive.weak_bg_fill = SURFACE_LOW;
     w.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
     w.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
-    w.inactive.rounding = Rounding::same(ROUND_SM);
+    w.inactive.rounding = Rounding::same(ROUND_FIELD);
 
-    w.hovered.bg_fill = SURFACE_HOVER;
-    w.hovered.weak_bg_fill = SURFACE_HOVER;
+    w.hovered.bg_fill = SURFACE_LOW;
+    w.hovered.weak_bg_fill = SURFACE_LOW;
     w.hovered.bg_stroke = Stroke::new(1.0_f32, BORDER_HI);
     w.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT);
-    w.hovered.rounding = Rounding::same(ROUND_SM);
-    w.hovered.expansion = 1.0;
+    w.hovered.rounding = Rounding::same(ROUND_FIELD);
+    w.hovered.expansion = 0.0;
 
-    w.active.bg_fill = ACCENT_DIM;
-    w.active.weak_bg_fill = ACCENT_DIM;
-    w.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+    // Focused. A 2-point accent edge, so which field has the keyboard is
+    // visible from across the room rather than inferred from the caret.
+    w.active.bg_fill = SURFACE_LOW;
+    w.active.weak_bg_fill = SURFACE_LOW;
+    w.active.bg_stroke = Stroke::new(2.0_f32, ACCENT_HI);
     w.active.fg_stroke = Stroke::new(1.0_f32, TEXT);
-    w.active.rounding = Rounding::same(ROUND_SM);
+    w.active.rounding = Rounding::same(ROUND_FIELD);
 
     w.open.bg_fill = SURFACE_HI;
     w.open.bg_stroke = Stroke::new(1.0_f32, BORDER_HI);
 
-    style.spacing.item_spacing = egui::vec2(12.0, 12.0);
+    style.spacing.item_spacing = egui::vec2(GAP_SM, GAP_SM);
     style.spacing.button_padding = egui::vec2(16.0, 9.0);
     style.spacing.window_margin = egui::Margin::same(18.0);
-    style.spacing.interact_size.y = 38.0;
+    style.spacing.interact_size.y = CONTROL_H;
     style.spacing.scroll.bar_width = 8.0;
 
     ctx.set_style(style);

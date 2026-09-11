@@ -28,6 +28,25 @@ pub const WALLET_VERSION: &str = match option_env!("NIGHTFALL_DEV_VERSION") {
 };
 pub const IS_DEV_BUILD: bool = option_env!("NIGHTFALL_DEV_VERSION").is_some();
 
+/// A development build that is allowed to open mainnet.
+///
+/// Off unless `NIGHTFALL_DEV_MAINNET` was set when the binary was compiled, so
+/// the permission belongs to one artifact rather than to a command line: a dev
+/// build that escapes cannot be talked into mainnet by an argument, and you
+/// can tell which kind you are holding without running it.
+///
+/// This exists because the operator asked for a build that opens their real
+/// wallet. It is not a step toward shipping development builds on mainnet.
+///
+/// # What such a build does to a 0.9.5 wallet
+///
+/// 1.0 adds a `invoices` field to the wallet file, and that file refuses
+/// unknown fields. So once a 1.0 build has *saved*, the released 0.9.5 app can
+/// no longer read that wallet — it is a one-way door, and the way back is an
+/// encrypted backup made beforehand. The banner in `mainnet_dev_warning` says
+/// so on every page, and the build's own README says it first.
+pub const IS_DEV_MAINNET: bool = option_env!("NIGHTFALL_DEV_MAINNET").is_some();
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Dashboard,
@@ -149,6 +168,8 @@ pub struct App {
     // showing it before it is handed over, not after.
     pub proof_input: String,
     pub proof_result: Option<Result<nightfall_wallet::ReceiptProof, String>>,
+    /// Set when a receipt was just produced, so the card scrolls into view.
+    pub proof_scroll: bool,
 
     // Counter — the till's "add an invoice" form. The invoices themselves live
     // in the wallet's encrypted snapshot, not here.
@@ -327,6 +348,7 @@ impl App {
             activity_filter: String::new(),
             proof_input: String::new(),
             proof_result: None,
+            proof_scroll: false,
             till_reference: String::new(),
             till_amount: String::new(),
             till_description: String::new(),
@@ -1018,7 +1040,20 @@ impl App {
                         .find(|(v, _)| *v == self.view)
                         .map(|(_, l)| *l)
                         .unwrap_or("");
-                    ui.label(RichText::new(title).size(20.0).strong());
+                    // Title and its one-line description together. The
+                    // description used to float in the content area between
+                    // the warning banner and the first card, belonging to
+                    // neither — a sentence in the middle of nothing. It is a
+                    // subtitle, so it sits under the title.
+                    ui.vertical(|ui| {
+                        ui.add_space(-2.0);
+                        ui.label(RichText::new(title).size(20.0).strong());
+                        ui.label(
+                            RichText::new(views::page_description(self.view))
+                                .size(11.5)
+                                .color(TEXT_FAINT),
+                        );
+                    });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let loading = self.status.as_ref().map(|s| s.loading).unwrap_or(false);
@@ -1132,7 +1167,20 @@ impl eframe::App for App {
                         .inner_margin(egui::Margin::same(28.0)),
                 )
                 .show(ctx, |ui| {
-                    views::onboarding(self, ui, ctx);
+                    screen_header(ui, &self.network.to_string(), &[
+                        ("Nothing is written until your words are confirmed", TEXT_FAINT),
+                        (WALLET_VERSION, TEXT_FAINT),
+                    ]);
+                    ui.add_space(GAP_LG);
+                    // Onboarding is the one full-window screen that never had a
+                    // scroll area, and it is also the tallest: on a 812-point
+                    // window the restore card ran past the bottom edge, so
+                    // "Save encrypted wallet" sat on the last visible line and
+                    // "Cancel setup" was simply not reachable. A person setting
+                    // up a wallet could not back out of it.
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| views::onboarding(self, ui, ctx));
                 });
             self.toasts.show(ctx);
             return;
@@ -1156,17 +1204,69 @@ impl eframe::App for App {
                 // content the way a background image would.
                 page_wash(ui.painter(), ui.clip_rect());
 
+                // The scan warning, at the size it is worth.
+                //
+                // It used to print three lines on all eight pages — over a
+                // hundred points of identical text above every screen, read
+                // once and then permanently in the way. It is now one line
+                // that opens when someone wants the detail, and it opens
+                // itself on the two pages where it changes what the wallet
+                // will do: Send, because sending is blocked, and Dashboard,
+                // because that is where the balance it qualifies is shown.
                 if let Some(error) = &self.wallet_sync_error {
+                    let detailed = matches!(self.view, View::Dashboard | View::Send);
                     egui::Frame::none()
                         .fill(WARN.gamma_multiply(0.12))
-                        .inner_margin(egui::Margin::same(12.0))
-                        .rounding(Rounding::same(ROUND_SM))
+                        .stroke(Stroke::new(1.0_f32, WARN.gamma_multiply(0.35)))
+                        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                        .rounding(Rounding::same(ROUND_FIELD))
                         .show(ui, |ui| {
-                            ui.colored_label(WARN, "Wallet scan incomplete — balances and confirmations may be stale");
-                            ui.label(error);
-                            ui.label("Sending is blocked until a valid scan completes. Preserve an encrypted backup; do not clear pending payments or swap reservations to bypass this warning.");
+                            ui.set_width(ui.available_width());
+                            egui::CollapsingHeader::new(
+                                RichText::new(
+                                    "Wallet scan incomplete — balances and confirmations may be stale",
+                                )
+                                .color(WARN)
+                                .size(12.5),
+                            )
+                            // Per page, so the open state on Dashboard does not
+                            // decide the state on Receive — a shared id made
+                            // `default_open` apply once, to whichever page was
+                            // shown first, and the rest inherited it.
+                            .id_salt(("scan-warning", self.view as u8))
+                            .default_open(detailed)
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(error).size(12.0).color(TEXT_DIM));
+                                ui.label(RichText::new("Sending is blocked until a valid scan completes. Preserve an encrypted backup; do not clear pending payments or swap reservations to bypass this warning.").size(12.0).color(TEXT_DIM));
+                            });
                         });
-                    ui.add_space(12.0);
+                    ui.add_space(GAP_SM);
+                }
+
+                // A development build looking at real money says so, on every
+                // page, in the colour reserved for things that cannot be
+                // undone. It is not a toast and it does not dismiss: the risk
+                // lasts as long as the build does.
+                if IS_DEV_MAINNET {
+                    egui::Frame::none()
+                        .fill(DANGER.gamma_multiply(0.14))
+                        .stroke(Stroke::new(1.0_f32, DANGER.gamma_multiply(0.5)))
+                        .rounding(Rounding::same(ROUND_FIELD))
+                        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width() - 28.0);
+                            ui.label(
+                                RichText::new(format!(
+                                    "Development build {WALLET_VERSION} on mainnet, using your \
+                                     real wallet directory. Once it saves, the released 0.9.5 \
+                                     app can no longer read this wallet — an encrypted backup \
+                                     is the only way back. Never run both at once.",
+                                ))
+                                .color(DANGER)
+                                .size(12.5),
+                            );
+                        });
+                    ui.add_space(GAP_SM);
                 }
 
                 if let Some(err) = self.status_error.clone() {
@@ -1364,8 +1464,28 @@ impl App {
                         .inner_margin(egui::Margin::same(28.0)),
                 )
                 .show(ctx, |ui| {
-                    ui.label(format!("NIGHTFALL · {}", self.network));
-                    ui.add_space(16.0);
+                    let tip = self.tip_height();
+                    let peers = self.status.as_ref().map(|s| s.peers).unwrap_or(0);
+                    screen_header(
+                        ui,
+                        &self.network.to_string(),
+                        &[
+                            (
+                                &if tip > 0 {
+                                    format!("Chain height {}", format_int(tip))
+                                } else {
+                                    "Reading the chain".to_owned()
+                                },
+                                if tip > 0 { SUCCESS } else { TEXT_FAINT },
+                            ),
+                            (
+                                &format!("{peers} peers"),
+                                if peers > 0 { TEXT_DIM } else { TEXT_FAINT },
+                            ),
+                            (WALLET_VERSION, TEXT_FAINT),
+                        ],
+                    );
+                    ui.add_space(GAP_XL);
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         narrow_column(ui, 620.0, |ui| self.show_vault_settings(ui, ctx));
                     });

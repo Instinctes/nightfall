@@ -53,12 +53,19 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
+            // The clock alone is not a unique name: these run in parallel
+            // threads of one process, and the platform does not hand each of
+            // them a distinct nanosecond. Two fixtures then race for the same
+            // directory and one loses. The counter makes the name unique by
+            // construction; the clock stays so leftovers remain readable.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let nonce = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
             let root = std::env::temp_dir().join(format!(
-                "nightfall-core-vault-test-{}-{nonce}",
+                "nightfall-core-vault-test-{}-{nonce}-{seq}",
                 std::process::id()
             ));
             fs::create_dir(&root).unwrap();
@@ -1212,32 +1219,33 @@ impl VaultUi {
                 }
                 let new_password = matches!(self.custody, Custody::Legacy | Custody::Unlocked)
                     || (self.custody == Custody::Migration && !self.has_snapshot);
-                ui.add_space(12.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut *self.password)
-                        .id_salt("vault-password")
-                        .password(true)
-                        .char_limit(1024)
-                        .desired_width(ui.available_width())
-                        .margin(FIELD_MARGIN)
-                        .hint_text(if new_password {
-                            "New unique password (at least 12 characters)"
-                        } else {
-                            "Vault password"
-                        }),
+                ui.add_space(GAP_MD);
+                text_field(
+                    ui,
+                    "vault-password",
+                    if new_password {
+                        "New password"
+                    } else {
+                        "Password"
+                    },
+                    if new_password {
+                        "At least 12 characters"
+                    } else {
+                        ""
+                    },
+                    &mut self.password,
+                    true,
                 );
                 if new_password {
-                    ui.add_space(8.0);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut *self.confirmation)
-                            .id_salt("vault-password-confirm")
-                            .password(true)
-                            .char_limit(1024)
-                            .desired_width(ui.available_width())
-                            .margin(FIELD_MARGIN)
-                            .hint_text("Repeat new password"),
+                    text_field(
+                        ui,
+                        "vault-password-confirm",
+                        "Password again",
+                        "",
+                        &mut self.confirmation,
+                        true,
                     );
-                    ui.label("Use a password manager or a long unique passphrase — never your recovery words.");
+                    ui.label(egui::RichText::new("Use a password manager or a long unique passphrase — never your recovery words.").size(11.5).color(TEXT_FAINT));
                 }
                 let migrating = matches!(self.custody, Custody::Legacy | Custody::Migration);
                 if migrating {
@@ -1253,15 +1261,39 @@ impl VaultUi {
                     }
                     _ => ("Encrypt a verified copy", Action::Prepare),
                 };
-                let enabled = !self.password.is_empty()
-                    && (!new_password || self.password == self.confirmation)
-                    && (!migrating || self.acknowledged);
-                ui.add_space(12.0);
-                if primary_button(ui, label, enabled).clicked() {
-                    action = Some(requested);
-                }
-                if ghost_button(ui, "Clear password fields").clicked() {
-                    self.clear_fields();
+                // Why this is not a disabled button.
+                //
+                // It was one, and on the lock screen a disabled primary button
+                // is almost indistinguishable from an enabled one — same pill,
+                // same size, a slightly different fill. Pressing it did
+                // nothing and said nothing, so the wallet looked broken rather
+                // than incomplete. The control now stays live and answers:
+                // press it with an empty field and it tells you the field is
+                // empty. A reason is worth more than a grey rectangle.
+                let blocker = if self.password.is_empty() {
+                    Some(if new_password {
+                        "Choose a password first."
+                    } else {
+                        "Enter your password first."
+                    })
+                } else if new_password && *self.password != *self.confirmation {
+                    Some("The two passwords are not the same.")
+                } else if migrating && !self.acknowledged {
+                    Some("Confirm the backup notice above first.")
+                } else {
+                    None
+                };
+                ui.add_space(GAP_MD);
+                match button_row(ui, &[label, "Clear fields"], true) {
+                    Some(0) => match blocker {
+                        Some(reason) => self.error = Some(reason.to_owned()),
+                        None => action = Some(requested),
+                    },
+                    Some(1) => {
+                        self.clear_fields();
+                        self.error = None;
+                    }
+                    _ => {}
                 }
                 if self.custody == Custody::Unlocked {
                     ui.add_space(20.0);
