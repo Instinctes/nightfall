@@ -19,10 +19,16 @@ use zeroize::{Zeroize, Zeroizing};
 
 mod receipt;
 pub use receipt::{verify_receipt, PaymentReceipt};
+/// The payment request: what a payee asks for, as one checkable line.
+pub mod amount_input;
+pub mod payment_request;
 pub mod recovery;
 pub mod vault;
 /// Per-platform filesystem primitives for the vault adapter. Private: the
-/// order of operations belongs to `vault_store`, not to its callers.
+/// order of operations belongs to `vault_store`, not to its callers — and it
+/// follows `vault_store` off the browser, where there is no filesystem for any
+/// of it to mean anything.
+#[cfg(not(target_arch = "wasm32"))]
 mod vault_fs;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod vault_store;

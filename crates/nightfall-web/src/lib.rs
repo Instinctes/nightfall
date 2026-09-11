@@ -32,33 +32,10 @@ fn height(n: f64) -> u64 {
     }
 }
 
+/// The shared parser, not a local one. See `nightfall_wallet::amount_input`
+/// for what the three copies used to disagree about.
 fn parse_amount(s: &str) -> Result<u64, JsError> {
-    let s = s.trim().replace(',', ".");
-    if s.is_empty() || s.starts_with('-') {
-        return Err(err("enter a positive amount"));
-    }
-    let (whole, frac) = s.split_once('.').unwrap_or((s.as_str(), ""));
-    if frac.len() > 8 {
-        return Err(err("at most 8 decimal places"));
-    }
-    let w: u64 = if whole.is_empty() {
-        0
-    } else {
-        whole.parse().map_err(|_| err("not a number"))?
-    };
-    let mut f = frac.to_string();
-    while f.len() < 8 {
-        f.push('0');
-    }
-    let f: u64 = if f.is_empty() {
-        0
-    } else {
-        f.parse().map_err(|_| err("not a number"))?
-    };
-    w.checked_mul(DARKS_PER_NIGHT)
-        .and_then(|x| x.checked_add(f))
-        .filter(|&x| x > 0)
-        .ok_or_else(|| err("amount too small or too large"))
+    nightfall_wallet::amount_input::parse_night(s).map_err(err)
 }
 
 fn lights_from_json(raw: &str) -> Result<Vec<LightOutput>, JsError> {
@@ -159,7 +136,26 @@ pub fn reset_scan(state: &str) -> Result<JsValue, JsError> {
 
 #[wasm_bindgen]
 pub fn address_qr_svg(address: &str) -> Result<String, JsError> {
-    let code = qrcode::QrCode::new(address.as_bytes()).map_err(err)?;
+    qr_svg(address)
+}
+
+/// A QR code for any text the wallet shows — an address, or a payment request.
+///
+/// Separate from `address_qr_svg` only in name and in what it refuses. The
+/// published 0.9.5 channel calls that one, so it stays exactly as it is; this
+/// is the 1.0 spelling, and it bounds its input, because a QR code that cannot
+/// be photographed is not an error anyone notices until a customer is standing
+/// there.
+#[wasm_bindgen(js_name = requestQrSvg)]
+pub fn request_qr_svg(text: &str) -> Result<String, JsError> {
+    if text.len() > nightfall_wallet::payment_request::MAX_LEN {
+        return Err(err("This is too long to put in a QR code."));
+    }
+    qr_svg(text)
+}
+
+fn qr_svg(text: &str) -> Result<String, JsError> {
+    let code = qrcode::QrCode::new(text.as_bytes()).map_err(err)?;
     Ok(code
         .render::<qrcode::render::svg::Color>()
         .min_dimensions(240, 240)

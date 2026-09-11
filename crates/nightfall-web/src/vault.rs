@@ -4,7 +4,7 @@
 use super::{err, lights_from_json, parse_amount, DEFAULT_FEE, MATURITY};
 use nightfall_crypto::{Address, WalletKeys};
 use nightfall_types::{Amount, NetworkId};
-use nightfall_wallet::{vault::Vault, Wallet};
+use nightfall_wallet::{payment_request::PaymentRequest, vault::Vault, Wallet};
 use serde_json::json;
 use wasm_bindgen::prelude::*;
 
@@ -113,6 +113,96 @@ impl BrowserVault {
     #[wasm_bindgen(js_name = viewKey)]
     pub fn view_key(&self) -> Result<String, JsError> {
         Ok(self.inner.wallet().map_err(err)?.view_key_string())
+    }
+
+    /// Write a payment request for this wallet's own address.
+    ///
+    /// Amounts arrive as the owner typed them, in NIGHT, and are converted by
+    /// the wallet's own amount parser rather than a second one written for this
+    /// screen — two parsers for one quantity is two chances to disagree about
+    /// somebody's money. An empty amount means the payer chooses.
+    ///
+    /// `expires_unix` is the payee's own deadline and nothing more. The chain
+    /// has no opinion about it and neither does this function.
+    ///
+    /// The request is built and then read back with the same parser a payer
+    /// will use, and a mismatch is an error. That round trip is what validates
+    /// it: the memo length, the amount bound and the encoding rules are all
+    /// enforced once, in the parser, instead of being restated here where they
+    /// could drift.
+    #[wasm_bindgen(js_name = paymentRequest)]
+    pub fn payment_request(
+        &self,
+        amount: &str,
+        memo: &str,
+        invoice: &str,
+        expires_unix: &str,
+    ) -> Result<String, JsError> {
+        let wallet = self.inner.wallet().map_err(err)?;
+        let amount = amount.trim();
+        let request = PaymentRequest {
+            address: wallet.address(),
+            network: wallet.network,
+            amount_darks: if amount.is_empty() {
+                None
+            } else {
+                Some(parse_amount(amount)?)
+            },
+            memo: memo.trim().to_owned(),
+            invoice: invoice.trim().to_owned(),
+            expires_unix: match expires_unix.trim() {
+                "" => None,
+                text => Some(
+                    text.parse()
+                        .map_err(|_| err("The expiry must be a whole number of seconds."))?,
+                ),
+            },
+        };
+        let uri = request.to_uri();
+        match PaymentRequest::parse(&uri) {
+            Ok(read_back) if read_back == request => Ok(uri),
+            Ok(_) => Err(err(
+                "This request did not survive being read back, so it has not been \
+                 produced. Please report this.",
+            )),
+            Err(problem) => Err(err(&problem.to_string())),
+        }
+    }
+
+    /// Read a payment request and say what it asks for.
+    ///
+    /// A request for another network is *described*, not rejected: a wallet
+    /// that merely fails to understand a testnet request teaches its owner to
+    /// distrust the message rather than the request, and the one thing they
+    /// need to be told is precisely why paying it here would be wrong.
+    /// `payable` is false and `network_problem` carries the explanation.
+    ///
+    /// `now_unix` comes from the caller because a browser's clock is the
+    /// caller's, not this module's — and an expiry is measured against the
+    /// reader's clock, which is the honest thing to say about it.
+    #[wasm_bindgen(js_name = readPaymentRequest)]
+    pub fn read_payment_request(&self, text: &str, now_unix: f64) -> Result<String, JsError> {
+        let now = height(now_unix)?;
+        let wallet = self.inner.wallet().map_err(err)?;
+        let request = PaymentRequest::parse(text).map_err(|e| err(&e.to_string()))?;
+        let network_problem = request.require_network(wallet.network).err();
+        Ok(json!({
+            "address": request.address.encode(),
+            "network": request.network.as_str(),
+            "amount_darks": request.amount_darks.map(|d| d.to_string()),
+            "amount_text": request.amount_text(),
+            "memo": request.memo,
+            "invoice": request.invoice,
+            "expires_unix": request.expires_unix.map(|e| e.to_string()),
+            "expired": request.is_expired(now),
+            "payable": network_problem.is_none(),
+            "network_problem": network_problem.map(|e| e.to_string()),
+            "mine": request.address == wallet.address(),
+            // The canonical spelling, so a payer can compare what they were
+            // given with what this wallet read it as.
+            "uri": request.to_uri(),
+        })
+        .to_string())
     }
 
     pub fn info(&self) -> Result<String, JsError> {

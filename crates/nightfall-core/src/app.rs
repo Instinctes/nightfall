@@ -1531,49 +1531,14 @@ fn save_proxy(datadir: &std::path::Path, value: &str) {
 
 /// Parse a decimal NIGHT amount into darks.
 ///
-/// Done on the string, never through `f64` — binary floating point cannot
-/// represent 8 decimal places exactly, and silently losing a dark in a payment
-/// form is not acceptable.
+/// The rules and the wording live in `nightfall_wallet::amount_input`, which
+/// Core, the browser wallet and the mobile wallet all call. They used to have
+/// one of these each, and the copies had drifted: `.5` was half a NIGHT in two
+/// of them and an error in this one, and `+5` was five NIGHT in two of them and
+/// an error here. Two wallets from one project disagreeing about what a typed
+/// amount means is a defect regardless of which reading is the better one.
 pub fn parse_amount(s: &str) -> Result<u64, String> {
-    let normalised = s.trim().replace(',', ".");
-    if normalised.is_empty() {
-        return Err("Enter an amount".into());
-    }
-    if normalised.starts_with('-') {
-        return Err("Amount must be positive".into());
-    }
-
-    let mut parts = normalised.splitn(2, '.');
-    let whole_str = parts.next().unwrap_or("");
-    let frac_str = parts.next().unwrap_or("");
-
-    if !whole_str.chars().all(|c| c.is_ascii_digit()) || whole_str.is_empty() {
-        return Err("Amount is not a number".into());
-    }
-    if !frac_str.chars().all(|c| c.is_ascii_digit()) {
-        return Err("Amount is not a number".into());
-    }
-    if frac_str.len() > 8 {
-        return Err("At most 8 decimal places".into());
-    }
-
-    let whole: u64 = whole_str
-        .parse()
-        .map_err(|_| "Amount too large".to_string())?;
-    let mut darks = whole
-        .checked_mul(DARKS_PER_NIGHT)
-        .ok_or("Amount too large")?;
-
-    if !frac_str.is_empty() {
-        let padded = format!("{frac_str:0<8}");
-        let frac: u64 = padded.parse().map_err(|_| "Bad decimals".to_string())?;
-        darks = darks.checked_add(frac).ok_or("Amount too large")?;
-    }
-
-    if darks == 0 {
-        return Err("Amount must be greater than zero".into());
-    }
-    Ok(darks)
+    nightfall_wallet::amount_input::parse_night(s).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -1600,6 +1565,17 @@ mod tests {
         assert!(parse_amount("-1").is_err());
         assert!(parse_amount("abc").is_err());
         assert!(parse_amount("0.123456789").is_err());
+    }
+
+    /// The two spellings that used to depend on which wallet you were holding.
+    /// Core now reads `.5` as half a NIGHT, where it used to refuse it, and the
+    /// browser and mobile wallets now refuse `+5`, where they used to read it
+    /// as five. Pinned here as well as in `amount_input` because this is where
+    /// someone looking for Core's behaviour will look.
+    #[test]
+    fn agrees_with_the_other_wallets_about_the_two_awkward_spellings() {
+        assert_eq!(parse_amount(".5").unwrap(), DARKS_PER_NIGHT / 2);
+        assert!(parse_amount("+5").is_err());
     }
 
     #[test]
@@ -1689,12 +1665,19 @@ mod tests {
     #[cfg(unix)]
     fn onboarding_publication_discards_setup_and_never_starts_a_node() {
         use super::*;
+        // The clock alone is not a unique name: these run in parallel
+        // threads of one process, and the platform does not hand each of
+        // them a distinct nanosecond. Two fixtures then race for the same
+        // directory and one loses. The counter makes the name unique by
+        // construction; the clock stays so leftovers remain readable.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "nightfall-onboarding-shell-{}-{nonce}",
+            "nightfall-onboarding-shell-{}-{nonce}-{seq}",
             std::process::id()
         ));
         std::fs::create_dir(&root).unwrap();

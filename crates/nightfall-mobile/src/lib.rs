@@ -118,46 +118,12 @@ fn rpc(
     Ok(v.get("result").cloned().unwrap_or(v))
 }
 
+/// The shared parser, not a local one. See `nightfall_wallet::amount_input`
+/// for what the three copies used to disagree about.
 fn parse_amount(s: &str) -> Result<u64, MobileError> {
-    let s = s.trim().replace(',', ".");
-    if s.is_empty() || s.starts_with('-') {
-        return Err(MobileError::Failed {
-            msg: "enter a positive amount".into(),
-        });
-    }
-    let (whole, frac) = match s.split_once('.') {
-        Some((w, f)) => (w, f),
-        None => (s.as_str(), ""),
-    };
-    if frac.len() > 8 {
-        return Err(MobileError::Failed {
-            msg: "at most 8 decimal places".into(),
-        });
-    }
-    let w: u64 = if whole.is_empty() {
-        0
-    } else {
-        whole.parse().map_err(|_| MobileError::Failed {
-            msg: "not a number".into(),
-        })?
-    };
-    let mut f = frac.to_string();
-    while f.len() < 8 {
-        f.push('0');
-    }
-    let f: u64 = if f.is_empty() {
-        0
-    } else {
-        f.parse().map_err(|_| MobileError::Failed {
-            msg: "not a number".into(),
-        })?
-    };
-    w.checked_mul(DARKS_PER_NIGHT)
-        .and_then(|x| x.checked_add(f))
-        .filter(|&x| x > 0)
-        .ok_or(MobileError::Failed {
-            msg: "amount too small or too large".into(),
-        })
+    nightfall_wallet::amount_input::parse_night(s).map_err(|e| MobileError::Failed {
+        msg: e.to_string(),
+    })
 }
 
 #[derive(uniffi::Object)]
