@@ -147,6 +147,15 @@ impl SwapWorker {
 
 impl App {
     pub fn queue_swap_job(&mut self, job: Job) -> Result<(), String> {
+        if self.wallet_paused.load(std::sync::atomic::Ordering::SeqCst)
+            || !self
+                .wallet
+                .lock()
+                .map(|wallet| wallet.custody() == crate::wallet_state::Custody::Legacy)
+                .unwrap_or(false)
+        {
+            return Err("Experimental swaps require a legacy wallet; Vault swap-secret integration is not released.".into());
+        }
         if self.swap_job.is_some() {
             return Err("The swap worker is busy. Please wait for the current check.".into());
         }

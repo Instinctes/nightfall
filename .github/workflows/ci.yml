@@ -40,66 +40,32 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
-      # Three UI bugs shipped on 26 Aug 2026 because a selector was written for
-      # markup that does not exist. A human found all three by squinting at a
-      # phone; this finds them in a second. See scripts/check-web-wallet.mjs.
-      - name: Browser wallet, static checks
-        # Website deployment files are maintained outside this repository.
-        if: ${{ hashFiles('website/wrangler.toml') != '' }}
-        run: node scripts/check-web-wallet.mjs
-
-      # Same class of bug, same one-second check, for the chain view: an id the
-      # script reaches for that the page never renders, a class with no rule,
-      # an inline script the CSP will block, a missing Worker route.
-      - name: Chain page, static checks
-        if: ${{ hashFiles('website/wrangler.toml') != '' }}
-        run: node scripts/check-chain-page.mjs
-
-      # The 0.8.3 bump updated every .html and left js/main.js pointing at
-      # 0.8.2 files that had just been deleted — the "recommended for your
-      # device" button was a 404 and a person found it in a screenshot. This
-      # compares the links against the directory listing, both directions.
-      - name: Download links, static checks
-        if: ${{ hashFiles('website/wrangler.toml') != '' }}
-        run: node scripts/check-download-links.mjs
-
-      # The site had a checker and was right every release; README had none
-      # and drifted. On the 0.9.0 tag it still told people to verify against
-      # SHA256SUMS-0.8.2.txt — two releases old and already deleted from the
-      # downloads page. Someone following our own instructions would have hit
-      # a missing file while doing the careful thing.
-      - name: Documentation versions, static checks
-        # This check reads the website's release-channel manifest.
-        if: ${{ hashFiles('website/wrangler.toml') != '' }}
-        run: node scripts/check-docs-version.mjs
-
-      # The weekly archive script decides which old archives to delete. It
-      # sorted names as strings, which is correct until the block height gains
-      # a digit: "…-99981" sorts above "…-100248", so the newest archive would
-      # have landed last in the list and been deleted by the same run that had
-      # just uploaded it — leaving the download page pointing at a file the
-      # script had thrown away. At 95,867 blocks that was about two weeks out.
-      - name: Chain archive retirement order
-        run: bash scripts/weekly-chain-archive.sh --self-test
-
-      # /js is served with max-age=86400, so ?v= is the only thing that tells
-      # a returning browser to fetch again. Maintained by hand it drifted:
-      # nav.js sat at ?v=1 on five pages since it was written, and chain.js
-      # was pinned to the release version — which does not change when a page
-      # is fixed between releases. A mobile fix went live on 3 Sep, correct on
-      # the server, and ran nowhere that had loaded the page that day.
-      - name: Cache busters match file contents
-        if: ${{ hashFiles('website/wrangler.toml') != '' }}
-        run: node scripts/stamp-cache-busters.mjs --check
-
-      # `.container a` is (0,1,1) and outranks `.btn-primary` at (0,1,0), so a
-      # button inside that container silently loses its white lettering. Four
-      # rules had it independently; the nav one repainted the site's main
-      # Download button in --text-dim on every page, and it survived that long
-      # because a button with unreadable text still looks like a button.
-      - name: Button colours survive container link rules
-        if: ${{ hashFiles('website/wrangler.toml') != '' }}
-        run: node scripts/check-button-colours.mjs
+      # The website checks used to sit here — browser wallet, chain page,
+      # download links, cache busters, button colours — and the archive
+      # retirement self-test with them. They are gone from this file, not from
+      # the project.
+      #
+      # The site left this repository on 8 September 2026, so every one of them
+      # reads files that will never exist here again; they did not weaken, they
+      # simply had nothing left to look at, and the first run after the move
+      # failed on exactly that. They now run in `scripts/deploy-website.sh`,
+      # which is the gate the site actually passes through, and they run there
+      # before every publication rather than on every commit.
+      #
+      # The archive self-test had the same problem — its script is
+      # workspace-only — and now runs inside the weekly archive script itself,
+      # on every real run, before anything is uploaded or deleted. A check that
+      # guards a deletion belongs next to the deletion.
+      #
+      # Documentation versions was kept here at first, on the grounds that it
+      # reads docs/ and README.md. It does — and it also imports
+      # release-channels.mjs, which reads website/public/releases.json. The
+      # dependency is one level down, so grepping the file itself for
+      # "website/" found nothing and the step failed on the next run anyway.
+      # Worth remembering: what a check reads is its imports' business too.
+      #
+      # No node-based check remains in this workflow. Every one of them now
+      # runs in scripts/deploy-website.sh, before each publication.
 
       # The whole point of the project. Every test in this suite is the
       # inverse of an exploit that once worked against a real build.
@@ -132,3 +98,14 @@ jobs:
 
       - name: Build release binaries
         run: cargo build --release -p nightfall-node -p nightfall-wallet -p nightfall-core
+
+      # A build proves the code compiles for this platform. It proves nothing
+      # about whether the wallet's storage rules hold there — and until this
+      # step existed, nothing did: the workspace test run above is Linux-only,
+      # and the encrypted-storage suite was gated to Unix, so Windows had no
+      # test coverage of the adapter at all. These are the ordering,
+      # verification and crash-injection cases; the ones that need symlinks or
+      # Unix permission bits are marked `#[cfg(unix)]` in the source and are
+      # skipped here by the compiler rather than silently at runtime.
+      - name: Wallet storage tests
+        run: cargo test -p nightfall-wallet --lib

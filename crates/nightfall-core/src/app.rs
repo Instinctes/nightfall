@@ -1,13 +1,14 @@
 //! Application shell: state, background sync, navigation.
 
 use crate::address_book::AddressBook;
+use crate::onboarding::Onboarding;
 use crate::theme::*;
 use crate::tray::{Tray, TrayAction};
 use crate::views;
+use crate::wallet_state::Custody;
 use crate::wallet_state::WalletState;
 use crate::widgets::*;
 use eframe::egui::{self, Color32, RichText, Rounding, Stroke, Vec2, ViewportCommand};
-use nightfall_crypto::WalletKeys;
 use nightfall_node::{NodeConfig, NodeHandle, StatusSnap};
 use nightfall_storage::now_unix;
 use nightfall_types::{NetworkId, DARKS_PER_NIGHT};
@@ -15,12 +16,36 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use zeroize::Zeroize;
 
 /// Default fee: 0.001 NIGHT. Burned in full.
 pub const DEFAULT_FEE_DARKS: u64 = DARKS_PER_NIGHT / 1_000;
 
 /// Desktop build. Not the protocol — that is `PROTOCOL_VERSION`.
-pub const WALLET_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const WALLET_VERSION: &str = match option_env!("NIGHTFALL_DEV_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+pub const IS_DEV_BUILD: bool = option_env!("NIGHTFALL_DEV_VERSION").is_some();
+
+/// A development build that is allowed to open mainnet.
+///
+/// Off unless `NIGHTFALL_DEV_MAINNET` was set when the binary was compiled, so
+/// the permission belongs to one artifact rather than to a command line: a dev
+/// build that escapes cannot be talked into mainnet by an argument, and you
+/// can tell which kind you are holding without running it.
+///
+/// This exists because the operator asked for a build that opens their real
+/// wallet. It is not a step toward shipping development builds on mainnet.
+///
+/// # What such a build does to a 0.9.5 wallet
+///
+/// 1.0 adds a `invoices` field to the wallet file, and that file refuses
+/// unknown fields. So once a 1.0 build has *saved*, the released 0.9.5 app can
+/// no longer read that wallet — it is a one-way door, and the way back is an
+/// encrypted backup made beforehand. The banner in `mainnet_dev_warning` says
+/// so on every page, and the build's own README says it first.
+pub const IS_DEV_MAINNET: bool = option_env!("NIGHTFALL_DEV_MAINNET").is_some();
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -45,6 +70,19 @@ impl View {
         (View::Swap, "Swap"),
         (View::Settings, "Settings"),
     ];
+
+    /// Glance pages fill the panel. Forms stop stretching at a readable width.
+    ///
+    /// This cap is applied to banners *and* the page together. Capping the
+    /// page alone left Settings' cards inset under a full-bleed scan warning,
+    /// and wrapping Dashboard in the same cap left a dead strip down the right.
+    pub fn content_max_width(self) -> f32 {
+        match self {
+            View::Send | View::Settings => 720.0,
+            View::Swap => 860.0,
+            _ => f32::INFINITY,
+        }
+    }
 }
 
 /// Sampled hashrate, derived from the node's cumulative hash counter.
@@ -89,6 +127,13 @@ pub struct App {
     pub datadir: PathBuf,
     pub node: Option<Arc<NodeHandle>>,
     pub wallet: Arc<Mutex<WalletState>>,
+    pub vault_ui: crate::vault_ui::VaultUi,
+    pub wallet_paused: Arc<AtomicBool>,
+    /// Outer lock: scans may hold the wallet for minutes. Frames only try this
+    /// gate and render a lock-free progress panel if a scan owns it. Hold it
+    /// through the entire frame; probing the wallet mutex alone races a scan.
+    pub wallet_scan_access: Arc<Mutex<()>>,
+    data_lock: Option<Arc<nightfall_storage::dirlock::DirLock>>,
     pub view: View,
 
     pub status: Option<StatusSnap>,
@@ -102,6 +147,9 @@ pub struct App {
     pub sync_signal: Arc<Mutex<Option<Result<u32, String>>>>,
     pub syncing: Arc<AtomicBool>,
     pub last_sync_at: Option<u64>,
+    /// A detected scan failure remains visible until a successful canonical
+    /// scan; it must not disappear with a toast or a successful node poll.
+    pub wallet_sync_error: Option<String>,
 
     // Send form
     pub send_to: String,
@@ -116,6 +164,7 @@ pub struct App {
     pub reveal_mnemonic: bool,
     pub reveal_view_key: bool,
     pub backup_acked: bool,
+    pub recovery_studio: crate::recovery_studio::RecoveryStudio,
     pub resync_confirm: bool,
     pub close_to_tray: bool,
     pub prune: bool,
@@ -125,6 +174,35 @@ pub struct App {
 
     // Activity filter
     pub activity_filter: String,
+
+    // Proof Card. `proof_input` holds a receipt someone pasted, or the one
+    // this wallet just produced — the owner is shown the same card the person
+    // receiving it will see, because "show exactly what is revealed" means
+    // showing it before it is handed over, not after.
+    pub proof_input: String,
+    pub proof_result: Option<Result<nightfall_wallet::ReceiptProof, String>>,
+    /// Set when a receipt was just produced, so the card scrolls into view.
+    pub proof_scroll: bool,
+
+    // Counter — the till's "add an invoice" form. The invoices themselves live
+    // in the wallet's encrypted snapshot, not here.
+    pub till_reference: String,
+    pub till_amount: String,
+    pub till_description: String,
+
+    // Air. `air_pending` is the request this online side wrote and is waiting
+    // for an answer to; `air_frames` is whatever this side is currently showing
+    // as animated QR. The nonce log is what stops a signed package being
+    // broadcast twice — see `nightfall_wallet::air`.
+    pub air_input: String,
+    pub air_pending: Option<nightfall_wallet::air::Intent>,
+    pub air_incoming: Option<nightfall_wallet::air::Intent>,
+    pub air_frames: Vec<String>,
+    pub air_frame_at: usize,
+    pub air_last_tick: Option<Instant>,
+    pub air_log: nightfall_wallet::air::NonceLog,
+    pub air_note: Option<String>,
+    pub air_error: Option<String>,
 
     // Network
     pub peer_input: String,
@@ -184,21 +262,10 @@ pub struct App {
     pub load_started: Option<(Instant, u64)>,
 
     pub onboarding: Option<Onboarding>,
+    /// A failed load must not look like a zero-balance wallet or first run.
+    pub wallet_load_error: Option<String>,
     tray: Option<Tray>,
     pending_chain_check: Option<Arc<Mutex<Option<ChainCheck>>>>,
-}
-
-/// First-run screens. Existing wallets skip this.
-pub enum Onboarding {
-    Choice,
-    Create {
-        phrase: String,
-        written: bool,
-    },
-    Restore {
-        phrase: String,
-        error: Option<String>,
-    },
 }
 
 #[derive(Clone)]
@@ -213,13 +280,44 @@ pub struct ChainCheck {
 }
 
 impl App {
+    #[cfg(test)]
     pub fn new(network: NetworkId, datadir: PathBuf) -> Self {
+        Self::construct(network, datadir, None)
+    }
+
+    pub fn with_data_lock(
+        network: NetworkId,
+        lock: Arc<nightfall_storage::dirlock::DirLock>,
+    ) -> Self {
+        let datadir = lock
+            .path()
+            .parent()
+            .expect("directory lock has a parent")
+            .to_path_buf();
+        Self::construct(network, datadir, Some(lock))
+    }
+
+    fn construct(
+        network: NetworkId,
+        datadir: PathBuf,
+        data_lock: Option<Arc<nightfall_storage::dirlock::DirLock>>,
+    ) -> Self {
         let has_seed = WalletState::seed_exists(&datadir);
+        let mut wallet_load_error = None;
         let wallet = if has_seed {
-            match WalletState::load_or_create(&datadir, network) {
+            let opened = (|| {
+                if nightfall_wallet::vault_required(&datadir, "core.seed")? {
+                    let lock = data_lock.clone().ok_or_else(|| anyhow::anyhow!("Vault requires the data-directory lock. Restart Core with a compatible build."))?;
+                    WalletState::open_vault(lock, network)
+                } else {
+                    WalletState::load_or_create(&datadir, network)
+                }
+            })();
+            match opened {
                 Ok(w) => w,
                 Err(e) => {
                     tracing::error!("wallet: {e}");
+                    wallet_load_error = Some(e.to_string());
                     WalletState::empty()
                 }
             }
@@ -229,11 +327,23 @@ impl App {
 
         let proxy_input = load_proxy(&datadir);
         let mining_threads = load_mining_threads(&datadir);
+        let custody = wallet.custody();
+        let has_snapshot = wallet.has_vault_snapshot();
+        let initial_restore = wallet.awaiting_initial_restore();
+        let mut vault_ui = crate::vault_ui::VaultUi::default();
+        vault_ui.custody = custody;
+        vault_ui.has_snapshot = has_snapshot;
         let mut app = Self {
             network,
             datadir: datadir.clone(),
             node: None,
             wallet: Arc::new(Mutex::new(wallet)),
+            vault_ui,
+            wallet_paused: Arc::new(AtomicBool::new(!matches!(
+                custody,
+                Custody::Legacy | Custody::Unlocked
+            ))),
+            data_lock,
             view: View::Dashboard,
             status: None,
             status_error: None,
@@ -241,8 +351,10 @@ impl App {
             hashrate: HashrateMeter::default(),
             toasts: Toasts::default(),
             sync_signal: Arc::new(Mutex::new(None)),
+            wallet_scan_access: Arc::new(Mutex::new(())),
             syncing: Arc::new(AtomicBool::new(false)),
             last_sync_at: None,
+            wallet_sync_error: None,
             send_to: String::new(),
             send_amount: String::new(),
             send_memo: String::new(),
@@ -253,6 +365,7 @@ impl App {
             reveal_mnemonic: false,
             reveal_view_key: false,
             backup_acked: load_backup_acked(&datadir),
+            recovery_studio: Default::default(),
             resync_confirm: false,
             close_to_tray: load_close_to_tray(&datadir),
             prune: load_flag(&datadir, "prune", false),
@@ -260,6 +373,21 @@ impl App {
             want_quit: false,
             window_hidden: false,
             activity_filter: String::new(),
+            proof_input: String::new(),
+            proof_result: None,
+            proof_scroll: false,
+            till_reference: String::new(),
+            till_amount: String::new(),
+            till_description: String::new(),
+            air_input: String::new(),
+            air_pending: None,
+            air_incoming: None,
+            air_frames: Vec::new(),
+            air_frame_at: 0,
+            air_last_tick: None,
+            air_log: nightfall_wallet::air::NonceLog::new(),
+            air_note: None,
+            air_error: None,
             peer_input: String::new(),
             proxy_input,
             chain_check: None,
@@ -288,15 +416,18 @@ impl App {
             swap_job: None,
             swap_report: Default::default(),
             load_started: None,
-            onboarding: if has_seed {
+            onboarding: if initial_restore {
+                Some(Onboarding::resume())
+            } else if has_seed {
                 None
             } else {
                 Some(Onboarding::Choice)
             },
+            wallet_load_error,
             tray: None,
             pending_chain_check: None,
         };
-        if has_seed {
+        if custody == Custody::Legacy && app.wallet_load_error.is_none() {
             app.start_node();
         }
         app
@@ -305,7 +436,7 @@ impl App {
     fn start_node(&mut self) {
         let miner = self.wallet.lock().ok().and_then(|w| w.address());
 
-        let cfg = NodeConfig {
+        let mut cfg = NodeConfig {
             network: self.network,
             datadir: self.datadir.clone(),
             p2p_listen: arg_or(
@@ -349,6 +480,15 @@ impl App {
             },
         };
 
+        // Local preview builds never inherit production peer/proxy environment
+        // settings or bind publicly. Devnet has no hard-coded seed nodes.
+        if IS_DEV_BUILD {
+            cfg.p2p_listen = "127.0.0.1:0".into();
+            cfg.rpc_listen = "127.0.0.1:0".into();
+            cfg.connect.clear();
+            cfg.peers_url = Some("off".into());
+            cfg.proxy = Some("off".into());
+        }
         match NodeHandle::start(cfg) {
             Ok(h) => {
                 h.set_mining_threads(self.mining_threads);
@@ -363,34 +503,25 @@ impl App {
         }
     }
 
-    pub fn begin_create_wallet(&mut self) {
-        let keys = WalletKeys::generate();
-        self.onboarding = Some(Onboarding::Create {
-            phrase: keys.to_mnemonic(),
-            written: false,
-        });
-    }
-
-    pub fn finish_create_wallet(&mut self, phrase: &str) -> anyhow::Result<()> {
-        let w = WalletState::restore_from_phrase(&self.datadir, self.network, phrase)?;
-        if let Ok(mut slot) = self.wallet.lock() {
-            *slot = w;
+    pub fn show_onboarding(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if let Some(error) = &self.vault_ui.error {
+            ui.colored_label(DANGER, error);
         }
-        self.ack_backup();
-        self.onboarding = None;
-        self.start_node();
-        Ok(())
-    }
-
-    pub fn finish_restore_wallet(&mut self, phrase: &str) -> anyhow::Result<()> {
-        let w = WalletState::restore_from_phrase(&self.datadir, self.network, phrase)?;
-        if let Ok(mut slot) = self.wallet.lock() {
-            *slot = w;
+        let available = cfg!(unix) && self.data_lock.is_some() && !self.vault_ui.busy();
+        let request = self
+            .onboarding
+            .as_mut()
+            .and_then(|setup| setup.show_panel(ui, available, self.network));
+        if let Some(request) = request {
+            self.vault_ui.start_provision(
+                self.wallet.clone(),
+                self.wallet_paused.clone(),
+                self.data_lock.clone(),
+                self.network,
+                request,
+                ctx.clone(),
+            );
         }
-        self.ack_backup();
-        self.onboarding = None;
-        self.start_node();
-        Ok(())
     }
 
     pub fn ack_backup(&mut self) {
@@ -449,22 +580,36 @@ impl App {
             self.toasts.error(ctx, "Node is not running");
             return;
         };
-        match node.resync_chain() {
-            Ok(backup) => {
-                if let Ok(mut w) = self.wallet.lock() {
-                    let _ = w.rescan(&node);
-                }
-                self.resync_confirm = false;
-                self.toasts.success(
-                    ctx,
-                    format!(
-                        "Chain file set aside at {}. Downloading the live chain.",
-                        backup.display()
-                    ),
+        let wallet = self.wallet.clone();
+        let access = self.wallet_scan_access.clone();
+        let paused = self.wallet_paused.clone();
+        let syncing = self.syncing.clone();
+        let signal = self.sync_signal.clone();
+        self.resync_confirm = false;
+        std::thread::spawn(move || {
+            let Ok(_access) = access.lock() else {
+                return;
+            };
+            syncing.store(true, Ordering::SeqCst);
+            let result = (|| -> anyhow::Result<u32> {
+                let mut wallet = wallet
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("wallet lock poisoned"))?;
+                anyhow::ensure!(
+                    !paused.load(Ordering::SeqCst) && wallet.can_scan(),
+                    "Resync cancelled: wallet is being secured."
                 );
+                wallet.check_rescan_allowed()?;
+                node.resync_chain()?;
+                wallet.rescan(&node)
+            })()
+            .map_err(|e| e.to_string());
+            syncing.store(false, Ordering::SeqCst);
+            if let Ok(mut slot) = signal.lock() {
+                *slot = Some(result);
             }
-            Err(e) => self.toasts.error(ctx, e.to_string()),
-        }
+        });
+        self.toasts.info(ctx, "Chain resync queued. The existing chain file is preserved by the node; scan errors will be reported.");
     }
 
     pub fn start_chain_check(&mut self) {
@@ -536,14 +681,18 @@ impl App {
         let wallet = Arc::clone(&self.wallet);
         let signal = Arc::clone(&self.sync_signal);
         let syncing = Arc::clone(&self.syncing);
+        let paused = Arc::clone(&self.wallet_paused);
+        let access = Arc::clone(&self.wallet_scan_access);
+        let data_lock = self.data_lock.clone();
 
         std::thread::spawn(move || {
+            let _data_lock = data_lock;
             let mut seen = node.tip_generation();
             // First pass: pick up whatever is already on disk.
-            run_wallet_scan(&wallet, &node, &signal, &syncing);
+            run_wallet_scan(&wallet, &node, &signal, &syncing, &paused, &access);
             loop {
                 seen = node.wait_tip_change(seen, Duration::from_secs(30));
-                run_wallet_scan(&wallet, &node, &signal, &syncing);
+                run_wallet_scan(&wallet, &node, &signal, &syncing, &paused, &access);
             }
         });
     }
@@ -554,7 +703,15 @@ fn run_wallet_scan(
     node: &NodeHandle,
     signal: &Arc<Mutex<Option<Result<u32, String>>>>,
     syncing: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
+    access: &Arc<Mutex<()>>,
 ) {
+    if paused.load(Ordering::SeqCst) {
+        return;
+    }
+    let Ok(_access) = access.lock() else {
+        return;
+    };
     syncing.store(true, Ordering::SeqCst);
     let result = {
         let mut w = match wallet.lock() {
@@ -564,6 +721,10 @@ fn run_wallet_scan(
                 return;
             }
         };
+        if paused.load(Ordering::SeqCst) || !w.can_scan() {
+            syncing.store(false, Ordering::SeqCst);
+            return;
+        }
         w.sync_from_node(node).map_err(|e| e.to_string())
     };
     syncing.store(false, Ordering::SeqCst);
@@ -638,17 +799,26 @@ impl App {
         if let Some(result) = taken {
             match result {
                 Ok(n) => {
+                    self.wallet_sync_error = None;
                     self.last_sync_at = Some(now_unix());
                     if n > 0 {
                         self.toasts.success(ctx, format!("Found {n} new output(s)"));
                     }
                 }
-                Err(e) => self.toasts.error(ctx, format!("Sync failed: {e}")),
+                Err(e) => {
+                    self.send_confirm = false;
+                    self.wallet_sync_error = Some(e.clone());
+                    self.toasts.error(ctx, format!("Sync failed: {e}"));
+                }
             }
         }
     }
 
     pub fn do_send(&mut self, ctx: &egui::Context) {
+        if self.wallet_sync_error.is_some() {
+            self.toasts.error(ctx, "Sending is blocked until the wallet completes a valid chain scan. Preserve a backup before recovery.");
+            return;
+        }
         let Some(node) = self.node.clone() else {
             self.toasts.error(ctx, "Node is not running");
             return;
@@ -662,27 +832,32 @@ impl App {
             }
         };
 
-        self.send_busy = true;
-        let result = {
-            let mut w = match self.wallet.lock() {
-                Ok(w) => w,
-                Err(_) => {
-                    self.send_busy = false;
-                    self.toasts.error(ctx, "Wallet is busy, try again");
-                    return;
-                }
-            };
-            w.send(
-                &node,
-                self.send_to.trim(),
-                amount_darks,
-                self.send_fee,
-                self.send_memo.trim(),
-            )
-        };
-        self.send_busy = false;
+        if self.vault_ui.busy() || self.wallet_paused.load(Ordering::SeqCst) {
+            return;
+        }
+        self.vault_ui.start_payment(
+            self.wallet.clone(),
+            self.wallet_paused.clone(),
+            crate::vault_ui::PaymentRequest {
+                node,
+                to: zeroize::Zeroizing::new(self.send_to.trim().to_string()),
+                amount: amount_darks,
+                fee: self.send_fee,
+                memo: zeroize::Zeroizing::new(self.send_memo.trim().to_string()),
+            },
+            ctx.clone(),
+        );
+        self.send_busy = self.vault_ui.busy();
         self.send_confirm = false;
+        if !self.send_busy {
+            if let Some(error) = &self.vault_ui.error {
+                self.toasts.error(ctx, error);
+            }
+        }
+    }
 
+    fn payment_feedback(&mut self, result: Result<String, String>, ctx: &egui::Context) {
+        self.send_busy = false;
         match result {
             Ok(txid) => {
                 // "Sent" was a lie by one word. The transaction has been handed
@@ -701,9 +876,8 @@ impl App {
                     self.toasts.error(
                         ctx,
                         format!(
-                            "Only {peers} peer(s) connected — a payment handed to one peer \
-                             can be lost. If it has not confirmed in an hour, rescan in \
-                             Settings and send it again."
+                            "Only {peers} peer(s) connected. Confirmation may be delayed. \
+                             The pending payment is saved for retry; check Activity before creating another payment."
                         ),
                     );
                 }
@@ -902,7 +1076,20 @@ impl App {
                         .find(|(v, _)| *v == self.view)
                         .map(|(_, l)| *l)
                         .unwrap_or("");
-                    ui.label(RichText::new(title).size(20.0).strong());
+                    // Title and its one-line description together. The
+                    // description used to float in the content area between
+                    // the warning banner and the first card, belonging to
+                    // neither — a sentence in the middle of nothing. It is a
+                    // subtitle, so it sits under the title.
+                    ui.vertical(|ui| {
+                        ui.add_space(-2.0);
+                        ui.label(RichText::new(title).size(20.0).strong());
+                        ui.label(
+                            RichText::new(views::page_description(self.view))
+                                .size(11.5)
+                                .color(TEXT_FAINT),
+                        );
+                    });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let loading = self.status.as_ref().map(|s| s.loading).unwrap_or(false);
@@ -979,10 +1166,31 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply(ctx);
+        if let Some(error) = &self.wallet_load_error {
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::none()
+                        .fill(BG)
+                        .inner_margin(egui::Margin::same(28.0)),
+                )
+                .show(ctx, |ui| wallet_load_error_panel(ui, error));
+            return;
+        }
+        self.handle_tray(ctx);
+        if self.vault_gate(ctx) {
+            return;
+        }
+        let access = self.wallet_scan_access.clone();
+        let Ok(_frame_access) = access.try_lock() else {
+            self.scan_wait_panel(ctx);
+            return;
+        };
+        if self.view != View::Settings || self.window_hidden || !ctx.input(|i| i.raw.focused) {
+            self.recovery_studio.clear();
+        }
         self.poll_status();
         self.tick_swaps(ctx);
         self.drain_sync_signal(ctx);
-        self.handle_tray(ctx);
 
         // Keep the UI live for hashrate, tray clicks, and sync animation.
         ctx.request_repaint_after(Duration::from_millis(500));
@@ -995,7 +1203,27 @@ impl eframe::App for App {
                         .inner_margin(egui::Margin::same(28.0)),
                 )
                 .show(ctx, |ui| {
-                    views::onboarding(self, ui, ctx);
+                    screen_header(
+                        ui,
+                        &self.network.to_string(),
+                        &[
+                            (
+                                "Nothing is written until your words are confirmed",
+                                TEXT_FAINT,
+                            ),
+                            (WALLET_VERSION, TEXT_FAINT),
+                        ],
+                    );
+                    ui.add_space(GAP_LG);
+                    // Onboarding is the one full-window screen that never had a
+                    // scroll area, and it is also the tallest: on a 812-point
+                    // window the restore card ran past the bottom edge, so
+                    // "Save encrypted wallet" sat on the last visible line and
+                    // "Cancel setup" was simply not reachable. A person setting
+                    // up a wallet could not back out of it.
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| views::onboarding(self, ui, ctx));
                 });
             self.toasts.show(ctx);
             return;
@@ -1019,61 +1247,297 @@ impl eframe::App for App {
                 // content the way a background image would.
                 page_wash(ui.painter(), ui.clip_rect());
 
-                if let Some(err) = self.status_error.clone() {
-                    egui::Frame::none()
-                        .fill(DANGER.gamma_multiply(0.12))
-                        .stroke(Stroke::new(1.0_f32, DANGER.gamma_multiply(0.5)))
-                        .rounding(Rounding::same(ROUND_SM))
-                        .inner_margin(egui::Margin::same(12.0))
-                        .show(ui, |ui| {
-                            ui.label(RichText::new(format!("Node error: {err}")).color(DANGER));
-                        });
-                    ui.add_space(12.0);
-                }
+                // One column for banners and the page. Same left edge, same
+                // right edge, same cap — so the scan warning cannot be a
+                // different width from the cards under it.
+                page_column(ui, self.view.content_max_width(), |ui| {
+                    // The always-on scrollbar lives in the scroll area below.
+                    // Inset banners by the same gutter so their right edge
+                    // matches the hero, not the bar.
+                    let gutter = scroll_gutter(ui);
+                    let banner_w = (ui.available_width() - gutter).max(0.0);
 
-                egui::ScrollArea::vertical()
-                    .id_salt(("page-scroll", self.view as u8))
-                    .auto_shrink([false, false])
-                    // Always reserve the bar. With the default the bar appears
-                    // only once the page overflows, which takes ~10px of width
-                    // away mid-session — every right-aligned column then shifts
-                    // sideways as you scroll. Reserving it costs a sliver of
-                    // width and makes the layout stop moving.
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                    .show(ui, |ui| {
-                        // Content is capped and centred: full-bleed cards on an
-                        // ultra-wide display look sparse and are hard to read.
-                        const MAX_CONTENT: f32 = 1180.0;
-                        let avail = ui.available_width();
-                        let pad = ((avail - MAX_CONTENT) / 2.0).max(0.0);
-                        ui.horizontal(|ui| {
-                            ui.add_space(pad);
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(avail - pad * 2.0, 0.0),
-                                egui::Layout::top_down(egui::Align::LEFT),
-                                |ui| {
-                                    views::page_intro(self.view, ui);
-                                    match self.view {
-                                        View::Dashboard => views::dashboard(self, ui),
-                                        View::Send => views::send(self, ui, ctx),
-                                        View::Receive => views::receive(self, ui, ctx),
-                                        View::Activity => views::activity(self, ui),
-                                        View::Mining => views::mining(self, ui),
-                                        View::Network => views::network(self, ui, ctx),
-                                        View::Swap => crate::views_swap::swap(self, ui, ctx),
-                                        View::Settings => views::settings(self, ui, ctx),
-                                    }
-                                },
-                            );
+                    if let Some(error) = &self.wallet_sync_error {
+                        let detailed = matches!(self.view, View::Dashboard | View::Send);
+                        egui::Frame::none()
+                            .fill(tint(BG, WARN, 0.16))
+                            .stroke(Stroke::new(1.0_f32, WARN.gamma_multiply(0.35)))
+                            .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                            .rounding(Rounding::same(ROUND_FIELD))
+                            .show(ui, |ui| {
+                                fill_width(ui, (banner_w - 28.0).max(0.0));
+                                egui::CollapsingHeader::new(
+                                    RichText::new(
+                                        "Wallet scan incomplete — balances and confirmations may be stale",
+                                    )
+                                    .color(WARN)
+                                    .size(12.5),
+                                )
+                                // Per page, so the open state on Dashboard does not
+                                // decide the state on Receive — a shared id made
+                                // `default_open` apply once, to whichever page was
+                                // shown first, and the rest inherited it.
+                                .id_salt(("scan-warning", self.view as u8))
+                                .default_open(detailed)
+                                .show(ui, |ui| {
+                                    ui.label(RichText::new(error).size(12.0).color(TEXT_DIM));
+                                    ui.label(RichText::new("Sending is blocked until a valid scan completes. Preserve an encrypted backup; do not clear pending payments or swap reservations to bypass this warning.").size(12.0).color(TEXT_DIM));
+                                });
+                            });
+                        ui.add_space(GAP_SM);
+                    }
+
+                    // A development build looking at real money says so, on every
+                    // page, in the colour reserved for things that cannot be
+                    // undone. It is not a toast and it does not dismiss: the risk
+                    // lasts as long as the build does.
+                    if IS_DEV_MAINNET {
+                        egui::Frame::none()
+                            .fill(tint(BG, DANGER, 0.18))
+                            .stroke(Stroke::new(1.0_f32, DANGER.gamma_multiply(0.5)))
+                            .rounding(Rounding::same(ROUND_FIELD))
+                            .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                            .show(ui, |ui| {
+                                fill_width(ui, (banner_w - 28.0).max(0.0));
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Development build {WALLET_VERSION} on mainnet, using your \
+                                         real wallet directory. Once it saves, the released 0.9.5 \
+                                         app can no longer read this wallet — an encrypted backup \
+                                         is the only way back. Never run both at once.",
+                                    ))
+                                    .color(DANGER)
+                                    .size(12.5),
+                                );
+                            });
+                        ui.add_space(GAP_SM);
+                    }
+
+                    if let Some(err) = self.status_error.clone() {
+                        egui::Frame::none()
+                            .fill(tint(BG, DANGER, 0.16))
+                            .stroke(Stroke::new(1.0_f32, DANGER.gamma_multiply(0.5)))
+                            .rounding(Rounding::same(ROUND_SM))
+                            .inner_margin(egui::Margin::same(12.0))
+                            .show(ui, |ui| {
+                                fill_width(ui, (banner_w - 24.0).max(0.0));
+                                ui.label(RichText::new(format!("Node error: {err}")).color(DANGER));
+                            });
+                        ui.add_space(12.0);
+                    }
+
+                    egui::ScrollArea::vertical()
+                        .id_salt(("page-scroll", self.view as u8))
+                        .auto_shrink([false, false])
+                        // Always reserve the bar. With the default the bar appears
+                        // only once the page overflows, which takes ~10px of width
+                        // away mid-session — every right-aligned column then shifts
+                        // sideways as you scroll. Reserving it costs a sliver of
+                        // width and makes the layout stop moving.
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                        .show(ui, |ui| {
+                            fill_width(ui, ui.available_width());
+                            views::page_intro(self.view, ui);
+                            match self.view {
+                                View::Dashboard => views::dashboard(self, ui),
+                                View::Send => views::send(self, ui, ctx),
+                                View::Receive => views::receive(self, ui, ctx),
+                                View::Activity => views::activity(self, ui),
+                                View::Mining => views::mining(self, ui),
+                                View::Network => views::network(self, ui, ctx),
+                                View::Swap => crate::views_swap::swap(self, ui, ctx),
+                                View::Settings => views::settings(self, ui, ctx),
+                            }
                         });
-                    });
+                });
             });
 
         self.toasts.show(ctx);
     }
 }
 
+fn wallet_load_error_panel(ui: &mut egui::Ui, error: &str) {
+    titled_card(ui, "WALLET FILES PRESERVED", |ui| {
+        ui.heading("Wallet could not be opened");
+        ui.add_space(16.0);
+        ui.colored_label(DANGER, error);
+        ui.add_space(16.0);
+        ui.label("No replacement wallet was created. Keep the original wallet files and resolve this error before restarting.");
+        ui.add_space(8.0);
+        ui.label("Do not delete a vault directory to bypass this protection. Use a compatible build and preserve the original files for recovery.");
+    });
+}
+
 impl App {
+    fn scan_wait_panel(&mut self, ctx: &egui::Context) -> egui::Rect {
+        ctx.request_repaint_after(Duration::from_millis(100));
+        // Do not read wallet/node state here: the scanner may own both locks.
+        // Conceal any previously revealed secrets while displaying progress.
+        self.reveal_seed = false;
+        self.reveal_mnemonic = false;
+        self.reveal_view_key = false;
+        self.recovery_studio.clear();
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(28.0);
+            narrow_column(ui, 620.0, |ui| {
+                titled_card(ui, "UPDATING WALLET", |ui| {
+                    ui.spinner();
+                    ui.heading("Scanning the local chain");
+                    ui.label("Balances and Activity will return after the scan is saved. No estimated balance is shown while it is being updated.");
+                    ui.add_space(12.0);
+                    if self.vault_ui.custody == Custody::Unlocked && ui.button("Lock wallet").clicked() {
+                        self.request_vault(crate::vault_ui::Action::Lock, ctx);
+                    }
+                    ui.label("Locking hides the wallet immediately; an active scan finishes before its in-memory keys are released.");
+                });
+            });
+            ui.min_rect()
+        }).inner
+    }
+
+    pub fn request_vault(&mut self, action: crate::vault_ui::Action, ctx: &egui::Context) {
+        if self.swap_job.is_some() && action != crate::vault_ui::Action::Lock {
+            self.vault_ui.error =
+                Some("Wait for the current swap operation before changing wallet storage.".into());
+            return;
+        }
+        if action == crate::vault_ui::Action::Lock || action == crate::vault_ui::Action::Prepare {
+            self.clear_wallet_views();
+        }
+        self.vault_ui.start(
+            action,
+            self.wallet.clone(),
+            self.wallet_paused.clone(),
+            self.data_lock.clone(),
+            self.network,
+            ctx.clone(),
+        );
+    }
+
+    fn clear_wallet_views(&mut self) {
+        self.reveal_seed = false;
+        self.reveal_mnemonic = false;
+        self.reveal_view_key = false;
+        self.recovery_studio.clear();
+        // A Proof Card names an address, an amount and a memo. None of them is
+        // a key, and all of them are this wallet's business rather than the
+        // next person's at the same screen.
+        self.proof_input.zeroize();
+        self.proof_result = None;
+        self.till_reference.zeroize();
+        self.till_amount.zeroize();
+        self.till_description.zeroize();
+        // An Air package names an address and an amount, and the frames on
+        // screen are a transaction. None of it is a key; all of it is this
+        // wallet's business rather than the next person's at the same screen.
+        self.air_input.zeroize();
+        self.air_incoming = None;
+        self.air_frames.clear();
+        self.air_frame_at = 0;
+        self.air_note = None;
+        self.air_error = None;
+        self.send_to.zeroize();
+        self.send_amount.zeroize();
+        self.send_memo.zeroize();
+        self.send_confirm = false;
+        self.book_name.zeroize();
+        self.book_addr.zeroize();
+        self.activity_filter.zeroize();
+        self.swap_packet_in.zeroize();
+        self.swap_packet_out.zeroize();
+        self.swap_signed_hex.zeroize();
+        self.toasts.clear();
+        if let Ok(mut signal) = self.sync_signal.try_lock() {
+            *signal = None;
+        }
+    }
+
+    pub fn show_vault_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.vault_ui.refresh(&self.wallet);
+        let available = cfg!(unix) && self.data_lock.is_some() && self.swap_job.is_none();
+        if let Some(action) = self.vault_ui.show(ui, available) {
+            self.request_vault(action, ctx);
+        }
+    }
+
+    fn vault_gate(&mut self, ctx: &egui::Context) -> bool {
+        self.vault_ui.refresh(&self.wallet);
+        let (focused, activity) = ctx.input(|input| (input.raw.focused, !input.events.is_empty()));
+        if let Some(setup) = &mut self.onboarding {
+            setup.observe_activity(focused, self.window_hidden, activity, Instant::now());
+        }
+        let auto_lock =
+            self.vault_ui
+                .observe_activity(focused, self.window_hidden, activity, Instant::now());
+        if auto_lock || self.vault_ui.needs_lock() {
+            self.request_vault(crate::vault_ui::Action::Lock, ctx);
+        }
+        if self.vault_ui.poll(&self.wallet, &self.wallet_paused) {
+            if self.vault_ui.has_snapshot && self.onboarding.is_some() {
+                self.onboarding = None;
+                if self.vault_ui.custody == Custody::Locked && self.vault_ui.error.is_none() {
+                    self.ack_backup();
+                }
+            }
+            if self.vault_ui.custody == Custody::Unlocked && self.node.is_none() {
+                self.start_node();
+            }
+        }
+        if let Some(result) = self.vault_ui.payment_result.take() {
+            self.send_busy = false;
+            if matches!(self.vault_ui.custody, Custody::Unlocked | Custody::Legacy) {
+                self.payment_feedback(result, ctx);
+            } else {
+                self.vault_ui.error = Some("A payment operation finished while the wallet was being secured. Unlock and check Activity before creating another payment.".into());
+            }
+        }
+        let blocked = self.vault_ui.busy()
+            || self.vault_ui.needs_lock()
+            || matches!(self.vault_ui.custody, Custody::Locked | Custody::Failed)
+            || (self.vault_ui.custody == Custody::Migration && self.onboarding.is_none())
+            || (self.vault_ui.custody == Custody::Empty && self.onboarding.is_none());
+        if blocked {
+            self.wallet_paused.store(true, Ordering::SeqCst);
+            ctx.request_repaint_after(Duration::from_millis(100));
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::none()
+                        .fill(BG)
+                        .inner_margin(egui::Margin::same(28.0)),
+                )
+                .show(ctx, |ui| {
+                    let tip = self.tip_height();
+                    let peers = self.status.as_ref().map(|s| s.peers).unwrap_or(0);
+                    screen_header(
+                        ui,
+                        &self.network.to_string(),
+                        &[
+                            (
+                                &if tip > 0 {
+                                    format!("Chain height {}", format_int(tip))
+                                } else {
+                                    "Reading the chain".to_owned()
+                                },
+                                if tip > 0 { SUCCESS } else { TEXT_FAINT },
+                            ),
+                            (
+                                &format!("{peers} peers"),
+                                if peers > 0 { TEXT_DIM } else { TEXT_FAINT },
+                            ),
+                            (WALLET_VERSION, TEXT_FAINT),
+                        ],
+                    );
+                    ui.add_space(GAP_XL);
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        narrow_column(ui, 620.0, |ui| self.show_vault_settings(ui, ctx));
+                    });
+                });
+        } else if self.view != View::Settings {
+            self.vault_ui.clear_fields();
+        }
+        blocked
+    }
+
     /// Rough time left on the chain load, phrased as a person would say it.
     ///
     /// Measured, not assumed: the first sighting of the load is remembered,
@@ -1255,49 +1719,14 @@ fn save_proxy(datadir: &std::path::Path, value: &str) {
 
 /// Parse a decimal NIGHT amount into darks.
 ///
-/// Done on the string, never through `f64` — binary floating point cannot
-/// represent 8 decimal places exactly, and silently losing a dark in a payment
-/// form is not acceptable.
+/// The rules and the wording live in `nightfall_wallet::amount_input`, which
+/// Core, the browser wallet and the mobile wallet all call. They used to have
+/// one of these each, and the copies had drifted: `.5` was half a NIGHT in two
+/// of them and an error in this one, and `+5` was five NIGHT in two of them and
+/// an error here. Two wallets from one project disagreeing about what a typed
+/// amount means is a defect regardless of which reading is the better one.
 pub fn parse_amount(s: &str) -> Result<u64, String> {
-    let normalised = s.trim().replace(',', ".");
-    if normalised.is_empty() {
-        return Err("Enter an amount".into());
-    }
-    if normalised.starts_with('-') {
-        return Err("Amount must be positive".into());
-    }
-
-    let mut parts = normalised.splitn(2, '.');
-    let whole_str = parts.next().unwrap_or("");
-    let frac_str = parts.next().unwrap_or("");
-
-    if !whole_str.chars().all(|c| c.is_ascii_digit()) || whole_str.is_empty() {
-        return Err("Amount is not a number".into());
-    }
-    if !frac_str.chars().all(|c| c.is_ascii_digit()) {
-        return Err("Amount is not a number".into());
-    }
-    if frac_str.len() > 8 {
-        return Err("At most 8 decimal places".into());
-    }
-
-    let whole: u64 = whole_str
-        .parse()
-        .map_err(|_| "Amount too large".to_string())?;
-    let mut darks = whole
-        .checked_mul(DARKS_PER_NIGHT)
-        .ok_or("Amount too large")?;
-
-    if !frac_str.is_empty() {
-        let padded = format!("{frac_str:0<8}");
-        let frac: u64 = padded.parse().map_err(|_| "Bad decimals".to_string())?;
-        darks = darks.checked_add(frac).ok_or("Amount too large")?;
-    }
-
-    if darks == 0 {
-        return Err("Amount must be greater than zero".into());
-    }
-    Ok(darks)
+    nightfall_wallet::amount_input::parse_night(s).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -1324,5 +1753,252 @@ mod tests {
         assert!(parse_amount("-1").is_err());
         assert!(parse_amount("abc").is_err());
         assert!(parse_amount("0.123456789").is_err());
+    }
+
+    /// The two spellings that used to depend on which wallet you were holding.
+    /// Core now reads `.5` as half a NIGHT, where it used to refuse it, and the
+    /// browser and mobile wallets now refuse `+5`, where they used to read it
+    /// as five. Pinned here as well as in `amount_input` because this is where
+    /// someone looking for Core's behaviour will look.
+    #[test]
+    fn agrees_with_the_other_wallets_about_the_two_awkward_spellings() {
+        assert_eq!(parse_amount(".5").unwrap(), DARKS_PER_NIGHT / 2);
+        assert!(parse_amount("+5").is_err());
+    }
+
+    #[test]
+    fn scan_failure_stays_visible_until_success_and_discards_confirmation() {
+        use super::*;
+        let root =
+            std::env::temp_dir().join(format!("nightfall-scan-warning-{}", std::process::id()));
+        let mut app = App::new(NetworkId::Devnet, root);
+        let ctx = egui::Context::default();
+        app.send_confirm = true;
+        *app.sync_signal.lock().unwrap() =
+            Some(Err("public test: canonical anchor changed".into()));
+        app.drain_sync_signal(&ctx);
+        assert!(!app.send_confirm);
+        assert!(app.wallet_sync_error.is_some());
+        app.drain_sync_signal(&ctx);
+        app.poll_status();
+        assert!(app.wallet_sync_error.is_some());
+        assert!(app.last_sync_at.is_none());
+        *app.sync_signal.lock().unwrap() = Some(Ok(0));
+        app.drain_sync_signal(&ctx);
+        assert!(app.wallet_sync_error.is_none());
+        assert!(app.last_sync_at.is_some());
+        assert!(app.node.is_none());
+    }
+
+    #[test]
+    fn scan_progress_renders_without_waiting_for_wallet_and_conceals_secrets() {
+        use super::*;
+        let root = std::env::temp_dir().join(format!(
+            "nightfall-scan-ui-{}-{}",
+            std::process::id(),
+            nightfall_storage::now_unix()
+        ));
+        let mut app = App::new(NetworkId::Devnet, root);
+        assert!(app.node.is_none());
+        let wallet = app.wallet.clone();
+        let access = app.wallet_scan_access.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let scanner = std::thread::spawn(move || {
+            let _access = access.lock().unwrap();
+            let _wallet = wallet.lock().unwrap();
+            ready_tx.send(()).unwrap();
+            // Bounds a regression that accidentally takes either lock in UI.
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+        });
+        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(app.wallet_scan_access.try_lock().is_err());
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let started = Instant::now();
+        for width in [320.0, 620.0, 1180.0] {
+            app.reveal_seed = true;
+            app.reveal_mnemonic = true;
+            app.reveal_view_key = true;
+            let mut used = egui::Rect::NOTHING;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 780.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    used = app.scan_wait_panel(ctx);
+                },
+            );
+            assert!(!app.reveal_seed && !app.reveal_mnemonic && !app.reveal_view_key);
+            assert!(
+                used.right() <= width + 1.0,
+                "scan panel overflow: width={width}, rect={used:?}"
+            );
+        }
+        let elapsed = started.elapsed();
+        let _ = release_tx.send(());
+        scanner.join().unwrap();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "UI waited for the scan: {elapsed:?}"
+        );
+        assert!(app.wallet_scan_access.try_lock().is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn onboarding_publication_discards_setup_and_never_starts_a_node() {
+        use super::*;
+        // The clock alone is not a unique name: these run in parallel
+        // threads of one process, and the platform does not hand each of
+        // them a distinct nanosecond. Two fixtures then race for the same
+        // directory and one loses. The counter makes the name unique by
+        // construction; the clock stays so leftovers remain readable.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "nightfall-onboarding-shell-{}-{nonce}-{seq}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let lock = Arc::new(nightfall_storage::dirlock::acquire(&root).unwrap());
+        let mut app = App::with_data_lock(NetworkId::Devnet, lock.clone());
+        assert!(app.onboarding.is_some() && app.node.is_none());
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        app.vault_ui.start_provision(
+            app.wallet.clone(),
+            app.wallet_paused.clone(),
+            Some(lock.clone()),
+            NetworkId::Devnet,
+            crate::onboarding::ProvisionRequest {
+                source: crate::onboarding::ProvisionSource::Words(zeroize::Zeroizing::new(
+                    nightfall_crypto::WalletKeys::from_seed([0; 32]).to_mnemonic(),
+                )),
+                password: zeroize::Zeroizing::new("public unfunded shell test password".into()),
+            },
+            ctx.clone(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(180);
+        while app.vault_ui.busy() {
+            let _ = ctx.run(
+                egui::RawInput {
+                    focused: false,
+                    ..Default::default()
+                },
+                |ctx| {
+                    assert!(app.vault_gate(ctx));
+                },
+            );
+            assert!(app.node.is_none());
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.vault_ui.error.is_none());
+        assert!(app.onboarding.is_none() && app.backup_acked);
+        assert_eq!(app.vault_ui.custody, Custody::Locked);
+        assert!(app.wallet_paused.load(Ordering::SeqCst));
+        drop(app);
+        let app = App::with_data_lock(NetworkId::Devnet, lock.clone());
+        assert!(app.node.is_none() && app.onboarding.is_none());
+        assert!(app.backup_acked && app.wallet_paused.load(Ordering::SeqCst));
+        drop(app);
+        drop(lock);
+        assert!(root
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("nightfall-onboarding-shell-"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wallet_startup_errors_do_not_start_a_node_or_offer_a_replacement() {
+        use super::App;
+        use nightfall_types::NetworkId;
+        use std::fs;
+        for case in ["vault", "broken-db", "orphan-db", "interrupted-save"] {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "nightfall-startup-test-{}-{nonce}-{case}",
+                std::process::id()
+            ));
+            fs::create_dir(&root).unwrap();
+            match case {
+                "vault" => {
+                    fs::create_dir(root.join("core.seed.vault")).unwrap();
+                }
+                "broken-db" => {
+                    fs::write(root.join("core.seed"), "00".repeat(32)).unwrap();
+                    fs::write(root.join("core.seed.outputs.json"), b"broken JSON").unwrap();
+                }
+                "orphan-db" => {
+                    fs::write(
+                        root.join("core.seed.outputs.json"),
+                        br#"{"outputs":[],"scanned_to":75}"#,
+                    )
+                    .unwrap();
+                }
+                "interrupted-save" => {
+                    fs::write(
+                        root.join("core.seed.outputs.json.tmp"),
+                        b"unfinished database",
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let app = App::new(NetworkId::Devnet, root.clone());
+            assert!(app.wallet_load_error.is_some(), "{case}");
+            assert!(app.onboarding.is_none(), "{case}");
+            assert!(app.node.is_none(), "{case}");
+            assert!(app.wallet.lock().unwrap().address().is_none(), "{case}");
+            assert!(!root.join("blocks.bin").exists());
+            if case != "broken-db" {
+                assert!(!root.join("core.seed").exists());
+            } else {
+                assert_eq!(
+                    fs::read(root.join("core.seed.outputs.json")).unwrap(),
+                    b"broken JSON"
+                );
+            }
+            drop(app);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn wallet_startup_error_card_fits_supported_widths() {
+        use eframe::egui;
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        for width in [320.0, 620.0, 884.0] {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 900.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let right = ui.max_rect().right();
+                    super::wallet_load_error_panel(ui, "Encrypted wallet or interrupted vault migration found. Plaintext fallback and replacement seeds are disabled.");
+                    assert!(ui.min_rect().right() <= right + 1.0, "overflow at {width}");
+                });
+            });
+        }
     }
 }

@@ -267,6 +267,12 @@ fn load_known_peers(datadir: &std::path::Path) -> Vec<String> {
 }
 
 impl NodeInner {
+    /// Read under the caller's existing state lock; wallet decisions must not
+    /// compare their scan against the partial chain of an active disk replay.
+    pub fn is_loading(&self) -> bool {
+        self.loading
+    }
+
     pub fn persist(&mut self) -> anyhow::Result<()> {
         if let Some(keep) = self.prune_keep {
             match self.chain.prune_keep(keep) {

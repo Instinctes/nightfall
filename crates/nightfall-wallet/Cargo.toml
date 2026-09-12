@@ -26,3 +26,18 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rand = { workspace = true }
+argon2 = { workspace = true, features = ["zeroize"] }
+chacha20poly1305 = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# The vault adapter's Windows filesystem primitives: the hard-link count of an
+# open handle, and a rename that asks to be written through. See src/vault_fs.rs.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
