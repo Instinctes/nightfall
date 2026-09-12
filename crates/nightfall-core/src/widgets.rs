@@ -557,7 +557,13 @@ pub fn narrow_column<R>(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egu
     // screens read as empty. A line of text still should not run the full
     // width of a wide window, so it grows to 820 and stops: wide enough to
     // stop looking abandoned, narrow enough to stay readable.
-    let width = width.max((avail * 0.72).min(820.0));
+    // 0.86 rather than something smaller because the main content area is
+    // already inset by the navigation rail and the page margins. At 0.72 the
+    // Send form worked out to exactly the 660 points it had asked for and so
+    // never grew at all, while the gate screens — which have the whole window
+    // — grew properly: one number, two very different amounts of room, and
+    // only one of them looked right.
+    let width = width.max((avail * 0.86).min(820.0));
     let pad = ((avail - width) / 2.0).max(0.0);
     let mut out = None;
     ui.horizontal(|ui| {
@@ -616,9 +622,13 @@ pub fn summary_row(ui: &mut egui::Ui, key: &str, value: RichText, strong: bool) 
 
 /// Small label above a value.
 pub fn metric_grid(ui: &mut egui::Ui, cells: &[(&str, String, Color32)], separate_cards: bool) {
-    let columns = if ui.available_width() >= 880.0 {
+    // Four across from 640 points, not 880. A strip of four figures is one
+    // reading; folding it into two rows of two turns it into two readings and
+    // leaves half the card empty — which is what Activity's totals did on a
+    // perfectly ordinary window.
+    let columns = if ui.available_width() >= 640.0 {
         4
-    } else if ui.available_width() >= 390.0 {
+    } else if ui.available_width() >= 320.0 {
         2
     } else {
         1
@@ -720,6 +730,21 @@ pub fn dot(ui: &mut egui::Ui, color: Color32, animate: bool) {
 
 /// Primary action button — a gradient pill.
 pub fn primary_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
+    primary_button_width(ui, text, enabled, None)
+}
+
+/// As [`primary_button`], with a width the caller insists on.
+///
+/// `button_row` allocates a shared width and then asks for a primary button;
+/// without this the button sized itself from its own label and came out
+/// narrower than the row had agreed, so "Send" at 75 points sat beside
+/// "Receive" at 92 — the exact raggedness the row exists to remove.
+pub fn primary_button_width(
+    ui: &mut egui::Ui,
+    text: &str,
+    enabled: bool,
+    exact: Option<f32>,
+) -> egui::Response {
     let enabled = enabled && ui.is_enabled();
     let fg = if enabled { INK } else { TEXT_FAINT };
     let galley =
@@ -734,7 +759,9 @@ pub fn primary_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Res
     // allocated a shared width and this happily drew past it, which is how a
     // clamped row still overflowed a 320-point card.
     let size = Vec2::new(
-        (galley.size().x + 44.0).min(ui.available_width().max(72.0)),
+        exact.unwrap_or_else(|| {
+            (galley.size().x + 44.0).min(ui.available_width().max(72.0))
+        }),
         CONTROL_H,
     );
     let (rect, resp) = ui
@@ -836,11 +863,7 @@ pub fn button_row(ui: &mut egui::Ui, labels: &[&str], enabled: bool) -> Option<u
     ui.horizontal(|ui| {
         for (index, label) in labels.iter().enumerate() {
             let pressed = if index == 0 {
-                ui.allocate_ui(Vec2::new(width, CONTROL_H), |ui| {
-                    primary_button(ui, label, enabled)
-                })
-                .inner
-                .clicked()
+                primary_button_width(ui, label, enabled, Some(width)).clicked()
             } else {
                 ui.add_enabled(
                     enabled,

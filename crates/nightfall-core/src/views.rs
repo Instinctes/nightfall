@@ -685,10 +685,15 @@ fn activity_row(ui: &mut egui::Ui, e: &nightfall_wallet::HistoryEntry, now: u64)
 
     egui::Frame::none()
         .fill(SURFACE_HI)
-        .rounding(Rounding::same(ROUND_SM))
-        .inner_margin(egui::Margin::symmetric(H_MARGIN, 10.0))
+        .rounding(Rounding::same(ROUND_FIELD))
+        .inner_margin(egui::Margin::symmetric(H_MARGIN, 9.0))
         .show(ui, |ui| {
             ui.set_width(inner);
+            // Two lines of text, not two paragraphs. The default vertical
+            // spacing put ten points between the direction and its memo and
+            // another ten under it, so a list of five payments was mostly
+            // padding and only three rows fitted on screen at once.
+            ui.spacing_mut().item_spacing.y = 2.0;
             ui.horizontal(|ui| {
                 ui.allocate_ui_with_layout(
                     Vec2::new(ICON_W, 0.0),
@@ -748,7 +753,7 @@ fn activity_row(ui: &mut egui::Ui, e: &nightfall_wallet::HistoryEntry, now: u64)
                 );
             });
         });
-    ui.add_space(6.0);
+    ui.add_space(2.0);
 }
 
 // ------------------------------------------------------------------ send ---
@@ -1505,13 +1510,20 @@ pub fn invoice_row(
     // the right figure without saying what it was for. Named, counted, and
     // applied to nothing.
     if !state.candidates.is_empty() {
+        let n = state.candidates.len();
         ui.label(
-            RichText::new(format!(
-                "{} payment(s) for this amount arrived without quoting the \
-                 reference. They have not been applied to anything — check them \
-                 in Activity before treating this as paid.",
-                state.candidates.len()
-            ))
+            RichText::new(if n == 1 {
+                "One payment for this amount arrived without quoting the reference. \
+                 It has not been applied to anything — check it in Activity before \
+                 treating this as paid."
+                    .to_owned()
+            } else {
+                format!(
+                    "{n} payments for this amount arrived without quoting the \
+                     reference. They have not been applied to anything — check them \
+                     in Activity before treating this as paid."
+                )
+            })
             .size(11.0)
             .color(WARN),
         );
@@ -1939,6 +1951,10 @@ pub fn activity(app: &mut App, ui: &mut egui::Ui) {
             // so every row got a different budget and the columns drifted.
             const RECEIPT_W: f32 = 88.0;
             let row_w = ui.available_width();
+            // A list, not a stack of cards. The default spacing put ten points
+            // between every row on top of each row's own margins, which is
+            // what made five payments fill a window.
+            ui.spacing_mut().item_spacing.y = 4.0;
             for e in filtered {
                 let can_receipt = matches!(e.direction, Direction::Received | Direction::Mined);
                 let body_w = (row_w - if can_receipt { RECEIPT_W } else { 0.0 }).max(240.0);

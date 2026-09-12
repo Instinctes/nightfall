@@ -261,6 +261,18 @@ pub fn status(invoice: &Invoice, payments: &[Incoming], now_unix: u64) -> Invoic
         }
     };
 
+    // A candidate is a question: "is this unidentified payment meant for this
+    // invoice?" Once the invoice is settled there is no question left, and
+    // asking it anyway tells a merchant something is unaccounted for when
+    // nothing is. Seen on a real till: an invoice marked Paid still carried
+    // "1 payment for this amount arrived without quoting the reference".
+    if matches!(
+        state,
+        InvoiceState::Paid { .. } | InvoiceState::Overpaid { .. } | InvoiceState::Closed
+    ) {
+        candidates.clear();
+    }
+
     InvoiceStatus {
         state,
         matched,
@@ -442,6 +454,37 @@ mod tests {
         let s = status(&inv, &[], 10_000);
         assert_eq!(s.state, InvoiceState::Expired);
         assert!(!s.is_settled());
+    }
+
+    /// A settled invoice asks no questions.
+    ///
+    /// A candidate is the question "is this unidentified payment meant for this
+    /// one?". Once the invoice is paid there is nothing left to ask, and
+    /// asking anyway tells the merchant something is unaccounted for when
+    /// nothing is — which is exactly what a real till showed: an invoice
+    /// marked Paid, carrying a warning about a payment it did not need.
+    #[test]
+    fn a_settled_invoice_stops_offering_candidates() {
+        let inv = invoice("A-17", Some(500));
+        let stranger = paid(500, "", 1_400);
+
+        let open = status(&inv, &[stranger.clone()], 1_600);
+        assert_eq!(open.state, InvoiceState::Open);
+        assert_eq!(open.candidates.len(), 1, "an open invoice still asks");
+
+        let settled = status(&inv, &[stranger.clone(), paid(500, "A-17", 1_500)], 1_600);
+        assert_eq!(settled.state, InvoiceState::Paid { late: false });
+        assert!(settled.candidates.is_empty());
+
+        // …but an invoice that is only part paid still asks, because the
+        // unidentified payment might be the rest of it.
+        let short = status(&inv, &[stranger.clone(), paid(200, "A-17", 1_500)], 1_600);
+        assert!(matches!(short.state, InvoiceState::Underpaid { .. }));
+        assert_eq!(short.candidates.len(), 1);
+
+        let mut closed_invoice = inv.clone();
+        closed_invoice.closed_note = Some("paid in cash".into());
+        assert!(status(&closed_invoice, &[stranger], 1_600).candidates.is_empty());
     }
 
     #[test]
