@@ -1185,14 +1185,24 @@ impl VaultUi {
                 Custody::Legacy => ("Protect this wallet", "This wallet still uses legacy storage. Vault encrypts the seed, outputs and history without changing your address."),
                 Custody::Migration if self.has_snapshot => ("Verify your encrypted copy", "Your encrypted copy is saved. Re-enter its password to verify it against the original files before replacing the legacy secrets."),
                 Custody::Migration => ("Resume wallet encryption", "Enrollment was interrupted before a complete encrypted copy was saved. Your legacy files will be read and verified; no new seed will be generated."),
-                Custody::Locked => ("Your wallet is locked", "Unlock to scan your balance and prepare payments. An already running node or miner can continue while wallet access is locked."),
+                Custody::Locked => ("Locked", "Unlock to see your balance and send. A node or miner that is already running keeps going."),
                 Custody::Unlocked => ("Vault is unlocked", "Automatic lock: five minutes without input, loss of focus or hiding the window. Existing backup copies retain their original protection."),
                 Custody::Failed => ("Wallet needs attention", "A storage operation could not be completed safely. Restart Core to inspect the saved state. Do not delete wallet files or create a replacement seed."),
                 Custody::Empty => ("No wallet is open", "Create or restore a wallet before enabling Vault."),
             };
-                ui.heading(title);
-                ui.add_space(8.0);
-                ui.label(description);
+                if self.custody == Custody::Locked {
+                    ui.vertical_centered(|ui| {
+                        logo(ui, 40.0);
+                    });
+                    ui.add_space(12.0);
+                    ui.label(egui::RichText::new(title).size(28.0).strong());
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(description).size(13.0).color(TEXT_DIM));
+                } else {
+                    ui.heading(title);
+                    ui.add_space(8.0);
+                    ui.label(description);
+                }
                 if let Some(error) = &self.error {
                     ui.add_space(8.0);
                     ui.colored_label(DANGER, error);

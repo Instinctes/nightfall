@@ -201,6 +201,20 @@ pub fn status_color(ok: bool) -> Color32 {
     }
 }
 
+/// An opaque tint of `color` laid over `base`.
+///
+/// Use this for any filled notice, never `Color32::gamma_multiply`, which
+/// lowers the *alpha* and leaves the fill see-through. That is invisible until
+/// something passes behind it — and the page banners are drawn above the
+/// scroll area, so the balance card slid underneath one and its buttons showed
+/// through the warning. A notice must be a surface, not a gel.
+///
+/// `base` is whatever the notice sits on: `BG` for a page banner, `SURFACE`
+/// for one inside a card.
+pub fn tint(base: Color32, color: Color32, amount: f32) -> Color32 {
+    lerp_color(base, color, amount)
+}
+
 /// Linear interpolation between two colours.
 pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);

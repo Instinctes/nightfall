@@ -157,6 +157,156 @@ fn the_payment_request_card_fits_supported_content_widths() {
     });
 }
 
+/// A handful of history entries, one of each shape.
+fn rows_fixture() -> Vec<nightfall_wallet::HistoryEntry> {
+    use nightfall_wallet::{Direction, HistoryEntry};
+    let row = |direction, fee, memo: &str, height| HistoryEntry {
+        direction,
+        amount: 150_000_000,
+        fee,
+        memo: memo.into(),
+        height,
+        txid: "ab".repeat(32),
+        timestamp: 1_000,
+        spent_commits: Vec::new(),
+        raw: None,
+        quarantined: false,
+    };
+    vec![
+        row(Direction::Received, 0, "A-17", Some(1_280)),
+        row(Direction::Received, 0, "", Some(1_281)),
+        row(Direction::Mined, 0, "", Some(1_278)),
+        row(Direction::Sent, 100_000, "Rent — March", Some(1_282)),
+        row(Direction::Sent, 100_000, "", None),
+    ]
+}
+
+/// Two columns do not overlap, and they leave a gap.
+///
+/// From a screenshot of the Dashboard: the right edge of "Recent activity"
+/// sat to the *right* of the left edge of "Network supply" — the two cards
+/// were drawn on top of each other. Measured here rather than looked at,
+/// because a card border crossing another card is easy to read as a divider.
+#[test]
+fn two_columns_do_not_overlap() {
+    use crate::widgets::{card, two_columns};
+
+    let ctx = egui::Context::default();
+    crate::theme::apply(&ctx);
+    for width in [620.0, 884.0, 1180.0, 1600.0] {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(width, 900.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let panel = ui.max_rect();
+                let mut left_rect = egui::Rect::NOTHING;
+                let mut right_rect = egui::Rect::NOTHING;
+                two_columns(
+                    ui,
+                    320.0,
+                    |ui| {
+                        left_rect = ui
+                            .scope(|ui| {
+                                card(ui, |ui| {
+                                    // The real content, not a label. A card
+                                    // holding a label cannot push its column
+                                    // wider; a card holding rows that size
+                                    // themselves from `available_width` can,
+                                    // and on the Dashboard it did — the
+                                    // activity list ran 72 points under the
+                                    // card beside it.
+                                    for entry in &rows_fixture() {
+                                        activity_row_for_test(ui, entry, 9_000);
+                                    }
+                                });
+                            })
+                            .response
+                            .rect;
+                    },
+                    |ui| {
+                        right_rect = ui
+                            .scope(|ui| {
+                                card(ui, |ui| {
+                                    ui.label("right");
+                                });
+                            })
+                            .response
+                            .rect;
+                    },
+                );
+                // Folded to one column on a narrow window: then they stack,
+                // and "no overlap" is about vertical order instead.
+                if right_rect.top() >= left_rect.bottom() - 1.0 {
+                    return;
+                }
+                assert!(
+                    left_rect.right() <= right_rect.left() + 0.5,
+                    "columns overlap at {width}px: left ends at {}, right starts at {}",
+                    left_rect.right(),
+                    right_rect.left(),
+                );
+                assert!(
+                    right_rect.right() <= panel.right() + 1.0,
+                    "right column runs past the panel at {width}px: {} > {}",
+                    right_rect.right(),
+                    panel.right(),
+                );
+            });
+        });
+    }
+}
+
+/// Every row in a list is the same width, whichever direction it is.
+///
+/// From a screenshot of the Dashboard: the received, mined and sent rows
+/// looked like three different widths inside one card. Three tints and three
+/// stroke colours make an edge easier or harder to see, so the eye is not a
+/// reliable instrument here — this measures instead.
+#[test]
+fn activity_rows_in_one_list_share_one_width() {
+    let ctx = egui::Context::default();
+    crate::theme::apply(&ctx);
+    let entries = rows_fixture();
+
+    for width in [620.0, 884.0, 1180.0] {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(width, 1400.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut widths = Vec::new();
+                crate::widgets::card(ui, |ui| {
+                    for entry in &entries {
+                        // Each row inside its own scope: `ui.min_rect()` is the
+                        // running total of everything drawn so far, so reading
+                        // it after each row reports the same number whatever
+                        // the rows do. The first version of this test did that
+                        // and passed while the screenshot plainly disagreed.
+                        let drawn = ui.scope(|ui| activity_row_for_test(ui, entry, 9_000)).response.rect;
+                        widths.push((drawn.width() * 100.0).round() / 100.0);
+                    }
+                });
+                let first = widths[0];
+                for (index, w) in widths.iter().enumerate() {
+                    assert_eq!(
+                        *w, first,
+                        "row {index} is {w} wide, row 0 is {first}, at {width}px",
+                    );
+                }
+            });
+        });
+    }
+}
+
 /// The Air card, in each of the states it can be in.
 ///
 /// The eight-page sweep reaches it only empty. Its populated states carry the
@@ -305,11 +455,18 @@ fn the_till_rows_fit_supported_content_widths() {
         (base.clone(), vec![], 9_999), // expired
         (base.clone(), vec![quoting(1_234_567_890, 1_500)], 1_600), // paid
         (base.clone(), vec![quoting(1_234_567_890, 9_000)], 9_999), // paid late
-        (base.clone(), vec![quoting(1, 1_500), anonymous.clone()], 1_600), // short + candidate
+        (
+            base.clone(),
+            vec![quoting(1, 1_500), anonymous.clone()],
+            1_600,
+        ), // short + candidate
         (base.clone(), vec![quoting(9_999_999_999, 1_500)], 1_600), // overpaid
         (closed, vec![], 1_600),
         (
-            Invoice { amount_darks: None, ..base.clone() },
+            Invoice {
+                amount_darks: None,
+                ..base.clone()
+            },
             vec![quoting(7, 1_500)],
             1_600,
         ),
@@ -354,8 +511,12 @@ fn the_till_rows_fit_supported_content_widths() {
     ] {
         assert!(seen.contains(&expected), "{expected:?} was never drawn");
     }
-    assert!(seen.iter().any(|s| matches!(s, InvoiceState::Underpaid { .. })));
-    assert!(seen.iter().any(|s| matches!(s, InvoiceState::Overpaid { .. })));
+    assert!(seen
+        .iter()
+        .any(|s| matches!(s, InvoiceState::Underpaid { .. })));
+    assert!(seen
+        .iter()
+        .any(|s| matches!(s, InvoiceState::Overpaid { .. })));
 }
 
 /// The state behind the Proof Card: a verdict must never outlive the document

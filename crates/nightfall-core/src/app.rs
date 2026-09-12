@@ -70,6 +70,19 @@ impl View {
         (View::Swap, "Swap"),
         (View::Settings, "Settings"),
     ];
+
+    /// Glance pages fill the panel. Forms stop stretching at a readable width.
+    ///
+    /// This cap is applied to banners *and* the page together. Capping the
+    /// page alone left Settings' cards inset under a full-bleed scan warning,
+    /// and wrapping Dashboard in the same cap left a dead strip down the right.
+    pub fn content_max_width(self) -> f32 {
+        match self {
+            View::Send | View::Settings => 720.0,
+            View::Swap => 860.0,
+            _ => f32::INFINITY,
+        }
+    }
 }
 
 /// Sampled hashrate, derived from the node's cumulative hash counter.
@@ -1190,10 +1203,17 @@ impl eframe::App for App {
                         .inner_margin(egui::Margin::same(28.0)),
                 )
                 .show(ctx, |ui| {
-                    screen_header(ui, &self.network.to_string(), &[
-                        ("Nothing is written until your words are confirmed", TEXT_FAINT),
-                        (WALLET_VERSION, TEXT_FAINT),
-                    ]);
+                    screen_header(
+                        ui,
+                        &self.network.to_string(),
+                        &[
+                            (
+                                "Nothing is written until your words are confirmed",
+                                TEXT_FAINT,
+                            ),
+                            (WALLET_VERSION, TEXT_FAINT),
+                        ],
+                    );
                     ui.add_space(GAP_LG);
                     // Onboarding is the one full-window screen that never had a
                     // scroll area, and it is also the tallest: on a 812-point
@@ -1227,119 +1247,109 @@ impl eframe::App for App {
                 // content the way a background image would.
                 page_wash(ui.painter(), ui.clip_rect());
 
-                // The scan warning, at the size it is worth.
-                //
-                // It used to print three lines on all eight pages — over a
-                // hundred points of identical text above every screen, read
-                // once and then permanently in the way. It is now one line
-                // that opens when someone wants the detail, and it opens
-                // itself on the two pages where it changes what the wallet
-                // will do: Send, because sending is blocked, and Dashboard,
-                // because that is where the balance it qualifies is shown.
-                if let Some(error) = &self.wallet_sync_error {
-                    let detailed = matches!(self.view, View::Dashboard | View::Send);
-                    egui::Frame::none()
-                        .fill(WARN.gamma_multiply(0.12))
-                        .stroke(Stroke::new(1.0_f32, WARN.gamma_multiply(0.35)))
-                        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
-                        .rounding(Rounding::same(ROUND_FIELD))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            egui::CollapsingHeader::new(
-                                RichText::new(
-                                    "Wallet scan incomplete — balances and confirmations may be stale",
-                                )
-                                .color(WARN)
-                                .size(12.5),
-                            )
-                            // Per page, so the open state on Dashboard does not
-                            // decide the state on Receive — a shared id made
-                            // `default_open` apply once, to whichever page was
-                            // shown first, and the rest inherited it.
-                            .id_salt(("scan-warning", self.view as u8))
-                            .default_open(detailed)
+                // One column for banners and the page. Same left edge, same
+                // right edge, same cap — so the scan warning cannot be a
+                // different width from the cards under it.
+                page_column(ui, self.view.content_max_width(), |ui| {
+                    // The always-on scrollbar lives in the scroll area below.
+                    // Inset banners by the same gutter so their right edge
+                    // matches the hero, not the bar.
+                    let gutter = scroll_gutter(ui);
+                    let banner_w = (ui.available_width() - gutter).max(0.0);
+
+                    if let Some(error) = &self.wallet_sync_error {
+                        let detailed = matches!(self.view, View::Dashboard | View::Send);
+                        egui::Frame::none()
+                            .fill(tint(BG, WARN, 0.16))
+                            .stroke(Stroke::new(1.0_f32, WARN.gamma_multiply(0.35)))
+                            .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                            .rounding(Rounding::same(ROUND_FIELD))
                             .show(ui, |ui| {
-                                ui.label(RichText::new(error).size(12.0).color(TEXT_DIM));
-                                ui.label(RichText::new("Sending is blocked until a valid scan completes. Preserve an encrypted backup; do not clear pending payments or swap reservations to bypass this warning.").size(12.0).color(TEXT_DIM));
+                                fill_width(ui, (banner_w - 28.0).max(0.0));
+                                egui::CollapsingHeader::new(
+                                    RichText::new(
+                                        "Wallet scan incomplete — balances and confirmations may be stale",
+                                    )
+                                    .color(WARN)
+                                    .size(12.5),
+                                )
+                                // Per page, so the open state on Dashboard does not
+                                // decide the state on Receive — a shared id made
+                                // `default_open` apply once, to whichever page was
+                                // shown first, and the rest inherited it.
+                                .id_salt(("scan-warning", self.view as u8))
+                                .default_open(detailed)
+                                .show(ui, |ui| {
+                                    ui.label(RichText::new(error).size(12.0).color(TEXT_DIM));
+                                    ui.label(RichText::new("Sending is blocked until a valid scan completes. Preserve an encrypted backup; do not clear pending payments or swap reservations to bypass this warning.").size(12.0).color(TEXT_DIM));
+                                });
                             });
-                        });
-                    ui.add_space(GAP_SM);
-                }
+                        ui.add_space(GAP_SM);
+                    }
 
-                // A development build looking at real money says so, on every
-                // page, in the colour reserved for things that cannot be
-                // undone. It is not a toast and it does not dismiss: the risk
-                // lasts as long as the build does.
-                if IS_DEV_MAINNET {
-                    egui::Frame::none()
-                        .fill(DANGER.gamma_multiply(0.14))
-                        .stroke(Stroke::new(1.0_f32, DANGER.gamma_multiply(0.5)))
-                        .rounding(Rounding::same(ROUND_FIELD))
-                        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                    // A development build looking at real money says so, on every
+                    // page, in the colour reserved for things that cannot be
+                    // undone. It is not a toast and it does not dismiss: the risk
+                    // lasts as long as the build does.
+                    if IS_DEV_MAINNET {
+                        egui::Frame::none()
+                            .fill(tint(BG, DANGER, 0.18))
+                            .stroke(Stroke::new(1.0_f32, DANGER.gamma_multiply(0.5)))
+                            .rounding(Rounding::same(ROUND_FIELD))
+                            .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                            .show(ui, |ui| {
+                                fill_width(ui, (banner_w - 28.0).max(0.0));
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Development build {WALLET_VERSION} on mainnet, using your \
+                                         real wallet directory. Once it saves, the released 0.9.5 \
+                                         app can no longer read this wallet — an encrypted backup \
+                                         is the only way back. Never run both at once.",
+                                    ))
+                                    .color(DANGER)
+                                    .size(12.5),
+                                );
+                            });
+                        ui.add_space(GAP_SM);
+                    }
+
+                    if let Some(err) = self.status_error.clone() {
+                        egui::Frame::none()
+                            .fill(tint(BG, DANGER, 0.16))
+                            .stroke(Stroke::new(1.0_f32, DANGER.gamma_multiply(0.5)))
+                            .rounding(Rounding::same(ROUND_SM))
+                            .inner_margin(egui::Margin::same(12.0))
+                            .show(ui, |ui| {
+                                fill_width(ui, (banner_w - 24.0).max(0.0));
+                                ui.label(RichText::new(format!("Node error: {err}")).color(DANGER));
+                            });
+                        ui.add_space(12.0);
+                    }
+
+                    egui::ScrollArea::vertical()
+                        .id_salt(("page-scroll", self.view as u8))
+                        .auto_shrink([false, false])
+                        // Always reserve the bar. With the default the bar appears
+                        // only once the page overflows, which takes ~10px of width
+                        // away mid-session — every right-aligned column then shifts
+                        // sideways as you scroll. Reserving it costs a sliver of
+                        // width and makes the layout stop moving.
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                         .show(ui, |ui| {
-                            ui.set_width(ui.available_width() - 28.0);
-                            ui.label(
-                                RichText::new(format!(
-                                    "Development build {WALLET_VERSION} on mainnet, using your \
-                                     real wallet directory. Once it saves, the released 0.9.5 \
-                                     app can no longer read this wallet — an encrypted backup \
-                                     is the only way back. Never run both at once.",
-                                ))
-                                .color(DANGER)
-                                .size(12.5),
-                            );
+                            fill_width(ui, ui.available_width());
+                            views::page_intro(self.view, ui);
+                            match self.view {
+                                View::Dashboard => views::dashboard(self, ui),
+                                View::Send => views::send(self, ui, ctx),
+                                View::Receive => views::receive(self, ui, ctx),
+                                View::Activity => views::activity(self, ui),
+                                View::Mining => views::mining(self, ui),
+                                View::Network => views::network(self, ui, ctx),
+                                View::Swap => crate::views_swap::swap(self, ui, ctx),
+                                View::Settings => views::settings(self, ui, ctx),
+                            }
                         });
-                    ui.add_space(GAP_SM);
-                }
-
-                if let Some(err) = self.status_error.clone() {
-                    egui::Frame::none()
-                        .fill(DANGER.gamma_multiply(0.12))
-                        .stroke(Stroke::new(1.0_f32, DANGER.gamma_multiply(0.5)))
-                        .rounding(Rounding::same(ROUND_SM))
-                        .inner_margin(egui::Margin::same(12.0))
-                        .show(ui, |ui| {
-                            ui.label(RichText::new(format!("Node error: {err}")).color(DANGER));
-                        });
-                    ui.add_space(12.0);
-                }
-
-                egui::ScrollArea::vertical()
-                    .id_salt(("page-scroll", self.view as u8))
-                    .auto_shrink([false, false])
-                    // Always reserve the bar. With the default the bar appears
-                    // only once the page overflows, which takes ~10px of width
-                    // away mid-session — every right-aligned column then shifts
-                    // sideways as you scroll. Reserving it costs a sliver of
-                    // width and makes the layout stop moving.
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                    .show(ui, |ui| {
-                        // Content is capped and centred: full-bleed cards on an
-                        // ultra-wide display look sparse and are hard to read.
-                        const MAX_CONTENT: f32 = 1180.0;
-                        let avail = ui.available_width();
-                        let pad = ((avail - MAX_CONTENT) / 2.0).max(0.0);
-                        ui.horizontal(|ui| {
-                            ui.add_space(pad);
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(avail - pad * 2.0, 0.0),
-                                egui::Layout::top_down(egui::Align::LEFT),
-                                |ui| {
-                                    views::page_intro(self.view, ui);
-                                    match self.view {
-                                        View::Dashboard => views::dashboard(self, ui),
-                                        View::Send => views::send(self, ui, ctx),
-                                        View::Receive => views::receive(self, ui, ctx),
-                                        View::Activity => views::activity(self, ui),
-                                        View::Mining => views::mining(self, ui),
-                                        View::Network => views::network(self, ui, ctx),
-                                        View::Swap => crate::views_swap::swap(self, ui, ctx),
-                                        View::Settings => views::settings(self, ui, ctx),
-                                    }
-                                },
-                            );
-                        });
-                    });
+                });
             });
 
         self.toasts.show(ctx);

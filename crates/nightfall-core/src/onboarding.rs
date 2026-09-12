@@ -202,10 +202,7 @@ impl Onboarding {
                             "Create an encrypted wallet",
                             "New 24 words, written down by you before anything is saved.",
                         ),
-                        (
-                            "Restore my 24 words",
-                            "You have the words on paper.",
-                        ),
+                        ("Restore my 24 words", "You have the words on paper."),
                         (
                             "Recover from encrypted backup",
                             "You have a .nfv file and the password it was exported with.",

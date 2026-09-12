@@ -37,42 +37,43 @@ pub fn swap(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         .map(|wallet| wallet.is_vault())
         .unwrap_or(true)
     {
-        ui.heading("Swaps remain a separate research track");
-        ui.label("Experimental swap secrets and recovery deadlines are not integrated with Vault. Swap actions are disabled for Vault wallets.");
+        status_banner(
+            ui,
+            WARN,
+            "Swaps remain a separate research track",
+            "Experimental swap secrets and recovery deadlines are not integrated with Vault. Swap actions are disabled for Vault wallets.",
+            false,
+            |_| {},
+        );
         return;
     }
-    // Centred instead of pinned to the left edge. On a wide window this page
-    // was a column of cards hugging one side with the rest of the screen
-    // empty, which read as something failing to load.
-    crate::widgets::narrow_column(ui, 860.0, |ui| {
-        header(app, ui);
-        ui.add_space(14.0);
+    header(app, ui);
+    ui.add_space(14.0);
 
-        let gate = logic::availability(app.network);
-        if let logic::Availability::Locked { headline, detail } = &gate {
-            locked_notice(ui, headline, detail);
-            ui.add_space(14.0);
-        }
+    let gate = logic::availability(app.network);
+    if let logic::Availability::Locked { headline, detail } = &gate {
+        status_banner(ui, DANGER, headline, detail, false, |_| {});
+        ui.add_space(14.0);
+    }
 
-        bitcoin_node_card(app, ui, ctx);
+    bitcoin_node_card(app, ui, ctx);
+    ui.add_space(14.0);
+    if let Some(note) = &app.swap_tick_note {
+        ui.label(RichText::new(note).size(12.0).color(WARN));
         ui.add_space(14.0);
-        if let Some(note) = &app.swap_tick_note {
-            ui.label(RichText::new(note).size(12.0).color(WARN));
-            ui.add_space(14.0);
-        }
-        swap_list(app, ui, ctx);
-        ui.add_space(14.0);
-        ui.add_enabled_ui(gate.is_enabled() && app.swap_job.is_none(), |ui| {
-            egui::CollapsingHeader::new("Start or join a trade")
-                .default_open(true)
-                .show(ui, |ui| {
-                    warnings(ui);
-                    ui.add_space(14.0);
-                    start_form(app, ui, ctx);
-                    ui.add_space(14.0);
-                    packets(app, ui, ctx);
-                });
-        });
+    }
+    swap_list(app, ui, ctx);
+    ui.add_space(14.0);
+    ui.add_enabled_ui(gate.is_enabled() && app.swap_job.is_none(), |ui| {
+        egui::CollapsingHeader::new("Start or join a trade")
+            .default_open(true)
+            .show(ui, |ui| {
+                warnings(ui);
+                ui.add_space(14.0);
+                start_form(app, ui, ctx);
+                ui.add_space(14.0);
+                packets(app, ui, ctx);
+            });
     });
 }
 
@@ -95,24 +96,6 @@ fn header(app: &App, ui: &mut egui::Ui) {
         .size(12.5)
         .color(TEXT_DIM),
     );
-}
-
-fn locked_notice(ui: &mut egui::Ui, headline: &str, detail: &str) {
-    egui::Frame::none()
-        .fill(DANGER.gamma_multiply(0.10))
-        .stroke(Stroke::new(1.0_f32, DANGER.gamma_multiply(0.45)))
-        .rounding(Rounding::same(ROUND))
-        .inner_margin(egui::Margin::same(16.0))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width() - 32.0);
-            ui.horizontal(|ui| {
-                dot(ui, DANGER, false);
-                ui.add_space(4.0);
-                ui.label(RichText::new(headline).size(13.5).color(DANGER).strong());
-            });
-            ui.add_space(6.0);
-            ui.label(RichText::new(detail).size(12.0).color(TEXT));
-        });
 }
 
 fn bitcoin_node_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -191,7 +174,7 @@ fn bitcoin_node_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 
 fn warnings(ui: &mut egui::Ui) {
     egui::Frame::none()
-        .fill(WARN.gamma_multiply(0.10))
+        .fill(tint(SURFACE, WARN, 0.13))
         .stroke(Stroke::new(1.0_f32, WARN.gamma_multiply(0.45)))
         .rounding(Rounding::same(ROUND))
         .inner_margin(egui::Margin::same(16.0))

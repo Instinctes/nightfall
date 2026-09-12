@@ -333,20 +333,28 @@ pub fn gradient_card<R>(ui: &mut egui::Ui, height: f32, add: impl FnOnce(&mut eg
 /// The three pieces are each nearly invisible alone. Together they are the
 /// difference between a panel and a rectangle of a slightly different colour.
 pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    let width = ui.available_width();
+    let outer = ui.available_width();
     egui::Frame::none()
         .fill(SURFACE)
         .stroke(Stroke::new(1.0_f32, BORDER))
         .rounding(Rounding::same(ROUND))
         .inner_margin(egui::Margin::same(20.0))
+        // A 24-point blur spreads 24 points in every direction, and the gap
+        // between two columns is 16 — so each card's shadow reached across the
+        // gap, over its neighbour's border and under its content. On a dark
+        // surface that reads as a smeared edge, and it is what made two cards
+        // side by side look as though they overlapped.
+        //
+        // Half the blur, half the drop: still a lift, contained within the
+        // gap. See `two_columns`, which now leaves more room than the blur.
         .shadow(egui::epaint::Shadow {
-            offset: Vec2::new(0.0, 8.0),
-            blur: 24.0,
+            offset: Vec2::new(0.0, 4.0),
+            blur: 12.0,
             spread: 0.0,
-            color: Color32::from_black_alpha(28),
+            color: Color32::from_black_alpha(30),
         })
         .show(ui, |ui| {
-            ui.set_width(width - 40.0);
+            fill_width(ui, (outer - 40.0).max(0.0));
             add(ui)
         })
         .inner
@@ -387,46 +395,90 @@ pub fn hairline(ui: &mut egui::Ui) {
     );
 }
 
+/// Pin this UI to `width` so a Frame cannot shrink to its text.
+///
+/// Without this, a scan warning sizes to its title and a card sizes to the
+/// panel, and the two right edges miss each other. Every page surface has
+/// to claim the same number.
+pub fn fill_width(ui: &mut egui::Ui, width: f32) {
+    ui.set_width(width.max(0.0));
+}
+
+/// How much the always-on vertical scrollbar steals from the page.
+///
+/// Banners sit *above* the scroll area. If they use the full panel width
+/// and the cards use the panel minus the bar, the warning is 8–12 px wider
+/// than the hero — which is exactly the "not aligned" the screenshot showed.
+pub fn scroll_gutter(ui: &egui::Ui) -> f32 {
+    ui.spacing().scroll.allocated_width()
+}
+
+/// One centred column for banners *and* the page, sharing a single width.
+///
+/// Glance pages pass `f32::INFINITY` and fill the panel. Form pages pass a
+/// cap (Send, Settings, Swap) so a text field is not 1400 px wide. Capping
+/// the page alone, with the scan warning still full-bleed, is what made
+/// Settings look inset and off-centre.
+pub fn page_column<R>(
+    ui: &mut egui::Ui,
+    max_width: f32,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let avail = ui.available_width();
+    let width = avail.min(max_width);
+    let height = ui.available_height();
+    let mut out = None;
+    // Own the full panel first so the inner column can be centred in it.
+    // A horizontal `add_space` + allocate pair shrinks to content and
+    // leaves a dead strip down the right — that was the Dashboard bug.
+    ui.allocate_ui_with_layout(
+        Vec2::new(avail, height),
+        egui::Layout::top_down(egui::Align::Center),
+        |ui| {
+            ui.allocate_ui_with_layout(
+                Vec2::new(width, height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    fill_width(ui, width);
+                    out = Some(add(ui));
+                },
+            );
+        },
+    );
+    out.expect("page_column body always runs")
+}
+
 /// Two columns side by side, stacked when the window is too narrow for them.
 ///
-/// The pages that were not dashboards each drew one narrow card against the
-/// left edge and left two thirds of the window empty. Splitting the content
-/// in two fills the width when there is width, and folds back to a single
-/// column when there is not, rather than squeezing two unreadable columns
-/// into a small window.
+/// `ui.columns` gives each cell its own top-down layout of equal width.
+/// Putting `allocate_ui` inside a horizontal layout is what staggered
+/// cards diagonally, and wrapping the *hero* in a column is what left
+/// the spendable card half-width with a dead strip on the right.
 pub fn two_columns<A, B>(
     ui: &mut egui::Ui,
     min_column: f32,
     left: impl FnOnce(&mut egui::Ui) -> A,
     right: impl FnOnce(&mut egui::Ui) -> B,
 ) {
-    const GAP: f32 = 16.0;
     let avail = ui.available_width();
-    if avail < min_column * 2.0 + GAP {
+    if avail < min_column * 2.0 + GAP_MD {
         left(ui);
-        ui.add_space(14.0);
+        ui.add_space(GAP_LG);
         right(ui);
         return;
     }
-    let col = (avail - GAP) / 2.0;
-    ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing.x = GAP;
-        ui.allocate_ui_with_layout(
-            Vec2::new(col, 0.0),
-            egui::Layout::top_down(egui::Align::LEFT),
-            |ui| {
-                ui.set_width(col);
-                left(ui);
-            },
-        );
-        ui.allocate_ui_with_layout(
-            Vec2::new(col, 0.0),
-            egui::Layout::top_down(egui::Align::LEFT),
-            |ui| {
-                ui.set_width(col);
-                right(ui);
-            },
-        );
+    ui.scope(|ui| {
+        // Wider than a card's shadow blur, so the two columns keep their own
+        // light. At GAP_MD the shadows met in the middle of the gap.
+        ui.spacing_mut().item_spacing.x = GAP_LG;
+        ui.columns(2, |cols| {
+            let w0 = cols[0].available_width();
+            fill_width(&mut cols[0], w0);
+            left(&mut cols[0]);
+            let w1 = cols[1].available_width();
+            fill_width(&mut cols[1], w1);
+            right(&mut cols[1]);
+        });
     });
 }
 
@@ -491,6 +543,65 @@ pub fn pill(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
     resp
 }
 
+/// A full-width notice: one colour, one title, one body, optional actions.
+///
+/// Dashboard, Activity and Swap each drew this frame by hand. The fills
+/// drifted (0.10 vs 0.12) and so did the title size, so the same kind of
+/// fact — "something needs you" — did not look like the same kind of fact.
+pub fn status_banner(
+    ui: &mut egui::Ui,
+    color: Color32,
+    title: &str,
+    body: &str,
+    pulse: bool,
+    actions: impl FnOnce(&mut egui::Ui),
+) {
+    // Outer width is captured *before* the frame's inner margin, so a
+    // banner and a card on the same page share one right edge. Measuring
+    // inside the frame and subtracting the margin again made banners 32 px
+    // narrower than the hero.
+    let outer = ui.available_width();
+    egui::Frame::none()
+        .fill(tint(BG, color, 0.16))
+        .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.55)))
+        .rounding(Rounding::same(ROUND))
+        .inner_margin(egui::Margin::same(16.0))
+        .show(ui, |ui| {
+            fill_width(ui, (outer - 32.0).max(0.0));
+            ui.horizontal(|ui| {
+                dot(ui, color, pulse);
+                ui.add_space(6.0);
+                ui.label(RichText::new(title).size(14.0).color(color).strong());
+            });
+            if !body.is_empty() {
+                ui.add_space(6.0);
+                ui.label(RichText::new(body).size(12.5).color(TEXT_DIM));
+            }
+            actions(ui);
+        });
+}
+
+/// A quiet placeholder when a list has nothing to show.
+///
+/// A filter box plus a blank card is what made empty pages look unfinished.
+/// The title is the state; the hint is the next action, in one sentence.
+pub fn empty_state(ui: &mut egui::Ui, title: &str, hint: &str) {
+    ui.add_space(18.0);
+    ui.vertical_centered(|ui| {
+        ui.label(RichText::new(title).size(14.0).color(TEXT_DIM));
+        ui.add_space(4.0);
+        ui.label(RichText::new(hint).size(11.5).color(TEXT_FAINT));
+    });
+    ui.add_space(18.0);
+}
+
+/// A grouping label between cards on a long page (Settings).
+pub fn section_label(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(GAP_SM);
+    kicker(ui, text);
+    ui.add_space(GAP_SM);
+}
+
 /// A card with a title row.
 ///
 /// The title uses [`kicker`], so every tab picks up the web wallet's
@@ -509,14 +620,14 @@ pub fn titled_card<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui
 /// the card it sits in, which is the only cue the phone wallet uses and the
 /// only one needed.
 pub fn well<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    let width = ui.available_width();
+    let outer = ui.available_width();
     egui::Frame::none()
         .fill(SURFACE_LOW)
         .stroke(Stroke::new(1.0_f32, BORDER.gamma_multiply(0.9)))
         .rounding(Rounding::same(ROUND_SM))
         .inner_margin(egui::Margin::symmetric(16.0, 14.0))
         .show(ui, |ui| {
-            ui.set_width(width - 32.0);
+            fill_width(ui, (outer - 32.0).max(0.0));
             add(ui)
         })
         .inner
@@ -542,40 +653,15 @@ pub fn field_label(ui: &mut egui::Ui, label: &str, note: Option<RichText>) {
 
 /// A capped-width column, centred in whatever space it is given.
 ///
-/// A form should not be as wide as a dashboard — a line of input 900px long
-/// is hard to scan and harder to fill in. But capping the width with
-/// `set_max_width` alone leaves the column pinned to the left edge with a
-/// third of the window empty beside it, which reads as a page that failed to
-/// load rather than as a deliberately narrow form.
+/// Used on lock and onboarding — a single form in a full window. The main
+/// pages fill the central panel instead: capping them left a dead strip down
+/// the right side of the window.
 pub fn narrow_column<R>(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    let avail = ui.available_width();
-    // Grow with the window, up to a point.
-    //
-    // Every full-window screen asked for 620 points regardless of how much
-    // space there was, so on a 1180-point window a form sat in the middle with
-    // 280 points of nothing on either side — the single biggest reason these
-    // screens read as empty. A line of text still should not run the full
-    // width of a wide window, so it grows to 820 and stops: wide enough to
-    // stop looking abandoned, narrow enough to stay readable.
-    // 0.86 rather than something smaller because the main content area is
-    // already inset by the navigation rail and the page margins. At 0.72 the
-    // Send form worked out to exactly the 660 points it had asked for and so
-    // never grew at all, while the gate screens — which have the whole window
-    // — grew properly: one number, two very different amounts of room, and
-    // only one of them looked right.
-    let width = width.max((avail * 0.86).min(820.0));
-    let pad = ((avail - width) / 2.0).max(0.0);
+    let width = width.min(ui.available_width());
     let mut out = None;
-    ui.horizontal(|ui| {
-        ui.add_space(pad);
-        ui.allocate_ui_with_layout(
-            Vec2::new(width.min(avail), 0.0),
-            egui::Layout::top_down(egui::Align::LEFT),
-            |ui| {
-                ui.set_width(width.min(avail));
-                out = Some(add(ui));
-            },
-        );
+    ui.vertical_centered(|ui| {
+        fill_width(ui, width);
+        out = Some(add(ui));
     });
     out.expect("narrow_column body always runs")
 }
@@ -759,9 +845,7 @@ pub fn primary_button_width(
     // allocated a shared width and this happily drew past it, which is how a
     // clamped row still overflowed a 320-point card.
     let size = Vec2::new(
-        exact.unwrap_or_else(|| {
-            (galley.size().x + 44.0).min(ui.available_width().max(72.0))
-        }),
+        exact.unwrap_or_else(|| (galley.size().x + 44.0).min(ui.available_width().max(72.0))),
         CONTROL_H,
     );
     let (rect, resp) = ui
@@ -804,6 +888,7 @@ pub fn primary_button_width(
 ///
 /// Dark fill, not translucent white: white-on-white over a light gradient stop
 /// is unreadable, which is exactly how the first version shipped.
+#[allow(dead_code)]
 pub fn on_gradient_chip(ui: &mut egui::Ui, text: &str) {
     let galley = ui.painter().layout_no_wrap(
         text.to_string(),
@@ -1312,6 +1397,45 @@ mod interaction_tests {
     }
 
     #[test]
+    fn narrow_column_pads_both_sides_equally() {
+        for width in [620.0, 900.0, 1400.0, 1800.0] {
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(width, 700.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(ctx, |ui| {
+                    let outer = ui.max_rect();
+                    let mut inner = Rect::NOTHING;
+                    narrow_column(ui, 620.0, |ui| {
+                        inner = ui.max_rect();
+                        ui.label("x");
+                    });
+                    let left = inner.left() - outer.left();
+                    let right = outer.right() - inner.right();
+                    assert!(
+                        (left - right).abs() <= 2.0,
+                        "at {width}px left pad {left} != right pad {right}"
+                    );
+                    let expected = width.min(620.0);
+                    assert!(
+                        (inner.width() - expected).abs() <= 2.0,
+                        "inner {} at window {width}, expected {expected}",
+                        inner.width()
+                    );
+                });
+            });
+        }
+    }
+
+    #[test]
     fn two_columns_fit_the_allocated_width() {
         for width in [660.0, 900.0, 1180.0] {
             let ctx = egui::Context::default();
@@ -1344,5 +1468,163 @@ mod interaction_tests {
                 });
             });
         }
+    }
+
+    #[test]
+    fn two_columns_are_equal_width() {
+        for width in [700.0, 900.0, 1180.0] {
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(width, 700.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(ctx, |ui| {
+                        let mut left_w = 0.0;
+                        let mut right_w = 0.0;
+                        two_columns(
+                            ui,
+                            280.0,
+                            |ui| {
+                                left_w = ui.available_width();
+                                ui.label("L");
+                            },
+                            |ui| {
+                                right_w = ui.available_width();
+                                ui.label("R");
+                            },
+                        );
+                        assert!(
+                            (left_w - right_w).abs() <= 2.0,
+                            "at {width}px left {left_w} != right {right_w}"
+                        );
+                    });
+            });
+        }
+    }
+
+    #[test]
+    fn page_column_centres_a_capped_width() {
+        for width in [900.0, 1400.0, 1800.0] {
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(width, 700.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(ctx, |ui| {
+                        let outer = ui.max_rect();
+                        let mut inner = Rect::NOTHING;
+                        page_column(ui, 720.0, |ui| {
+                            inner = ui.max_rect();
+                            ui.label("x");
+                        });
+                        let left = inner.left() - outer.left();
+                        let right = outer.right() - inner.right();
+                        assert!(
+                            (left - right).abs() <= 2.0,
+                            "at {width}px left pad {left} != right pad {right}"
+                        );
+                        assert!(
+                            (inner.width() - 720.0).abs() <= 2.0,
+                            "inner {} at window {width}",
+                            inner.width()
+                        );
+                    });
+            });
+        }
+    }
+
+    #[test]
+    fn banner_and_card_share_the_outer_edge() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none())
+                .show(ctx, |ui| {
+                    let mut banner = Rect::NOTHING;
+                    let mut panel = Rect::NOTHING;
+                    ui.scope(|ui| {
+                        status_banner(ui, WARN, "Title", "Body", false, |_| {});
+                        banner = ui.min_rect();
+                    });
+                    ui.scope(|ui| {
+                        card(ui, |ui| {
+                            ui.label("inside");
+                        });
+                        panel = ui.min_rect();
+                    });
+                    assert!(
+                        (banner.left() - panel.left()).abs() <= 2.0,
+                        "left banner {} card {}",
+                        banner.left(),
+                        panel.left()
+                    );
+                    assert!(
+                        (banner.right() - panel.right()).abs() <= 2.0,
+                        "right banner {} card {}",
+                        banner.right(),
+                        panel.right()
+                    );
+                });
+        });
+    }
+
+    #[test]
+    fn two_columns_stack_when_the_window_is_narrow() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(500.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none())
+                .show(ctx, |ui| {
+                    let mut left_w = 0.0;
+                    let mut right_w = 0.0;
+                    two_columns(
+                        ui,
+                        320.0,
+                        |ui| {
+                            left_w = ui.available_width();
+                            ui.label("L");
+                        },
+                        |ui| {
+                            right_w = ui.available_width();
+                            ui.label("R");
+                        },
+                    );
+                    // Stacked: each child sees the full panel, not a half.
+                    assert!(
+                        left_w > 400.0 && right_w > 400.0,
+                        "stacked columns should fill 500px, got {left_w} / {right_w}"
+                    );
+                });
+        });
     }
 }

@@ -92,13 +92,14 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
         .unwrap_or(SyncHold::Synced);
 
     if loading {
+        let outer = ui.available_width();
         egui::Frame::none()
-            .fill(ACCENT.gamma_multiply(0.12))
+            .fill(tint(SURFACE, ACCENT, 0.16))
             .stroke(Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.55)))
             .rounding(Rounding::same(ROUND))
             .inner_margin(egui::Margin::same(16.0))
             .show(ui, |ui| {
-                ui.set_width(ui.available_width() - 32.0);
+                fill_width(ui, (outer - 32.0).max(0.0));
                 ui.horizontal(|ui| {
                     dot(ui, ACCENT, true);
                     ui.add_space(6.0);
@@ -199,139 +200,99 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
         _ => None,
     };
     if let Some((color, title, body, offer_resync)) = hold_banner {
-        egui::Frame::none()
-            .fill(color.gamma_multiply(0.12))
-            .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.55)))
-            .rounding(Rounding::same(ROUND))
-            .inner_margin(egui::Margin::same(16.0))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width() - 32.0);
-                ui.horizontal(|ui| {
-                    dot(ui, color, true);
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(title).size(14.0).color(color).strong());
-                });
-                ui.add_space(6.0);
-                ui.label(RichText::new(body).size(12.5).color(TEXT_DIM));
-                if offer_resync {
-                    ui.add_space(10.0);
-                    if ghost_button(ui, "  Open Settings to resync  ").clicked() {
-                        app.view = View::Settings;
-                        app.resync_confirm = true;
-                    }
+        status_banner(ui, color, &title, &body, true, |ui| {
+            if offer_resync {
+                ui.add_space(10.0);
+                if ghost_button(ui, "Open Settings to resync").clicked() {
+                    app.view = View::Settings;
+                    app.resync_confirm = true;
                 }
-            });
+            }
+        });
         ui.add_space(14.0);
     }
 
     if !app.backup_acked {
-        egui::Frame::none()
-            .fill(WARN.gamma_multiply(0.12))
-            .stroke(Stroke::new(1.0_f32, WARN.gamma_multiply(0.55)))
-            .rounding(Rounding::same(ROUND))
-            .inner_margin(egui::Margin::same(16.0))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width() - 32.0);
-                ui.horizontal(|ui| {
-                    dot(ui, WARN, false);
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new("Write down the 24 words")
-                            .size(14.0)
-                            .color(WARN)
-                            .strong(),
-                    );
-                });
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(
-                        "The hex seed is no longer the backup. Settings → Backup shows the same 24 words the phone and browser wallets use. Anyone who sees them can spend.",
-                    )
-                    .size(12.5)
-                    .color(TEXT_DIM),
-                );
+        status_banner(
+            ui,
+            WARN,
+            "Write down the 24 words",
+            "The hex seed is no longer the backup. Settings → Backup shows the same 24 words the phone and browser wallets use. Anyone who sees them can spend.",
+            false,
+            |ui| {
                 ui.add_space(10.0);
-                if ghost_button(ui, "  Open Backup  ").clicked() {
+                if ghost_button(ui, "Open Backup").clicked() {
                     app.view = View::Settings;
                     app.reveal_mnemonic = true;
                 }
-            });
+            },
+        );
         ui.add_space(14.0);
     }
 
     // Mining with no peers is how you end up on a private fork without
     // noticing. Say so loudly, before hours of work get discarded.
     if app.is_mining() && peers == 0 && !loading {
-        egui::Frame::none()
-            .fill(WARN.gamma_multiply(0.12))
-            .stroke(Stroke::new(1.0_f32, WARN.gamma_multiply(0.55)))
-            .rounding(Rounding::same(ROUND))
-            .inner_margin(egui::Margin::same(16.0))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width() - 32.0);
-                ui.horizontal(|ui| {
-                    dot(ui, WARN, true);
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new("Mining alone — not connected to anyone")
-                            .size(14.0)
-                            .color(WARN)
-                            .strong(),
-                    );
-                });
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(
-                        "You are building your own chain. If another miner is running on the \
-                         same genesis, one of the two chains will be discarded when you finally \
-                         connect — and everything mined on the lighter one is lost.",
-                    )
-                    .size(11.5)
-                    .color(TEXT_DIM),
-                );
+        status_banner(
+            ui,
+            WARN,
+            "Mining alone — not connected to anyone",
+            "You are building your own chain. If another miner is running on the \
+             same genesis, one of the two chains will be discarded when you finally \
+             connect — and everything mined on the lighter one is lost.",
+            true,
+            |ui| {
                 ui.add_space(10.0);
-                if ghost_button(ui, "  Connect to a peer  ").clicked() {
+                if ghost_button(ui, "Connect to a peer").clicked() {
                     app.view = View::Network;
                 }
-            });
+            },
+        );
         ui.add_space(14.0);
     }
 
     // --- balance hero: the one gradient surface in the app ---
-    gradient_card(ui, 172.0, |ui| {
+    //
+    // One number. Unlocking and pending sit under it as quiet lines, not as
+    // chips competing with the figure they qualify. The chips used to be the
+    // same visual weight as the balance, so "12 NIGHT" and "3 outputs" read
+    // as two facts of equal rank.
+    gradient_card(ui, 156.0, |ui| {
+        ui.label(RichText::new("SPENDABLE").size(11.0).color(INK).strong());
+        ui.add_space(2.0);
         ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new("TOTAL BALANCE")
-                        .size(11.0)
-                        .color(INK)
-                        .strong(),
-                );
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(night(balances.available))
-                            .size(40.0)
-                            .color(INK)
-                            .strong(),
-                    );
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("NIGHT").size(16.0).color(INK).strong());
-                });
-
-                ui.add_space(12.0);
-                ui.horizontal_wrapped(|ui| {
-                    if balances.immature > 0 {
-                        on_gradient_chip(ui, &format!("{} unlocking", night(balances.immature)));
-                    }
-                    if balances.pending_out > 0 {
-                        on_gradient_chip(ui, &format!("{} pending", night(balances.pending_out)));
-                    }
-                    let count = app.wallet.lock().map(|w| w.output_count()).unwrap_or(0);
-                    on_gradient_chip(ui, &format!("{count} outputs"));
-                });
-            });
+            ui.label(
+                RichText::new(night(balances.available))
+                    .size(42.0)
+                    .color(INK)
+                    .strong(),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("NIGHT")
+                    .size(15.0)
+                    .color(INK.gamma_multiply(0.72))
+                    .strong(),
+            );
         });
+        ui.add_space(10.0);
+        let count = app.wallet.lock().map(|w| w.output_count()).unwrap_or(0);
+        let mut parts = Vec::new();
+        if balances.immature > 0 {
+            parts.push(format!("{} unlocking", night(balances.immature)));
+        }
+        if balances.pending_out > 0 {
+            parts.push(format!("{} pending", night(balances.pending_out)));
+        }
+        parts.push(format!(
+            "{count} output{}",
+            if count == 1 { "" } else { "s" }
+        ));
+        ui.label(
+            RichText::new(parts.join("  ·  "))
+                .size(12.0)
+                .color(INK.gamma_multiply(0.78)),
+        );
     });
 
     // Actions live below the gradient, not on it: a white pill on the light end
@@ -342,12 +303,12 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
         // two sizes for one pair of equally important choices — and the
         // padding hack that produced it (`"  Receive  "`) is exactly the kind
         // of thing that stops working the moment the label changes.
-        if let Some(index) = button_row(
-            ui,
-            &["Send", "Receive"],
-            true,
-        ) {
-            app.view = if index == 0 { View::Send } else { View::Receive };
+        if let Some(index) = button_row(ui, &["Send", "Receive"], true) {
+            app.view = if index == 0 {
+                View::Send
+            } else {
+                View::Receive
+            };
         }
 
         // The wallet syncs itself every few seconds; this is a status readout,
@@ -460,27 +421,7 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
         );
     }
 
-    ui.add_space(14.0);
-
-    // `ui.columns` gives each cell its own top-down layout. Using
-    // `allocate_ui` inside a horizontal layout makes the children horizontal
-    // too, which is what staggered the cards diagonally.
-    metric_grid(
-        ui,
-        &[
-            ("BLOCKS", format_int(blocks), TEXT),
-            (
-                "PEERS",
-                peers.to_string(),
-                if peers > 0 { SUCCESS } else { WARN },
-            ),
-            ("MEMPOOL", mempool.to_string(), TEXT),
-            ("DIFFICULTY", format_int(difficulty), TEXT),
-        ],
-        true,
-    );
-
-    ui.add_space(14.0);
+    ui.add_space(GAP_LG);
 
     let now = now_unix();
     let tip_time = app.status.as_ref().map(|s| s.tip_time).unwrap_or(0);
@@ -528,135 +469,163 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
         None => ("—".to_string(), TEXT_DIM),
     };
 
-    metric_grid(
+    // Hero stays full width. These two cards sit *under* it, equal width,
+    // same left and right edges. Putting them beside the hero is what left
+    // the spendable number in a left column with a dead strip on the right.
+    two_columns(
         ui,
-        &[
-            ("LAST BLOCK", last_block, last_color),
-            ("NETWORK HASH", net_label, TEXT),
-            ("YOUR SHARE", share_label, share_color),
-            ("NEXT UNLOCK", unlock_label, unlock_color),
-        ],
-        true,
-    );
-
-    ui.add_space(8.0);
-    ui.label(
-        RichText::new(
-            "Network hash is difficulty ÷ 15 s — an estimate, not a miner count. \
-             Your share is this machine against that estimate.",
-        )
-        .size(11.0)
-        .color(TEXT_FAINT),
-    );
-
-    ui.add_space(14.0);
-
-    ui.columns(2, |cols| {
-        // --- recent activity ---
-        titled_card(&mut cols[0], "Recent activity", |ui| {
-            let entries: Vec<_> = app
-                .wallet
-                .lock()
-                .map(|w| w.history().iter().take(6).cloned().collect())
-                .unwrap_or_default();
-
-            if entries.is_empty() {
-                empty_state(
+        320.0,
+        |ui| {
+            titled_card(ui, "This node", |ui| {
+                metric_grid(
                     ui,
-                    "Nothing yet",
-                    "Turn on mining or share your address to receive NIGHT.",
-                );
-            } else {
-                let now = now_unix();
-                for e in &entries {
-                    activity_row(ui, e, now);
-                }
-                ui.add_space(4.0);
-                if ghost_button(ui, "View all activity").clicked() {
-                    app.view = View::Activity;
-                }
-            }
-        });
-
-        // --- supply panel ---
-        titled_card(&mut cols[1], "Network supply", |ui| {
-            if loading {
-                ui.label(RichText::new("—").size(20.0).monospace().strong());
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new("Hidden until the chain file is in memory. Not zero.")
-                        .size(11.5)
-                        .color(TEXT_DIM),
-                );
-                return;
-            }
-            let circulating = minted.saturating_sub(burned);
-            let pct = circulating as f64 / (MAX_SUPPLY_NIGHT as f64 * DARKS_PER_NIGHT as f64);
-
-            ui.label(
-                RichText::new(format!("{} NIGHT", night(circulating)))
-                    .size(20.0)
-                    .monospace()
-                    .strong(),
-            );
-            ui.add_space(3.0);
-            ui.label(
-                RichText::new(format!(
-                    "of {} max · {:.4}% issued",
-                    format_int(MAX_SUPPLY_NIGHT),
-                    pct * 100.0
-                ))
-                .size(11.5)
-                .color(TEXT_DIM),
-            );
-            ui.add_space(10.0);
-            progress(ui, pct as f32, "");
-
-            ui.add_space(14.0);
-            kv(
-                ui,
-                "Mined",
-                RichText::new(night(minted)).monospace().color(TEXT),
-            );
-            kv(
-                ui,
-                "Burned in fees",
-                RichText::new(night(burned)).monospace().color(WARN),
-            );
-
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                dot(ui, status_color(supply_ok), false);
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(if loading {
-                        "Supply proof waits until the file is loaded"
-                    } else if supply_ok {
-                        "Supply proof verified"
-                    } else {
-                        "Supply proof FAILED"
-                    })
-                    .size(12.0)
-                    .color(status_color(supply_ok)),
+                    &[
+                        ("BLOCKS", format_int(blocks), TEXT),
+                        (
+                            "PEERS",
+                            peers.to_string(),
+                            if peers > 0 { SUCCESS } else { WARN },
+                        ),
+                        ("MEMPOOL", mempool.to_string(), TEXT),
+                        ("DIFFICULTY", format_int(difficulty), TEXT),
+                    ],
+                    false,
                 );
             });
-            ui.label(
-                RichText::new("Every node re-checks that no coin exists which was never mined.")
+        },
+        |ui| {
+            titled_card(ui, "Hashrate", |ui| {
+                metric_grid(
+                    ui,
+                    &[
+                        ("LAST BLOCK", last_block, last_color),
+                        ("NETWORK HASH", net_label, TEXT),
+                        ("YOUR SHARE", share_label, share_color),
+                        ("NEXT UNLOCK", unlock_label, unlock_color),
+                    ],
+                    false,
+                );
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new(
+                        "Network hash is difficulty ÷ 15 s — an estimate, not a miner count. \
+                         Your share is this machine against that estimate.",
+                    )
+                    .size(11.0)
+                    .color(TEXT_FAINT),
+                );
+            });
+        },
+    );
+
+    ui.add_space(GAP_LG);
+
+    two_columns(
+        ui,
+        320.0,
+        |ui| {
+            titled_card(ui, "Recent activity", |ui| {
+                let entries: Vec<_> = app
+                    .wallet
+                    .lock()
+                    .map(|w| w.history().iter().take(6).cloned().collect())
+                    .unwrap_or_default();
+
+                if entries.is_empty() {
+                    empty_state(
+                        ui,
+                        "Nothing yet",
+                        "Share your address or start mining. Incoming payments appear here.",
+                    );
+                    ui.horizontal(|ui| {
+                        if ghost_button(ui, "Receive").clicked() {
+                            app.view = View::Receive;
+                        }
+                    });
+                } else {
+                    let now = now_unix();
+                    for e in &entries {
+                        activity_row(ui, e, now);
+                    }
+                    ui.add_space(4.0);
+                    if ghost_button(ui, "View all activity").clicked() {
+                        app.view = View::Activity;
+                    }
+                }
+            });
+        },
+        |ui| {
+            titled_card(ui, "Network supply", |ui| {
+                if loading {
+                    ui.label(RichText::new("—").size(20.0).monospace().strong());
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Hidden until the chain file is in memory. Not zero.")
+                            .size(11.5)
+                            .color(TEXT_DIM),
+                    );
+                    return;
+                }
+                let circulating = minted.saturating_sub(burned);
+                let pct = circulating as f64 / (MAX_SUPPLY_NIGHT as f64 * DARKS_PER_NIGHT as f64);
+
+                ui.label(
+                    RichText::new(format!("{} NIGHT", night(circulating)))
+                        .size(20.0)
+                        .monospace()
+                        .strong(),
+                );
+                ui.add_space(3.0);
+                ui.label(
+                    RichText::new(format!(
+                        "of {} max · {:.4}% issued",
+                        format_int(MAX_SUPPLY_NIGHT),
+                        pct * 100.0
+                    ))
+                    .size(11.5)
+                    .color(TEXT_DIM),
+                );
+                ui.add_space(10.0);
+                progress(ui, pct as f32, "");
+
+                ui.add_space(14.0);
+                kv(
+                    ui,
+                    "Mined",
+                    RichText::new(night(minted)).monospace().color(TEXT),
+                );
+                kv(
+                    ui,
+                    "Burned in fees",
+                    RichText::new(night(burned)).monospace().color(WARN),
+                );
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    dot(ui, status_color(supply_ok), false);
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(if loading {
+                            "Supply proof waits until the file is loaded"
+                        } else if supply_ok {
+                            "Supply proof verified"
+                        } else {
+                            "Supply proof FAILED"
+                        })
+                        .size(12.0)
+                        .color(status_color(supply_ok)),
+                    );
+                });
+                ui.label(
+                    RichText::new(
+                        "Every node re-checks that no coin exists which was never mined.",
+                    )
                     .size(10.5)
                     .color(TEXT_FAINT),
-            );
-        });
-    });
-}
-
-fn empty_state(ui: &mut egui::Ui, title: &str, hint: &str) {
-    ui.add_space(18.0);
-    ui.vertical_centered(|ui| {
-        ui.label(RichText::new(title).size(14.0).color(TEXT_DIM));
-        ui.add_space(4.0);
-        ui.label(RichText::new(hint).size(11.5).color(TEXT_FAINT));
-    });
-    ui.add_space(18.0);
+                );
+            });
+        },
+    );
 }
 
 /// One row of the Activity list.
@@ -667,25 +636,55 @@ fn empty_state(ui: &mut egui::Ui, title: &str, hint: &str) {
 /// slightly different width and the amounts walked sideways as you scrolled —
 /// which is exactly what it looked like: a broken table. A right-aligned column
 /// has to be pinned to a width the row cannot renegotiate.
+/// One activity row, for the layout test. Same function, public name.
+#[cfg(test)]
+pub fn activity_row_for_test(ui: &mut egui::Ui, e: &nightfall_wallet::HistoryEntry, now: u64) {
+    activity_row(ui, e, now)
+}
+
 fn activity_row(ui: &mut egui::Ui, e: &nightfall_wallet::HistoryEntry, now: u64) {
     // Only glyphs that exist in egui's bundled font — a missing one renders
     // as a tofu box, which is what made the first build look broken.
+    // The tint says which way the money went before a single figure is read.
+    // Sent was neutral white, which made an outgoing payment look like a note
+    // rather than a movement; red is the convention every other wallet uses
+    // and the one people already have in their heads.
+    //
+    // It is a wash, not an alarm — `tint` lays 13% of the colour over the
+    // card. A failed or stuck payment is a different thing and still says so
+    // in words.
     let (icon, color, sign) = match e.direction {
         Direction::Received => ("+", SUCCESS, "+"),
         Direction::Mined => ("*", ACCENT_HI, "+"),
-        Direction::Sent => ("-", TEXT, "-"),
+        Direction::Sent => ("-", DANGER, "-"),
     };
 
     const ICON_W: f32 = 18.0;
-    const AMOUNT_W: f32 = 150.0;
     const H_MARGIN: f32 = 12.0;
+    const GAP: f32 = 8.0;
 
+    // The columns are shares of the room there is, not fixed numbers.
+    //
+    // The amount column used to be 150 points whatever the card was, and the
+    // middle column had a floor of 90. In a narrow card — the Dashboard's
+    // left-hand list on a 1400-point window is about 380 — those three fixed
+    // parts add up to more than the row has, so the row overflows. And an
+    // overflowing child *widens its parent*, so the next row sees more room
+    // and takes it: the five rows measured 407, 432, 455, 475 and 495 inside
+    // a 382-point card, fanning out to the right until the last one ran under
+    // the card beside it.
+    //
+    // Now the three parts are computed to add up to exactly `inner`, so a row
+    // can never be wider than the card, and a narrow card gets a narrow
+    // amount column instead of a broken layout.
     let full = ui.available_width();
-    let inner = (full - H_MARGIN * 2.0).max(200.0);
-    let mid = (inner - ICON_W - AMOUNT_W - 14.0).max(90.0);
+    let inner = (full - H_MARGIN * 2.0).max(80.0);
+    let amount_w = (inner * 0.34).clamp(84.0, 150.0);
+    let mid = (inner - ICON_W - amount_w - GAP * 2.0).max(40.0);
 
     egui::Frame::none()
-        .fill(SURFACE_HI)
+        .fill(tint(SURFACE, color, 0.13))
+        .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.22)))
         .rounding(Rounding::same(ROUND_FIELD))
         .inner_margin(egui::Margin::symmetric(H_MARGIN, 9.0))
         .show(ui, |ui| {
@@ -696,6 +695,11 @@ fn activity_row(ui: &mut egui::Ui, e: &nightfall_wallet::HistoryEntry, now: u64)
             // padding and only three rows fitted on screen at once.
             ui.spacing_mut().item_spacing.y = 2.0;
             ui.horizontal(|ui| {
+                // The same gap the widths were computed from. egui inserts
+                // `item_spacing.x` between the three columns on top of their
+                // own sizes, so arithmetic that ignores it is arithmetic that
+                // overflows by two spacings.
+                ui.spacing_mut().item_spacing.x = GAP;
                 ui.allocate_ui_with_layout(
                     Vec2::new(ICON_W, 0.0),
                     egui::Layout::left_to_right(egui::Align::Center),
@@ -712,7 +716,11 @@ fn activity_row(ui: &mut egui::Ui, e: &nightfall_wallet::HistoryEntry, now: u64)
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(e.direction.label()).size(13.0).strong());
                             if e.is_pending() {
-                                badge(ui, "pending", WARN);
+                                ui.horizontal(|ui| {
+                                    dot(ui, WARN, true);
+                                    ui.add_space(2.0);
+                                    badge(ui, "pending", WARN);
+                                });
                             }
                         });
                         let sub = if e.memo.is_empty() {
@@ -733,10 +741,10 @@ fn activity_row(ui: &mut egui::Ui, e: &nightfall_wallet::HistoryEntry, now: u64)
                 );
 
                 ui.allocate_ui_with_layout(
-                    Vec2::new(AMOUNT_W, 0.0),
+                    Vec2::new(amount_w, 0.0),
                     egui::Layout::top_down(egui::Align::RIGHT),
                     |ui| {
-                        ui.set_width(AMOUNT_W);
+                        ui.set_width(amount_w);
                         ui.label(
                             RichText::new(format!("{sign}{}", night(e.amount)))
                                 .size(13.5)
@@ -857,7 +865,11 @@ fn air_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             kv(
                 ui,
                 "Waiting for",
-                RichText::new(format!("{} to {}", Amount(intent.amount_darks), short_hex(&intent.to.encode()))),
+                RichText::new(format!(
+                    "{} to {}",
+                    Amount(intent.amount_darks),
+                    short_hex(&intent.to.encode())
+                )),
             );
             ui.add_space(GAP_SM);
             if copyable(ui, &intent.to_text(), true) {
@@ -941,8 +953,16 @@ fn air_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 "Pays to",
                 RichText::new(intent.to.encode()).monospace().size(11.5),
             );
-            kv(ui, "Amount", RichText::new(format!("{}", Amount(intent.amount_darks))));
-            kv(ui, "Fee", RichText::new(format!("{}", Amount(intent.fee_darks))));
+            kv(
+                ui,
+                "Amount",
+                RichText::new(format!("{}", Amount(intent.amount_darks))),
+            );
+            kv(
+                ui,
+                "Fee",
+                RichText::new(format!("{}", Amount(intent.fee_darks))),
+            );
             kv(ui, "Network", RichText::new(intent.network.as_str()));
             kv(
                 ui,
@@ -1055,7 +1075,9 @@ fn broadcast(app: &mut App, payload: &[u8]) -> String {
     };
     let tx: nightfall_ledger::Transaction = match serde_json::from_slice(payload) {
         Ok(tx) => tx,
-        Err(problem) => return format!("That is not a transaction this wallet can read: {problem}"),
+        Err(problem) => {
+            return format!("That is not a transaction this wallet can read: {problem}")
+        }
     };
     match app
         .wallet
@@ -1112,8 +1134,11 @@ pub fn proof_card(ui: &mut egui::Ui, proof: &nightfall_wallet::ReceiptProof) {
     kv(
         ui,
         "Amount",
-        RichText::new(format!("{}", Amount(proof.amount_darks)))
-            .color(if proof.amount_proven { TEXT } else { WARN }),
+        RichText::new(format!("{}", Amount(proof.amount_darks))).color(if proof.amount_proven {
+            TEXT
+        } else {
+            WARN
+        }),
     );
     if !proof.memo.is_empty() {
         kv(ui, "Memo", RichText::new(&proof.memo));
@@ -1140,7 +1165,7 @@ pub fn proof_card(ui: &mut egui::Ui, proof: &nightfall_wallet::ReceiptProof) {
     // block past its container. Take them off first.
     let inner = (ui.available_width() - 28.0).max(80.0);
     egui::Frame::none()
-        .fill(tone.gamma_multiply(0.10))
+        .fill(tint(SURFACE, tone, 0.13))
         .stroke(Stroke::new(1.0_f32, tone.gamma_multiply(0.35)))
         .rounding(Rounding::same(ROUND_FIELD))
         .inner_margin(egui::Margin::symmetric(14.0, 12.0))
@@ -1292,274 +1317,270 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     // time. The grouping here is the same one the user already has in their
     // head — who, how much, what it costs — and the summary at the end states
     // the consequence before the irreversible button.
-    narrow_column(ui, 660.0, |ui| {
-        ui.add_enabled_ui(!app.send_confirm, |ui| {
-            let mut addr_state = None;
+    ui.add_enabled_ui(!app.send_confirm, |ui| {
+        let mut addr_state = None;
 
-            titled_card(ui, "Recipient", |ui| {
-                ui.set_width(ui.available_width());
+        titled_card(ui, "Recipient", |ui| {
+            ui.set_width(ui.available_width());
 
-                field_label(ui, "Address", None);
-                ui.add(
-                    egui::TextEdit::multiline(&mut app.send_to)
-                        .margin(FIELD_MARGIN)
-                        .desired_rows(2)
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Monospace)
-                        .hint_text("nf1…"),
-                );
+            field_label(ui, "Address", None);
+            ui.add(
+                egui::TextEdit::multiline(&mut app.send_to)
+                    .margin(FIELD_MARGIN)
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY)
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text("nf1…"),
+            );
 
-                // Live validation — a wrong address must never reach a signature.
-                // Untouched by the redesign: this is the check that stands between a
-                // typo and a payment that cannot come back.
-                let trimmed = app.send_to.trim().to_string();
-                addr_state = if trimmed.is_empty() {
-                    None
-                } else if trimmed == own_address {
-                    Some(Err("This is your own address".to_string()))
-                } else {
-                    Some(Address::decode(&trimmed).map_err(|e| e.to_string()))
-                };
+            // Live validation — a wrong address must never reach a signature.
+            // Untouched by the redesign: this is the check that stands between a
+            // typo and a payment that cannot come back.
+            let trimmed = app.send_to.trim().to_string();
+            addr_state = if trimmed.is_empty() {
+                None
+            } else if trimmed == own_address {
+                Some(Err("This is your own address".to_string()))
+            } else {
+                Some(Address::decode(&trimmed).map_err(|e| e.to_string()))
+            };
 
-                ui.add_space(5.0);
-                match &addr_state {
-                    None => {
+            ui.add_space(5.0);
+            match &addr_state {
+                None => {
+                    ui.label(
+                        RichText::new("Paste the nf1 address the recipient shared with you.")
+                            .size(11.0)
+                            .color(TEXT_FAINT),
+                    );
+                }
+                Some(Ok(a)) => {
+                    ui.horizontal(|ui| {
+                        dot(ui, SUCCESS, false);
+                        ui.add_space(3.0);
                         ui.label(
-                            RichText::new("Paste the nf1 address the recipient shared with you.")
+                            RichText::new(format!("Valid address · {}", a.short()))
                                 .size(11.0)
-                                .color(TEXT_FAINT),
-                        );
-                    }
-                    Some(Ok(a)) => {
-                        ui.horizontal(|ui| {
-                            dot(ui, SUCCESS, false);
-                            ui.add_space(3.0);
-                            ui.label(
-                                RichText::new(format!("Valid address · {}", a.short()))
-                                    .size(11.0)
-                                    .color(SUCCESS),
-                            );
-                        });
-                    }
-                    Some(Err(e)) => {
-                        ui.horizontal(|ui| {
-                            dot(ui, DANGER, false);
-                            ui.add_space(3.0);
-                            ui.label(RichText::new(e).size(11.0).color(DANGER));
-                        });
-                    }
-                }
-
-                // A pasted payment request is read here and applied only when
-                // the owner presses the button.
-                //
-                // Nothing fills itself in. A request is someone else's
-                // statement of what they want, and the gap between reading it
-                // and acting on it is where a person gets to notice that the
-                // address is not the one they expected.
-                if let Some(applied) = payment_request_card(ui, &app.send_to, app.network) {
-                    app.send_to = applied.address.encode();
-                    if let Some(darks) = applied.amount_darks {
-                        app.send_amount = Amount(darks).decimal_string();
-                    }
-                    if !applied.memo.is_empty() {
-                        app.send_memo = applied.memo.clone();
-                    }
-                }
-
-                if !app.address_book.entries.is_empty() {
-                    divider(ui);
-                    ui.label(RichText::new("Address book").size(11.0).color(TEXT_DIM));
-                    ui.add_space(6.0);
-                    let picks: Vec<(String, String)> = app
-                        .address_book
-                        .entries
-                        .iter()
-                        .map(|e| (e.name.clone(), e.address.clone()))
-                        .collect();
-                    ui.horizontal_wrapped(|ui| {
-                        for (name, addr) in picks {
-                            if ghost_button(ui, &format!("  {name}  ")).clicked() {
-                                app.send_to = addr;
-                            }
-                        }
-                    });
-                }
-            });
-
-            ui.add_space(14.0);
-
-            let mut amount_state = parse_amount(&app.send_amount);
-
-            titled_card(ui, "Amount", |ui| {
-                ui.set_width(ui.available_width());
-
-                // The MAX button and the available balance belong to the amount
-                // field, so they sit on its label row instead of floating above it.
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("NIGHT to send").size(12.0).color(TEXT_DIM));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new("MAX").size(10.5).color(ACCENT_HI))
-                                    .fill(Color32::TRANSPARENT)
-                                    .stroke(Stroke::new(1.0_f32, ACCENT_DIM))
-                                    .rounding(Rounding::same(999.0)),
-                            )
-                            .on_hover_text("Send everything, minus the fee")
-                            .clicked()
-                        {
-                            let max = balances.available.saturating_sub(app.send_fee);
-                            app.send_amount = night(max).replace('\u{202F}', "");
-                        }
-                        ui.label(
-                            RichText::new(format!("Available {}", night(balances.available)))
-                                .size(11.0)
-                                .color(TEXT_FAINT),
+                                .color(SUCCESS),
                         );
                     });
-                });
-                ui.add_space(5.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut app.send_amount)
-                        .margin(FIELD_MARGIN)
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Monospace)
-                        .hint_text("0.00000000"),
-                );
-
-                amount_state = parse_amount(&app.send_amount);
-                ui.add_space(4.0);
-                // Only errors live here now. "Total debit" used to sit under the
-                // field, competing with the memo and the fee for the same glance;
-                // it belongs in the summary, where the reader is deciding.
-                let amount_error = match &amount_state {
-                    Ok(darks) => {
-                        let total = darks.saturating_add(app.send_fee);
-                        (total > balances.available)
-                            .then(|| format!("Not enough — {} needed including fee", night(total)))
-                    }
-                    Err(_) if app.send_amount.trim().is_empty() => None,
-                    Err(e) => Some(e.clone()),
-                };
-                message_slot(ui, |ui| {
-                    if let Some(msg) = &amount_error {
+                }
+                Some(Err(e)) => {
+                    ui.horizontal(|ui| {
                         dot(ui, DANGER, false);
                         ui.add_space(3.0);
-                        ui.label(RichText::new(msg).size(11.0).color(DANGER));
+                        ui.label(RichText::new(e).size(11.0).color(DANGER));
+                    });
+                }
+            }
+
+            // A pasted payment request is read here and applied only when
+            // the owner presses the button.
+            //
+            // Nothing fills itself in. A request is someone else's
+            // statement of what they want, and the gap between reading it
+            // and acting on it is where a person gets to notice that the
+            // address is not the one they expected.
+            if let Some(applied) = payment_request_card(ui, &app.send_to, app.network) {
+                app.send_to = applied.address.encode();
+                if let Some(darks) = applied.amount_darks {
+                    app.send_amount = Amount(darks).decimal_string();
+                }
+                if !applied.memo.is_empty() {
+                    app.send_memo = applied.memo.clone();
+                }
+            }
+
+            if !app.address_book.entries.is_empty() {
+                divider(ui);
+                ui.label(RichText::new("Address book").size(11.0).color(TEXT_DIM));
+                ui.add_space(6.0);
+                let picks: Vec<(String, String)> = app
+                    .address_book
+                    .entries
+                    .iter()
+                    .map(|e| (e.name.clone(), e.address.clone()))
+                    .collect();
+                ui.horizontal_wrapped(|ui| {
+                    for (name, addr) in picks {
+                        if ghost_button(ui, &format!("  {name}  ")).clicked() {
+                            app.send_to = addr;
+                        }
                     }
                 });
+            }
+        });
 
-                divider(ui);
+        ui.add_space(14.0);
 
-                // Memo
-                field_label(
-                    ui,
-                    "Memo",
-                    Some(
-                        RichText::new(format!("{}/64", app.send_memo.len()))
-                            .size(10.5)
+        let mut amount_state = parse_amount(&app.send_amount);
+
+        titled_card(ui, "Amount", |ui| {
+            ui.set_width(ui.available_width());
+
+            // The MAX button and the available balance belong to the amount
+            // field, so they sit on its label row instead of floating above it.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("NIGHT to send").size(12.0).color(TEXT_DIM));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("MAX").size(10.5).color(ACCENT_HI))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::new(1.0_f32, ACCENT_DIM))
+                                .rounding(Rounding::same(999.0)),
+                        )
+                        .on_hover_text("Send everything, minus the fee")
+                        .clicked()
+                    {
+                        let max = balances.available.saturating_sub(app.send_fee);
+                        app.send_amount = night(max).replace('\u{202F}', "");
+                    }
+                    ui.label(
+                        RichText::new(format!("Available {}", night(balances.available)))
+                            .size(11.0)
                             .color(TEXT_FAINT),
-                    ),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut app.send_memo)
-                        .margin(FIELD_MARGIN)
-                        .desired_width(f32::INFINITY)
-                        .char_limit(64)
-                        .hint_text("optional"),
-                );
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("Encrypted. Only the recipient can read it.")
-                        .size(10.5)
-                        .color(TEXT_FAINT),
-                );
+                    );
+                });
+            });
+            ui.add_space(5.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut app.send_amount)
+                    .margin(FIELD_MARGIN)
+                    .desired_width(f32::INFINITY)
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text("0.00000000"),
+            );
+
+            amount_state = parse_amount(&app.send_amount);
+            ui.add_space(4.0);
+            // Only errors live here now. "Total debit" used to sit under the
+            // field, competing with the memo and the fee for the same glance;
+            // it belongs in the summary, where the reader is deciding.
+            let amount_error = match &amount_state {
+                Ok(darks) => {
+                    let total = darks.saturating_add(app.send_fee);
+                    (total > balances.available)
+                        .then(|| format!("Not enough — {} needed including fee", night(total)))
+                }
+                Err(_) if app.send_amount.trim().is_empty() => None,
+                Err(e) => Some(e.clone()),
+            };
+            message_slot(ui, |ui| {
+                if let Some(msg) = &amount_error {
+                    dot(ui, DANGER, false);
+                    ui.add_space(3.0);
+                    ui.label(RichText::new(msg).size(11.0).color(DANGER));
+                }
             });
 
-            ui.add_space(14.0);
+            divider(ui);
 
-            // There is one fee, and it was never a choice.
-            //
-            // This card offered Economy, Standard and Priority. Nothing in the
-            // protocol tells them apart: the fee is burned rather than paid to a
-            // miner, and no part of the node orders the mempool by it. So
-            // "Priority" promised faster confirmation that nothing delivers, and
-            // "Economy" invited paying a tenth for exactly the same service —
-            // three buttons where the phone wallet and the command line each show
-            // one number. A choice that changes nothing is worse than no choice:
-            // it makes people think they got it wrong when a payment is slow.
-            app.send_fee = DEFAULT_FEE_DARKS;
+            // Memo
+            field_label(
+                ui,
+                "Memo",
+                Some(
+                    RichText::new(format!("{}/64", app.send_memo.len()))
+                        .size(10.5)
+                        .color(TEXT_FAINT),
+                ),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut app.send_memo)
+                    .margin(FIELD_MARGIN)
+                    .desired_width(f32::INFINITY)
+                    .char_limit(64)
+                    .hint_text("optional"),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Encrypted. Only the recipient can read it.")
+                    .size(10.5)
+                    .color(TEXT_FAINT),
+            );
+        });
 
-            // --- what is about to happen -------------------------------------------
-            //
-            // The numbers that decide the payment, gathered in one recessed block
-            // immediately above the button that commits it. Previously the total sat
-            // three fields further up, next to the amount, and the button sat alone
-            // under the fee chips — so the last thing read before pressing was the
-            // burn note, not the sum leaving the wallet.
-            let ready = matches!(addr_state, Some(Ok(_)))
-                && amount_state
-                    .as_ref()
-                    .map(|d| d.saturating_add(app.send_fee) <= balances.available)
-                    .unwrap_or(false)
-                && !app.send_busy
-                && app.wallet_sync_error.is_none();
+        ui.add_space(14.0);
 
-            card(ui, |ui| {
-                ui.set_width(ui.available_width());
-                let amount = amount_state.as_ref().copied().unwrap_or(0);
-                let total = amount.saturating_add(app.send_fee);
+        // There is one fee, and it was never a choice.
+        //
+        // This card offered Economy, Standard and Priority. Nothing in the
+        // protocol tells them apart: the fee is burned rather than paid to a
+        // miner, and no part of the node orders the mempool by it. So
+        // "Priority" promised faster confirmation that nothing delivers, and
+        // "Economy" invited paying a tenth for exactly the same service —
+        // three buttons where the phone wallet and the command line each show
+        // one number. A choice that changes nothing is worse than no choice:
+        // it makes people think they got it wrong when a payment is slow.
+        app.send_fee = DEFAULT_FEE_DARKS;
 
-                well(ui, |ui| {
-                    summary_row(ui, "Amount", RichText::new(night(amount)), false);
+        // --- what is about to happen -------------------------------------------
+        //
+        // The numbers that decide the payment, gathered in one recessed block
+        // immediately above the button that commits it. Previously the total sat
+        // three fields further up, next to the amount, and the button sat alone
+        // under the fee chips — so the last thing read before pressing was the
+        // burn note, not the sum leaving the wallet.
+        let ready = matches!(addr_state, Some(Ok(_)))
+            && amount_state
+                .as_ref()
+                .map(|d| d.saturating_add(app.send_fee) <= balances.available)
+                .unwrap_or(false)
+            && !app.send_busy
+            && app.wallet_sync_error.is_none();
+
+        card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let amount = amount_state.as_ref().copied().unwrap_or(0);
+            let total = amount.saturating_add(app.send_fee);
+
+            well(ui, |ui| {
+                summary_row(ui, "Amount", RichText::new(night(amount)), false);
+                ui.add_space(6.0);
+                summary_row(
+                    ui,
+                    "Fee (burned)",
+                    RichText::new(night(app.send_fee)).color(WARN),
+                    false,
+                );
+                ui.add_space(8.0);
+                let w = ui.available_width();
+                let (r, _) = ui.allocate_exact_size(Vec2::new(w, 1.0), egui::Sense::hover());
+                ui.painter().hline(
+                    r.x_range(),
+                    r.center().y,
+                    Stroke::new(1.0_f32, BORDER.gamma_multiply(0.9)),
+                );
+                ui.add_space(8.0);
+                summary_row(
+                    ui,
+                    "Leaves your wallet",
+                    RichText::new(night(total)).strong().size(15.0),
+                    true,
+                );
+                if let Some(Ok(a)) = &addr_state {
                     ui.add_space(6.0);
                     summary_row(
                         ui,
-                        "Fee (burned)",
-                        RichText::new(night(app.send_fee)).color(WARN),
+                        "To",
+                        RichText::new(a.short()).color(TEXT_DIM).size(12.0),
                         false,
                     );
-                    ui.add_space(8.0);
-                    let w = ui.available_width();
-                    let (r, _) = ui.allocate_exact_size(Vec2::new(w, 1.0), egui::Sense::hover());
-                    ui.painter().hline(
-                        r.x_range(),
-                        r.center().y,
-                        Stroke::new(1.0_f32, BORDER.gamma_multiply(0.9)),
-                    );
-                    ui.add_space(8.0);
-                    summary_row(
-                        ui,
-                        "Leaves your wallet",
-                        RichText::new(night(total)).strong().size(15.0),
-                        true,
-                    );
-                    if let Some(Ok(a)) = &addr_state {
-                        ui.add_space(6.0);
-                        summary_row(
-                            ui,
-                            "To",
-                            RichText::new(a.short()).color(TEXT_DIM).size(12.0),
-                            false,
-                        );
-                    }
-                });
-
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(
-                        "The fee is fixed and destroyed, not paid to a miner. 100% burn.",
-                    )
-                    .size(10.5)
-                    .color(TEXT_FAINT),
-                );
-
-                ui.add_space(14.0);
-                if primary_button(ui, "Review payment", ready).clicked() {
-                    app.send_confirm = true;
                 }
             });
+
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("The fee is fixed and destroyed, not paid to a miner. 100% burn.")
+                    .size(10.5)
+                    .color(TEXT_FAINT),
+            );
+
+            ui.add_space(14.0);
+            if primary_button(ui, "Review payment", ready).clicked() {
+                app.send_confirm = true;
+            }
         });
     });
 
@@ -1577,28 +1598,34 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 egui::Frame::none()
                     .fill(SURFACE)
                     .stroke(Stroke::new(1.0_f32, BORDER_HI))
-                    .rounding(Rounding::same(12.0))
-                    .inner_margin(egui::Margin::same(22.0))
+                    .rounding(Rounding::same(ROUND))
+                    .inner_margin(egui::Margin::same(24.0))
                     .shadow(egui::epaint::Shadow {
-                        offset: egui::vec2(0.0, 8.0),
-                        blur: 30.0,
+                        offset: egui::vec2(0.0, 12.0),
+                        blur: 40.0,
                         spread: 0.0,
-                        color: Color32::from_black_alpha(160),
+                        color: Color32::from_black_alpha(180),
                     }),
             )
             .show(ctx, |ui| {
-                ui.set_width(380.0);
+                ui.set_width(420.0);
                 ui.label(
-                    RichText::new(format!("{} NIGHT", night(amount)))
-                        .size(28.0)
-                        .strong(),
+                    RichText::new("You are about to send")
+                        .size(12.0)
+                        .color(TEXT_FAINT),
                 );
-                ui.add_space(14.0);
-                field_label(ui, "Recipient — verify the full address", None);
-                ui.add(
-                    egui::Label::new(RichText::new(app.send_to.trim()).monospace().size(12.0))
-                        .wrap(),
-                );
+                ui.add_space(4.0);
+                ui.label(RichText::new(night(amount)).size(36.0).strong());
+                ui.label(RichText::new("NIGHT").size(14.0).color(TEXT_DIM).strong());
+                ui.add_space(16.0);
+                field_label(ui, "Recipient — compare every character", None);
+                well(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(app.send_to.trim()).monospace().size(12.5))
+                            .wrap(),
+                    );
+                });
+                ui.add_space(8.0);
                 kv(
                     ui,
                     "Fee (burned)",
@@ -1606,10 +1633,11 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 );
                 kv(
                     ui,
-                    "Total",
+                    "Leaves your wallet",
                     RichText::new(night(amount.saturating_add(app.send_fee)))
                         .monospace()
-                        .strong(),
+                        .strong()
+                        .size(15.0),
                 );
                 if !app.send_memo.trim().is_empty() {
                     kv(ui, "Memo", RichText::new(app.send_memo.trim()));
@@ -1617,15 +1645,17 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 
                 ui.add_space(14.0);
                 egui::Frame::none()
-                    .fill(WARN.gamma_multiply(0.10))
-                    .rounding(Rounding::same(ROUND_SM))
-                    .inner_margin(egui::Margin::same(11.0))
+                    .fill(tint(SURFACE, WARN, 0.16))
+                    .stroke(Stroke::new(1.0_f32, WARN.gamma_multiply(0.4)))
+                    .rounding(Rounding::same(ROUND_FIELD))
+                    .inner_margin(egui::Margin::same(12.0))
                     .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
                         ui.label(
                             RichText::new(
                                 "Payments cannot be reversed. Check the address once more.",
                             )
-                            .size(11.5)
+                            .size(12.0)
                             .color(WARN),
                         );
                     });
@@ -1634,14 +1664,14 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 ui.horizontal(|ui| {
                     if primary_button(
                         ui,
-                        "  Send now  ",
+                        "Send now",
                         !app.send_busy && app.wallet_sync_error.is_none(),
                     )
                     .clicked()
                     {
                         do_send = true;
                     }
-                    if ghost_button(ui, "  Cancel  ").clicked() {
+                    if ghost_button(ui, "Cancel").clicked() {
                         cancel = true;
                     }
                 });
@@ -1659,7 +1689,7 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     // Below the ordinary form on purpose: it is the unusual path, and putting
     // it first would make every payment look complicated.
     ui.add_space(GAP_LG);
-    narrow_column(ui, 660.0, |ui| air_card(app, ui, ctx));
+    air_card(app, ui, ctx);
 }
 
 // --------------------------------------------------------------- receive ---
@@ -1689,10 +1719,10 @@ pub fn receive(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             card(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.vertical_centered(|ui| {
-                    qr_code(ui, &address, 224.0);
-                    ui.add_space(14.0);
+                    qr_code(ui, &address, 240.0);
+                    ui.add_space(12.0);
                     ui.label(
-                        RichText::new("Scan or copy to receive NIGHT")
+                        RichText::new("Scan to receive NIGHT")
                             .size(12.5)
                             .color(TEXT_DIM),
                     );
@@ -1701,6 +1731,11 @@ pub fn receive(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 divider(ui);
                 field_label(ui, "Your address", None);
                 if copyable(ui, &address, true) {
+                    app.toasts.success(ctx, "Address copied");
+                }
+                ui.add_space(10.0);
+                if primary_button(ui, "Copy address", !address.is_empty()).clicked() {
+                    ui.ctx().copy_text(address.clone());
                     app.toasts.success(ctx, "Address copied");
                 }
             });
@@ -1854,11 +1889,7 @@ fn counter_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, address: 
     use nightfall_wallet::counter::Invoice;
 
     let now = now_unix();
-    let till = app
-        .wallet
-        .lock()
-        .map(|w| w.till(now))
-        .unwrap_or_default();
+    let till = app.wallet.lock().map(|w| w.till(now)).unwrap_or_default();
 
     titled_card(ui, "Counter", |ui| {
         ui.set_width(ui.available_width());
@@ -1956,13 +1987,7 @@ fn counter_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, address: 
         divider(ui);
         let takings: u64 = till
             .iter()
-            .map(|(_, s)| {
-                if s.is_settled() {
-                    s.received_darks
-                } else {
-                    0
-                }
-            })
+            .map(|(_, s)| if s.is_settled() { s.received_darks } else { 0 })
             .fold(0, u64::saturating_add);
         kv(
             ui,
@@ -2009,7 +2034,9 @@ fn counter_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, address: 
                 .map(|mut w| w.close_invoice(&reference, "closed at the counter"))
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("wallet is busy")));
             match done {
-                Ok(()) => app.toasts.success(ctx, "Invoice closed — no payment was invented"),
+                Ok(()) => app
+                    .toasts
+                    .success(ctx, "Invoice closed — no payment was invented"),
                 Err(problem) => app.toasts.error(ctx, problem.to_string()),
             }
         }
@@ -2052,7 +2079,7 @@ pub fn withheld_notice(
     let n = withheld.len();
     let mut rescan = false;
     egui::Frame::none()
-        .fill(DANGER.gamma_multiply(0.10))
+        .fill(tint(SURFACE, DANGER, 0.13))
         .stroke(Stroke::new(1.0_f32, DANGER.gamma_multiply(0.5)))
         .rounding(Rounding::same(ROUND_SM))
         .inner_margin(egui::Margin::symmetric(14.0, 12.0))
@@ -2180,7 +2207,7 @@ pub fn activity(app: &mut App, ui: &mut egui::Ui) {
     if let Some(oldest) = stuck.iter().min_by_key(|e| e.timestamp) {
         let n = stuck.len();
         egui::Frame::none()
-            .fill(WARN.gamma_multiply(0.10))
+            .fill(tint(SURFACE, WARN, 0.13))
             .stroke(Stroke::new(1.0_f32, WARN.gamma_multiply(0.5)))
             .rounding(Rounding::same(ROUND_SM))
             .inner_margin(egui::Margin::symmetric(14.0, 12.0))
@@ -2248,14 +2275,20 @@ pub fn activity(app: &mut App, ui: &mut egui::Ui) {
                     "Nothing matches that filter"
                 },
                 if entries.is_empty() {
-                    "Mining rewards and incoming payments appear here automatically."
+                    "Share your address or start mining. Incoming payments and rewards appear here."
                 } else {
                     "Try a shorter memo, a transaction ID or another direction."
                 },
             );
-            if !entries.is_empty() && ghost_button(ui, "Clear filter").clicked() {
-                app.activity_filter.clear();
-            }
+            ui.horizontal(|ui| {
+                if entries.is_empty() {
+                    if primary_button(ui, "Receive NIGHT", true).clicked() {
+                        app.view = View::Receive;
+                    }
+                } else if ghost_button(ui, "Clear filter").clicked() {
+                    app.activity_filter.clear();
+                }
+            });
         } else {
             let now = now_unix();
             // Measured once, outside the loop. Inside it, `available_width`
@@ -2394,16 +2427,23 @@ pub fn mining(app: &mut App, ui: &mut egui::Ui) {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             dot(ui, if mining { SUCCESS } else { TEXT_FAINT }, mining);
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new(if mining {
-                    "Mining active"
-                } else {
-                    "Mining stopped"
-                })
-                .size(16.0)
-                .strong(),
-            );
+            ui.add_space(8.0);
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new(if mining { "Mining" } else { "Stopped" })
+                        .size(22.0)
+                        .strong(),
+                );
+                ui.label(
+                    RichText::new(if mining {
+                        format_hashrate(app.hashrate.current)
+                    } else {
+                        "CPU idle".to_string()
+                    })
+                    .size(13.0)
+                    .color(if mining { ACCENT_HI } else { TEXT_FAINT }),
+                );
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let label = if mining { "Stop" } else { "Start mining" };
                 if primary_button(ui, label, true).clicked() {
@@ -2429,10 +2469,9 @@ pub fn mining(app: &mut App, ui: &mut egui::Ui) {
             false,
         );
 
-        // Hashrate sparkline
         if app.hashrate.history.len() > 2 {
             ui.add_space(16.0);
-            sparkline(ui, &app.hashrate.history, 54.0);
+            sparkline(ui, &app.hashrate.history, 72.0);
         }
 
         ui.add_space(16.0);
@@ -2466,74 +2505,79 @@ pub fn mining(app: &mut App, ui: &mut egui::Ui) {
 
     ui.add_space(14.0);
 
-    ui.columns(2, |cols| {
-        titled_card(&mut cols[0], "Difficulty", |ui| {
-            ui.label(
-                RichText::new(format_int(difficulty))
-                    .size(22.0)
-                    .monospace()
-                    .strong(),
-            );
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new(
-                    "Retargeted every block using a linearly-weighted moving average over \
+    two_columns(
+        ui,
+        320.0,
+        |ui| {
+            titled_card(ui, "Difficulty", |ui| {
+                ui.label(
+                    RichText::new(format_int(difficulty))
+                        .size(22.0)
+                        .monospace()
+                        .strong(),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "Retargeted every block using a linearly-weighted moving average over \
                      the last 90 blocks, aiming at 15 second intervals.",
-                )
-                .size(11.5)
-                .color(TEXT_DIM),
-            );
-            ui.add_space(10.0);
-            let expected = if app.hashrate.current > 0.0 {
-                let secs = difficulty as f64 / app.hashrate.current.max(1.0);
-                if secs < 90_000.0 {
-                    format!("≈ one block every {}", human_duration(secs))
+                    )
+                    .size(11.5)
+                    .color(TEXT_DIM),
+                );
+                ui.add_space(10.0);
+                let expected = if app.hashrate.current > 0.0 {
+                    let secs = difficulty as f64 / app.hashrate.current.max(1.0);
+                    if secs < 90_000.0 {
+                        format!("≈ one block every {}", human_duration(secs))
+                    } else {
+                        "Block time beyond a day at this hashrate".to_string()
+                    }
                 } else {
-                    "Block time beyond a day at this hashrate".to_string()
-                }
-            } else {
-                "Start mining to estimate your block time".to_string()
-            };
-            ui.label(RichText::new(expected).size(12.0).color(ACCENT_HI));
-        });
+                    "Start mining to estimate your block time".to_string()
+                };
+                ui.label(RichText::new(expected).size(12.0).color(ACCENT_HI));
+            });
+        },
+        |ui| {
+            titled_card(ui, "Rewards", |ui| {
+                let maturity = app.maturity();
+                let tip = app.tip_height();
+                let balances = app
+                    .wallet
+                    .lock()
+                    .map(|w| w.balances(tip, maturity))
+                    .unwrap_or_default();
 
-        titled_card(&mut cols[1], "Rewards", |ui| {
-            let maturity = app.maturity();
-            let tip = app.tip_height();
-            let balances = app
-                .wallet
-                .lock()
-                .map(|w| w.balances(tip, maturity))
-                .unwrap_or_default();
-
-            kv(
-                ui,
-                "Block subsidy",
-                RichText::new(format!("{} NIGHT", night(reward_at(blocks)))).monospace(),
-            );
-            kv(
-                ui,
-                "Immature",
-                RichText::new(night(balances.immature))
-                    .monospace()
-                    .color(WARN),
-            );
-            kv(
-                ui,
-                "Maturity",
-                RichText::new(format!("{maturity} blocks")).monospace(),
-            );
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new(
-                    "Mining pays only the block subsidy. Transaction fees are burned, so \
+                kv(
+                    ui,
+                    "Block subsidy",
+                    RichText::new(format!("{} NIGHT", night(reward_at(blocks)))).monospace(),
+                );
+                kv(
+                    ui,
+                    "Immature",
+                    RichText::new(night(balances.immature))
+                        .monospace()
+                        .color(WARN),
+                );
+                kv(
+                    ui,
+                    "Maturity",
+                    RichText::new(format!("{maturity} blocks")).monospace(),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "Mining pays only the block subsidy. Transaction fees are burned, so \
                      nobody profits from congestion.",
-                )
-                .size(11.5)
-                .color(TEXT_DIM),
-            );
-        });
-    });
+                    )
+                    .size(11.5)
+                    .color(TEXT_DIM),
+                );
+            });
+        },
+    );
 
     // --- rewards still ripening ---
     let ripening: Vec<(u64, u64)> = app
@@ -2727,12 +2771,17 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     card(ui, |ui| {
         ui.set_width(ui.available_width());
         let peers = s.map(|s| s.live_peers).unwrap_or(0);
+        let blocks = s.map(|s| s.blocks).unwrap_or(0);
+        let tor_on = s.map(|st| st.tor_proxy).unwrap_or(false);
         ui.horizontal(|ui| {
             dot(ui, if peers > 0 { SUCCESS } else { WARN }, false);
             ui.add_space(6.0);
             ui.label(
                 RichText::new(if peers > 0 {
-                    format!("Connected to {peers} peer(s)")
+                    format!(
+                        "Connected to {peers} peer{}",
+                        if peers == 1 { "" } else { "s" }
+                    )
                 } else if s.map(|s| s.loading).unwrap_or(false) {
                     "No peers — chain still loading".to_string()
                 } else if crate::app::IS_DEV_BUILD {
@@ -2740,10 +2789,33 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 } else {
                     "No peers — disconnected".to_string()
                 })
-                .size(16.0)
+                .size(20.0)
                 .strong(),
             );
         });
+        ui.add_space(14.0);
+        metric_grid(
+            ui,
+            &[
+                (
+                    "PEERS",
+                    peers.to_string(),
+                    if peers > 0 { SUCCESS } else { WARN },
+                ),
+                ("TIP", format_int(blocks), TEXT),
+                (
+                    "TOR",
+                    if tor_on { "on".into() } else { "off".into() },
+                    if tor_on { SUCCESS } else { TEXT_FAINT },
+                ),
+                (
+                    "LISTEN",
+                    format!("{}", app.network.default_p2p_port()),
+                    TEXT_DIM,
+                ),
+            ],
+            false,
+        );
         if let Some(reason) = peers_zero_reason(app, peers, s.map(|s| s.blocks).unwrap_or(0)) {
             ui.add_space(8.0);
             ui.label(RichText::new(reason).size(12.0).color(TEXT_DIM));
@@ -2797,15 +2869,19 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 
         let known = app.node.as_ref().map(|n| n.peers()).unwrap_or_default();
         if !known.is_empty() {
-            ui.add_space(12.0);
+            ui.add_space(14.0);
             ui.label(RichText::new("Known peers").size(12.0).color(TEXT_DIM));
-            ui.add_space(4.0);
+            ui.add_space(6.0);
             for p in known.iter().take(12) {
-                ui.label(RichText::new(p).monospace().size(11.5).color(TEXT_FAINT));
+                ui.horizontal(|ui| {
+                    dot(ui, SUCCESS, false);
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(p).monospace().size(12.0).color(TEXT));
+                });
             }
         }
 
-        ui.add_space(12.0);
+        ui.add_space(14.0);
         ui.label(RichText::new("Peer versions").size(12.0).color(TEXT_DIM));
         ui.add_space(4.0);
         let empty_versions = std::collections::BTreeMap::new();
@@ -2815,6 +2891,13 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             ))
             .size(12.0)
             .color(if peers > 0 { TEXT } else { TEXT_FAINT }),
+        );
+        ui.label(
+            RichText::new(
+                "Self-reported in the handshake — not verified. Only the wire version is enforced.",
+            )
+            .size(10.5)
+            .color(TEXT_FAINT),
         );
     });
 
@@ -2880,10 +2963,13 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         );
     });
 
-    ui.add_space(14.0);
+    ui.add_space(GAP_LG);
 
+    two_columns(
+        ui,
+        320.0,
+        |ui| {
     titled_card(ui, "Chain", |ui| {
-        ui.set_width(ui.available_width());
         kv(
             ui,
             "Network",
@@ -2987,11 +3073,9 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             RichText::new(s.map(|s| s.mempool).unwrap_or(0).to_string()).monospace(),
         );
     });
-
-    ui.add_space(14.0);
-
+        },
+        |ui| {
     titled_card(ui, "Ledger state", |ui| {
-        ui.set_width(ui.available_width());
         kv(
             ui,
             "UTXOs",
@@ -3017,19 +3101,21 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             RichText::new(if ok { "verified" } else { "FAILED" }).color(status_color(ok)),
         );
     });
+        },
+    );
 }
 
 // -------------------------------------------------------------- settings ---
 
 pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
-    // Centred rather than pinned left. Seven cards in a 700px column against
-    // the left edge of a wide window is most of a screen of nothing.
-    narrow_column(ui, 760.0, |ui| {
+    // Width comes from the page shell — banners and these cards share it.
+    {
         app.show_vault_settings(ui, ctx);
         if app.vault_ui.busy() {
             return;
         }
         ui.add_space(14.0);
+        section_label(ui, "Keys & backup");
         let address = app.wallet.lock().ok().and_then(|wallet| wallet.address());
         app.recovery_studio.show(ui, address.as_ref());
         ui.add_space(14.0);
@@ -3064,11 +3150,10 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                     }
                 })
                 .unwrap_or_default();
-            kv(
-                ui,
-                "Wallet storage",
-                RichText::new(storage_path).monospace().size(11.0),
-            );
+            field_label(ui, "Wallet storage", None);
+            if copyable(ui, &storage_path, true) {
+                app.toasts.success(ctx, "Path copied");
+            }
             kv(
                 ui,
                 "Protection",
@@ -3158,8 +3243,9 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         });
 
         ui.add_space(14.0);
+        section_label(ui, "This node");
 
-        titled_card(ui, "Wallet", |ui| {
+        titled_card(ui, "Chain & scan", |ui| {
             ui.set_width(ui.available_width());
             let (scanned, outputs) = app
                 .wallet
@@ -3271,6 +3357,7 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         });
 
         ui.add_space(14.0);
+        section_label(ui, "Swaps");
 
         titled_card(ui, "Bitcoin node (atomic swaps)", |ui| {
             ui.set_width(ui.available_width());
@@ -3312,6 +3399,7 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         });
 
         ui.add_space(14.0);
+        section_label(ui, "Contacts");
 
         titled_card(ui, "Address book", |ui| {
             ui.set_width(ui.available_width());
@@ -3370,6 +3458,7 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         });
 
         ui.add_space(14.0);
+        section_label(ui, "This machine");
 
         titled_card(ui, "Storage", |ui| {
             ui.set_width(ui.available_width());
@@ -3466,7 +3555,7 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 
             ui.add_space(12.0);
             egui::Frame::none()
-                .fill(WARN.gamma_multiply(0.10))
+                .fill(tint(SURFACE, WARN, 0.13))
                 .rounding(Rounding::same(ROUND_SM))
                 .inner_margin(egui::Margin::same(12.0))
                 .show(ui, |ui| {
@@ -3489,7 +3578,7 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         });
 
         ui.add_space(20.0);
-    });
+    }
     let _ = Amount::ZERO;
 }
 
