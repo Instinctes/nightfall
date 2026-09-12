@@ -177,6 +177,20 @@ pub struct App {
     pub till_amount: String,
     pub till_description: String,
 
+    // Air. `air_pending` is the request this online side wrote and is waiting
+    // for an answer to; `air_frames` is whatever this side is currently showing
+    // as animated QR. The nonce log is what stops a signed package being
+    // broadcast twice — see `nightfall_wallet::air`.
+    pub air_input: String,
+    pub air_pending: Option<nightfall_wallet::air::Intent>,
+    pub air_incoming: Option<nightfall_wallet::air::Intent>,
+    pub air_frames: Vec<String>,
+    pub air_frame_at: usize,
+    pub air_last_tick: Option<Instant>,
+    pub air_log: nightfall_wallet::air::NonceLog,
+    pub air_note: Option<String>,
+    pub air_error: Option<String>,
+
     // Network
     pub peer_input: String,
     pub proxy_input: String,
@@ -352,6 +366,15 @@ impl App {
             till_reference: String::new(),
             till_amount: String::new(),
             till_description: String::new(),
+            air_input: String::new(),
+            air_pending: None,
+            air_incoming: None,
+            air_frames: Vec::new(),
+            air_frame_at: 0,
+            air_last_tick: None,
+            air_log: nightfall_wallet::air::NonceLog::new(),
+            air_note: None,
+            air_error: None,
             peer_input: String::new(),
             proxy_input,
             chain_check: None,
@@ -1394,6 +1417,15 @@ impl App {
         self.till_reference.zeroize();
         self.till_amount.zeroize();
         self.till_description.zeroize();
+        // An Air package names an address and an amount, and the frames on
+        // screen are a transaction. None of it is a key; all of it is this
+        // wallet's business rather than the next person's at the same screen.
+        self.air_input.zeroize();
+        self.air_incoming = None;
+        self.air_frames.clear();
+        self.air_frame_at = 0;
+        self.air_note = None;
+        self.air_error = None;
         self.send_to.zeroize();
         self.send_amount.zeroize();
         self.send_memo.zeroize();

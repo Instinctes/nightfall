@@ -627,6 +627,30 @@ impl WalletState {
         Ok(())
     }
 
+    /// Hand the network a transaction that was built somewhere else.
+    ///
+    /// For Air. The transaction was built and signed on a machine that is not
+    /// on a network, and this side is a relay and nothing more. Nothing is
+    /// recorded in this wallet, because these are not this wallet's coins to
+    /// record — the wallet here may be locked, may be a different wallet, or
+    /// may not exist at all. Requiring one would defeat the point: the whole
+    /// idea is that the machine with the network has nothing worth stealing.
+    pub fn broadcast_foreign(
+        &mut self,
+        node: &NodeHandle,
+        tx: nightfall_ledger::Transaction,
+    ) -> anyhow::Result<String> {
+        let txid = tx.txid().to_hex();
+        let shared = node.shared();
+        let mut guard = shared
+            .lock()
+            .map_err(|_| anyhow::anyhow!("node state lock poisoned"))?;
+        guard
+            .submit_tx(tx)
+            .map_err(|e| anyhow::anyhow!("The node refused this transaction: {e}"))?;
+        Ok(txid)
+    }
+
     /// Build and submit a payment.
     pub fn send(
         &mut self,

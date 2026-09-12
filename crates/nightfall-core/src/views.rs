@@ -15,6 +15,7 @@ use nightfall_types::{
 // somebody else asked for, before anyone has agreed to it.
 use nightfall_wallet::payment_request::{self, PaymentRequest};
 use nightfall_wallet::Direction;
+use std::time::{Duration, Instant};
 
 /// One line saying what a page is for. Rendered as the topbar's subtitle.
 pub fn page_description(view: View) -> &'static str {
@@ -766,6 +767,311 @@ fn activity_row(ui: &mut egui::Ui, e: &nightfall_wallet::HistoryEntry, now: u64)
 /// wallet that merely refuses to understand a testnet request leaves its owner
 /// guessing, and the guess they are most likely to make is that the address is
 /// wrong.
+/// Air: paying from, or for, a wallet that is never on a network.
+///
+/// One card for both sides of the gap, because the same Core runs on both
+/// machines and which side you are depends only on which one has the node.
+///
+/// What is here: writing a request, reading one, signing it, and showing or
+/// reading back the answer — as text you can copy, and as QR codes. What is
+/// *not* here is a camera. Core cannot see one, so the return journey is a
+/// paste or a file; the frames exist so a phone can read them, and the phone
+/// side is not built either. That is stated on the card rather than left for
+/// someone to discover with a transaction they cannot move.
+fn air_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
+    use nightfall_wallet::air::{self, Intent, Signed};
+
+    titled_card(ui, "Offline wallet (Air)", |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(
+            RichText::new(
+                "Keep the seed on a machine that has never been on a network. This side \
+                 writes the request and hands the finished payment to the network; the \
+                 offline side reads the request, checks it for itself, and signs. \
+                 Nothing secret crosses.",
+            )
+            .size(12.0)
+            .color(TEXT_DIM),
+        );
+        ui.add_space(GAP_XS);
+        ui.label(
+            RichText::new(
+                "Core has no camera: the way back is the text below, or a file. The QR \
+                 codes are for a phone to read, and the phone side does not exist yet.",
+            )
+            .size(11.5)
+            .color(WARN),
+        );
+
+        divider(ui);
+
+        // ---- this side is online: write a request, broadcast the answer ----
+        kicker(ui, "THIS MACHINE HAS THE NODE");
+        ui.add_space(GAP_XS);
+        ui.label(
+            RichText::new(
+                "Fill in the recipient and amount above, then write a request for the \
+                 offline wallet to sign.",
+            )
+            .size(12.0)
+            .color(TEXT_DIM),
+        );
+        ui.add_space(GAP_SM);
+        if ghost_button(ui, "Write a request from the form above").clicked() {
+            app.air_error = None;
+            app.air_note = None;
+            match (
+                Address::decode(app.send_to.trim()),
+                parse_amount(&app.send_amount),
+            ) {
+                (Err(_), _) => {
+                    app.air_error = Some("Enter a valid recipient address above first.".into())
+                }
+                (_, Err(problem)) => app.air_error = Some(problem),
+                (Ok(to), Ok(amount)) => {
+                    let intent = Intent {
+                        network: app.network,
+                        to,
+                        amount_darks: amount,
+                        fee_darks: app.send_fee,
+                        tip_height: app.tip_height(),
+                        nonce: air::new_nonce(),
+                        // An hour. The fee was chosen for a chain height, and
+                        // a height goes stale.
+                        expires_unix: now_unix() + 3_600,
+                    };
+                    app.air_frames = air::frames(intent.to_text().as_bytes()).unwrap_or_default();
+                    app.air_frame_at = 0;
+                    app.air_pending = Some(intent);
+                    app.air_note = Some(
+                        "Request written. Show this to the offline wallet, then paste its \
+                         answer below."
+                            .into(),
+                    );
+                }
+            }
+        }
+
+        if let Some(intent) = app.air_pending.clone() {
+            ui.add_space(GAP_SM);
+            kv(
+                ui,
+                "Waiting for",
+                RichText::new(format!("{} to {}", Amount(intent.amount_darks), short_hex(&intent.to.encode()))),
+            );
+            ui.add_space(GAP_SM);
+            if copyable(ui, &intent.to_text(), true) {
+                app.toasts.success(ctx, "Request copied");
+            }
+        }
+
+        ui.add_space(GAP_MD);
+        field_label(ui, "The signed answer, or a request to sign", None);
+        ui.add(
+            egui::TextEdit::multiline(&mut app.air_input)
+                .desired_rows(2)
+                .desired_width(f32::INFINITY)
+                .hint_text("Paste a nightfall-air: package"),
+        );
+        ui.add_space(GAP_SM);
+
+        match button_row(ui, &["Read this package", "Clear"], true) {
+            Some(0) => {
+                app.air_error = None;
+                app.air_note = None;
+                let text = app.air_input.trim().to_string();
+                if let Ok(intent) = Intent::parse(&text) {
+                    // A request arrived: this machine is the offline side.
+                    match intent.check(app.network, now_unix()) {
+                        Ok(()) => {
+                            app.air_incoming = Some(intent);
+                            app.air_note =
+                                Some("Check what this asks for before signing it.".into());
+                        }
+                        Err(problem) => app.air_error = Some(problem.to_string()),
+                    }
+                } else {
+                    match Signed::parse(&text) {
+                        Err(problem) => app.air_error = Some(problem.to_string()),
+                        Ok(signed) => match app.air_pending.clone() {
+                            None => {
+                                app.air_error = Some(
+                                    "This is a signed payment, but this wallet did not ask \
+                                     for it. Write the request here, so the answer can be \
+                                     checked against it."
+                                        .into(),
+                                )
+                            }
+                            Some(intent) => {
+                                match signed.accept(&intent, app.network, &mut app.air_log) {
+                                    Err(problem) => app.air_error = Some(problem.to_string()),
+                                    Ok(()) => app.air_note = Some(broadcast(app, &signed.payload)),
+                                }
+                            }
+                        },
+                    }
+                }
+            }
+            Some(1) => {
+                app.air_input.clear();
+                app.air_incoming = None;
+                app.air_error = None;
+                app.air_note = None;
+            }
+            _ => {}
+        }
+
+        // ---- this side is offline: read a request, sign it -----------------
+        if let Some(intent) = app.air_incoming.clone() {
+            ui.add_space(GAP_MD);
+            divider(ui);
+            kicker(ui, "THIS REQUEST, AS THIS WALLET READ IT");
+            ui.add_space(GAP_XS);
+            ui.label(
+                RichText::new(
+                    "Read from the package, not copied from a label somebody else wrote. \
+                     What is signed is built from exactly these values.",
+                )
+                .size(11.5)
+                .color(TEXT_FAINT),
+            );
+            ui.add_space(GAP_SM);
+            kv(
+                ui,
+                "Pays to",
+                RichText::new(intent.to.encode()).monospace().size(11.5),
+            );
+            kv(ui, "Amount", RichText::new(format!("{}", Amount(intent.amount_darks))));
+            kv(ui, "Fee", RichText::new(format!("{}", Amount(intent.fee_darks))));
+            kv(ui, "Network", RichText::new(intent.network.as_str()));
+            kv(
+                ui,
+                "Written at chain height",
+                RichText::new(format_int(intent.tip_height)).monospace(),
+            );
+            ui.add_space(GAP_SM);
+            if primary_button(ui, "Sign this payment", true).clicked() {
+                app.air_error = None;
+                app.air_note = None;
+                let maturity = app.maturity();
+                let built = app.wallet.lock().map(|mut w| {
+                    w.prepare_payment(
+                        &intent.to,
+                        intent.amount_darks,
+                        intent.fee_darks,
+                        "",
+                        intent.tip_height,
+                        maturity,
+                    )
+                });
+                match built {
+                    Err(_) => app.air_error = Some("The wallet is busy.".into()),
+                    Ok(Err(problem)) => app.air_error = Some(problem.to_string()),
+                    Ok(Ok(tx)) => match serde_json::to_vec(&tx) {
+                        Err(problem) => app.air_error = Some(problem.to_string()),
+                        Ok(payload) => {
+                            let signed = Signed {
+                                network: intent.network,
+                                nonce: intent.nonce.clone(),
+                                payload,
+                            };
+                            let text = signed.to_text();
+                            match air::frames(text.as_bytes()) {
+                                Err(problem) => app.air_error = Some(problem.to_string()),
+                                Ok(cut) => {
+                                    app.air_frames = cut;
+                                    app.air_frame_at = 0;
+                                    app.air_incoming = None;
+                                    app.air_input = text;
+                                    app.air_note = Some(
+                                        "Signed. Carry this back to the machine with the \
+                                         node — the text above, or the codes below."
+                                            .into(),
+                                    );
+                                }
+                            }
+                        }
+                    },
+                }
+            }
+        }
+
+        if let Some(note) = &app.air_note {
+            ui.add_space(GAP_SM);
+            ui.colored_label(SUCCESS, note);
+        }
+        if let Some(error) = &app.air_error {
+            ui.add_space(GAP_SM);
+            ui.colored_label(DANGER, error);
+        }
+
+        // ---- the frames ----------------------------------------------------
+        if !app.air_frames.is_empty() {
+            ui.add_space(GAP_MD);
+            divider(ui);
+            let total = app.air_frames.len();
+            // One frame at a time, advanced on a clock. A still image of a
+            // multi-frame transfer is not a transfer, so the count is shown
+            // beside it: a person holding a phone needs to know whether they
+            // are waiting for one code or thirty.
+            let now = Instant::now();
+            let due = app
+                .air_last_tick
+                .map(|t| now.duration_since(t) >= Duration::from_millis(450))
+                .unwrap_or(true);
+            if due && total > 1 {
+                app.air_frame_at = (app.air_frame_at + 1) % total;
+                app.air_last_tick = Some(now);
+                ctx.request_repaint_after(Duration::from_millis(450));
+            }
+            let index = app.air_frame_at.min(total - 1);
+            ui.horizontal(|ui| {
+                kicker(ui, "SHOW THIS TO THE OTHER MACHINE");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(if total == 1 {
+                            "one code".to_owned()
+                        } else {
+                            format!("code {} of {total}", index + 1)
+                        })
+                        .size(11.5)
+                        .color(TEXT_FAINT),
+                    );
+                });
+            });
+            ui.add_space(GAP_SM);
+            ui.vertical_centered(|ui| {
+                qr_code(ui, &app.air_frames[index], 224.0);
+            });
+        }
+    });
+}
+
+/// Hand a foreign transaction to the node, and say what happened.
+fn broadcast(app: &mut App, payload: &[u8]) -> String {
+    let Some(node) = app.node.clone() else {
+        return "This machine has no node running, so there is nothing to broadcast with."
+            .to_owned();
+    };
+    let tx: nightfall_ledger::Transaction = match serde_json::from_slice(payload) {
+        Ok(tx) => tx,
+        Err(problem) => return format!("That is not a transaction this wallet can read: {problem}"),
+    };
+    match app
+        .wallet
+        .lock()
+        .map(|mut w| w.broadcast_foreign(&node, tx))
+    {
+        Err(_) => "The wallet is busy.".to_owned(),
+        Ok(Err(problem)) => problem.to_string(),
+        Ok(Ok(txid)) => {
+            app.air_pending = None;
+            app.air_frames.clear();
+            format!("Handed to the network. Transaction {}", short_hex(&txid))
+        }
+    }
+}
+
 /// A Proof Card: what a receipt establishes, and what it leaves open.
 ///
 /// The three questions are kept visually apart because they are three
@@ -1348,6 +1654,12 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             app.do_send(ctx);
         }
     }
+
+    // Air lives on Send because it is a way of paying, not a separate subject.
+    // Below the ordinary form on purpose: it is the unusual path, and putting
+    // it first would make every payment look complicated.
+    ui.add_space(GAP_LG);
+    narrow_column(ui, 660.0, |ui| air_card(app, ui, ctx));
 }
 
 // --------------------------------------------------------------- receive ---

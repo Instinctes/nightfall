@@ -157,6 +157,109 @@ fn the_payment_request_card_fits_supported_content_widths() {
     });
 }
 
+/// The Air card, in each of the states it can be in.
+///
+/// The eight-page sweep reaches it only empty. Its populated states carry the
+/// longest text on the page — a full address in monospace, a signed package as
+/// text, and an animated code — and those are the ones that would overflow.
+#[test]
+fn the_air_card_fits_supported_content_widths_in_every_state() {
+    use nightfall_crypto::WalletKeys;
+    use nightfall_types::NetworkId;
+    use nightfall_wallet::air::{self, Intent, Signed};
+
+    let ctx = egui::Context::default();
+    crate::theme::apply(&ctx);
+    let dir = std::env::temp_dir().join(format!(
+        "nf-air-layout-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id(),
+    ));
+    let mut app = App::new(NetworkId::Devnet, dir.clone());
+
+    let intent = Intent {
+        network: NetworkId::Devnet,
+        to: WalletKeys::from_seed([61; 32]).address(),
+        amount_darks: 1_234_567_890,
+        fee_darks: 100_000,
+        tip_height: 1_284,
+        nonce: air::new_nonce(),
+        expires_unix: nightfall_storage::now_unix() + 3_600,
+    };
+    let signed = Signed {
+        network: NetworkId::Devnet,
+        nonce: intent.nonce.clone(),
+        payload: vec![0xab; 2_000],
+    };
+
+    // Empty, waiting for an answer, reading a request, and showing frames.
+    let states: [(&str, Box<dyn Fn(&mut App)>); 4] = [
+        ("empty", Box::new(|_: &mut App| {})),
+        (
+            "waiting",
+            Box::new({
+                let intent = intent.clone();
+                move |app: &mut App| {
+                    app.air_pending = Some(intent.clone());
+                    app.air_frames = air::frames(intent.to_text().as_bytes()).unwrap();
+                }
+            }),
+        ),
+        (
+            "reading a request",
+            Box::new({
+                let intent = intent.clone();
+                move |app: &mut App| app.air_incoming = Some(intent.clone())
+            }),
+        ),
+        (
+            "showing a signed answer",
+            Box::new({
+                let text = signed.to_text();
+                move |app: &mut App| {
+                    app.air_input = text.clone();
+                    app.air_frames = air::frames(text.as_bytes()).unwrap();
+                    app.air_note = Some("Signed.".into());
+                    app.air_error = Some("An error long enough to wrap onto a second line, because that is the one that overflows.".into());
+                }
+            }),
+        ),
+    ];
+
+    for width in [620.0, 884.0, 1180.0] {
+        for (name, set_up) in &states {
+            app.air_pending = None;
+            app.air_incoming = None;
+            app.air_frames.clear();
+            app.air_note = None;
+            app.air_error = None;
+            app.air_input.clear();
+            set_up(&mut app);
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(width, 1600.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let right = ui.max_rect().right();
+                    app.view = View::Send;
+                    send(&mut app, ui, ctx);
+                    assert!(
+                        ui.min_rect().right() <= right + 1.0,
+                        "air card overflow at {width}px while {name}: {} > {right}",
+                        ui.min_rect().right(),
+                    );
+                });
+            });
+        }
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// The till's invoice rows, at every width and in every state.
 ///
 /// The candidate warning is the longest sentence this screen can produce and

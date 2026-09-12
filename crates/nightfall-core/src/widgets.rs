@@ -1025,6 +1025,15 @@ pub fn screen_header(ui: &mut egui::Ui, network: &str, right: &[(&str, Color32)]
 /// A monospace value with a copy button. Returns true when copied.
 pub fn copyable(ui: &mut egui::Ui, value: &str, wrap: bool) -> bool {
     let mut copied = false;
+    // Measured outside the frame, because inside it `available_width` does not
+    // account for the margins the frame is about to add back around whatever
+    // is drawn. Taking the inner width from the inner `ui` made the block
+    // twelve points wider than the card holding it — which only showed up on
+    // the narrowest window, and only once something long was put in one.
+    // 24 for the margins, and a few more for the stroke and the rounding —
+    // measured against the narrowest supported window rather than derived,
+    // because egui charges for a border in more places than one.
+    let inner = (ui.available_width() - 30.0).max(80.0);
     egui::Frame::none()
         .fill(SURFACE_LOW)
         .stroke(Stroke::new(1.0_f32, BORDER))
@@ -1033,7 +1042,7 @@ pub fn copyable(ui: &mut egui::Ui, value: &str, wrap: bool) -> bool {
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.style_mut().spacing.item_spacing.x = 8.0;
-                let avail = ui.available_width() - 40.0;
+                let avail = (inner - 48.0).max(40.0);
                 ui.allocate_ui_with_layout(
                     Vec2::new(avail, 0.0),
                     egui::Layout::top_down(egui::Align::LEFT),
