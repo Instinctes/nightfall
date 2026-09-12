@@ -3262,13 +3262,13 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 "Known outputs",
                 RichText::new(outputs.to_string()).monospace(),
             );
-            kv(
-                ui,
-                "Data folder",
-                RichText::new(app.datadir.display().to_string())
-                    .monospace()
-                    .size(11.0),
-            );
+            // A path is not a value that fits on a row, and a truncated one is
+            // no use to anybody. It wraps, and it can be copied.
+            ui.add_space(GAP_MD);
+            field_label(ui, "Data folder", None);
+            if copyable(ui, &app.datadir.display().to_string(), true) {
+                app.toasts.success(ui.ctx(), "Path copied");
+            }
 
             ui.add_space(12.0);
             let pruned = app.status.as_ref().map(|s| s.pruned).unwrap_or(false);
@@ -3369,15 +3369,12 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 .size(12.0)
                 .color(TEXT_DIM),
             );
-            ui.add_space(10.0);
-            kv(
-                ui,
-                "Config",
-                RichText::new(app.btc_rpc_path().display().to_string())
-                    .monospace()
-                    .size(11.0),
-            );
-            ui.add_space(8.0);
+            ui.add_space(GAP_MD);
+            field_label(ui, "Config file", None);
+            if copyable(ui, &app.btc_rpc_path().display().to_string(), true) {
+                app.toasts.success(ctx, "Path copied");
+            }
+            ui.add_space(GAP_SM);
             if app.bitcoin_rpc_configured() {
                 ui.label(
                     RichText::new("Configuration saved. Connection and network checks are shown on the Swap page.")
@@ -3409,45 +3406,110 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                     .color(TEXT_DIM),
             );
             ui.add_space(10.0);
-            ui.horizontal(|ui| {
+            // Name, address and Add used to be 140 + 280 + a button, added up
+            // by hand. On a narrow window that row was 21 points wider than the
+            // card, and an overflowing card pushes out the page it sits in —
+            // which is why every card *below* Contacts was also the wrong
+            // width. The row is measured now, and stacks when it has to.
+            let gap = ui.spacing().item_spacing.x;
+            let add_w = ghost_button_width(ui, "Add");
+            // A TextEdit's `desired_width` is its *inner* width; the margin is
+            // added outside it.
+            let field_pad = FIELD_MARGIN.sum().x;
+            let room = ui.available_width();
+            let shared = room - add_w - gap * 2.0 - field_pad * 2.0;
+            let name_w = (shared * 0.32).min(140.0);
+            let addr_w = shared - name_w;
+            // Below this the address field shows a dozen characters of a
+            // 70-character address, which tells nobody anything.
+            let add_clicked = if addr_w >= 200.0 {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut app.book_name)
+                            .margin(FIELD_MARGIN)
+                            .desired_width(name_w)
+                            .hint_text("Name"),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut app.book_addr)
+                            .margin(FIELD_MARGIN)
+                            .desired_width(addr_w)
+                            .font(egui::TextStyle::Monospace)
+                            .hint_text("nf1…"),
+                    );
+                    ghost_button(ui, "Add").clicked()
+                })
+                .inner
+            } else {
+                let full = (room - field_pad).max(80.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut app.book_name)
                         .margin(FIELD_MARGIN)
-                        .desired_width(140.0)
+                        .desired_width(full)
                         .hint_text("Name"),
                 );
+                ui.add_space(GAP_SM);
                 ui.add(
                     egui::TextEdit::singleline(&mut app.book_addr)
                         .margin(FIELD_MARGIN)
-                        .desired_width(280.0)
+                        .desired_width(full)
                         .font(egui::TextStyle::Monospace)
                         .hint_text("nf1…"),
                 );
-                if ghost_button(ui, "Add").clicked() {
-                    match app
-                        .address_book
-                        .add(app.book_name.clone(), app.book_addr.clone())
-                    {
-                        Ok(()) => {
-                            let _ = app.address_book.save(&app.datadir);
-                            app.book_name.clear();
-                            app.book_addr.clear();
-                            app.toasts.success(ctx, "Contact saved");
-                        }
-                        Err(e) => app.toasts.error(ctx, e),
+                ui.add_space(GAP_SM);
+                ghost_button(ui, "Add").clicked()
+            };
+            if add_clicked {
+                match app
+                    .address_book
+                    .add(app.book_name.clone(), app.book_addr.clone())
+                {
+                    Ok(()) => {
+                        let _ = app.address_book.save(&app.datadir);
+                        app.book_name.clear();
+                        app.book_addr.clear();
+                        app.toasts.success(ctx, "Contact saved");
                     }
+                    Err(e) => app.toasts.error(ctx, e),
                 }
-            });
+            }
             ui.add_space(8.0);
             let entries = app.address_book.entries.clone();
+            let remove_w = ghost_button_width(ui, "Remove");
             for e in entries {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(&e.name).size(12.5));
-                    ui.label(
-                        RichText::new(short_hex(&e.address))
-                            .monospace()
-                            .size(11.0)
-                            .color(TEXT_FAINT),
+                    // A contact name is typed by the owner, so the row cannot
+                    // be sized from it: one long name would widen this card,
+                    // and a card wider than the page widens every card under
+                    // it. Each part gets a column, and the name truncates.
+                    let room = ui.available_width();
+                    let hex_w = (room * 0.3).min(110.0);
+                    let name_w = (room - remove_w - hex_w - gap * 2.0).max(60.0);
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(name_w, 0.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.set_width(name_w);
+                            ui.add(
+                                egui::Label::new(RichText::new(&e.name).size(12.5)).truncate(),
+                            );
+                        },
+                    );
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(hex_w, 0.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.set_width(hex_w);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(short_hex(&e.address))
+                                        .monospace()
+                                        .size(11.0)
+                                        .color(TEXT_FAINT),
+                                )
+                                .truncate(),
+                            );
+                        },
                     );
                     if ghost_button(ui, "Remove").clicked() {
                         app.address_book.remove(&e.address);
@@ -3462,15 +3524,10 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 
         titled_card(ui, "Storage", |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                let mut prune = app.prune;
-                if ui
-                    .checkbox(&mut prune, "Prune old blocks — keep UTXO + last 500 bodies")
-                    .changed()
-                {
-                    app.set_prune(prune, ctx);
-                }
-            });
+            let mut prune = app.prune;
+            if check(ui, &mut prune, "Prune old blocks — keep UTXO + last 500 bodies") {
+                app.set_prune(prune, ctx);
+            }
             ui.add_space(4.0);
             ui.label(
             RichText::new(
@@ -3497,15 +3554,10 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 
         titled_card(ui, "Window", |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                let mut tray = app.close_to_tray;
-                if ui
-                    .checkbox(&mut tray, "Close to tray — mining keeps running")
-                    .changed()
-                {
-                    app.set_close_to_tray(tray);
-                }
-            });
+            let mut tray = app.close_to_tray;
+            if check(ui, &mut tray, "Close to tray — mining keeps running") {
+                app.set_close_to_tray(tray);
+            }
             ui.add_space(4.0);
             ui.label(
                 RichText::new(
@@ -3554,11 +3606,7 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             );
 
             ui.add_space(12.0);
-            egui::Frame::none()
-                .fill(tint(SURFACE, WARN, 0.13))
-                .rounding(Rounding::same(ROUND_SM))
-                .inner_margin(egui::Margin::same(12.0))
-                .show(ui, |ui| {
+            inset_note(ui, WARN, |ui| {
                     ui.label(
                         RichText::new("Not independently audited.")
                             .size(12.0)
@@ -3574,7 +3622,7 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                         .size(11.0)
                         .color(TEXT_DIM),
                     );
-                });
+            });
         });
 
         ui.add_space(20.0);

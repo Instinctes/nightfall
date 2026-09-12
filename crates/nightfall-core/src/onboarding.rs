@@ -295,7 +295,7 @@ impl Onboarding {
                         "setup-confirmation",
                         "Vault password again",
                     );
-                    ui.checkbox(&mut setup.acknowledged, "I have an offline copy of my words and understand there is no password reset.");
+                    crate::widgets::check(ui, &mut setup.acknowledged, "I have an offline copy of my words and understand there is no password reset.");
                     if let Some(error) = &setup.error {
                         ui.add_space(GAP_SM);
                         ui.colored_label(DANGER, error);

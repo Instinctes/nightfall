@@ -21,6 +21,7 @@ mod swap_live_tests;
 mod swap_worker;
 mod theme;
 mod tray;
+mod ui_shots;
 #[cfg(all(test, unix))]
 mod vault_node_tests;
 mod vault_ui;
@@ -213,11 +214,23 @@ fn a_development_build_opens_mainnet_only_when_it_was_built_to() {
     let gate = |is_dev: bool, dev_mainnet: bool, network: NetworkId| {
         is_dev && !dev_mainnet && network != NetworkId::Devnet
     };
-    assert!(gate(true, false, NetworkId::Mainnet), "dev build must refuse mainnet");
-    assert!(gate(true, false, NetworkId::Testnet), "dev build must refuse testnet");
+    assert!(
+        gate(true, false, NetworkId::Mainnet),
+        "dev build must refuse mainnet"
+    );
+    assert!(
+        gate(true, false, NetworkId::Testnet),
+        "dev build must refuse testnet"
+    );
     assert!(!gate(true, false, NetworkId::Devnet));
-    assert!(!gate(true, true, NetworkId::Mainnet), "an opted-in build may");
-    assert!(!gate(false, false, NetworkId::Mainnet), "a release build may");
+    assert!(
+        !gate(true, true, NetworkId::Mainnet),
+        "an opted-in build may"
+    );
+    assert!(
+        !gate(false, false, NetworkId::Mainnet),
+        "a release build may"
+    );
 }
 
 fn parse_datadir_arg() -> Option<PathBuf> {

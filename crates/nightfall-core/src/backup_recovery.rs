@@ -279,7 +279,7 @@ impl BackupRecovery {
             } else {
                 "I checked the address and want keys-only recovery. I will keep the original backup and review prior payments before spending."
             };
-            ui.checkbox(&mut self.acknowledged, consent);
+            crate::widgets::check(ui, &mut self.acknowledged, consent);
             let action = if full {
                 "Import full state into new Vault"
             } else {

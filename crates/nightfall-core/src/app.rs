@@ -143,6 +143,9 @@ pub struct App {
     pub hashrate: HashrateMeter,
     pub toasts: Toasts,
 
+    /// Dev-only page capture. `None` in every normal run — see `ui_shots`.
+    pub shots: Option<crate::ui_shots::Shots>,
+
     /// Set by the background sync thread when new outputs arrive.
     pub sync_signal: Arc<Mutex<Option<Result<u32, String>>>>,
     pub syncing: Arc<AtomicBool>,
@@ -350,6 +353,7 @@ impl App {
             last_status_poll: None,
             hashrate: HashrateMeter::default(),
             toasts: Toasts::default(),
+            shots: crate::ui_shots::Shots::from_env(),
             sync_signal: Arc::new(Mutex::new(None)),
             wallet_scan_access: Arc::new(Mutex::new(())),
             syncing: Arc::new(AtomicBool::new(false)),
@@ -1326,7 +1330,11 @@ impl eframe::App for App {
                         ui.add_space(12.0);
                     }
 
-                    egui::ScrollArea::vertical()
+                    // Dev-only: the page walker drives the scroll so it can
+                    // photograph a page taller than the window. `None` in
+                    // every normal run, which leaves the area untouched.
+                    let forced = self.shots.as_ref().and_then(|s| s.offset());
+                    let mut area = egui::ScrollArea::vertical()
                         .id_salt(("page-scroll", self.view as u8))
                         .auto_shrink([false, false])
                         // Always reserve the bar. With the default the bar appears
@@ -1334,25 +1342,36 @@ impl eframe::App for App {
                         // away mid-session — every right-aligned column then shifts
                         // sideways as you scroll. Reserving it costs a sliver of
                         // width and makes the layout stop moving.
-                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                        .show(ui, |ui| {
-                            fill_width(ui, ui.available_width());
-                            views::page_intro(self.view, ui);
-                            match self.view {
-                                View::Dashboard => views::dashboard(self, ui),
-                                View::Send => views::send(self, ui, ctx),
-                                View::Receive => views::receive(self, ui, ctx),
-                                View::Activity => views::activity(self, ui),
-                                View::Mining => views::mining(self, ui),
-                                View::Network => views::network(self, ui, ctx),
-                                View::Swap => crate::views_swap::swap(self, ui, ctx),
-                                View::Settings => views::settings(self, ui, ctx),
-                            }
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible);
+                    if let Some(offset) = forced {
+                        area = area.vertical_scroll_offset(offset);
+                    }
+                    let drawn = area.show(ui, |ui| {
+                        fill_width(ui, ui.available_width());
+                        views::page_intro(self.view, ui);
+                        match self.view {
+                            View::Dashboard => views::dashboard(self, ui),
+                            View::Send => views::send(self, ui, ctx),
+                            View::Receive => views::receive(self, ui, ctx),
+                            View::Activity => views::activity(self, ui),
+                            View::Mining => views::mining(self, ui),
+                            View::Network => views::network(self, ui, ctx),
+                            View::Swap => crate::views_swap::swap(self, ui, ctx),
+                            View::Settings => views::settings(self, ui, ctx),
+                        }
+                    });
+                    if let Some(shots) = self.shots.as_mut() {
+                        shots.note(crate::ui_shots::Area {
+                            viewport: drawn.inner_rect,
+                            content: drawn.content_size.y,
+                            offset: drawn.state.offset.y,
                         });
+                    }
                 });
             });
 
         self.toasts.show(ctx);
+        crate::ui_shots::step(self, ctx);
     }
 }
 

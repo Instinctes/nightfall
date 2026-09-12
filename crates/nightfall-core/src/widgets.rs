@@ -323,6 +323,55 @@ pub fn gradient_card<R>(ui: &mut egui::Ui, height: f32, add: impl FnOnce(&mut eg
     add(&mut child)
 }
 
+/// Test-only: the outer rect of every outermost [`card`] drawn this frame.
+///
+/// A card's edges are the one thing a screenshot shows plainly and a layout
+/// test could not see: the existing tests assert that nothing overflows the
+/// page, which a card that is 50 points narrower than its neighbour passes
+/// without complaint. Recording the rects lets a test say the thing the eye
+/// says — these two cards do not line up.
+///
+/// Only the outermost card is recorded. A card nested inside another is
+/// meant to be inset, so its edges are not the page's edges.
+#[cfg(test)]
+pub(crate) mod card_probe {
+    use eframe::egui::Rect;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static PENDING: RefCell<Option<String>> = const { RefCell::new(None) };
+        static OPEN: RefCell<Vec<Option<String>>> = const { RefCell::new(Vec::new()) };
+        static DRAWN: RefCell<Vec<(Rect, String)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// The title `titled_card` is about to draw, so a failure can name the card
+    /// instead of making somebody count cards down a page.
+    pub fn name(title: &str) {
+        PENDING.with(|p| *p.borrow_mut() = Some(title.to_string()));
+    }
+
+    pub fn enter() {
+        let title = PENDING.with(|p| p.borrow_mut().take());
+        OPEN.with(|s| s.borrow_mut().push(title));
+    }
+
+    pub fn leave(rect: Rect) {
+        let title = OPEN.with(|s| s.borrow_mut().pop().flatten());
+        if OPEN.with(|s| s.borrow().is_empty()) {
+            DRAWN.with(|d| {
+                d.borrow_mut()
+                    .push((rect, title.unwrap_or_else(|| "untitled".into())))
+            });
+        }
+    }
+
+    /// The cards since the last call, and reset. Call once to discard a warm-up
+    /// frame, then again to read the frame you mean to measure.
+    pub fn take() -> Vec<(Rect, String)> {
+        DRAWN.with(|d| std::mem::take(&mut *d.borrow_mut()))
+    }
+}
+
 /// A surface panel: body that falls off downwards, border, lit top edge.
 ///
 /// Reserving two paint slots before the content and filling them afterwards
@@ -334,7 +383,9 @@ pub fn gradient_card<R>(ui: &mut egui::Ui, height: f32, add: impl FnOnce(&mut eg
 /// difference between a panel and a rectangle of a slightly different colour.
 pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let outer = ui.available_width();
-    egui::Frame::none()
+    #[cfg(test)]
+    card_probe::enter();
+    let drawn = egui::Frame::none()
         .fill(SURFACE)
         .stroke(Stroke::new(1.0_f32, BORDER))
         .rounding(Rounding::same(ROUND))
@@ -356,8 +407,10 @@ pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
         .show(ui, |ui| {
             fill_width(ui, (outer - 40.0).max(0.0));
             add(ui)
-        })
-        .inner
+        });
+    #[cfg(test)]
+    card_probe::leave(drawn.response.rect);
+    drawn.inner
 }
 
 /// One row of a data list: label left, value hard right, hairline under.
@@ -595,6 +648,72 @@ pub fn empty_state(ui: &mut egui::Ui, title: &str, hint: &str) {
     ui.add_space(18.0);
 }
 
+/// A section label that folds the block under it.
+///
+/// egui's own `CollapsingHeader` draws its title in plain body text with a
+/// triangle pressed against the first letter, and indents everything under it
+/// by 18 points. On a page made of cards that reads as a stray line of debug
+/// text above a column that no longer lines up — which is exactly what "Start
+/// or join a trade" looked like on Swap. This is the wallet's own section
+/// label with a chevron, and no indent.
+pub fn section_fold<R>(
+    ui: &mut egui::Ui,
+    id: &str,
+    text: &str,
+    default_open: bool,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<R> {
+    let id = egui::Id::new(("section-fold", id));
+    let mut state =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, default_open);
+    let openness = state.openness(ui.ctx());
+
+    ui.add_space(GAP_SM);
+    let spaced: String = text.to_uppercase().chars().flat_map(|c| [c, ' ']).collect();
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 18.0), Sense::click());
+    let lit = response.hovered();
+    let colour = if lit {
+        TEXT_DIM
+    } else {
+        TEXT_FAINT.gamma_multiply(1.35)
+    };
+    // A triangle that points right when closed and down when open, turning
+    // through the openness the state is animating. 12 points of box, so it
+    // reads at the same weight as the label beside it.
+    let c = egui::pos2(rect.left() + 5.0, rect.center().y);
+    let a = std::f32::consts::FRAC_PI_2 * openness;
+    let (sin, cos) = a.sin_cos();
+    let turn = |p: egui::Vec2| egui::pos2(c.x + p.x * cos - p.y * sin, c.y + p.x * sin + p.y * cos);
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![
+            turn(Vec2::new(-2.5, -5.0)),
+            turn(Vec2::new(4.5, 0.0)),
+            turn(Vec2::new(-2.5, 5.0)),
+        ],
+        colour,
+        Stroke::NONE,
+    ));
+    ui.painter().text(
+        egui::pos2(rect.left() + 18.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        spaced.trim_end(),
+        egui::FontId::proportional(11.0),
+        colour,
+    );
+    if response.clicked() {
+        state.toggle(ui);
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    ui.add_space(GAP_SM);
+
+    let out = state.show_body_unindented(ui, body);
+    state.store(ui.ctx());
+    out.map(|r| r.inner)
+}
+
 /// A grouping label between cards on a long page (Settings).
 pub fn section_label(ui: &mut egui::Ui, text: &str) {
     ui.add_space(GAP_SM);
@@ -607,6 +726,8 @@ pub fn section_label(ui: &mut egui::Ui, text: &str) {
 /// The title uses [`kicker`], so every tab picks up the web wallet's
 /// heading rhythm from one place instead of eighteen call sites.
 pub fn titled_card<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    #[cfg(test)]
+    card_probe::name(title);
     card(ui, |ui| {
         kicker(ui, title);
         ui.add_space(10.0);
@@ -776,9 +897,29 @@ pub fn kv(ui: &mut egui::Ui, key: &str, value: RichText) {
     ui.add_space(9.0);
     ui.horizontal(|ui| {
         ui.label(RichText::new(key).size(13.5).color(TEXT_DIM));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(value.size(13.5));
-        });
+        // The value gets the room that is left, and is truncated inside it.
+        //
+        // It used to be a right-to-left layout with no width of its own, so a
+        // value longer than the space grew *leftwards over the key* and drew
+        // on top of it. On the Settings page the Bitcoin config path did
+        // exactly that: "Config" and "/Users/hux/…" were painted in the same
+        // place, one on top of the other, and the result read as corrupted
+        // glyphs. A long value now stops at the key instead of climbing over
+        // it — and if it does not fit, the card is the wrong shape for it and
+        // `copyable` is the right widget.
+        // Asked for after the key is drawn, so egui's own accounting — which
+        // includes the spacing it inserts between the two — decides how much
+        // is left. Measuring the key by hand and subtracting a guessed gap is
+        // how the first attempt at this overflowed the Dashboard by 32 points.
+        let room = ui.available_width().max(60.0);
+        ui.allocate_ui_with_layout(
+            Vec2::new(room, 0.0),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                ui.set_width(room);
+                ui.add(egui::Label::new(value.size(13.5)).truncate());
+            },
+        );
     });
 }
 
@@ -908,6 +1049,19 @@ pub fn on_gradient_chip(ui: &mut egui::Ui, text: &str) {
 }
 
 /// Secondary / outline button.
+/// How wide [`ghost_button`] will draw for this label.
+///
+/// A row that puts fields beside a button has to know the button's room
+/// before it can size the fields. Guessing it is how the Address book row
+/// came to overflow its card by 21 points — and an overflowing card widens
+/// the page under it, so every card below inherited the wrong width. Asked
+/// of the same style the button uses, so it cannot drift.
+pub fn ghost_button_width(ui: &egui::Ui, text: &str) -> f32 {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let galley = ui.fonts(|f| f.layout_no_wrap(text.to_string(), font, TEXT));
+    galley.size().x + ui.spacing().button_padding.x * 2.0
+}
+
 pub fn ghost_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(text).color(TEXT))
@@ -1001,6 +1155,78 @@ pub fn text_field(
     );
     ui.add_space(GAP_SM);
     response
+}
+
+/// A two- or three-way switch: one row, one decision, one highlighted answer.
+///
+/// egui's `selectable_label` draws the unselected option with no box at all,
+/// so a pair of them reads as one button beside a stray piece of text — which
+/// is what "I give NIGHT / I give Bitcoin" looked like on Swap, the single
+/// most consequential choice in the wallet. Both halves of a switch have to
+/// look like halves of a switch.
+///
+/// Returns the index pressed, if any.
+pub fn segmented(ui: &mut egui::Ui, id: &str, labels: &[&str], selected: usize) -> Option<usize> {
+    let font = egui::FontId::proportional(12.5);
+    let widest = labels
+        .iter()
+        .map(|l| {
+            ui.fonts(|f| f.layout_no_wrap((*l).to_string(), font.clone(), TEXT))
+                .size()
+                .x
+        })
+        .fold(0.0_f32, f32::max);
+    const PAD: f32 = 4.0;
+    let count = labels.len().max(1) as f32;
+    let room = ((ui.available_width() - PAD * 2.0) / count).max(56.0);
+    let seg_w = (widest + 34.0).min(room);
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(seg_w * count + PAD * 2.0, CONTROL_H),
+        Sense::hover(),
+    );
+    ui.painter().rect(
+        rect,
+        Rounding::same(ROUND_PILL),
+        SURFACE_LOW,
+        Stroke::new(1.0_f32, BORDER),
+    );
+    let mut clicked = None;
+    for (index, label) in labels.iter().enumerate() {
+        let seg = Rect::from_min_size(
+            egui::pos2(rect.left() + PAD + seg_w * index as f32, rect.top() + PAD),
+            Vec2::new(seg_w, rect.height() - PAD * 2.0),
+        );
+        let resp = ui.interact(seg, egui::Id::new(("segmented", id, index)), Sense::click());
+        let on = index == selected;
+        if on {
+            // The chosen half carries the accent. At SURFACE_HI on SURFACE_LOW
+            // the difference was one step of grey, and which way round a swap
+            // runs is not something to leave to a careful look.
+            ui.painter().rect(
+                seg,
+                Rounding::same(ROUND_PILL),
+                tint(SURFACE_HI, ACCENT_HI, 0.28),
+                Stroke::new(1.0_f32, ACCENT_HI),
+            );
+        } else if resp.hovered() {
+            ui.painter()
+                .rect_filled(seg, Rounding::same(ROUND_PILL), SURFACE);
+        }
+        ui.painter().text(
+            seg.center(),
+            egui::Align2::CENTER_CENTER,
+            *label,
+            font.clone(),
+            if on { TEXT } else { TEXT_DIM },
+        );
+        if resp.hovered() && !on {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if resp.clicked() {
+            clicked = Some(index);
+        }
+    }
+    clicked
 }
 
 /// A full-width choice: a label, and one line saying what it is for.
@@ -1107,6 +1333,99 @@ pub fn screen_header(ui: &mut egui::Ui, network: &str, right: &[(&str, Color32)]
         });
 }
 
+/// A tinted block inside a card: a caution that belongs to the card.
+///
+/// A frame with no width of its own shrink-wraps its text, so a note under a
+/// full-width list ends short of it and the card appears to have two right
+/// edges — which is what the About card did. The width is taken outside the
+/// frame, where the margins have not been added yet.
+pub fn inset_note<R>(
+    ui: &mut egui::Ui,
+    tone: Color32,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    const PAD: f32 = 12.0;
+    let inner = (ui.available_width() - PAD * 2.0).max(60.0);
+    egui::Frame::none()
+        .fill(tint(SURFACE, tone, 0.13))
+        .stroke(Stroke::new(1.0_f32, tone.gamma_multiply(0.35)))
+        .rounding(Rounding::same(ROUND_SM))
+        .inner_margin(egui::Margin::same(PAD))
+        .show(ui, |ui| {
+            ui.set_width(inner);
+            add(ui)
+        })
+        .inner
+}
+
+/// A checkbox the wallet draws itself. Returns true when it was just changed.
+///
+/// egui's own is a hairline square that reads as an empty rectangle on a dark
+/// surface. Settings has three of them and one gates an irreversible
+/// migration, so "is that ticked?" has to be answerable at a glance. Filled
+/// and accented when on, clearly outlined when off, and the label is part of
+/// the hit area rather than a separate piece of text beside it.
+pub fn check(ui: &mut egui::Ui, on: &mut bool, label: &str) -> bool {
+    const BOX: f32 = 17.0;
+    const GAP: f32 = 10.0;
+    let width = ui.available_width();
+    let galley = ui.fonts(|f| {
+        f.layout(
+            label.to_string(),
+            egui::FontId::proportional(13.0),
+            TEXT,
+            (width - BOX - GAP).max(40.0),
+        )
+    });
+    let height = galley.size().y.max(BOX);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
+    let enabled = ui.is_enabled();
+    let hot = resp.hovered() && enabled;
+    let square = Rect::from_min_size(
+        egui::pos2(rect.left(), rect.top() + (height - BOX) / 2.0),
+        Vec2::splat(BOX),
+    );
+    let (fill, stroke) = match (*on, hot) {
+        (true, _) => (GRAD_A, GRAD_A),
+        (false, true) => (SURFACE_HOVER, ACCENT_HI),
+        (false, false) => (SURFACE_LOW, BORDER),
+    };
+    ui.painter().rect(
+        square,
+        Rounding::same(5.0),
+        if enabled { fill } else { SURFACE_LOW },
+        Stroke::new(1.0_f32, if enabled { stroke } else { BORDER }),
+    );
+    if *on {
+        // A tick drawn as two strokes, not a glyph: the bundled font has no
+        // check mark, and a missing glyph is a box — which is exactly the
+        // thing an unticked checkbox already looks like.
+        let c = square.center();
+        ui.painter().add(egui::Shape::line(
+            vec![
+                egui::pos2(c.x - 4.0, c.y),
+                egui::pos2(c.x - 1.0, c.y + 3.2),
+                egui::pos2(c.x + 4.2, c.y - 3.4),
+            ],
+            Stroke::new(2.0_f32, INK),
+        ));
+    }
+    ui.painter().galley(
+        egui::pos2(square.right() + GAP, rect.top() + (height - galley.size().y) / 2.0),
+        galley,
+        if enabled { TEXT } else { TEXT_FAINT },
+    );
+    if hot {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, *on, label));
+    if resp.clicked() && enabled {
+        *on = !*on;
+        return true;
+    }
+    false
+}
+
 /// A monospace value with a copy button. Returns true when copied.
 pub fn copyable(ui: &mut egui::Ui, value: &str, wrap: bool) -> bool {
     let mut copied = false;
@@ -1127,11 +1446,28 @@ pub fn copyable(ui: &mut egui::Ui, value: &str, wrap: bool) -> bool {
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.style_mut().spacing.item_spacing.x = 8.0;
-                let avail = (inner - 48.0).max(40.0);
+                // The copy button's room, asked of the style rather than
+                // guessed: a guess that is two points short overflows the card
+                // the moment the value column claims its full width.
+                let icon = ui
+                    .fonts(|f| {
+                        f.layout_no_wrap("⧉".to_string(), egui::FontId::proportional(15.0), TEXT)
+                    })
+                    .size()
+                    .x
+                    + ui.spacing().button_padding.x * 2.0;
+                let avail = (inner - icon - 8.0).max(40.0);
                 ui.allocate_ui_with_layout(
                     Vec2::new(avail, 0.0),
                     egui::Layout::top_down(egui::Align::LEFT),
                     |ui| {
+                        // Claim the column even when the value is short. An
+                        // `allocate_ui` advances by what its child used, so a
+                        // 15-character path made this box shrink-wrap itself
+                        // and two of them in one page were two widths — which
+                        // is most of what "the cards are different widths"
+                        // turned out to look like on Settings.
+                        ui.set_width(avail);
                         let mut text = RichText::new(value).monospace().color(TEXT);
                         if !wrap {
                             text = text.size(12.0);

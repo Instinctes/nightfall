@@ -1260,7 +1260,7 @@ impl VaultUi {
                 let migrating = matches!(self.custody, Custody::Legacy | Custody::Migration);
                 if migrating {
                     ui.add_space(12.0);
-                    ui.checkbox(&mut self.acknowledged, "I have my offline recovery backup and understand that old backups and experimental swap secrets are not erased or encrypted by this migration.");
+                    crate::widgets::check(ui, &mut self.acknowledged, "I have my offline recovery backup and understand that old backups and experimental swap secrets are not erased or encrypted by this migration.");
                     ui.label("Contacts and preferences are outside Vault. Interrupted legacy save files must be resolved before continuing.");
                 }
                 let (label, requested) = match self.custody {
@@ -1331,7 +1331,7 @@ impl VaultUi {
                             .hint_text("Current password to save; backup password to check"),
                     );
                     ui.label("Use a new filename outside the wallet data folder, preferably on an offline device. A failed write may leave an incomplete new file; retry with another filename. No ~ expansion is applied.");
-                    ui.checkbox(&mut self.backup_acknowledged, "I understand that backups retain their own password and may contain old state. Checking does not import or send transactions.");
+                    crate::widgets::check(ui, &mut self.backup_acknowledged, "I understand that backups retain their own password and may contain old state. Checking does not import or send transactions.");
                     let ready = self.backup_acknowledged
                         && !self.backup_password.is_empty()
                         && std::path::Path::new(&self.backup_path).is_absolute();

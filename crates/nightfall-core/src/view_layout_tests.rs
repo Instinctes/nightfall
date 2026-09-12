@@ -157,6 +157,57 @@ fn the_payment_request_card_fits_supported_content_widths() {
     });
 }
 
+/// A long value in a data row stays on its own side of the label.
+///
+/// From a screenshot of Settings: "Config" and the path beginning
+/// "/Users/hux/…" were painted in the same place, one over the other, and the
+/// result read as corrupted glyphs. The value was drawn in a right-to-left
+/// layout with no width of its own, so anything longer than the free space
+/// grew leftwards across the label.
+#[test]
+fn a_long_value_never_climbs_over_its_label() {
+    use crate::widgets::{card, kv};
+    use eframe::egui::RichText;
+
+    let ctx = egui::Context::default();
+    crate::theme::apply(&ctx);
+    let long = "/Users/hux/Library/Application Support/nightfall/devnet/n8/wallet-1.0-dev/bitcoin-rpc.conf";
+
+    for width in [380.0, 620.0, 884.0, 1180.0] {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(width, 600.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let right = ui.max_rect().right();
+                let drawn = ui
+                    .scope(|ui| {
+                        card(ui, |ui| {
+                            kv(ui, "Config", RichText::new(long).monospace().size(11.0));
+                            kv(ui, "Short", RichText::new("0").monospace());
+                        });
+                    })
+                    .response
+                    .rect;
+                assert!(
+                    drawn.right() <= right + 1.0,
+                    "a long value pushed the card past the panel at {width}px: {} > {right}",
+                    drawn.right(),
+                );
+                assert!(
+                    drawn.left() >= -1.0,
+                    "a long value grew leftwards out of the card at {width}px: {}",
+                    drawn.left(),
+                );
+            });
+        });
+    }
+}
+
 /// A handful of history entries, one of each shape.
 fn rows_fixture() -> Vec<nightfall_wallet::HistoryEntry> {
     use nightfall_wallet::{Direction, HistoryEntry};
@@ -680,4 +731,163 @@ fn the_proof_card_fits_supported_content_widths() {
             assert!(open.contains("amount is what the receipt says"), "{open}");
         }
     }
+}
+
+/// Render one page exactly as `App::update` does — centred column, the page's
+/// own width cap, the always-visible scrollbar — and return the outer rect of
+/// every top-level card on it.
+///
+/// The shell matters. `settings()` called straight onto a CentralPanel gets a
+/// different width from the real thing, and the difference is the scrollbar:
+/// measuring without it is measuring a page nobody sees.
+fn card_edges(
+    ctx: &egui::Context,
+    app: &mut App,
+    view: View,
+    width: f32,
+) -> Vec<(egui::Rect, String)> {
+    let mut run = || {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(width, 900.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().inner_margin(egui::Margin {
+                    left: 24.0,
+                    right: 24.0,
+                    top: 4.0,
+                    bottom: 16.0,
+                }))
+                .show(ctx, |ui| {
+                    crate::widgets::page_column(ui, view.content_max_width(), |ui| {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                            )
+                            .show(ui, |ui| {
+                                crate::widgets::fill_width(ui, ui.available_width());
+                                page_intro(view, ui);
+                                match view {
+                                    View::Settings => settings(app, ui, ctx),
+                                    View::Send => send(app, ui, ctx),
+                                    View::Receive => receive(app, ui, ctx),
+                                    View::Dashboard => dashboard(app, ui),
+                                    View::Activity => activity(app, ui),
+                                    View::Mining => mining(app, ui),
+                                    View::Network => network(app, ui, ctx),
+                                    View::Swap => crate::views_swap::swap(app, ui, ctx),
+                                }
+                            });
+                    });
+                });
+        });
+    };
+    // First frame warms galleys and scroll state; the second is the one that
+    // reflects what a person looking at the window would see.
+    run();
+    let _ = crate::widgets::card_probe::take();
+    run();
+    crate::widgets::card_probe::take()
+}
+
+/// Cards on one page stand in one column, or the page looks broken.
+///
+/// This is the fault the owner reported on Settings and no test could see:
+/// every card fitted inside the page, so `all_eight_pages_fit…` passed, while
+/// on screen one card started 50 points to the right of the one above it. An
+/// overflow test measures the page; this measures the cards against each other.
+#[test]
+fn cards_on_one_page_share_one_left_and_right_edge() {
+    let ctx = egui::Context::default();
+    crate::theme::apply(&ctx);
+    let dir = std::env::temp_dir().join(format!("nf-ui-edges-{}", nightfall_storage::now_unix()));
+    let mut app = App::new(nightfall_types::NetworkId::Devnet, dir);
+    // An empty wallet is the one case where nothing can overflow. Give the
+    // page the content a used wallet has — including a contact name longer
+    // than today's limit, because a file written by an older build still has
+    // to draw — or the test only ever measures a wallet nobody owns.
+    app.address_book.entries = vec![
+        crate::address_book::AddressBookEntry {
+            name: "Kiosk".into(),
+            address: format!("nf1{}", "a".repeat(70)),
+        },
+        crate::address_book::AddressBookEntry {
+            name: "x".repeat(200),
+            address: format!("nf1{}", "b".repeat(70)),
+        },
+    ];
+    app.book_name = "y".repeat(120);
+    app.book_addr = format!("nf1{}", "c".repeat(70));
+    // Every page at every width, reported together. Stopping at the first
+    // ragged card hides the rest, and these faults come in families.
+    let mut ragged: Vec<String> = Vec::new();
+    // 620 is narrower than the window can be made (940 minus the rail), so it
+    // is the stress case; 1728 is a 1920 display, where the capped pages have
+    // to stay centred instead of drifting.
+    for width in [620.0, 884.0, 1180.0, 1728.0] {
+        for (view, name) in View::ALL {
+            app.view = view;
+            let rects = card_edges(&ctx, &mut app, view, width);
+            if rects.len() < 2 {
+                continue;
+            }
+            // Two columns put two cards side by side, and those two are meant
+            // to have different x. Group the cards into rows by vertical
+            // overlap first; what must line up is the *row*, left edge of the
+            // leftmost card and right edge of the rightmost.
+            struct Row {
+                bottom: f32,
+                left: f32,
+                right: f32,
+                titles: Vec<String>,
+            }
+            let mut rows: Vec<Row> = Vec::new();
+            for (r, title) in &rects {
+                match rows.iter_mut().find(|row| r.top() < row.bottom - 1.0) {
+                    Some(row) => {
+                        row.bottom = row.bottom.max(r.bottom());
+                        row.left = row.left.min(r.left());
+                        row.right = row.right.max(r.right());
+                        row.titles.push(title.clone());
+                    }
+                    None => rows.push(Row {
+                        bottom: r.bottom(),
+                        left: r.left(),
+                        right: r.right(),
+                        titles: vec![title.clone()],
+                    }),
+                }
+            }
+            let Some(first) = rows.first() else { continue };
+            let (first_left, first_right) = (first.left, first.right);
+            // Cards that touch read as one block, and cards that overlap read
+            // as a bug. Consecutive rows keep at least a small gap.
+            for pair in rects.windows(2) {
+                let (above, below) = (&pair[0], &pair[1]);
+                let gap = below.0.top() - above.0.bottom();
+                if below.0.top() > above.0.bottom() - 1.0 && gap < 8.0 {
+                    ragged.push(format!(
+                        "{name} at {width}px: only {gap:.0} points between \"{}\" and \"{}\"",
+                        above.1, below.1,
+                    ));
+                }
+            }
+            for row in &rows {
+                if (row.left - first_left).abs() > 0.5 || (row.right - first_right).abs() > 0.5 {
+                    ragged.push(format!(
+                        "{name} at {width}px: \"{}\" is [{:.0}..{:.0}], the page is [{first_left:.0}..{first_right:.0}]",
+                        row.titles.join("\" + \""),
+                        row.left,
+                        row.right,
+                    ));
+                }
+            }
+        }
+    }
+    assert!(ragged.is_empty(), "cards do not line up:\n{}", ragged.join("\n"));
 }
