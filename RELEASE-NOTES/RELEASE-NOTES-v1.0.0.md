@@ -1,8 +1,7 @@
 # NIGHTFALLCOIN 1.0.0 — mainnet wallets
 
 The first 1.0 Core release for macOS Apple Silicon, Intel macOS, Windows x64
-and Linux x64, plus the web wallet on its own origin at
-`wallet.nightfallcoin.org`. This replaces 0.9.5 as the current download.
+and Linux x64. This replaces 0.9.5 as the current download.
 
 **Same chain.** Protocol v8, wire v6, `n8` data format, unchanged emission and
 genesis. No reset, no migration, no seed-node upgrade. If you run a node or
@@ -72,17 +71,22 @@ rebroadcast on its own.
 
 Reasoning: [`docs/SWAP-WITHDRAWN.md`](../docs/SWAP-WITHDRAWN.md).
 
-## Web wallet
+## Web wallet — unchanged in this release
 
-The browser wallet moves to its own origin, `wallet.nightfallcoin.org`, so that
-browser-stored key material is separated from the rest of the site by the only
-boundary a browser actually enforces. The old `/wallet/` path serves a
-transition page that helps existing users move their wallet across before the
-address is retired — open it and follow it rather than assuming your browser
-wallet came along by itself.
+**The browser wallet stays where it is, at `nightfallcoin.org/wallet/`.** This
+release is desktop Core only. Nothing about your browser wallet changes, and
+there is nothing for you to move.
 
-It remains a light wallet that trusts a node for chain data, with browser
-storage that can be cleared or lost.
+`wallet.nightfallcoin.org` exists and is reserved for it. A browser separates
+stored keys by origin and by nothing smaller, so moving the wallet to its own
+host is worth doing — but the build prepared there handles keys, backups and
+recovery and cannot yet make a payment. Shipping it would trade a wallet that
+pays for one that does not, so it waits.
+
+When the move happens it will be announced, and the old address will hand your
+wallet across before it stops serving one. Until then, the wallet at
+`/wallet/` remains a light wallet that trusts a node for chain data, with
+browser storage that can be cleared or lost.
 
 ## Download and verify
 

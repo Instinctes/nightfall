@@ -931,16 +931,28 @@ mod tests {
                 store.wallet().unwrap().swap_checkpoint(SWAP_ID).unwrap().0,
                 expected
             );
+            // Close the store before reading its directory. An open store holds
+            // a byte-range lock on its files; on Unix that is advisory and a
+            // read goes through, on Windows it is mandatory and `fs::read`
+            // fails with "another process has locked a portion of the file".
+            // The scan below needs no open store, so this is the whole fix —
+            // and the Windows job is where it surfaced, because until the
+            // vault work landed that job only ran `cargo build`.
+            drop(store);
             // Even interrupted files are ciphertext, never a secret JSON fallback.
+            let mut scanned = 0;
             for entry in fs::read_dir(f.root.join("core.seed.vault")).unwrap() {
                 let path = entry.unwrap().path();
                 if path.is_file() {
-                    let bytes = fs::read(path).unwrap();
+                    let bytes = fs::read(&path)
+                        .unwrap_or_else(|e| panic!("{} is unreadable: {e}", path.display()));
                     assert!(!bytes
                         .windows(SWAP_SECRET.len())
                         .any(|w| w == SWAP_SECRET.as_bytes()));
+                    scanned += 1;
                 }
             }
+            assert!(scanned > 0, "the vault directory held no files to check");
         }
     }
 
