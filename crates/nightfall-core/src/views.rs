@@ -510,6 +510,7 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
     // the spendable number in a left column with a dead strip on the right.
     paired_cards(
         ui,
+        "dashboard-node-hashrate",
         320.0,
         |ui| {
             titled_card(ui, "This node", |ui| {
@@ -558,6 +559,7 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
 
     paired_cards(
         ui,
+        "dashboard-row2",
         320.0,
         |ui| {
             titled_card(ui, "Recent activity", |ui| {
@@ -2622,6 +2624,7 @@ pub fn mining(app: &mut App, ui: &mut egui::Ui) {
 
     paired_cards(
         ui,
+        "row-2623",
         320.0,
         |ui| {
             titled_card(ui, "Difficulty", |ui| {
@@ -3100,6 +3103,7 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 
     paired_cards(
         ui,
+        "row-3101",
         320.0,
         |ui| {
             titled_card(ui, "Chain", |ui| {

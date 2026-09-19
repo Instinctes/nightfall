@@ -632,20 +632,28 @@ pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
             fill_width(ui, (outer - 44.0).max(0.0));
             let y0 = ui.cursor().top();
             let out = add(ui);
+            // The card's own content, before it is padded out to match its
+            // neighbour. This is what gets reported upwards, and reporting the
+            // *padded* height instead is what made a card that was once too
+            // tall stay too tall for good: the padding confirmed the floor that
+            // produced it, so the row could only ever grow. Dashboard ended up
+            // with two cards of metrics stretched down the whole window.
+            let natural = ui.cursor().top() - y0 + 44.0;
             if floor > 1.0 {
                 let used = ui.cursor().top() - y0;
                 let inner = (floor - 44.0).max(0.0);
                 ui.add_space((inner - used).max(0.0));
             }
-            out
+            (out, natural)
         });
+    let (out, natural) = drawn.inner;
     if depth == 0 {
-        ROW_HEIGHTS.with(|h| h.borrow_mut().push(drawn.response.rect.height()));
+        ROW_HEIGHTS.with(|h| h.borrow_mut().push(natural));
     }
     CARD_DEPTH.set(depth);
     #[cfg(test)]
     card_probe::leave(drawn.response.rect);
-    drawn.inner
+    out
 }
 
 /// One row of a data list: label left, value hard right, hairline under.
@@ -759,6 +767,7 @@ pub fn two_columns<A, B>(
 /// and stretching every sheet would leave a half-width card on its own row.
 pub fn paired_cards<A, B>(
     ui: &mut egui::Ui,
+    key: &'static str,
     min_column: f32,
     left: impl FnOnce(&mut egui::Ui) -> A,
     right: impl FnOnce(&mut egui::Ui) -> B,
@@ -770,10 +779,14 @@ pub fn paired_cards<A, B>(
         right(ui);
         return;
     }
-    // Each row needs its own memory. `ui.id().with("pair-h")` was the same
-    // for every pair on a page, so Dashboard row 1 and row 2 overwrote one
-    // height and the cards jumped every frame.
-    let id = ui.auto_id_with("pair-h");
+    // Each row needs its own memory, and it has to be the *same* memory every
+    // frame. `ui.id().with("pair-h")` was shared by every pair on a page, so
+    // the rows fought over one height. `ui.auto_id_with` fixed that and
+    // introduced a subtler version of it: an auto id counts widgets, so a
+    // banner appearing above these cards renumbers the rows and hands one of
+    // them the height that belonged to the other. On Dashboard the other row
+    // is Activity, which is tall. The caller names the row instead.
+    let id = egui::Id::new(("pair-h", key));
     let floor = ui.ctx().data(|d| d.get_temp::<f32>(id)).unwrap_or(0.0);
     ROW_HEIGHTS.with(|h| h.borrow_mut().clear());
     CARD_FLOOR.set(floor);
@@ -2029,6 +2042,7 @@ mod interaction_tests {
                     .show(ctx, |ui| {
                         paired_cards(
                             ui,
+                            "pair-a",
                             280.0,
                             |ui| {
                                 card(ui, |ui| {
@@ -2078,6 +2092,7 @@ mod interaction_tests {
                     .show(ctx, |ui| {
                         paired_cards(
                             ui,
+                            "pair-b",
                             280.0,
                             |ui| {
                                 card(ui, |ui| {
@@ -2093,6 +2108,7 @@ mod interaction_tests {
                         ui.add_space(24.0);
                         paired_cards(
                             ui,
+                            "pair-c",
                             280.0,
                             |ui| {
                                 card(ui, |ui| {
@@ -2126,6 +2142,112 @@ mod interaction_tests {
             "rows must not share one floor: short {} tall {}",
             h(0),
             h(2)
+        );
+    }
+
+    /// A row must be able to get shorter again, and a banner above it must not
+    /// hand it somebody else's height.
+    ///
+    /// Both halves of this are the Dashboard bug reported on 19 September: the
+    /// node and hashrate cards ran the full height of the window with a field
+    /// of empty glass under four numbers. The row height was measured *after*
+    /// the shorter card had been padded out to match the taller one, so the
+    /// measurement only ever confirmed the padding — once a row was too tall it
+    /// stayed too tall forever, and the value persisted in egui memory. The
+    /// height it got in the first place came from the row being identified by a
+    /// widget counter, which a conditional banner renumbers, so Dashboard's
+    /// metrics row inherited the height of its Activity row.
+    #[test]
+    fn a_row_shrinks_back_and_keeps_its_own_height_when_a_banner_appears() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(900.0, 1200.0),
+            )),
+            ..Default::default()
+        };
+        // `lines` drives the first row's content; `banner` adds a widget above
+        // it, which is what used to change the row's identity.
+        let frame = |lines: usize, banner: bool| {
+            let _ = crate::widgets::card_probe::take();
+            let _ = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(ctx, |ui| {
+                        if banner {
+                            ui.label("wallet scan incomplete");
+                        }
+                        paired_cards(
+                            ui,
+                            "metrics",
+                            280.0,
+                            |ui| {
+                                card(ui, |ui| {
+                                    for i in 0..lines {
+                                        ui.label(format!("metric {i}"));
+                                    }
+                                });
+                            },
+                            |ui| {
+                                card(ui, |ui| {
+                                    ui.label("hashrate");
+                                });
+                            },
+                        );
+                        ui.add_space(24.0);
+                        paired_cards(
+                            ui,
+                            "activity",
+                            280.0,
+                            |ui| {
+                                card(ui, |ui| {
+                                    for i in 0..14 {
+                                        ui.label(format!("row {i}"));
+                                    }
+                                });
+                            },
+                            |ui| {
+                                card(ui, |ui| {
+                                    ui.label("peers");
+                                });
+                            },
+                        );
+                    });
+            });
+            let cards = crate::widgets::card_probe::take();
+            assert_eq!(cards.len(), 4, "{cards:?}");
+            (cards[0].0.height(), cards[2].0.height())
+        };
+
+        // Settle on tall content, then shrink it.
+        for _ in 0..3 {
+            frame(14, false);
+        }
+        let (tall, _) = frame(14, false);
+        for _ in 0..3 {
+            frame(2, false);
+        }
+        let (short, activity) = frame(2, false);
+        assert!(
+            short < tall - 20.0,
+            "a row that lost content must lose height: was {tall}, still {short}",
+        );
+
+        // The banner appears. The metrics row must keep its own height rather
+        // than adopting the tall Activity row's.
+        for _ in 0..3 {
+            frame(2, true);
+        }
+        let (with_banner, _) = frame(2, true);
+        assert!(
+            (with_banner - short).abs() <= 2.0,
+            "a banner above the row changed its height: {short} -> {with_banner}",
+        );
+        assert!(
+            with_banner < activity - 20.0,
+            "the metrics row inherited the activity row's height: {with_banner} vs {activity}",
         );
     }
 

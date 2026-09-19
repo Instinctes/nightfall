@@ -519,6 +519,16 @@ impl WalletState {
             // birth height, which is the repair the wallet already implements
             // and the only one it considers sound, and which writes the anchor
             // on its way out. Every later page is an ordinary 1024-block one.
+            //
+            // This covers a *missing* anchor only. A wallet whose anchor no
+            // longer matches the chain has not lost provenance, it has been
+            // told that the history under it changed, and that is a decision
+            // rather than a repair: the node may be on a competing branch of
+            // the same height, and quietly re-scanning onto it would move
+            // someone's wallet to whichever branch their node happened to
+            // prefer. It stops, says so, and refuses to spend until a person
+            // resolves it — see the "another valid branch" case in
+            // `vault_node_tests`, which exists to hold this line.
             let (from, page_size) = canonical_scan_request(
                 wallet.needs_canonical_pass(),
                 wallet.birth_height(),
