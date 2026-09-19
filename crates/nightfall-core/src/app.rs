@@ -155,6 +155,14 @@ pub struct App {
     /// Set by the background sync thread when new outputs arrive.
     pub sync_signal: Arc<Mutex<Option<Result<u32, String>>>>,
     pub syncing: Arc<AtomicBool>,
+    /// The scan worker's next pass must reconcile onto the node's chain rather
+    /// than scan the next page. Set only by an explicit action in the scan
+    /// warning; cleared by the worker that honours it.
+    pub reconcile_requested: Arc<AtomicBool>,
+    /// The wallet's anchor no longer matches the node, sampled once per poll so
+    /// the banner does not take the node lock on every frame.
+    pub scan_anchor_broken: bool,
+    pub reconcile_confirm: bool,
     pub last_sync_at: Option<u64>,
     /// A detected scan failure remains visible until a successful canonical
     /// scan; it must not disappear with a toast or a successful node poll.
@@ -333,6 +341,9 @@ impl App {
             sync_signal: Arc::new(Mutex::new(None)),
             wallet_scan_access: Arc::new(Mutex::new(())),
             syncing: Arc::new(AtomicBool::new(false)),
+            reconcile_requested: Arc::new(AtomicBool::new(false)),
+            scan_anchor_broken: false,
+            reconcile_confirm: false,
             last_sync_at: None,
             wallet_sync_error: None,
             send_to: String::new(),
@@ -640,16 +651,21 @@ impl App {
         let syncing = Arc::clone(&self.syncing);
         let paused = Arc::clone(&self.wallet_paused);
         let access = Arc::clone(&self.wallet_scan_access);
+        let reconcile = Arc::clone(&self.reconcile_requested);
         let data_lock = self.data_lock.clone();
 
         std::thread::spawn(move || {
             let _data_lock = data_lock;
             let mut seen = node.tip_generation();
             // First pass: pick up whatever is already on disk.
-            run_wallet_scan(&wallet, &node, &signal, &syncing, &paused, &access);
+            run_wallet_scan(
+                &wallet, &node, &signal, &syncing, &paused, &access, &reconcile,
+            );
             loop {
                 seen = node.wait_tip_change(seen, Duration::from_secs(30));
-                run_wallet_scan(&wallet, &node, &signal, &syncing, &paused, &access);
+                run_wallet_scan(
+                    &wallet, &node, &signal, &syncing, &paused, &access, &reconcile,
+                );
             }
         });
     }
@@ -662,6 +678,7 @@ fn run_wallet_scan(
     syncing: &Arc<AtomicBool>,
     paused: &Arc<AtomicBool>,
     access: &Arc<Mutex<()>>,
+    reconcile: &Arc<AtomicBool>,
 ) {
     if paused.load(Ordering::SeqCst) {
         return;
@@ -682,7 +699,14 @@ fn run_wallet_scan(
             syncing.store(false, Ordering::SeqCst);
             return;
         }
-        w.sync_from_node(node).map_err(|e| e.to_string())
+        // An explicit reconciliation replaces this pass and only this pass.
+        // Taken with `swap`, so a request cannot be honoured twice and cannot
+        // be lost between the check and the act.
+        if reconcile.swap(false, Ordering::SeqCst) {
+            w.reconcile_with_chain(node).map_err(|e| e.to_string())
+        } else {
+            w.sync_from_node(node).map_err(|e| e.to_string())
+        }
     };
     syncing.store(false, Ordering::SeqCst);
     if let Ok(mut slot) = signal.lock() {
@@ -735,6 +759,16 @@ impl App {
         }
         self.last_status_poll = Some(Instant::now());
         self.take_chain_check();
+
+        // Sampled here rather than in the banner: answering it takes the node
+        // lock, and a banner is drawn every frame.
+        self.scan_anchor_broken = match (&self.node, self.wallet.try_lock()) {
+            (Some(node), Ok(w)) => w.chain_moved_under_scan(node),
+            _ => self.scan_anchor_broken,
+        };
+        if !self.scan_anchor_broken {
+            self.reconcile_confirm = false;
+        }
 
         if let Some(node) = &self.node {
             match node.status_snapshot() {
@@ -1477,6 +1511,37 @@ impl eframe::App for App {
                                 .show(ui, |ui| {
                                     ui.label(RichText::new(error).size(13.0).color(TEXT));
                                     ui.label(RichText::new("Sending is blocked until a valid scan completes. Preserve an encrypted backup; do not clear pending payments or reservations to bypass this warning.").size(13.0).color(TEXT));
+                                    // A changed history below the scan position
+                                    // is the one case the wallet cannot resolve
+                                    // by itself, and it must not: a competing
+                                    // branch of the same height is a decision
+                                    // with money attached. It used to leave no
+                                    // way to make that decision either — a
+                                    // wallet holding pending payments cannot
+                                    // even rescan — so it simply stopped. This
+                                    // is that decision, made on purpose.
+                                    if self.scan_anchor_broken {
+                                        ui.add_space(GAP_SM);
+                                        if self.reconcile_confirm {
+                                            ui.label(RichText::new(
+                                                "This reads the whole chain your node follows and makes this wallet agree with it:                                                  anything that chain does not contain is dropped, and a payment whose inputs it no                                                  longer spends goes back to unconfirmed. Nothing is broadcast. Export an encrypted                                                  backup first — this cannot be undone from inside the wallet.",
+                                            ).size(13.0).color(TEXT));
+                                            ui.add_space(GAP_SM);
+                                            ui.horizontal(|ui| {
+                                                if primary_button(ui, "Reconcile with this chain", true).clicked() {
+                                                    self.reconcile_requested
+                                                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                                                    self.reconcile_confirm = false;
+                                                    self.toasts.info(ctx, "Reconciling — this reads the whole chain and takes a while");
+                                                }
+                                                if ghost_button(ui, "Cancel").clicked() {
+                                                    self.reconcile_confirm = false;
+                                                }
+                                            });
+                                        } else if ghost_button(ui, "Reconcile with this chain…").clicked() {
+                                            self.reconcile_confirm = true;
+                                        }
+                                    }
                                 });
                             });
                         ui.add_space(GAP_SM);

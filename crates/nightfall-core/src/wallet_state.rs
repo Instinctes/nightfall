@@ -746,6 +746,74 @@ impl WalletState {
         self.update(|w| w.reset_scan())?;
         self.sync_from_node(node)
     }
+
+    /// Is the wallet's anchor on a block the node no longer has at that height?
+    ///
+    /// Only true for a wallet that has an anchor and a node that can answer.
+    /// A node still replaying, or one that cannot supply the block at all, is
+    /// not evidence of a reorg and must not be treated as one.
+    pub fn chain_moved_under_scan(&self, node: &NodeHandle) -> bool {
+        let Ok(wallet) = self.require_wallet() else {
+            return false;
+        };
+        if wallet.needs_canonical_pass() {
+            return false;
+        }
+        let shared = node.shared();
+        let Ok(guard) = shared.lock() else {
+            return false;
+        };
+        if guard.is_loading() {
+            return false;
+        }
+        match guard.chain.block_by_height(wallet.scanned_to()) {
+            Some(anchor) => wallet.check_scan_anchor(anchor).is_err(),
+            None => false,
+        }
+    }
+
+    /// Accept the chain the node is on, deliberately.
+    ///
+    /// When the history under the scan position changes, the wallet stops and
+    /// refuses to spend. That refusal is right — a competing branch of the same
+    /// height is a decision with money attached, and a wallet that quietly
+    /// re-scans onto whichever branch its node prefers has made that decision
+    /// for its owner. What was missing is the other half: a way for the owner
+    /// to make it. Without one the wallet is simply stuck, and a wallet holding
+    /// pending payments cannot even rescan, because `check_rescan_allowed`
+    /// refuses while any exist.
+    ///
+    /// So this is the same canonical pass a rescan ends in, without discarding
+    /// what is already known and without that precondition. Pending payments
+    /// are exactly what a reorg calls into question, and `reconcile_with`
+    /// answers the question properly: an output the chain does not contain is
+    /// dropped, a send whose inputs are no longer consumed goes back to
+    /// unconfirmed rather than silently staying settled. Nothing is
+    /// rebroadcast here.
+    ///
+    /// Only for a wallet whose anchor has actually broken; anything else is a
+    /// plain scan and should go through one.
+    pub fn reconcile_with_chain(&mut self, node: &NodeHandle) -> anyhow::Result<u32> {
+        anyhow::ensure!(
+            self.chain_moved_under_scan(node),
+            "This wallet's scan still matches the chain. There is nothing to reconcile."
+        );
+        let from = self.require_wallet()?.birth_height();
+        let page = {
+            let shared = node.shared();
+            let guard = shared
+                .lock()
+                .map_err(|_| anyhow::anyhow!("node state lock poisoned"))?;
+            require_finished_replay(guard.is_loading())?;
+            anyhow::ensure!(
+                !(guard.chain.is_pruned() && from < guard.chain.first_height),
+                "This node is pruned; bodies start at height {}. Reconciling needs the history from {from}. Use an archive node.",
+                guard.chain.first_height
+            );
+            guard.chain.blocks_from(from, usize::MAX)
+        };
+        self.update(|wallet| wallet.scan_blocks(&page))
+    }
 }
 
 #[cfg(test)]

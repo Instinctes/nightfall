@@ -1,7 +1,7 @@
-# NIGHTFALLCOIN Core Wallet 1.0.2
+# NIGHTFALLCOIN Core Wallet 1.0.3
 
 A mainnet full node, miner and wallet in one desktop application. Download
-[v1.0.2](https://github.com/Instinctes/nightfall/releases/tag/v1.0.2) or build:
+[v1.0.3](https://github.com/Instinctes/nightfall/releases/tag/v1.0.3) or build:
 
 ```bash
 cargo build --locked --release -p nightfall-core
@@ -44,7 +44,7 @@ phrase in a bug report.
 
 ## Atomic swap
 
-Withdrawn before 1.0.2 and removed from the wallet. There is no Swap page and
+Withdrawn before 1.0.3 and removed from the wallet. There is no Swap page and
 no bitcoind configuration. The reasoning is in
 [SWAP-WITHDRAWN.md](SWAP-WITHDRAWN.md). A wallet file written by an
 experimental build still opens normally; rescan and backup restore refuse while

@@ -213,6 +213,14 @@ fn vault_node_child() {
         assert!(node.shared().lock().unwrap().mempool.txs.is_empty());
         alice.check_rescan_allowed().unwrap();
 
+        // Refusing is half the job; the way out is pinned separately, in
+        // `reconciling_is_the_way_out_of_a_changed_history`, so that this
+        // sequence keeps testing the refusal on an untouched wallet.
+        assert!(
+            alice.chain_moved_under_scan(&node),
+            "the wallet must be able to say that this is what happened to it"
+        );
+
         // A new tip that has not been scanned cannot be used to infer that
         // old coin-selection state is still current either.
         node.shared().lock().unwrap().chain = canonical_chain.clone();
@@ -253,6 +261,56 @@ fn vault_node_child() {
             .history()
             .iter()
             .all(|entry| entry.memo != "must not submit"));
+
+        // Last in the phase, because it deliberately moves this wallet onto
+        // another branch and nothing after it should inherit that.
+        //
+        // Refusing a changed history is half the job. The other half was
+        // missing until 19 September, when a real wallet sat at a height its
+        // node had left a hundred blocks behind: it could not scan, because the
+        // anchor no longer matched, and it could not rescan, because
+        // `check_rescan_allowed` refuses while payments are pending — which a
+        // reorg is precisely what calls into question. Nothing in the interface
+        // could resolve it. Reconciling is that decision, made on purpose.
+        // Branch A: mine two, let the wallet scan them, so its anchor sits on
+        // a block that a second branch will replace.
+        let fork_base = node.shared().lock().unwrap().chain.clone();
+        mine(&node, &bob_keys.address(), 2);
+        alice.sync_from_node(&node).unwrap();
+        let before = alice.scanned_to();
+        // Branch B from the same base, mined to a different address so the
+        // blocks at those heights are genuinely different ones.
+        {
+            let shared = node.shared();
+            let mut state = shared.lock().unwrap();
+            state.chain = fork_base;
+            state.persist().unwrap();
+        }
+        mine(&node, &alice_keys.address(), 3);
+        assert!(
+            alice.chain_moved_under_scan(&node),
+            "the fixture must actually reproduce a changed history"
+        );
+        assert!(
+            alice.sync_from_node(&node).is_err(),
+            "and must still refuse"
+        );
+        assert!(
+            alice.check_rescan_allowed().is_ok() || alice.rescan(&node).is_err(),
+            "rescan is not the way out when payments are pending",
+        );
+
+        alice.reconcile_with_chain(&node).unwrap();
+        assert!(
+            !alice.chain_moved_under_scan(&node),
+            "reconciling must leave the wallet agreeing with the node",
+        );
+        // Having agreed, it is an ordinary wallet again.
+        alice.sync_from_node(&node).unwrap();
+        assert!(alice.scanned_to() > before);
+        // ...and the offer is only on the table while it is true.
+        let err = alice.reconcile_with_chain(&node).unwrap_err().to_string();
+        assert!(err.contains("nothing to reconcile"), "{err}");
     } else {
         assert_eq!(phase, "reopen");
         alice.sync_from_node(&node).unwrap();
