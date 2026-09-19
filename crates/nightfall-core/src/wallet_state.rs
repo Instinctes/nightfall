@@ -21,6 +21,32 @@ use std::sync::Arc;
 /// today's chain and roughly 140 pages for a rescan from genesis.
 const SCAN_PAGE: usize = 1024;
 
+/// Which range the next scan page should cover: `(from, how_many)`.
+///
+/// Ordinary scanning walks the chain in `SCAN_PAGE` steps starting at the
+/// wallet's scan position, and the one-block overlap with the previous page is
+/// what arms the reorg anchor.
+///
+/// A wallet with no anchor at all is the exception. `Wallet::scan_blocks`
+/// refuses an incremental page from such a wallet, because a page that starts
+/// at the scan position carries no evidence about the history below it — and
+/// refusing is correct. What it needs instead is the one range it accepts: a
+/// single canonical run from the birth height, which re-establishes provenance
+/// against the chain the node actually has and records the anchor. That run is
+/// asked for once, in full, and only for a wallet that has none; it is not a
+/// page size anyone should reach for otherwise.
+fn canonical_scan_request(
+    needs_canonical_pass: bool,
+    birth_height: u64,
+    scan_from: u64,
+) -> (u64, usize) {
+    if needs_canonical_pass {
+        (birth_height, usize::MAX)
+    } else {
+        (scan_from, SCAN_PAGE)
+    }
+}
+
 fn require_finished_replay(loading: bool) -> anyhow::Result<()> {
     anyhow::ensure!(
         !loading,
@@ -483,7 +509,21 @@ impl WalletState {
     pub fn sync_from_node(&mut self, node: &NodeHandle) -> anyhow::Result<u32> {
         let mut found: u32 = 0;
         loop {
-            let from = self.require_wallet()?.scan_from();
+            let wallet = self.require_wallet()?;
+            // A wallet written before the scan anchor existed cannot prove
+            // which chain its observations came from, and `scan_blocks` is
+            // right to refuse an incremental page from it. Refusing forever is
+            // the bug: every 0.9.5 wallet has no anchor, so after an upgrade
+            // the scan stopped advancing and the interface only said "catching
+            // up". Ask for the canonical range instead — one pass from the
+            // birth height, which is the repair the wallet already implements
+            // and the only one it considers sound, and which writes the anchor
+            // on its way out. Every later page is an ordinary 1024-block one.
+            let (from, page_size) = canonical_scan_request(
+                wallet.needs_canonical_pass(),
+                wallet.birth_height(),
+                wallet.scan_from(),
+            );
             // Snapshot one page under the lock, then release it before
             // scanning: trial-decrypting every output is not something to do
             // while holding the node's state mutex.
@@ -505,7 +545,7 @@ impl WalletState {
                         guard.chain.first_height
                     );
                 }
-                (guard.chain.blocks_from(from, SCAN_PAGE), tip)
+                (guard.chain.blocks_from(from, page_size), tip)
             };
 
             if page.is_empty() {
@@ -522,7 +562,7 @@ impl WalletState {
                 break;
             }
 
-            let was_full_page = page.len() == SCAN_PAGE;
+            let was_full_page = page.len() == page_size;
             found = found.saturating_add(self.update(|wallet| wallet.scan_blocks(&page))?);
 
             if !was_full_page {
@@ -700,12 +740,46 @@ impl WalletState {
 
 #[cfg(test)]
 mod scan_readiness_tests {
-    use super::require_finished_replay;
+    use super::{canonical_scan_request, require_finished_replay, SCAN_PAGE};
 
     #[test]
     fn chain_replay_must_finish_before_scanning_or_sending() {
         let error = require_finished_replay(true).unwrap_err().to_string();
         assert!(error.contains("still verifying its saved chain"));
         require_finished_replay(false).unwrap();
+    }
+
+    /// A wallet with no anchor must be asked for the one range that can give it
+    /// one, and every other wallet must keep paging.
+    ///
+    /// This is the shape of the 1.0.0 upgrade bug. Wallets written by 0.9.5
+    /// carry no `scanned_tip`, `scan_blocks` refuses every incremental page
+    /// from them — correctly, it cannot tell which chain the old observations
+    /// came from — and the scan therefore never advanced again while the
+    /// interface said nothing worse than "catching up". Asking from the birth
+    /// height instead is the repair the wallet already implements.
+    #[test]
+    fn a_wallet_without_an_anchor_is_asked_for_its_whole_history_once() {
+        // The broken case: 191,102 blocks scanned, no anchor, scan position
+        // far above the birth height.
+        assert_eq!(
+            canonical_scan_request(true, 0, 191_103),
+            (0, usize::MAX),
+            "an anchorless wallet must be offered the canonical run, not a page \
+             it is guaranteed to refuse",
+        );
+        // A birth height above genesis is still where its own history starts.
+        assert_eq!(
+            canonical_scan_request(true, 42_000, 191_103),
+            (42_000, usize::MAX)
+        );
+
+        // Once the anchor exists, nothing special happens ever again.
+        assert_eq!(
+            canonical_scan_request(false, 0, 191_103),
+            (191_103, SCAN_PAGE),
+        );
+        // ...including on a fresh wallet, which has no history to prove.
+        assert_eq!(canonical_scan_request(false, 0, 0), (0, SCAN_PAGE));
     }
 }

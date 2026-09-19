@@ -543,6 +543,18 @@ impl Wallet {
             || !self.db.reserved.is_empty()
     }
 
+    /// Whether this wallet's observations are tied to a known chain.
+    ///
+    /// False for every wallet written before the anchor existed. Such a wallet
+    /// is not broken and not untrusted — it simply cannot prove which chain it
+    /// was reading, so an incremental page is refused until one complete
+    /// canonical pass has established provenance. The caller that owns a chain
+    /// (`WalletState::sync_from_node`) uses this to decide what to ask for; the
+    /// answer must never be used to *skip* the check.
+    pub fn needs_canonical_pass(&self) -> bool {
+        self.db.scanned_tip.is_empty() && self.has_scanned_history()
+    }
+
     /// Read-only canonical-anchor preflight for native scanning and sending.
     /// Unknown historical provenance is not established by adopting today's
     /// block hash: old wallets need a complete canonical reconciliation first.
@@ -1883,6 +1895,75 @@ mod tests {
         // Complete canonical history may establish provenance and re-add data.
         restored.scan_blocks(&blocks).unwrap();
         restored.check_scan_anchor(blocks.last().unwrap()).unwrap();
+    }
+
+    /// The upgrade path out of "no anchor": one canonical pass, then normal
+    /// paging, with the balance intact on both sides of it.
+    ///
+    /// Every wallet written before the anchor existed lands here, so this is
+    /// not an edge case — it is what the first launch of 1.0.0 does to a 0.9.5
+    /// wallet. The sibling test above pins that an *incremental* page is
+    /// refused. That refusal is right, and on its own it left the scan frozen
+    /// for good: the only way it is not a dead end is if something offers the
+    /// canonical range instead, which is what `needs_canonical_pass` is for.
+    #[test]
+    fn a_wallet_without_an_anchor_recovers_from_one_canonical_pass() {
+        let network = NetworkId::Devnet;
+        let keys = WalletKeys::from_seed([3; 32]);
+        let mut chain = nightfall_consensus::Chain::new_fair(network).unwrap();
+        for time in 1_800_000_000..1_800_000_006 {
+            chain.mine_block(&keys.address(), vec![], time).unwrap();
+        }
+        let all = chain.blocks_from(0, usize::MAX);
+
+        // A wallet that scanned part of the chain under an older version:
+        // real observations, no anchor.
+        let mut wallet = Wallet::in_memory(network, keys.clone(), 0);
+        wallet.scan_blocks(&all[..4]).unwrap();
+        let balance_before = wallet.outputs().len();
+        assert!(balance_before > 0);
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&wallet.export_state().unwrap()).unwrap();
+        legacy["db"].as_object_mut().unwrap().remove("scanned_tip");
+        let mut old = Wallet::import_state(&legacy.to_string()).unwrap();
+
+        assert!(
+            old.needs_canonical_pass(),
+            "a wallet with history and no anchor is exactly the case that needs the pass"
+        );
+        // What the app used to do, every thirty seconds, forever.
+        assert!(
+            old.scan_blocks(&all[3..]).is_err(),
+            "an incremental page must still be refused"
+        );
+
+        // What it does now: ask from the birth height instead.
+        let (from, _size) = (old.birth_height(), usize::MAX);
+        old.scan_blocks(&chain.blocks_from(from, usize::MAX))
+            .unwrap();
+
+        assert!(!old.needs_canonical_pass(), "the pass must leave an anchor");
+        assert_eq!(old.scanned_to(), all.last().unwrap().header.height.0);
+        old.check_scan_anchor(all.last().unwrap()).unwrap();
+
+        // The coins survived the repair rather than being rediscovered twice.
+        let fresh = {
+            let mut w = Wallet::in_memory(network, keys, 0);
+            w.scan_blocks(&all).unwrap();
+            w
+        };
+        assert_eq!(old.outputs().len(), fresh.outputs().len());
+        assert_eq!(
+            old.outputs().iter().map(|o| o.value).sum::<u64>(),
+            fresh.outputs().iter().map(|o| o.value).sum::<u64>(),
+        );
+
+        // And from here it is an ordinary wallet: incremental pages work.
+        chain
+            .mine_block(&old.address(), vec![], 1_800_000_006)
+            .unwrap();
+        let next = chain.blocks_from(old.scan_from(), usize::MAX);
+        old.scan_blocks(&next).unwrap();
     }
 
     /// Reading the chain in pages must land in the same place as one big read.
