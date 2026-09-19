@@ -40,7 +40,7 @@
 use crate::WalletKeys;
 use bip39::Mnemonic;
 use thiserror::Error;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// A 256-bit seed is 24 words under BIP-39.
 pub const MNEMONIC_WORDS: usize = 24;
@@ -77,8 +77,8 @@ impl WalletKeys {
     /// Whitespace and case are normalised, because a user copying words off
     /// paper produces neither consistently.
     pub fn from_mnemonic(phrase: &str) -> Result<Self, MnemonicError> {
-        let normalised = phrase.split_whitespace().collect::<Vec<_>>().join(" ");
-        let normalised = normalised.to_lowercase();
+        let spaced = Zeroizing::new(phrase.split_whitespace().collect::<Vec<_>>().join(" "));
+        let normalised = Zeroizing::new(spaced.to_lowercase());
 
         let count = normalised.split_whitespace().count();
         if count != MNEMONIC_WORDS {
@@ -88,8 +88,9 @@ impl WalletKeys {
         let mnemonic = Mnemonic::parse_normalized(&normalised)
             .map_err(|e| MnemonicError::Invalid(e.to_string()))?;
 
-        let (entropy, len) = mnemonic.to_entropy_array();
+        let (mut entropy, len) = mnemonic.to_entropy_array();
         if len != 32 {
+            entropy.zeroize();
             return Err(MnemonicError::Invalid(format!(
                 "phrase carries {len} bytes of entropy, expected 32"
             )));
@@ -99,6 +100,7 @@ impl WalletKeys {
         seed.copy_from_slice(&entropy[..32]);
         let keys = WalletKeys::from_seed(seed);
         seed.zeroize();
+        entropy.zeroize();
         Ok(keys)
     }
 }

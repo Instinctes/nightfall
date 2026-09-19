@@ -35,11 +35,21 @@ impl AddressBook {
         Ok(())
     }
 
+    /// Longest contact name kept. A label that does not fit on its row is not
+    /// a label, and the Settings row is sized from the window, not the name.
+    pub const MAX_NAME: usize = 40;
+
     pub fn add(&mut self, name: String, address: String) -> Result<(), String> {
         let name = name.trim().to_string();
         let address = address.trim().to_string();
         if name.is_empty() {
             return Err("Give the contact a name".into());
+        }
+        if name.chars().count() > Self::MAX_NAME {
+            return Err(format!(
+                "Keep the name under {} characters — it has to fit on one row.",
+                Self::MAX_NAME
+            ));
         }
         Address::decode(&address).map_err(|e| e.to_string())?;
         if self.entries.iter().any(|e| e.address == address) {

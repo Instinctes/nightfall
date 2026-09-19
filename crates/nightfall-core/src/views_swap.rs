@@ -31,37 +31,46 @@ fn urgency_colour(u: logic::Urgency) -> Color32 {
 }
 
 pub fn swap(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
-    // Centred instead of pinned to the left edge. On a wide window this page
-    // was a column of cards hugging one side with the rest of the screen
-    // empty, which read as something failing to load.
-    crate::widgets::narrow_column(ui, 860.0, |ui| {
-        header(app, ui);
-        ui.add_space(14.0);
+    if app
+        .wallet
+        .lock()
+        .map(|wallet| wallet.is_vault())
+        .unwrap_or(true)
+    {
+        status_banner(
+            ui,
+            WARN,
+            "Swaps remain a separate research track",
+            "Experimental swap secrets and recovery deadlines are not integrated with Vault. Swap actions are disabled for Vault wallets.",
+            false,
+            |_| {},
+        );
+        return;
+    }
+    header(app, ui);
+    ui.add_space(14.0);
 
-        let gate = logic::availability(app.network);
-        if let logic::Availability::Locked { headline, detail } = &gate {
-            locked_notice(ui, headline, detail);
-            ui.add_space(14.0);
-        }
+    let gate = logic::availability(app.network);
+    if let logic::Availability::Locked { headline, detail } = &gate {
+        status_banner(ui, DANGER, headline, detail, false, |_| {});
+        ui.add_space(14.0);
+    }
 
-        bitcoin_node_card(app, ui, ctx);
+    bitcoin_node_card(app, ui, ctx);
+    ui.add_space(14.0);
+    if let Some(note) = &app.swap_tick_note {
+        ui.label(RichText::new(note).size(12.0).color(WARN));
         ui.add_space(14.0);
-        if let Some(note) = &app.swap_tick_note {
-            ui.label(RichText::new(note).size(12.0).color(WARN));
+    }
+    swap_list(app, ui, ctx);
+    ui.add_space(14.0);
+    ui.add_enabled_ui(gate.is_enabled() && app.swap_job.is_none(), |ui| {
+        section_fold(ui, "start-or-join", "Start or join a trade", true, |ui| {
+            warnings(ui);
             ui.add_space(14.0);
-        }
-        swap_list(app, ui, ctx);
-        ui.add_space(14.0);
-        ui.add_enabled_ui(gate.is_enabled() && app.swap_job.is_none(), |ui| {
-            egui::CollapsingHeader::new("Start or join a trade")
-                .default_open(true)
-                .show(ui, |ui| {
-                    warnings(ui);
-                    ui.add_space(14.0);
-                    start_form(app, ui, ctx);
-                    ui.add_space(14.0);
-                    packets(app, ui, ctx);
-                });
+            start_form(app, ui, ctx);
+            ui.add_space(14.0);
+            packets(app, ui, ctx);
         });
     });
 }
@@ -85,24 +94,6 @@ fn header(app: &App, ui: &mut egui::Ui) {
         .size(12.5)
         .color(TEXT_DIM),
     );
-}
-
-fn locked_notice(ui: &mut egui::Ui, headline: &str, detail: &str) {
-    egui::Frame::none()
-        .fill(DANGER.gamma_multiply(0.10))
-        .stroke(Stroke::new(1.0_f32, DANGER.gamma_multiply(0.45)))
-        .rounding(Rounding::same(ROUND))
-        .inner_margin(egui::Margin::same(16.0))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width() - 32.0);
-            ui.horizontal(|ui| {
-                dot(ui, DANGER, false);
-                ui.add_space(4.0);
-                ui.label(RichText::new(headline).size(13.5).color(DANGER).strong());
-            });
-            ui.add_space(6.0);
-            ui.label(RichText::new(detail).size(12.0).color(TEXT));
-        });
 }
 
 fn bitcoin_node_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -180,13 +171,18 @@ fn bitcoin_node_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 }
 
 fn warnings(ui: &mut egui::Ui) {
+    // A frame's inner margin is already taken off the width its content sees,
+    // so subtracting it again *inside* makes the block 32 points narrower than
+    // the cards above and below it — which is what made this warning look
+    // inset on a page where nothing else is. Measure outside, subtract once.
+    let inner = (ui.available_width() - 32.0).max(80.0);
     egui::Frame::none()
-        .fill(WARN.gamma_multiply(0.10))
+        .fill(tint(SURFACE, WARN, 0.13))
         .stroke(Stroke::new(1.0_f32, WARN.gamma_multiply(0.45)))
         .rounding(Rounding::same(ROUND))
         .inner_margin(egui::Margin::same(16.0))
         .show(ui, |ui| {
-            ui.set_width(ui.available_width() - 32.0);
+            ui.set_width(inner);
             kicker(ui, "Read this before you lock anything");
             ui.add_space(8.0);
             ui.label(
@@ -212,21 +208,15 @@ fn start_form(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     titled_card(ui, "Start a swap", |ui| {
         ui.set_width(ui.available_width());
 
-        ui.horizontal(|ui| {
-            let give = app.swap_draft.give_night;
-            if ui
-                .selectable_label(give, RichText::new("  I give NIGHT  ").size(12.5))
-                .clicked()
-            {
-                app.swap_draft.give_night = true;
-            }
-            if ui
-                .selectable_label(!give, RichText::new("  I give Bitcoin  ").size(12.5))
-                .clicked()
-            {
-                app.swap_draft.give_night = false;
-            }
-        });
+        let give = app.swap_draft.give_night;
+        if let Some(picked) = segmented(
+            ui,
+            "swap-side",
+            &["I give NIGHT", "I give Bitcoin"],
+            usize::from(!give),
+        ) {
+            app.swap_draft.give_night = picked == 0;
+        }
         ui.add_space(4.0);
         ui.label(
             RichText::new(if app.swap_draft.give_night {
@@ -241,43 +231,53 @@ fn start_form(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         );
 
         ui.add_space(14.0);
-        ui.horizontal(|ui| {
+        // Three fields at 180 / 150 / 110 points huddled against the left edge
+        // of a card that is 800 wide, with a third of the row empty — the
+        // amounts are the point of this card and they looked like an
+        // afterthought. They share the row now, in the proportions the numbers
+        // need: an eight-decimal NIGHT amount is the longest of the three.
+        const GAP: f32 = 16.0;
+        let pad = FIELD_MARGIN.sum().x;
+        let room = (ui.available_width() - GAP * 2.0 - pad * 3.0).max(120.0);
+        let stacked = room < 330.0;
+        let amount_field = |ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str, w: f32| {
             ui.vertical(|ui| {
-                ui.label(RichText::new("NIGHT").size(11.5).color(TEXT_DIM));
+                ui.label(RichText::new(label).size(11.5).color(TEXT_DIM));
                 ui.add_space(4.0);
                 ui.add(
-                    egui::TextEdit::singleline(&mut app.swap_draft.night)
+                    egui::TextEdit::singleline(text)
                         .margin(FIELD_MARGIN)
-                        .desired_width(180.0)
+                        .desired_width(w)
                         .font(egui::TextStyle::Monospace)
-                        .hint_text("0.00000000"),
+                        .hint_text(hint),
                 );
             });
-            ui.add_space(16.0);
-            ui.vertical(|ui| {
-                ui.label(RichText::new("Bitcoin (sat)").size(11.5).color(TEXT_DIM));
-                ui.add_space(4.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut app.swap_draft.btc)
-                        .margin(FIELD_MARGIN)
-                        .desired_width(150.0)
-                        .font(egui::TextStyle::Monospace)
-                        .hint_text("200000"),
+        };
+        if stacked {
+            let full = (ui.available_width() - pad).max(80.0);
+            amount_field(ui, "NIGHT", &mut app.swap_draft.night, "0.00000000", full);
+            ui.add_space(GAP_SM);
+            amount_field(ui, "Bitcoin (sat)", &mut app.swap_draft.btc, "200000", full);
+            ui.add_space(GAP_SM);
+            amount_field(ui, "BTC fee (sat)", &mut app.swap_draft.btc_fee, "auto", full);
+        } else {
+            let night_w = room * 0.42;
+            let btc_w = room * 0.33;
+            let fee_w = room - night_w - btc_w;
+            ui.horizontal(|ui| {
+                amount_field(
+                    ui,
+                    "NIGHT",
+                    &mut app.swap_draft.night,
+                    "0.00000000",
+                    night_w,
                 );
+                ui.add_space(GAP);
+                amount_field(ui, "Bitcoin (sat)", &mut app.swap_draft.btc, "200000", btc_w);
+                ui.add_space(GAP);
+                amount_field(ui, "BTC fee (sat)", &mut app.swap_draft.btc_fee, "auto", fee_w);
             });
-            ui.add_space(16.0);
-            ui.vertical(|ui| {
-                ui.label(RichText::new("BTC fee (sat)").size(11.5).color(TEXT_DIM));
-                ui.add_space(4.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut app.swap_draft.btc_fee)
-                        .margin(FIELD_MARGIN)
-                        .desired_width(110.0)
-                        .font(egui::TextStyle::Monospace)
-                        .hint_text("auto"),
-                );
-            });
-        });
+        }
 
         if app.swap_draft.give_night {
             ui.add_space(6.0);
@@ -320,21 +320,18 @@ fn start_form(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             if (label == "Refund to") == app.swap_draft.give_night {
                 continue;
             }
-            ui.horizontal(|ui| {
-                ui.add_sized(
-                    [90.0, 20.0],
-                    egui::Label::new(RichText::new(label).size(11.5).color(TEXT_DIM))
-                        .selectable(false),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(field)
-                        .margin(FIELD_MARGIN)
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Monospace)
-                        .hint_text(hint),
-                );
-            });
-            ui.add_space(5.0);
+            // Label above the field, like every other input in the wallet. It
+            // used to sit in a 90-point column to the left, which is a second
+            // form layout on a page that already has one.
+            field_label(ui, label, None);
+            ui.add(
+                egui::TextEdit::singleline(field)
+                    .margin(FIELD_MARGIN)
+                    .desired_width(f32::INFINITY)
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text(hint),
+            );
+            ui.add_space(GAP_SM);
         }
 
         ui.add_space(12.0);
@@ -461,22 +458,28 @@ fn packets(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 ui.label(RichText::new("Importing this opening offer accepts these amounts and reserves your NIGHT. Check them with your counterparty first.").color(WARN));
             }
         }
-        ui.horizontal(|ui| {
-            if ghost_button(ui, "  Check and import  ").clicked() {
-                match app.import_packet() {
-                    Ok(msg) => {
-                        app.swap_import_error = None;
-                        app.swap_packet_in.clear();
-                        app.toasts.success(ctx, msg);
-                    }
-                    Err(e) => app.swap_import_error = Some(e),
+        // Two buttons that belong to the same box get the same box. They used
+        // to be ghost buttons padded with spaces — "  Check and import  " and
+        // "  Clear  " — which is two different widths and no primary.
+        match button_row(
+            ui,
+            &["Check and import", "Clear"],
+            !app.swap_packet_in.trim().is_empty(),
+        ) {
+            Some(0) => match app.import_packet() {
+                Ok(msg) => {
+                    app.swap_import_error = None;
+                    app.swap_packet_in.clear();
+                    app.toasts.success(ctx, msg);
                 }
-            }
-            if ghost_button(ui, "  Clear  ").clicked() {
+                Err(e) => app.swap_import_error = Some(e),
+            },
+            Some(_) => {
                 app.swap_packet_in.clear();
                 app.swap_import_error = None;
             }
-        });
+            None => {}
+        }
         if let Some(e) = &app.swap_import_error {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
