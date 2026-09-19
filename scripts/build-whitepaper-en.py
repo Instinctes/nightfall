@@ -98,7 +98,7 @@ def background(c,page,title='WHITEPAPER'):
         tracked(c,'NIGHTFALL',70,H-47,8,'text',1.15)
         c.setFont('Inter',7.5);c.setFillColor(COLORS['faint']);c.drawRightString(W-46,H-47,'WHITEPAPER / 08 SEP 2026')
     c.setStrokeColor(COLORS['border']);c.setLineWidth(.5);c.line(LEFT,42,W-RIGHT,42)
-    c.setFont('Inter',7.3);c.setFillColor(COLORS['faint']);c.drawString(LEFT,27,'NIGHTFALLCOIN / Protocol 8 / Software 1.0.0')
+    c.setFont('Inter',7.3);c.setFillColor(COLORS['faint']);c.drawString(LEFT,27,'NIGHTFALLCOIN / Protocol 8 / Software 1.0.4')
     c.drawRightString(W-RIGHT,27,f'{page:02d} / {len(DATA["sections"])+2:02d}')
     c.linkURL('https://nightfallcoin.org/whitepaper/',(LEFT,22,LEFT+220,37),relative=0,thickness=0)
 
@@ -131,7 +131,7 @@ def cover(c):
         roundbox(c,x,140,cw,75)
         draw_p(c,n,x+16,198,cw-32,24,27,'text','InterBold')
         draw_p(c,label,x+16,163,cw-32,8.5,12,'dim')
-    draw_p(c,'Release 1.0.0 / Protocol 8 / Wire 6',LEFT,113,size=9,leading=13,color='dim')
+    draw_p(c,'Release 1.0.4 / Protocol 8 / Wire 6',LEFT,113,size=9,leading=13,color='dim')
     draw_p(c,'Independent review outstanding. Mainnet swaps disabled.',LEFT,89,size=8.8,leading=13,color='faint')
     c.showPage()
 
@@ -252,7 +252,7 @@ def build_pdf():
     register_fonts();OUT.parent.mkdir(parents=True,exist_ok=True)
     c=canvas.Canvas(str(OUT),pagesize=A4,pageCompression=1,invariant=1)
     c.setTitle('NIGHTFALL - Private settlement. Verifiable supply.');c.setAuthor('NIGHTFALLCOIN')
-    c.setSubject('English whitepaper / 18 September 2026 / release 1.0.0 / protocol 8')
+    c.setSubject('English whitepaper / 18 September 2026 / release 1.0.4 / protocol 8')
     c.setKeywords('Nightfall, NIGHT, whitepaper, confidential transactions, proof of work, privacy')
     c.setViewerPreference('DisplayDocTitle','true')
     cover(c);contents(c)
@@ -311,7 +311,7 @@ def build_html():
     html_doc=f'''<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>NIGHTFALL Whitepaper - Private settlement. Verifiable supply.</title>
-<meta name="description" content="The Nightfall 1.0.0 whitepaper: confidential payments, verifiable supply, proof of work, wallet trust, and an evidence-led research agenda.">
+<meta name="description" content="The Nightfall 1.0 whitepaper: confidential payments, verifiable supply, proof of work, wallet trust, and an evidence-led research agenda.">
 <meta name="theme-color" content="#423858"><link rel="canonical" href="https://nightfallcoin.org/whitepaper/">
 <link rel="icon" href="/assets/favicon-32.png" sizes="32x32" type="image/png">
 <link rel="stylesheet" href="/css/style.css?v={finger('css/style.css')}"><link rel="stylesheet" href="/css/whitepaper.css?v={finger('css/whitepaper.css')}">
@@ -319,8 +319,8 @@ def build_html():
 <main id="content" class="wp" tabindex="-1"><header class="wp-hero wrap"><div class="wp-hero-copy"><p class="wp-label">Whitepaper / English edition / 18 September 2026</p>
 <h1>Private settlement.<br><span class="grad-text">Verifiable supply.</span></h1>
 <p class="wp-intro">The design, the evidence and the limits of NIGHTFALLCOIN.</p>
-<div class="wp-actions"><a class="btn btn-primary" href="#abstract">Read the whitepaper</a><a class="btn btn-outline" href="/downloads/{PDF_NAME}">Download PDF</a></div>
-<p class="wp-edition">Software 1.0.0 <span>Protocol 8</span><span>20 chapters</span></p></div>
+<div class="wp-actions"><a class="btn btn-primary" href="#abstract">Read the whitepaper</a><a class="btn btn-outline" href="/downloads/{PDF_NAME}">Download PDF</a></div>\n<p class="wp-prev">Previous edition: <a href="/downloads/NIGHTFALLCOIN-Whitepaper-EN-2026-09-08.pdf">8 September 2026 (release 0.9.5)</a> — kept as published. Its chapter on atomic swaps describes a feature that has since been withdrawn.</p>
+<p class="wp-edition">Software 1.0.4 <span>Protocol 8</span><span>20 chapters</span></p></div>
 <div class="wp-cover" aria-label="Nightfall whitepaper cover"><img src="/assets/logo-256.png" width="64" height="64" alt=""><p>NIGHTFALL</p><strong>Whitepaper</strong><span>Confidential values.<br>Explicit monetary rules.</span><small>English / September 2026</small></div></header>
 <div class="wrap wp-layout"><aside class="wp-toc"><details open><summary>In this paper <span>20 chapters</span></summary><ol>{toc}</ol></details></aside>
 <article class="wp-article" aria-label="Whitepaper chapters">{sections}<div class="wp-end"><a class="btn btn-primary" href="/downloads/{PDF_NAME}">Download the PDF edition</a><a href="#content">Back to the beginning</a></div></article></div></main>

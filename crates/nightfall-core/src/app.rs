@@ -658,14 +658,10 @@ impl App {
             let _data_lock = data_lock;
             let mut seen = node.tip_generation();
             // First pass: pick up whatever is already on disk.
-            run_wallet_scan(
-                &wallet, &node, &signal, &syncing, &paused, &access, &reconcile,
-            );
+            run_wallet_scan(&wallet, &node, &signal, &syncing, &paused, &access, &reconcile);
             loop {
                 seen = node.wait_tip_change(seen, Duration::from_secs(30));
-                run_wallet_scan(
-                    &wallet, &node, &signal, &syncing, &paused, &access, &reconcile,
-                );
+                run_wallet_scan(&wallet, &node, &signal, &syncing, &paused, &access, &reconcile);
             }
         });
     }

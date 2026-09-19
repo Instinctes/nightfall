@@ -2,7 +2,7 @@
   "title": "NIGHTFALL",
   "subtitle": "Private settlement. Verifiable supply.",
   "edition": "18 September 2026",
-  "version": "1.0.0",
+  "version": "1.0.4",
   "protocol": 8,
   "wire": 6,
   "genesis": "061a052d49607ff8f4b306c75d622ebd230cff4ec3a45a6dffc2f7738d4b20de",
@@ -41,7 +41,7 @@
         },
         {
           "type": "p",
-          "text": "This paper explains the implementation represented by release 1.0.0, protocol 8 and wire version 6. It also identifies operational trust, unresolved security risks and research objectives. It makes no claim of universal anonymity, hardware neutrality, guaranteed finality or investment performance."
+          "text": "This paper explains the implementation represented by release 1.0.4, protocol 8 and wire version 6. It also identifies operational trust, unresolved security risks and research objectives. It makes no claim of universal anonymity, hardware neutrality, guaranteed finality or investment performance."
         },
         {
           "type": "callout",
@@ -881,7 +881,7 @@
         },
         {
           "type": "p",
-          "text": "Native implementation claims are anchored to v1.0.0 and selected code paths were checked against outdated prose. Website configuration and the September review are separately dated; the live site is not part of that release baseline."
+          "text": "Native implementation claims are anchored to v1.0.4 and selected code paths were checked against outdated prose. Website configuration and the September review are separately dated; the live site is not part of that release baseline."
         },
         {
           "type": "callout",
@@ -1152,7 +1152,7 @@
       "id": "sources",
       "title": "Sources and document scope",
       "label": "20 / Reproducible references",
-      "lead": "Implementation references are pinned to v1.0.0. The website review is dated separately. External literature describes primitives, not an endorsement of Nightfall.",
+      "lead": "Implementation references are pinned to v1.0.4. The website review is dated separately. External literature describes primitives, not an endorsement of Nightfall.",
       "blocks": [
         {
           "type": "references"
@@ -1173,31 +1173,31 @@
   "references": {
     "types": {
       "title": "Protocol identity, monetary constants and PoW parameters",
-      "url": "https://github.com/Instinctes/nightfall/blob/v1.0.0/crates/nightfall-types/src/lib.rs"
+      "url": "https://github.com/Instinctes/nightfall/blob/v1.0.4/crates/nightfall-types/src/lib.rs"
     },
     "crypto": {
       "title": "Native cryptography: commitments, stealth, signatures and mnemonic encoding",
-      "url": "https://github.com/Instinctes/nightfall/tree/v1.0.0/crates/nightfall-crypto/src"
+      "url": "https://github.com/Instinctes/nightfall/tree/v1.0.4/crates/nightfall-crypto/src"
     },
     "ledger": {
       "title": "Ledger validation, UTXO authorization and exploit regressions",
-      "url": "https://github.com/Instinctes/nightfall/tree/v1.0.0/crates/nightfall-ledger"
+      "url": "https://github.com/Instinctes/nightfall/tree/v1.0.4/crates/nightfall-ledger"
     },
     "consensus": {
       "title": "Consensus, emission, checkpoints, replay and mempool selection",
-      "url": "https://github.com/Instinctes/nightfall/blob/v1.0.0/crates/nightfall-consensus/src/lib.rs"
+      "url": "https://github.com/Instinctes/nightfall/blob/v1.0.4/crates/nightfall-consensus/src/lib.rs"
     },
     "node": {
       "title": "Node runtime: session relay, embargo timers and network behavior",
-      "url": "https://github.com/Instinctes/nightfall/blob/v1.0.0/crates/nightfall-node/src/runtime.rs"
+      "url": "https://github.com/Instinctes/nightfall/blob/v1.0.4/crates/nightfall-node/src/runtime.rs"
     },
     "storage": {
       "title": "Storage implementation and operating-system directory locks",
-      "url": "https://github.com/Instinctes/nightfall/tree/v1.0.0/crates/nightfall-storage/src"
+      "url": "https://github.com/Instinctes/nightfall/tree/v1.0.4/crates/nightfall-storage/src"
     },
     "wallet": {
       "title": "Wallet keys, state and receipt implementation",
-      "url": "https://github.com/Instinctes/nightfall/tree/v1.0.0/crates/nightfall-wallet/src"
+      "url": "https://github.com/Instinctes/nightfall/tree/v1.0.4/crates/nightfall-wallet/src"
     },
     "swap": {
       "title": "Why atomic swap was withdrawn before 1.0.0",
@@ -1209,7 +1209,7 @@
     },
     "history": {
       "title": "Project history and discarded chain epochs",
-      "url": "https://github.com/Instinctes/nightfall/blob/v1.0.0/docs/HISTORY.md"
+      "url": "https://github.com/Instinctes/nightfall/blob/v1.0.4/docs/HISTORY.md"
     },
     "review": {
       "title": "Internal security review, 8 September 2026 - scope and open risks",

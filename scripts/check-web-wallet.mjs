@@ -98,9 +98,21 @@ if (vs.size > 1) {
 // shell is published, every returning wallet keeps serving the old one out of
 // its own cache, and nothing anywhere says so. Tying the name to the version
 // means the release bump cannot forget it, because this fails.
-const release = readFileSync(join(here, "..", "Cargo.toml"), "utf8").match(
-    /^version = "([^"]+)"/m,
-)?.[1];
+//
+// The version to compare against is the *browser wallet's*, not the desktop
+// one. They are separate artefacts on separate release cycles: 1.0 shipped
+// desktop Core while the browser wallet stayed on its 0.9.5 build, and
+// comparing against Cargo.toml then demanded that a 0.9.5 shell relabel itself
+// 1.0.4 — a version string that would have been simply untrue in the UI.
+// `web_wallet` in releases.json is the declaration, so publishing a new browser
+// wallet still cannot forget the cache name: bumping it is what makes this pass.
+const channels = JSON.parse(
+    readFileSync(join(here, "..", "website/public/releases.json"), "utf8"),
+);
+const release = channels.web_wallet;
+if (!release) {
+    note("releases.json has no web_wallet version — nothing pins the shell cache");
+}
 const swCache = (sw.match(/const CACHE = "([^"]+)"/) || [])[1];
 if (!swCache) {
     note("sw.js has no CACHE name — the old shell will survive a deploy");
@@ -114,9 +126,8 @@ if (!swCache) {
 // ------------------------------------------------------------------ build ---
 
 const build = app.match(/const BUILD = "([^"]+)"/)?.[1];
-const cargo = readFileSync(join(here, "..", "Cargo.toml"), "utf8").match(/^version = "([^"]+)"/m)?.[1];
-if (build && cargo && build !== cargo) {
-    note(`BUILD in app.js is ${build} but the workspace is ${cargo}`);
+if (build && release && build !== release) {
+    note(`BUILD in app.js is ${build} but releases.json declares web_wallet ${release}`);
 }
 
 // ------------------------------------------------------------------ report --

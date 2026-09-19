@@ -291,10 +291,7 @@ fn vault_node_child() {
             alice.chain_moved_under_scan(&node),
             "the fixture must actually reproduce a changed history"
         );
-        assert!(
-            alice.sync_from_node(&node).is_err(),
-            "and must still refuse"
-        );
+        assert!(alice.sync_from_node(&node).is_err(), "and must still refuse");
         assert!(
             alice.check_rescan_allowed().is_ok() || alice.rescan(&node).is_err(),
             "rescan is not the way out when payments are pending",

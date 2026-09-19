@@ -15,6 +15,6 @@
 # auf 1.0.0, bis die Freigabegates von docs/WALLET-1.0.0-PLAN.md erfuellt sind.
 
 febcbd277cfd1956cd1dcbd8cbd71be6be4cb34b8deece10a22c6325e992fdab  website/public/wallet/app.js
-c09e942244a1df00224552090466f20e426bbf62f2a711434059858e9091107f  website/public/releases.json
+a433fd51a417b65ba906101bd489c1e0ffc78c0336ac460e82f86716684af38c  website/public/releases.json
 12142d70145f75b4d153ac292e498370dee0d7a6c1566ab8ba6b85f46c84094f  website/public/wallet/pkg/nightfall_web.js
 365a1978edeaf2004a91d74a6faa51f902e7239273555e7492e0d90b309d0a9b  website/public/wallet/pkg/nightfall_web_bg.wasm
