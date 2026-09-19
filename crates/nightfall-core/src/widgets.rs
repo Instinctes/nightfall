@@ -787,7 +787,22 @@ pub fn paired_cards<A, B>(
     // them the height that belonged to the other. On Dashboard the other row
     // is Activity, which is tall. The caller names the row instead.
     let id = egui::Id::new(("pair-h", key));
-    let floor = ui.ctx().data(|d| d.get_temp::<f32>(id)).unwrap_or(0.0);
+    // The height belongs to the width it was measured at, and is discarded when
+    // that width changes. A remembered height applied at a *different* width is
+    // how the window flickered when the scan banner appeared: the banner made
+    // the page taller, the scrollbar took a few points of width, the text
+    // rewrapped to a new natural height, that height was stored, the padding it
+    // produced changed the page height back, and the whole thing oscillated
+    // once per frame. Padding a row to a height measured for some other width
+    // is not a stale value to tolerate — it is an answer to a different
+    // question.
+    let measured_at = (ui.available_width() * 4.0).round() as i32;
+    let floor = ui
+        .ctx()
+        .data(|d| d.get_temp::<(i32, f32)>(id))
+        .filter(|(w, _)| *w == measured_at)
+        .map(|(_, h)| h)
+        .unwrap_or(0.0);
     ROW_HEIGHTS.with(|h| h.borrow_mut().clear());
     CARD_FLOOR.set(floor);
     ui.scope(|ui| {
@@ -804,7 +819,8 @@ pub fn paired_cards<A, B>(
     CARD_FLOOR.set(0.0);
     let row_h = ROW_HEIGHTS.with(|h| h.borrow().iter().copied().fold(0.0_f32, f32::max));
     if row_h > 1.0 && (row_h - floor).abs() > 1.0 {
-        ui.ctx().data_mut(|d| d.insert_temp(id, row_h));
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(id, (measured_at, row_h)));
     }
 }
 

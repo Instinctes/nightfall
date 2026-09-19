@@ -360,14 +360,20 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
                 true,
                 format!("Loading chain · local block {}", format_int(blocks)),
             )
-        } else if syncing {
-            (WARN, true, "Scanning…".to_string())
         } else if connected && (sync_hold != SyncHold::Synced || scanned != tip) {
+            // Ahead of `syncing` on purpose. A catch-up is a sequence of short
+            // passes, so `syncing` flips true and false several times a second
+            // and the readout alternated between "Scanning…" and "Catching up"
+            // fast enough to read as flicker. While the wallet is behind, that
+            // it is behind is the stable fact worth showing; a pass running is
+            // how it stops being behind, not separate news.
             (
                 WARN,
                 true,
                 format!("Catching up · scanned block {}", format_int(scanned)),
             )
+        } else if syncing {
+            (WARN, true, "Scanning…".to_string())
         } else if connected {
             (
                 SUCCESS,

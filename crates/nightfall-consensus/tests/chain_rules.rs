@@ -518,11 +518,27 @@ fn rejected_block_leaves_the_chain_untouched() {
     let before_minted = chain.total_minted();
     let before_utxos = chain.ledger.utxos.len();
 
-    let bad = chain
-        .build_template(&miner, vec![], NOW + 20)
-        .unwrap()
-        .seal(1);
-    let _ = chain.apply_block(bad, NOW + 20);
+    // A nonce that is *known* not to meet the target, rather than one that
+    // probably does not. This sealed at nonce 1 and hoped: the miner address is
+    // freshly generated on every run, so the block hash differs every run, and
+    // on devnet's difficulty nonce 1 clears the target often enough to be a
+    // real coin flip. When it cleared, the block was valid, the tip moved, and
+    // the failure surfaced as an inscrutable `Hash256 != Hash256` in CI while
+    // the same test passed locally all morning.
+    let template = chain.build_template(&miner, vec![], NOW + 20).unwrap();
+    let params = chain.pow_params();
+    let bad = (1u64..10_000)
+        .map(|nonce| template.clone().seal(nonce))
+        .find(|block| !block.pow_is_valid(params))
+        .expect("some nonce under ten thousand must miss the target");
+    assert!(
+        matches!(
+            chain.apply_block(bad, NOW + 20),
+            Err(ConsensusError::BadPow)
+        ),
+        "the fixture must actually be rejected, or it proves nothing about what \
+         a rejection leaves behind",
+    );
 
     assert_eq!(chain.tip_hash(), before_tip);
     assert_eq!(chain.total_work, before_work);
