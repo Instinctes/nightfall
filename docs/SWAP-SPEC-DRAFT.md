@@ -1,5 +1,11 @@
 # NIGHT ↔ BTC atomic swap — protocol specification
 
+> **WITHDRAWN — 18 September 2026.** Atomic swap is not part of NIGHTFALLCOIN.
+> It is not in wallet 1.0.0 and is not scheduled for a later release. The code
+> has been removed from the tree. This document is kept as a historical record
+> only; it describes software that no longer exists in the product. See
+> [`SWAP-WITHDRAWN.md`](SWAP-WITHDRAWN.md) for the decision and its reasoning.
+
 **Version 0.3 · 29 August 2026 · draft for review · not for real coins**
 
 ## What changed from v0.1, and why
@@ -126,24 +132,27 @@ counterparty.** Say so in the interface.
 
 NIGHT is Ristretto255, Bitcoin is secp256k1. One scalar must be meaningful on
 both, which needs a cross-group discrete-log-equality proof. This is the most
-error-prone component and it is adopted, not invented — Monero has the same
-mismatch and `xmr-btc-swap` has run this in production for years.
+error-prone component.
 
-**How much of it is a copy — measured, not assumed.** v0.2 warned that the
-proof would have to be re-instantiated on a non-standard generator and that
-`xmr-btc-swap`'s vectors would not apply. That warning was based on an
-unverified reading of `commit.rs`. The generator is in fact the Ristretto
-basepoint (§2), so a proof written against the standard basepoint *is* a proof
-about `S_x`, and the reference construction carries over directly.
+**Corrected 14 September 2026 (C-SWAP-01).** Using each curve's standard
+basepoint for both the bit term and the blinding term of the Pedersen
+commitments was unsound: different NIGHT and Bitcoin secrets could still pass
+the verifier. The live construction is proof/packet/session **v2**. Additional
+generators HP/HQ are derived as curve points from versioned domain strings
+(not as `h·G`), and the final same-curve DLEQs bind those generators. Old
+unversioned proofs and sessions are not accepted automatically. See
+`docs/INTERNAL-SWAP-REVIEW-2026-09-13.md`.
 
-One real difference survives, and it is about encoding rather than about the
-generator: Monero works with **Ed25519** points, we work with **Ristretto**.
-The scalar field is identical — same order ℓ — so the proof's scalar
-arithmetic is unchanged; the point type and its serialisation are not. Test
-vectors therefore have to be regenerated for Ristretto encodings even though
-the underlying construction is the same. That is a much smaller job than
-re-instantiating a proof on a foreign generator, and it should be stated as
-such rather than left as the earlier, scarier claim.
+Historical notes below about “the generator is not a problem” referred to
+whether NIGHT's spend generator was the Ristretto basepoint. That is still
+true for `S_x`. It is **not** a statement that Pedersen blinding may reuse G.
+
+The proof is adopted from the `sigma_fun` cross-curve construction,
+re-instantiated on Ristretto encodings and on the extra generators above.
+Monero has the same curve mismatch; `xmr-btc-swap` vectors do not apply to
+this encoding. Monero works with **Ed25519** points, we work with
+**Ristretto**. The scalar field is identical — same order ℓ — so the proof's
+scalar arithmetic is unchanged; the point type and its serialisation are not.
 
 Scalars are rejection-sampled below `2²⁵²`. Interpreting the same 32 bytes as
 both a Ristretto and a secp256k1 scalar without rejection yields two different
@@ -158,10 +167,10 @@ must fail closed, on both sides, before anything is locked.
 
 Four findings, all against `sigma_fun` 0.9.0 and `curve25519-dalek` 4.1.3.
 
-**The generator is not a problem.** `generator_g()` is the Ristretto basepoint
-(§2), and `sigma_fun`'s `DL` takes the generator as part of the statement
-anyway, so an arbitrary one would have been supported regardless. The earlier
-warning was doubly wrong.
+**The spend generator is the Ristretto basepoint.** `generator_g()` is G
+(§2). That does not license using G as the Pedersen blinding generator.
+v2 derives independent HP/HQ and uses them in the final DLEQ. The earlier
+sentence “the generator is not a problem” is withdrawn.
 
 **The 252-bit bound is not ours, it is theirs too.** `CrossCurveDLEQ::prove`
 asserts `secret.as_bytes()[31] & 0b0001_0000 == 0` — the same bound
@@ -353,9 +362,9 @@ Residual risk, on screen: a Bitcoin reorg deeper than 6 after TX_redeem, or a NI
 | 1 | ECDSA adaptor on P2WSH, borrowed from `xmr-btc-swap`, with its vectors | malleability handled and tested |
 | 2 | Cross-curve DLEQ instantiated on NIGHT's `G` | **our own** vectors; rogue-key test |
 | 3 | Shared address, Bob's §8 phase-2a verification | every failure mode aborts, on testnet |
-| 4 | State machine, every path in §9 forced by a test | resume-after-crash lands in refund |
+| 4 | State machine, every path in §9 forced by a test | preserve durable state and reconcile both chains; never reset an exposed redeem secret into a fresh abort |
 | 5 | Long testnet operation, small amounts | weeks |
-| 6 | External cryptographic review | **before mainnet, not negotiable** |
+| 6 | Internal cryptographic/protocol review and documented test evidence | operator policy updated 13 September 2026; no independent review claimed |
 | 7 | Interface, with the wart and the privacy warning on screen | last |
 
 Crates: `rust-bitcoin`, `ecdsa_fun`, `sigma_fun`, `curve25519-dalek` (present).
@@ -366,8 +375,11 @@ Crates: `rust-bitcoin`, `ecdsa_fun`, `sigma_fun`, `curve25519-dalek` (present).
 
 1. Signet (real block times). Regtest hides every timing problem.
 2. Whether the capital-lockup grief of §9.3 is acceptable between strangers.
-3. External cryptographic review of `dleq.rs` (the Ristretto leaf). Not optional
-   before mainnet.
+3. Internal review of `dleq.rs` (the Ristretto leaf), its bindings and malformed
+   inputs. The operator explicitly removed external review as a planned release
+   requirement on 13 September 2026. This does not provide independent assurance
+   or close the outstanding implementation gates. See
+   `SWAP-VAULT-PROGRESS-2026-09-13.md` for current scope and evidence.
 
 Transport is copy-paste packets (§16). A mailbox that can withhold a message is
 still an operator and is still forbidden.

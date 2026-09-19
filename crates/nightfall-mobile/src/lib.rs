@@ -121,9 +121,8 @@ fn rpc(
 /// The shared parser, not a local one. See `nightfall_wallet::amount_input`
 /// for what the three copies used to disagree about.
 fn parse_amount(s: &str) -> Result<u64, MobileError> {
-    nightfall_wallet::amount_input::parse_night(s).map_err(|e| MobileError::Failed {
-        msg: e.to_string(),
-    })
+    nightfall_wallet::amount_input::parse_night(s)
+        .map_err(|e| MobileError::Failed { msg: e.to_string() })
 }
 
 #[derive(uniffi::Object)]

@@ -8,17 +8,10 @@
 
 mod address_book;
 mod app;
-mod app_swap;
-mod app_swap_drive;
-mod app_swap_lock;
-mod app_swap_night;
-mod app_swap_send;
 mod backup_recovery;
+mod feedback;
 mod onboarding;
 mod recovery_studio;
-#[cfg(test)]
-mod swap_live_tests;
-mod swap_worker;
 mod theme;
 mod tray;
 mod ui_shots;
@@ -28,10 +21,8 @@ mod vault_ui;
 #[cfg(test)]
 mod view_layout_tests;
 mod views;
-mod views_swap;
 mod wallet_state;
 mod widgets;
-mod widgets_swap;
 
 use app::App;
 use nightfall_storage::default_data_dir;
@@ -56,7 +47,7 @@ fn main() -> eframe::Result<()> {
         // it must not be sent to the `wallet-1.0-dev` sandbox, which would
         // silently present an empty wallet instead.
         if app::IS_DEV_BUILD && !app::IS_DEV_MAINNET {
-            path.join("wallet-1.0-dev")
+            path.join(app::DEV_DATA_SUBDIR)
         } else {
             path
         }
@@ -89,9 +80,36 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1180.0, 780.0])
-            .with_min_inner_size([940.0, 620.0])
+            .with_inner_size([1280.0, 820.0])
+            // The floating rail has a real footer (network + supply). This is
+            // the smallest complete composition: below it the app would still
+            // be technically drawable, but the reference layout loses its
+            // deliberate breathing room. macOS therefore stops resizing here.
+            .with_min_inner_size([1160.0, 820.0])
             .with_icon(load_window_icon())
+            // A real window with its title bar hidden — not a borderless one.
+            //
+            // Borderless was the obvious way to get a rounded sheet with the
+            // rail hanging off it, and it cost the wallet its keyboard. On
+            // macOS an `NSWindow` with the borderless style mask answers
+            // `canBecomeKeyWindow` with false unless its class overrides it,
+            // and a window that cannot become key receives no key events at
+            // all. The password field could not be typed into after the window
+            // had been minimised and brought back, and no amount of work on
+            // the field-clearing logic was ever going to fix that, because the
+            // characters were never arriving.
+            //
+            // Titled, with the bar itself hidden and the content running the
+            // full height, keeps every native behaviour — key status, dragging
+            // by the top edge, the resize borders, minimise and restore, the
+            // rounded corners and the drop shadow — while the glass is still
+            // ours to draw. It is what the reference application the operator
+            // showed does too.
+            .with_transparent(true)
+            .with_resizable(true)
+            .with_fullsize_content_view(true)
+            .with_title_shown(false)
+            .with_titlebar_shown(false)
             .with_title(format!(
                 "{COIN_NAME} Core {} — {network}",
                 app::WALLET_VERSION
@@ -103,6 +121,7 @@ fn main() -> eframe::Result<()> {
         "nightfall-core",
         options,
         Box::new(move |cc| {
+            theme::install_platform_fonts(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx);
             Ok(Box::new(App::with_data_lock(network, dir_lock)))
         }),
@@ -206,10 +225,12 @@ fn prereleases_default_to_isolated_devnet() {
 fn a_development_build_opens_mainnet_only_when_it_was_built_to() {
     // This test binary is itself built without the flag, which is the ordinary
     // case and the one worth pinning.
-    assert!(
-        !app::IS_DEV_MAINNET,
-        "the default build must not carry the mainnet permission",
-    );
+    const {
+        assert!(
+            !app::IS_DEV_MAINNET,
+            "the default build must not carry the mainnet permission",
+        );
+    }
     // …and the gate is written in terms of that constant, not of an argument.
     let gate = |is_dev: bool, dev_mainnet: bool, network: NetworkId| {
         is_dev && !dev_mainnet && network != NetworkId::Devnet

@@ -226,9 +226,21 @@ impl ReceiptProof {
                  whose signature does not cover {}, so {} can be changed without \
                  breaking it. Ask for a new receipt if that matters.",
                 self.unsigned_fields.join(" and "),
-                if self.unsigned_fields.len() == 1 { "is" } else { "are" },
-                if self.unsigned_fields.len() == 1 { "it" } else { "them" },
-                if self.unsigned_fields.len() == 1 { "it" } else { "they" },
+                if self.unsigned_fields.len() == 1 {
+                    "is"
+                } else {
+                    "are"
+                },
+                if self.unsigned_fields.len() == 1 {
+                    "it"
+                } else {
+                    "them"
+                },
+                if self.unsigned_fields.len() == 1 {
+                    "it"
+                } else {
+                    "they"
+                },
             ));
         }
         open
@@ -456,12 +468,19 @@ mod tests {
         let keys = WalletKeys::generate();
         let mut r = received(&keys);
         sign_as_v1(&keys, &mut r);
-        assert!(verify_receipt(&r).is_ok(), "old receipts must stay verifiable");
+        assert!(
+            verify_receipt(&r).is_ok(),
+            "old receipts must stay verifiable"
+        );
 
         for (field, rewrite) in [
-            ("kind", (|r: &mut PaymentReceipt| r.kind = "sent".into())
-                as fn(&mut PaymentReceipt)),
-            ("timestamp", |r: &mut PaymentReceipt| r.timestamp += 31_536_000),
+            (
+                "kind",
+                (|r: &mut PaymentReceipt| r.kind = "sent".into()) as fn(&mut PaymentReceipt),
+            ),
+            ("timestamp", |r: &mut PaymentReceipt| {
+                r.timestamp += 31_536_000
+            }),
         ] {
             let mut tampered = r.clone();
             rewrite(&mut tampered);
@@ -485,7 +504,8 @@ mod tests {
         assert_eq!(good.v, 2);
         assert!(verify_receipt(&good).unwrap().unsigned_fields.is_empty());
 
-        let changes: [(&str, fn(&mut PaymentReceipt)); 7] = [
+        type ReceiptMutation = (&'static str, fn(&mut PaymentReceipt));
+        let changes: [ReceiptMutation; 7] = [
             ("kind", |r| r.kind = "sent".into()),
             ("timestamp", |r| r.timestamp += 1),
             ("amount", |r| r.amount_darks += 1),
@@ -526,11 +546,16 @@ mod tests {
         assert!(!proof.amount_proven);
         assert!(proof.summary().contains("their own statement"));
         let open = proof.not_established();
-        assert!(open.iter().any(|line| line.contains("amount is what the receipt says")));
+        assert!(open
+            .iter()
+            .any(|line| line.contains("amount is what the receipt says")));
         // …and the chain line is there whatever kind it is.
         assert!(open.iter().any(|line| line.contains("in the chain")));
-        assert!(verify_receipt(&received(&keys)).unwrap().not_established()
-            .iter().any(|line| line.contains("in the chain")));
+        assert!(verify_receipt(&received(&keys))
+            .unwrap()
+            .not_established()
+            .iter()
+            .any(|line| line.contains("in the chain")));
     }
 
     /// The auditor's whole path, on a receipt this wallet really produced:
@@ -567,7 +592,10 @@ mod tests {
         assert_eq!(proof.amount_darks, value);
         assert_eq!(proof.address, keys.address().encode());
         assert_eq!(proof.memo, "invoice 17");
-        assert!(proof.amount_proven, "a received receipt opens its commitment");
+        assert!(
+            proof.amount_proven,
+            "a received receipt opens its commitment"
+        );
         assert!(proof.unsigned_fields.is_empty());
 
         // The seed is not in the document, and neither is the view key. A

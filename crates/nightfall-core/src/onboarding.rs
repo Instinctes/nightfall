@@ -235,7 +235,7 @@ impl Onboarding {
                             "Restore your Nightfall wallet"
                         });
                     }
-                    ui.label("Keep the 24 words offline: they allow spending without your Vault password. Nightfall has no password reset. Words recover keys, not local history, labels or experimental swap secrets. Bitcoin/Ethereum phrases do not restore those coins here; Nightfall derives different keys.");
+                    ui.label("Keep the 24 words offline: they allow spending without your Vault password. Nightfall has no password reset. Words recover keys, not local history or labels. Bitcoin/Ethereum phrases do not restore those coins here; Nightfall derives different keys.");
                     ui.add_space(12.0);
                     if setup.expected.is_some() {
                         ui.label("1 · Write down your recovery words");
@@ -350,7 +350,7 @@ impl Onboarding {
 /// identical rows of dots with nothing saying which was the phrase, which the
 /// password and which the repeat.
 fn secret_field(ui: &mut egui::Ui, text: &mut Zeroizing<String>, id: &str, label: &str) {
-    crate::widgets::text_field(ui, id, label, "", &mut **text, true);
+    crate::widgets::text_field(ui, id, label, "", text, true);
 }
 
 #[cfg(test)]

@@ -153,7 +153,10 @@ mod tests {
 
         // …and a valid phrase for another wallet still gets its own message.
         assert_eq!(
-            verify_phrase(&keys.address(), &WalletKeys::from_seed([32; 32]).to_mnemonic()),
+            verify_phrase(
+                &keys.address(),
+                &WalletKeys::from_seed([32; 32]).to_mnemonic()
+            ),
             Err(RecoveryError::DifferentWallet),
         );
     }

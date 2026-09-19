@@ -1,7 +1,7 @@
-# NIGHTFALLCOIN Core Wallet 0.9.5
+# NIGHTFALLCOIN Core Wallet 1.0.0
 
 A mainnet full node, miner and wallet in one desktop application. Download
-[v0.9.5](https://github.com/Instinctes/nightfall/releases/tag/v0.9.5) or build:
+[v1.0.0](https://github.com/Instinctes/nightfall/releases/tag/v1.0.0) or build:
 
 ```bash
 cargo build --locked --release -p nightfall-core
@@ -23,7 +23,6 @@ migration is required from 0.9.2.
 | Activity | Payments, mining rewards, confirmations and receipts |
 | Mining | Start/stop mining and set CPU threads |
 | Network | Peers, connectivity, Tor and relay information |
-| Swap | Experimental NIGHT/BTC trades; disabled on mainnet |
 | Settings | Backups, view key, address book and maintenance |
 
 Core scans automatically. Mined coins unlock after 1,440 blocks; the standard
@@ -41,13 +40,12 @@ Maintenance operations may require a rescan; do not delete data to upgrade.
 A view key (`nfview1…`) can read amounts and memos but cannot spend. Use
 Settings → Show view key, or `nightfall-wallet --network mainnet export-view-key`.
 To prove only one payment, prefer its Receipt in Activity. Never share a seed
-phrase or swap `.secret` file in a bug report.
+phrase in a bug report.
 
-## Experimental swap boundary
+## Atomic swap
 
-Use explicit `--network devnet` or `--network testnet` only with test coins.
-Mainnet swaps stay blocked. There is no independent timed NIGHT refund; if Bob
-never publishes his Bitcoin refund, Alice's NIGHT can remain locked permanently.
-Back up per-swap secrets as well as the seed, and keep Core and both nodes online
-until settlement/recovery finishes. See [operator notes](SWAP.md) and
-[loss cases](SWAP-LOSS.md). The web wallet does not implement atomic swaps.
+Withdrawn before 1.0.0 and removed from the wallet. There is no Swap page and
+no bitcoind configuration. The reasoning is in
+[SWAP-WITHDRAWN.md](SWAP-WITHDRAWN.md). A wallet file written by an
+experimental build still opens normally; rescan and backup restore refuse while
+it carries swap journal records, which is intentional.

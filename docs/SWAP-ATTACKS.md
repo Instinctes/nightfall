@@ -1,10 +1,21 @@
 # NIGHT ↔ BTC swap — attacks we ran, and the ones we did not
 
+> **WITHDRAWN — 18 September 2026.** Atomic swap is not part of NIGHTFALLCOIN.
+> It is not in wallet 1.0.0 and is not scheduled for a later release. The code
+> has been removed from the tree. This document is kept as a historical record
+> only; it describes software that no longer exists in the product. See
+> [`SWAP-WITHDRAWN.md`](SWAP-WITHDRAWN.md) for the decision and its reasoning.
+
 v0.9.2. This is the honesty sheet for the warning in the wallet.
 
 There is **no external cryptographic review** of the Ristretto DLEQ leaf
 in `nightfall_crypto::dleq`. Tests below are ours. That is weaker than a
-person who is trying to break it. Mainnet stays gated for that reason.
+person independently trying to break it. On 13 September 2026 the operator
+requested internal verification only; external review is no longer a planned
+release dependency. Mainnet still stays gated for unfinished Vault execution,
+deadline ownership, fee variants and their verification. The historic results
+below do not prove those newer paths. Current work and limits are recorded in
+`SWAP-VAULT-PROGRESS-2026-09-13.md`.
 
 ## What we forced, in this tree
 

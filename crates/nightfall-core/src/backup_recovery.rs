@@ -94,14 +94,17 @@ impl BackupRecovery {
     }
 
     pub fn observe_activity(&mut self, focused: bool, hidden: bool, activity: bool, now: Instant) {
-        if !focused
-            || hidden
-            || now.saturating_duration_since(self.last_activity) >= Duration::from_secs(300)
-        {
+        // Same distinction as `vault_ui::observe_activity`: the recovery screen
+        // also holds fields somebody is part-way through typing — a password,
+        // 24 words — and clearing them because the window briefly stopped
+        // being the key window means they can never be finished. Out of sight,
+        // or five minutes untouched, still empties everything.
+        if hidden || now.saturating_duration_since(self.last_activity) >= Duration::from_secs(300) {
             self.clear();
             self.discard = true;
             self.error = None;
         }
+        let _ = focused;
         if activity {
             self.last_activity = now;
         }
@@ -254,12 +257,12 @@ impl BackupRecovery {
                 } else {
                     ui.label("No unresolved payments in this backup.");
                 }
-                ui.label("Reservations come across untouched. They hold coins a swap may still be relying on; this import cannot tell whether it is. Keep the original backup.");
+                ui.label("Reservations come across untouched. They hold coins back from selection, and this import cannot tell what put them on hold. Keep the original backup.");
             } else {
                 ui.label(format!("In the source, not copied — scan height: {} · History entries: {} · Pending sends: {} · Reservations: {}",
                     preview.scanned_to, preview.history, preview.pending, preview.reservations));
                 ui.colored_label(WARN, "Keys-only recovery: old history, pending sends and reservations are NOT copied. The new wallet scans from genesis after a separate unlock. Already broadcast payments are not cancelled.");
-                ui.label("Keep the original backup. Review earlier payments and any unfinished swaps before spending. The saved height and counts are local metadata, not verified chain state.");
+                ui.label("Keep the original backup. Review earlier payments before spending. The saved height and counts are local metadata, not verified chain state.");
             }
             ui.add_space(12.0);
             field(

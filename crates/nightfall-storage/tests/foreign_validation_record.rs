@@ -41,13 +41,20 @@ fn seeded(dir: &std::path::Path) -> ChainStore {
 }
 
 fn tmpdir(tag: &str) -> std::path::PathBuf {
+    // The clock alone is not a unique name: these run in parallel threads of
+    // one process and the platform does not hand each of them a distinct
+    // nanosecond, so two fixtures race for the same directory and one loses.
+    // The counter makes the name unique by construction; the clock stays so
+    // that anything left behind is still readable.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let d = std::env::temp_dir().join(format!(
-        "nf-vr-{tag}-{}-{}",
+        "nf-vr-{tag}-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&d).unwrap();
     d

@@ -208,17 +208,19 @@ impl NetworkId {
     /// any amount of hardening on the first.
     pub fn seed_nodes(self) -> &'static [&'static str] {
         match self {
-            // Two entries, deliberately. A name that does not resolve costs a
+            // Three entries, deliberately. A name that does not resolve costs a
             // failed dial and a log line, so listing a seed before it is
             // reachable is harmless — while listing only one means every new
             // install depends on a single machine staying up.
             //
-            // Both currently belong to the same operator, which halves the
-            // benefit: they share a failure mode and an owner. A seed run by
-            // somebody else would be worth more than a third run by us.
+            // All three currently belong to the same operator, which halves the
+            // benefit: they share an owner. They do not share a provider:
+            // seed is Contabo, seed3 is OVH. A seed run by somebody else
+            // would still be worth more than a fourth run by us.
             Self::Mainnet => &[
                 "seed.nightfallcoin.org:17891",
                 "seed2.nightfallcoin.org:17891",
+                "seed3.nightfallcoin.org:17891",
             ],
             // No public testnet seed yet — pass --connect by hand.
             Self::Testnet => &[],

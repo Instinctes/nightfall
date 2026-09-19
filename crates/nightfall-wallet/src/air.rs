@@ -108,8 +108,14 @@ pub enum AirError {
     BadAddress,
     BadNumber(&'static str),
     AmountTooLarge,
-    WrongNetwork { package: NetworkId, wallet: NetworkId },
-    Expired { expired_at: u64, now: u64 },
+    WrongNetwork {
+        package: NetworkId,
+        wallet: NetworkId,
+    },
+    Expired {
+        expired_at: u64,
+        now: u64,
+    },
     ReplayedNonce,
     NonceMismatch,
     PayloadTooLarge(usize),
@@ -117,7 +123,10 @@ pub enum AirError {
     BadFrame,
     FrameFromAnotherTransfer,
     TooManyFrames(usize),
-    IncompleteTransfer { have: usize, total: usize },
+    IncompleteTransfer {
+        have: usize,
+        total: usize,
+    },
     DigestMismatch,
 }
 
@@ -134,7 +143,10 @@ impl fmt::Display for AirError {
                  version may mean something different by the same words, so it is \
                  refused rather than half-understood."
             ),
-            Self::UnknownKind(k) => write!(f, "This package says it is a `{k}`, which this wallet does not handle."),
+            Self::UnknownKind(k) => write!(
+                f,
+                "This package says it is a `{k}`, which this wallet does not handle."
+            ),
             Self::MissingField(field) => write!(
                 f,
                 "This package does not say `{field}`, and that is not something a \
@@ -150,7 +162,10 @@ impl fmt::Display for AirError {
                 f,
                 "This package gives `{field}` more than once, so what it asks for is ambiguous."
             ),
-            Self::BadAddress => write!(f, "The address in this package is not a valid Nightfall address."),
+            Self::BadAddress => write!(
+                f,
+                "The address in this package is not a valid Nightfall address."
+            ),
             Self::BadNumber(field) => write!(
                 f,
                 "`{field}` must be a whole number, with no sign, decimal point or spaces."
@@ -180,7 +195,9 @@ impl fmt::Display for AirError {
                 "This signed transaction answers a different request than the one it \
                  was matched with. Nothing was broadcast."
             ),
-            Self::PayloadTooLarge(n) => write!(f, "This package is {n} bytes, more than Air carries."),
+            Self::PayloadTooLarge(n) => {
+                write!(f, "This package is {n} bytes, more than Air carries.")
+            }
             Self::PayloadEmpty => write!(f, "There is nothing in this package."),
             Self::BadFrame => write!(f, "That is not a readable frame."),
             Self::FrameFromAnotherTransfer => write!(
@@ -188,7 +205,9 @@ impl fmt::Display for AirError {
                 "That frame belongs to a different transfer. Scanning two at once \
                  would splice them together, so it was refused."
             ),
-            Self::TooManyFrames(n) => write!(f, "A transfer of {n} frames is more than Air carries."),
+            Self::TooManyFrames(n) => {
+                write!(f, "A transfer of {n} frames is more than Air carries.")
+            }
             Self::IncompleteTransfer { have, total } => {
                 write!(f, "{have} of {total} frames so far.")
             }
@@ -271,7 +290,10 @@ impl Intent {
         if intent.amount_darks > MAX_SUPPLY_DARKS || intent.fee_darks > MAX_SUPPLY_DARKS {
             return Err(AirError::AmountTooLarge);
         }
-        refuse_unknown(&fields, &["network", "to", "amount", "fee", "tip", "nonce", "expires"])?;
+        refuse_unknown(
+            &fields,
+            &["network", "to", "amount", "fee", "tip", "nonce", "expires"],
+        )?;
         Ok(intent)
     }
 }
@@ -458,8 +480,8 @@ impl Reassembler {
         let digest = parts.next().ok_or(AirError::BadFrame)?.to_owned();
         let seq: usize = parse_index(parts.next().ok_or(AirError::BadFrame)?)?;
         let total: usize = parse_index(parts.next().ok_or(AirError::BadFrame)?)?;
-        let body = hex::decode(parts.next().ok_or(AirError::BadFrame)?)
-            .map_err(|_| AirError::BadFrame)?;
+        let body =
+            hex::decode(parts.next().ok_or(AirError::BadFrame)?).map_err(|_| AirError::BadFrame)?;
         if parts.next().is_some() || body.is_empty() || body.len() > MAX_FRAME_PAYLOAD {
             return Err(AirError::BadFrame);
         }
@@ -521,10 +543,7 @@ impl Reassembler {
 
 // ----------------------------------------------------------------- parsing ---
 
-fn split_package<'a>(
-    text: &'a str,
-    kind: &str,
-) -> Result<BTreeMap<&'a str, &'a str>, AirError> {
+fn split_package<'a>(text: &'a str, kind: &str) -> Result<BTreeMap<&'a str, &'a str>, AirError> {
     let text = text.trim();
     let rest = text
         .strip_prefix(&format!("{SCHEME}:"))
@@ -656,10 +675,15 @@ mod tests {
         };
         let mut log = NonceLog::new();
         assert!(matches!(
-            signed.accept(&testnet, NetworkId::Mainnet, &mut log).unwrap_err(),
+            signed
+                .accept(&testnet, NetworkId::Mainnet, &mut log)
+                .unwrap_err(),
             AirError::WrongNetwork { .. }
         ));
-        assert!(log.is_empty(), "a refused package must not be recorded as used");
+        assert!(
+            log.is_empty(),
+            "a refused package must not be recorded as used"
+        );
     }
 
     #[test]
@@ -703,7 +727,9 @@ mod tests {
         };
         let mut log = NonceLog::new();
         assert_eq!(signed.accept(&intent, NetworkId::Mainnet, &mut log), Ok(()));
-        let again = signed.accept(&intent, NetworkId::Mainnet, &mut log).unwrap_err();
+        let again = signed
+            .accept(&intent, NetworkId::Mainnet, &mut log)
+            .unwrap_err();
         assert_eq!(again, AirError::ReplayedNonce);
         assert!(again.to_string().contains("Nothing was done"));
         assert_eq!(log.len(), 1);
@@ -842,7 +868,10 @@ mod tests {
     fn a_transfer_is_bounded_at_both_ends() {
         assert_eq!(frames(&[]), Err(AirError::PayloadEmpty));
         let huge = vec![0u8; MAX_PAYLOAD + 1];
-        assert_eq!(frames(&huge), Err(AirError::PayloadTooLarge(MAX_PAYLOAD + 1)));
+        assert_eq!(
+            frames(&huge),
+            Err(AirError::PayloadTooLarge(MAX_PAYLOAD + 1))
+        );
         // The largest payload Air does carry still fits the frame budget.
         let full = vec![0u8; MAX_PAYLOAD];
         assert_eq!(frames(&full).unwrap().len(), MAX_FRAMES);
@@ -856,19 +885,31 @@ mod tests {
         let cases: Vec<(String, &str)> = vec![
             ("".into(), "empty"),
             ("nightfall:nf1abc".into(), "a payment request, not this"),
-            (good.replace("nightfall-air:intent", "nightfall-air:signed"), "wrong kind"),
+            (
+                good.replace("nightfall-air:intent", "nightfall-air:signed"),
+                "wrong kind",
+            ),
             (good.replace(":intent:1|", ":intent:9|"), "unknown version"),
             (good.replace("|fee=100000", ""), "missing fee"),
             (format!("{good}|priority=high"), "unknown field"),
             (format!("{good}|fee=1"), "repeated field"),
-            (good.replace("amount=150000000", "amount=0150000000"), "two spellings"),
+            (
+                good.replace("amount=150000000", "amount=0150000000"),
+                "two spellings",
+            ),
             (good.replace("amount=150000000", "amount=+1"), "signed"),
             (good.replace("amount=150000000", "amount="), "empty amount"),
-            (good.replace("network=mainnet", "network=regtest"), "unknown network"),
+            (
+                good.replace("network=mainnet", "network=regtest"),
+                "unknown network",
+            ),
             (good.replace("to=nf1", "to=zz1"), "bad address"),
             (good.replace(&"ab".repeat(32), "abc"), "short nonce"),
             (
-                good.replace("amount=150000000", &format!("amount={}", MAX_SUPPLY_DARKS + 1)),
+                good.replace(
+                    "amount=150000000",
+                    &format!("amount={}", MAX_SUPPLY_DARKS + 1),
+                ),
                 "more than will exist",
             ),
         ];
@@ -960,7 +1001,10 @@ mod tests {
         // …across the gap as frames, delivered out of order and with repeats.
         let text = signed.to_text();
         let cut = frames(text.as_bytes()).unwrap();
-        assert!(cut.len() > 1, "a real transaction needs more than one frame");
+        assert!(
+            cut.len() > 1,
+            "a real transaction needs more than one frame"
+        );
         let mut reader = Reassembler::new();
         for frame in cut.iter().rev().chain(cut.iter()) {
             reader.accept(frame).unwrap();

@@ -96,9 +96,9 @@ impl RecoveryStudio {
             );
             ui.label(
                 RichText::new(
-                    "Contacts and preferences need a separate backup. Experimental swap secrets \
-                 cannot be reconstructed from the 24 words. A successful check does not verify \
-                 your balance, synchronization or a swap's recovery state.",
+                    "Contacts, labels and preferences need a separate backup; the words do not \
+                 carry them. A successful check does not verify your balance or how far the \
+                 wallet has synchronized.",
                 )
                 .size(12.0)
                 .color(TEXT_DIM),

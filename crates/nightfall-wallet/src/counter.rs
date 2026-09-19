@@ -102,11 +102,19 @@ pub enum InvoiceState {
     /// A payment afterwards still settles it.
     Expired,
     /// Paid in full, or more than asked with the difference named.
-    Paid { late: bool },
+    Paid {
+        late: bool,
+    },
     /// Less arrived than was asked for. The shortfall is what the merchant
     /// needs to say out loud, so it is carried rather than recomputed.
-    Underpaid { short_darks: u64, late: bool },
-    Overpaid { extra_darks: u64, late: bool },
+    Underpaid {
+        short_darks: u64,
+        late: bool,
+    },
+    Overpaid {
+        extra_darks: u64,
+        late: bool,
+    },
     /// The merchant closed it themselves.
     Closed,
 }
@@ -185,11 +193,9 @@ impl Invoice {
         }
         match self.amount_darks {
             Some(0) => {
-                return Err(
-                    "An invoice for zero is not an invoice. Leave the amount \
+                return Err("An invoice for zero is not an invoice. Leave the amount \
                      empty if the payer chooses it."
-                        .to_owned(),
-                )
+                    .to_owned())
             }
             Some(darks) if darks > MAX_SUPPLY_DARKS => {
                 return Err("That is more NIGHT than will ever exist.".to_owned())
@@ -221,25 +227,33 @@ pub fn status(invoice: &Invoice, payments: &[Incoming], now_unix: u64) -> Invoic
         // is shown so the merchant can recognise it; it never moves the state.
         if let Some(asked) = invoice.amount_darks {
             let unclaimed = !looks_like_another_reference(&payment.memo);
-            if unclaimed && payment.amount_darks == asked && payment.timestamp >= invoice.created_unix
+            if unclaimed
+                && payment.amount_darks == asked
+                && payment.timestamp >= invoice.created_unix
             {
                 candidates.push(payment.clone());
             }
         }
     }
 
-    let received_darks: u64 = matched.iter().map(|p| p.amount_darks).fold(0, u64::saturating_add);
+    let received_darks: u64 = matched
+        .iter()
+        .map(|p| p.amount_darks)
+        .fold(0, u64::saturating_add);
     // Late is a property of the payments, not of the clock at read time: an
     // invoice paid on time does not become "late" because it is looked at a
     // week afterwards.
-    let late = invoice.expires_unix.is_some_and(|deadline| {
-        matched.iter().any(|p| p.timestamp > deadline)
-    });
+    let late = invoice
+        .expires_unix
+        .is_some_and(|deadline| matched.iter().any(|p| p.timestamp > deadline));
 
     let state = if invoice.closed_note.is_some() {
         InvoiceState::Closed
     } else if matched.is_empty() {
-        if invoice.expires_unix.is_some_and(|deadline| now_unix > deadline) {
+        if invoice
+            .expires_unix
+            .is_some_and(|deadline| now_unix > deadline)
+        {
             InvoiceState::Expired
         } else {
             InvoiceState::Open
@@ -301,7 +315,12 @@ fn looks_like_another_reference(memo: &str) -> bool {
 pub fn takings_darks(statuses: &[InvoiceStatus]) -> u64 {
     statuses
         .iter()
-        .filter(|s| matches!(s.state, InvoiceState::Paid { .. } | InvoiceState::Overpaid { .. }))
+        .filter(|s| {
+            matches!(
+                s.state,
+                InvoiceState::Paid { .. } | InvoiceState::Overpaid { .. }
+            )
+        })
         .map(|s| s.received_darks)
         .fold(0, u64::saturating_add)
 }
@@ -331,7 +350,11 @@ pub fn request_for(
 
 /// Whole NIGHT, for a till display that has no room for eight decimals.
 pub fn round_night(darks: u64) -> String {
-    format!("{}.{:02}", darks / DARKS_PER_NIGHT, (darks % DARKS_PER_NIGHT) / 1_000_000)
+    format!(
+        "{}.{:02}",
+        darks / DARKS_PER_NIGHT,
+        (darks % DARKS_PER_NIGHT) / 1_000_000
+    )
 }
 
 #[cfg(test)]
@@ -384,7 +407,11 @@ mod tests {
         let sa = status(&a, &payments, 1_600);
         let sb = status(&b, &payments, 1_600);
         assert_eq!(sa.state, InvoiceState::Paid { late: false });
-        assert_eq!(sb.state, InvoiceState::Open, "B must not be settled by A's payment");
+        assert_eq!(
+            sb.state,
+            InvoiceState::Open,
+            "B must not be settled by A's payment"
+        );
         assert_eq!(sb.received_darks, 0);
         // …and B is not even offered it as a candidate, because that memo is
         // recognisably somebody else's reference.
@@ -411,10 +438,17 @@ mod tests {
     #[test]
     fn part_payments_add_up_and_the_shortfall_is_named() {
         let inv = invoice("A-17", Some(1_000));
-        let s = status(&inv, &[paid(400, "A-17", 1_100), paid(300, "A-17", 1_200)], 1_500);
+        let s = status(
+            &inv,
+            &[paid(400, "A-17", 1_100), paid(300, "A-17", 1_200)],
+            1_500,
+        );
         assert_eq!(
             s.state,
-            InvoiceState::Underpaid { short_darks: 300, late: false }
+            InvoiceState::Underpaid {
+                short_darks: 300,
+                late: false
+            }
         );
         assert_eq!(s.received_darks, 700);
         assert!(!s.is_settled(), "an underpayment is not a payment");
@@ -422,7 +456,11 @@ mod tests {
 
         let s = status(
             &inv,
-            &[paid(400, "A-17", 1_100), paid(300, "A-17", 1_200), paid(300, "A-17", 1_300)],
+            &[
+                paid(400, "A-17", 1_100),
+                paid(300, "A-17", 1_200),
+                paid(300, "A-17", 1_300),
+            ],
             1_500,
         );
         assert_eq!(s.state, InvoiceState::Paid { late: false });
@@ -434,9 +472,15 @@ mod tests {
         let s = status(&inv, &[paid(750, "A-17", 1_500)], 1_600);
         assert_eq!(
             s.state,
-            InvoiceState::Overpaid { extra_darks: 250, late: false }
+            InvoiceState::Overpaid {
+                extra_darks: 250,
+                late: false
+            }
         );
-        assert!(s.is_settled(), "the goods are paid for; the change is a separate matter");
+        assert!(
+            s.is_settled(),
+            "the goods are paid for; the change is a separate matter"
+        );
         assert!(s.headline().contains("Overpaid by"));
     }
 
@@ -468,7 +512,7 @@ mod tests {
         let inv = invoice("A-17", Some(500));
         let stranger = paid(500, "", 1_400);
 
-        let open = status(&inv, &[stranger.clone()], 1_600);
+        let open = status(&inv, std::slice::from_ref(&stranger), 1_600);
         assert_eq!(open.state, InvoiceState::Open);
         assert_eq!(open.candidates.len(), 1, "an open invoice still asks");
 
@@ -484,7 +528,9 @@ mod tests {
 
         let mut closed_invoice = inv.clone();
         closed_invoice.closed_note = Some("paid in cash".into());
-        assert!(status(&closed_invoice, &[stranger], 1_600).candidates.is_empty());
+        assert!(status(&closed_invoice, &[stranger], 1_600)
+            .candidates
+            .is_empty());
     }
 
     #[test]
@@ -506,7 +552,10 @@ mod tests {
         let s = status(&inv, &[], 1_200);
         assert_eq!(s.state, InvoiceState::Closed);
         assert!(s.is_settled());
-        assert_eq!(s.received_darks, 0, "closing must not pretend money arrived");
+        assert_eq!(
+            s.received_darks, 0,
+            "closing must not pretend money arrived"
+        );
     }
 
     #[test]
@@ -529,11 +578,20 @@ mod tests {
         assert_eq!(ok.check(), Ok(()));
 
         for (mutate, expect) in [
-            ((|i: &mut Invoice| i.reference = "   ".into()) as fn(&mut Invoice), "reference"),
+            (
+                (|i: &mut Invoice| i.reference = "   ".into()) as fn(&mut Invoice),
+                "reference",
+            ),
             (|i| i.reference = "r".repeat(MAX_REFERENCE + 1), "at most"),
-            (|i| i.description = "d".repeat(MAX_DESCRIPTION + 1), "at most"),
+            (
+                |i| i.description = "d".repeat(MAX_DESCRIPTION + 1),
+                "at most",
+            ),
             (|i| i.amount_darks = Some(0), "zero is not an invoice"),
-            (|i| i.amount_darks = Some(MAX_SUPPLY_DARKS + 1), "ever exist"),
+            (
+                |i| i.amount_darks = Some(MAX_SUPPLY_DARKS + 1),
+                "ever exist",
+            ),
         ] {
             let mut bad = ok.clone();
             mutate(&mut bad);
@@ -557,7 +615,10 @@ mod tests {
         let read = PaymentRequest::parse(&uri).unwrap();
         assert_eq!(read, request);
         assert_eq!(read.invoice, "A-17");
-        assert_eq!(read.memo, "A-17", "the memo is the channel back to the till");
+        assert_eq!(
+            read.memo, "A-17",
+            "the memo is the channel back to the till"
+        );
 
         // A payer whose wallet fills the memo from the request settles it.
         let arrival = paid(150_000_000, &read.memo, 1_500);

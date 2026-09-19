@@ -203,7 +203,11 @@ mod tests {
         let supply = MAX_SUPPLY_DARKS;
         let whole = supply / DARKS_PER_NIGHT;
         let text = format!("{}.{:08}", whole, supply % DARKS_PER_NIGHT);
-        assert_eq!(parse_night(&text), Ok(supply), "the supply itself is payable");
+        assert_eq!(
+            parse_night(&text),
+            Ok(supply),
+            "the supply itself is payable"
+        );
         assert_eq!(
             parse_night(&format!("{}", whole + 1)),
             Err(AmountError::TooLarge),

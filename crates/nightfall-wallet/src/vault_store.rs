@@ -56,6 +56,8 @@ pub fn recover_backup_keys(
     let mut vault = Vault::from_bytes(&bytes)?;
     vault.unlock(password, network)?;
     let original = vault.wallet()?;
+    ensure!(!original.has_swap_recovery(),
+        "This backup includes swap secrets and deadlines. Ordinary keys-only recovery would discard them; dedicated swap recovery is required. Preserve the original backup.");
     Ok(RecoveredBackupKeys {
         wallet: Wallet::in_memory(network, WalletKeys::from_seed(original.keys.seed), 0),
         source_scanned_to: original.db.scanned_to,
@@ -105,6 +107,9 @@ pub fn recover_backup_state(
     let mut vault = Vault::from_bytes(&bytes)?;
     vault.unlock(password, network)?;
     let original = vault.wallet()?;
+
+    ensure!(!original.has_swap_recovery(),
+        "This backup includes swap secrets and deadlines. Automatic swap replay from an old backup is unsafe; dedicated swap recovery is required. Preserve the original backup.");
 
     // Round-tripping through the state blob is what `Vault::create` does, and
     // it is deliberate here too: the import parser rejects unknown fields, so a
@@ -740,6 +745,9 @@ fn parse_database(bytes: &[u8]) -> anyhow::Result<WalletFile> {
         // them would have lost a merchant's open invoices at the moment they
         // encrypted their wallet.
         invoices: db.invoices,
+        // Legacy plaintext databases must never contain encrypted swap recovery
+        // records. Database's deny_unknown_fields rejects such an input above.
+        swap_journal: Default::default(),
     })
 }
 
@@ -779,6 +787,193 @@ mod tests {
     const PASSWORD: &str = "public unfunded test password";
     const NEW_PASSWORD: &str = "another public test password";
     const SEED: &str = "core.seed";
+
+    const SWAP_ID: &str = "00000000-0000-4000-8000-000000000001";
+    const SWAP_SECRET: &str =
+        "PUBLIC UNFUNDED swap secret fixture, handshake and execution revision 1";
+
+    #[test]
+    fn swap_journal_is_encrypted_and_survives_lock_restart_and_password_rotation() {
+        let f = Fixture::new();
+        let mut store = f.initialized();
+        let revision = store
+            .update(|wallet| wallet.put_swap_checkpoint(SWAP_ID, 0, SWAP_SECRET))
+            .unwrap();
+        assert_eq!(revision, 1);
+        let bytes = fs::read(f.snapshot()).unwrap();
+        assert!(!bytes
+            .windows(SWAP_SECRET.len())
+            .any(|w| w == SWAP_SECRET.as_bytes()));
+        assert!(!f.root.join("swaps").exists(), "no plaintext sidecar");
+        store.lock();
+        assert!(store.wallet().is_err());
+        assert!(store
+            .update(|w| w.put_swap_checkpoint(SWAP_ID, 1, "public second revision"))
+            .is_err());
+        assert_eq!(fs::read(f.snapshot()).unwrap(), bytes);
+        drop(store);
+        let mut store = f.open();
+        assert!(store.is_locked());
+        assert!(store.unlock(NEW_PASSWORD).is_err());
+        store.unlock(PASSWORD).unwrap();
+        assert_eq!(
+            store.wallet().unwrap().swap_checkpoint(SWAP_ID),
+            Some((1, SWAP_SECRET))
+        );
+        store.change_password(NEW_PASSWORD).unwrap();
+        drop(store);
+        let mut store = f.open();
+        assert!(store.unlock(PASSWORD).is_err());
+        store.unlock(NEW_PASSWORD).unwrap();
+        assert_eq!(
+            store.wallet().unwrap().swap_checkpoint(SWAP_ID),
+            Some((1, SWAP_SECRET))
+        );
+    }
+
+    #[test]
+    fn swap_journal_stale_or_failed_edits_publish_nothing() {
+        let f = Fixture::new();
+        let mut store = f.initialized();
+        store
+            .update(|w| w.put_swap_checkpoint(SWAP_ID, 0, SWAP_SECRET))
+            .unwrap();
+        let bytes = fs::read(f.snapshot()).unwrap();
+        assert!(store
+            .update(|w| w.put_swap_checkpoint(SWAP_ID, 0, "stale worker"))
+            .is_err());
+        let failed: anyhow::Result<()> = store.update(|w| {
+            w.put_swap_checkpoint(SWAP_ID, 1, "must never be published")?;
+            anyhow::bail!("public injected failure before persistence");
+        });
+        assert!(failed.is_err());
+        assert_eq!(fs::read(f.snapshot()).unwrap(), bytes);
+        assert_eq!(
+            store.wallet().unwrap().swap_checkpoint(SWAP_ID),
+            Some((1, SWAP_SECRET))
+        );
+    }
+
+    #[test]
+    fn swap_journal_admission_failure_preserves_the_committed_candidate() {
+        let f = Fixture::new();
+        let mut store = f.initialized();
+        store
+            .update(|wallet| {
+                for index in 0..crate::swap_journal::MAX_RESERVED_RECORDS {
+                    wallet.put_swap_checkpoint(
+                        &format!("00000000-0000-4000-8000-{index:012x}"),
+                        0,
+                        SWAP_SECRET,
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let bytes = fs::read(f.snapshot()).unwrap();
+        let state = store.wallet().unwrap().export_state().unwrap();
+        let failed = store.update(|wallet| {
+            wallet.put_swap_checkpoint(SWAP_ID, 1, "candidate that must roll back")?;
+            wallet.put_swap_checkpoint(
+                &format!(
+                    "00000000-0000-4000-8000-{:012x}",
+                    crate::swap_journal::MAX_RESERVED_RECORDS
+                ),
+                0,
+                "cannot reserve a fifth recovery slot",
+            )?;
+            Ok("outgoing packet must not escape")
+        });
+        assert!(failed.is_err());
+        assert_eq!(fs::read(f.snapshot()).unwrap(), bytes);
+        assert_eq!(store.wallet().unwrap().export_state().unwrap(), state);
+        drop(store);
+        let mut reopened = f.open();
+        reopened.unlock(PASSWORD).unwrap();
+        assert_eq!(reopened.wallet().unwrap().export_state().unwrap(), state);
+    }
+
+    #[test]
+    fn swap_journal_commit_failures_never_return_an_outgoing_packet() {
+        for point in [
+            Checkpoint::PartialWritten,
+            Checkpoint::FileSynced,
+            Checkpoint::Renamed,
+            Checkpoint::DirectorySynced,
+        ] {
+            let f = Fixture::new();
+            let mut store = f.initialized();
+            store
+                .update(|w| w.put_swap_checkpoint(SWAP_ID, 0, SWAP_SECRET))
+                .unwrap();
+            store.fault = Some(point);
+            let result = store.update(|w| {
+                w.put_swap_checkpoint(SWAP_ID, 1, "public revision 2 with outbound intent")?;
+                Ok("MUST NOT BE SENT")
+            });
+            assert!(
+                result.is_err(),
+                "failed commit must never return the sendable result"
+            );
+            let expected = if matches!(point, Checkpoint::Renamed | Checkpoint::DirectorySynced) {
+                2
+            } else {
+                1
+            };
+            if expected == 2 {
+                assert!(store.requires_reopen());
+                assert!(store.wallet().is_err());
+            }
+            drop(store);
+            let mut store = f.open();
+            store.unlock(PASSWORD).unwrap();
+            assert_eq!(
+                store.wallet().unwrap().swap_checkpoint(SWAP_ID).unwrap().0,
+                expected
+            );
+            // Even interrupted files are ciphertext, never a secret JSON fallback.
+            for entry in fs::read_dir(f.root.join("core.seed.vault")).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_file() {
+                    let bytes = fs::read(path).unwrap();
+                    assert!(!bytes
+                        .windows(SWAP_SECRET.len())
+                        .any(|w| w == SWAP_SECRET.as_bytes()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn swap_journal_backup_is_preserved_and_cannot_be_silently_dropped_or_replayed() {
+        let f = Fixture::new();
+        let external = Fixture::new();
+        let mut store = f.initialized();
+        store
+            .update(|w| w.put_swap_checkpoint(SWAP_ID, 0, SWAP_SECRET))
+            .unwrap();
+        let path = external.root.join("swap-backup.nfv");
+        store.export_backup(&path, PASSWORD).unwrap();
+        assert!(store.verify_backup(&path, PASSWORD).unwrap());
+        let before = fs::read(&path).unwrap();
+        let keys_error = recover_backup_keys(&path, PASSWORD, NetworkId::Mainnet)
+            .err()
+            .unwrap()
+            .to_string();
+        let state_error = recover_backup_state(&path, PASSWORD, NetworkId::Mainnet)
+            .err()
+            .unwrap()
+            .to_string();
+        for error in [keys_error, state_error] {
+            assert!(error.contains("dedicated swap recovery is required"));
+            assert!(!error.contains(SWAP_SECRET));
+        }
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(
+            store.wallet().unwrap().swap_checkpoint(SWAP_ID),
+            Some((1, SWAP_SECRET))
+        );
+    }
 
     struct Fixture {
         root: PathBuf,

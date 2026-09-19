@@ -104,22 +104,8 @@ pub(crate) fn derive_key_offset(t: &[u8; 32]) -> Scalar {
 ///
 /// Monero adopted the identical construction in 2022 and needed a hard fork to
 /// do it. Adding it here while the chain is being reset costs nothing.
-/// The view tag, exposed for the swap module's lock verification.
-pub(crate) fn derive_view_tag_pub(t: &[u8; 32]) -> u8 {
-    derive_view_tag(t)
-}
-
 fn derive_view_tag(t: &[u8; 32]) -> u8 {
     hash_multi(b"nightfall:stealth:viewtag:v3", &[t]).0[0]
-}
-
-/// AEAD key and nonce, exposed inside the crate so the swap tests can build
-/// an output whose sealed payload disagrees with its commitment. Without this
-/// the hostile-payload branch of `SharedLock::verify_lock` is unreachable from
-/// a test, and an unreachable branch is an untested one.
-#[cfg(test)]
-pub(crate) fn derive_aead_pub(t: &[u8; 32]) -> ([u8; 32], [u8; 24]) {
-    derive_aead(t)
 }
 
 fn derive_aead(t: &[u8; 32]) -> ([u8; 32], [u8; 24]) {

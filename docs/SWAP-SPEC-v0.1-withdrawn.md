@@ -1,5 +1,11 @@
 # NIGHT ↔ BTC atomic swap — protocol specification
 
+> **WITHDRAWN — 18 September 2026.** Atomic swap is not part of NIGHTFALLCOIN.
+> It is not in wallet 1.0.0 and is not scheduled for a later release. The code
+> has been removed from the tree. This document is kept as a historical record
+> only; it describes software that no longer exists in the product. See
+> [`SWAP-WITHDRAWN.md`](SWAP-WITHDRAWN.md) for the decision and its reasoning.
+
 **Status: draft for review. Not implemented. Do not build from this yet.**
 
 Version 0.1 · 28 August 2026 · target: NIGHTFALLCOIN 0.9.x

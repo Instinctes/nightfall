@@ -8,8 +8,6 @@
 
 mod aggregate;
 mod builder;
-/// Swap claim construction. Experimental — see the module docs.
-pub mod swap;
 mod tx;
 mod utxo;
 

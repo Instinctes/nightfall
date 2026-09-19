@@ -8,6 +8,43 @@ use nightfall_wallet::{payment_request::PaymentRequest, vault::Vault, Wallet};
 use serde_json::json;
 use wasm_bindgen::prelude::*;
 
+/// The browser has no swap executor, deadline watcher or chain reconciliation.
+/// Never publish a session that would make its owner believe these obligations
+/// are being serviced. Keep this check independent of JS errors for native tests.
+fn require_browser_wallet(wallet: &Wallet) -> Result<(), &'static str> {
+    if wallet.network != NetworkId::Mainnet {
+        return Err("Expected a mainnet wallet.");
+    }
+    if wallet.has_swap_recovery() {
+        return Err("This vault contains swap recovery material. The browser cannot monitor or recover swaps. Open the original vault in a compatible native wallet; preserve this backup.");
+    }
+    Ok(())
+}
+
+fn import_browser_legacy(state: &str) -> Result<Wallet, String> {
+    let wallet =
+        Wallet::import_state(state).map_err(|_| "Invalid legacy wallet state.".to_owned())?;
+    require_browser_wallet(&wallet).map_err(str::to_owned)?;
+    Ok(wallet)
+}
+
+fn unlock_browser_vault(vault: &mut Vault, password: &str) -> Result<(), String> {
+    if !vault.is_locked() {
+        return Err("The wallet is already unlocked.".into());
+    }
+    // Authenticate and inspect an isolated candidate. A rejected swap-bearing
+    // vault must stay locked with the exact original ciphertext, not be unlocked
+    // briefly and then re-encrypted during an attempted rollback.
+    let mut candidate = Vault::from_bytes(vault.sealed_bytes()).map_err(|e| e.to_string())?;
+    candidate
+        .unlock(password, NetworkId::Mainnet)
+        .map_err(|e| e.to_string())?;
+    require_browser_wallet(candidate.wallet().map_err(|e| e.to_string())?)
+        .map_err(str::to_owned)?;
+    *vault = candidate;
+    Ok(())
+}
+
 fn height(value: f64) -> Result<u64, JsError> {
     if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > 9_007_199_254_740_991.0
     {
@@ -33,11 +70,7 @@ impl BrowserVault {
     /// This is preparation, not migration completion. Never removes old storage.
     #[wasm_bindgen(js_name = fromLegacy)]
     pub fn from_legacy(state: &str, password: &str) -> Result<BrowserVault, JsError> {
-        let wallet =
-            Wallet::import_state(state).map_err(|_| err("Invalid legacy wallet state."))?;
-        if wallet.network != NetworkId::Mainnet {
-            return Err(err("Expected a mainnet wallet."));
-        }
+        let wallet = import_browser_legacy(state).map_err(err)?;
         Ok(Self {
             inner: Vault::create(&wallet, password).map_err(err)?,
         })
@@ -75,7 +108,7 @@ impl BrowserVault {
     }
 
     pub fn unlock(&mut self, password: &str) -> Result<(), JsError> {
-        self.inner.unlock(password, NetworkId::Mainnet).map_err(err)
+        unlock_browser_vault(&mut self.inner, password).map_err(err)
     }
 
     /// Retains ciphertext in this object if browser storage subsequently fails.
@@ -165,7 +198,7 @@ impl BrowserVault {
                 "This request did not survive being read back, so it has not been \
                  produced. Please report this.",
             )),
-            Err(problem) => Err(err(&problem.to_string())),
+            Err(problem) => Err(err(problem)),
         }
     }
 
@@ -184,7 +217,7 @@ impl BrowserVault {
     pub fn read_payment_request(&self, text: &str, now_unix: f64) -> Result<String, JsError> {
         let now = height(now_unix)?;
         let wallet = self.inner.wallet().map_err(err)?;
-        let request = PaymentRequest::parse(text).map_err(|e| err(&e.to_string()))?;
+        let request = PaymentRequest::parse(text).map_err(err)?;
         let network_problem = request.require_network(wallet.network).err();
         Ok(json!({
             "address": request.address.encode(),
@@ -378,4 +411,67 @@ impl PreparedSend {
     /// Throw this away. Equivalent to letting it go out of scope; here so the
     /// intent reads as a decision rather than as forgetting to use it.
     pub fn discard(self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PASSWORD: &str = "public unfunded browser test password";
+    const ID: &str = "00000000-0000-4000-8000-000000000001";
+    const RECOVERY: &str = "PUBLIC UNFUNDED swap recovery fixture";
+
+    fn wallet() -> Wallet {
+        Wallet::in_memory(NetworkId::Mainnet, WalletKeys::from_seed([59; 32]), 0)
+    }
+
+    #[test]
+    fn browser_legacy_import_rejects_swap_records_without_exposing_secrets() {
+        let mut wallet = wallet();
+        assert!(import_browser_legacy(&wallet.export_state().unwrap()).is_ok());
+        wallet.put_swap_checkpoint(ID, 0, RECOVERY).unwrap();
+        let state = wallet.export_state().unwrap();
+        let error = import_browser_legacy(&state).err().unwrap();
+        assert!(error.contains("browser cannot monitor or recover swaps"));
+        assert!(!error.contains(RECOVERY));
+        assert_eq!(wallet.export_state().unwrap(), state);
+    }
+
+    #[test]
+    fn rejected_browser_unlock_preserves_original_ciphertext_and_lock() {
+        let mut wallet = wallet();
+        wallet.put_swap_checkpoint(ID, 0, RECOVERY).unwrap();
+        let original = Vault::create(&wallet, PASSWORD).unwrap();
+        let bytes = original.sealed_bytes().to_vec();
+        let mut vault = Vault::from_bytes(&bytes).unwrap();
+        let error = unlock_browser_vault(&mut vault, PASSWORD).unwrap_err();
+        assert!(error.contains("browser cannot monitor or recover swaps"));
+        assert!(!error.contains(RECOVERY));
+        assert!(vault.is_locked());
+        assert!(vault.wallet().is_err());
+        assert_eq!(vault.sealed_bytes(), bytes);
+
+        // Refusal by an unsupported host must not damage native recovery.
+        vault.unlock(PASSWORD, NetworkId::Mainnet).unwrap();
+        assert_eq!(
+            vault.wallet().unwrap().swap_checkpoint(ID),
+            Some((1, RECOVERY))
+        );
+    }
+
+    #[test]
+    fn ordinary_browser_unlock_still_authenticates_and_rejects_duplicate_unlock() {
+        let wallet = wallet();
+        let original = Vault::create(&wallet, PASSWORD).unwrap();
+        let bytes = original.sealed_bytes().to_vec();
+        let mut vault = Vault::from_bytes(&bytes).unwrap();
+        assert!(unlock_browser_vault(&mut vault, "wrong public password").is_err());
+        assert!(vault.is_locked());
+        assert_eq!(vault.sealed_bytes(), bytes);
+        unlock_browser_vault(&mut vault, PASSWORD).unwrap();
+        assert_eq!(vault.wallet().unwrap().address(), wallet.address());
+        assert!(unlock_browser_vault(&mut vault, PASSWORD).is_err());
+        assert_eq!(vault.wallet().unwrap().address(), wallet.address());
+        assert_eq!(vault.sealed_bytes(), bytes);
+    }
 }

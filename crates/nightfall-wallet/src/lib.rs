@@ -18,15 +18,14 @@ use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, Zeroizing};
 
 mod receipt;
-pub use receipt::{
-    verify_receipt, PaymentReceipt, ReceiptKind, ReceiptProof, RECEIPT_VERSION,
-};
+pub use receipt::{verify_receipt, PaymentReceipt, ReceiptKind, ReceiptProof, RECEIPT_VERSION};
 /// The payment request: what a payee asks for, as one checkable line.
 pub mod air;
 pub mod amount_input;
 pub mod counter;
 pub mod payment_request;
 pub mod recovery;
+pub mod swap_journal;
 pub mod vault;
 /// Per-platform filesystem primitives for the vault adapter. Private: the
 /// order of operations belongs to `vault_store`, not to its callers — and it
@@ -213,7 +212,7 @@ impl HistoryEntry {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WalletFile {
     outputs: Vec<OwnedOutput>,
@@ -273,6 +272,10 @@ struct WalletFile {
     /// one that predates the field, because this struct denies unknown fields.
     #[serde(default)]
     invoices: Vec<counter::Invoice>,
+    /// Swap handshake and executor checkpoints belong in the encrypted wallet,
+    /// never in a plaintext sidecar. Omitted for wallets without swap records.
+    #[serde(default, skip_serializing_if = "swap_journal::Journal::is_empty")]
+    swap_journal: swap_journal::Journal,
 }
 
 /// Balance split by what the user can actually do with it.
@@ -457,6 +460,9 @@ impl Wallet {
         } else {
             WalletFile::default()
         };
+        db.swap_journal.validate()?;
+        anyhow::ensure!(db.swap_journal.is_empty(),
+            "Swap recovery data found in plaintext wallet storage. Preserve the file; use the encrypted recovery workflow.");
 
         // A birth height applies to a wallet being created, not to one being
         // reopened. Changing it later would either skip blocks that were never
@@ -652,6 +658,7 @@ impl Wallet {
             bail!("wallet state is too large");
         }
         let state: Import<'_> = serde_json::from_str(blob).context("invalid wallet state")?;
+        state.db.swap_journal.validate()?;
         if state.v != 1 {
             bail!("unsupported wallet state version");
         }
@@ -1382,17 +1389,27 @@ impl Wallet {
     /// select them. Mutation test: drop the filter in `select_coins_at` and
     /// `reserved_output_is_not_spent_as_a_normal_payment` fails.
     pub fn reserve_commits(&mut self, hexes: &[String]) -> anyhow::Result<()> {
+        let before = self.db.reserved.clone();
         for h in hexes {
             if !self.db.reserved.contains(h) {
                 self.db.reserved.push(h.clone());
             }
         }
-        self.save()
+        if let Err(error) = self.save() {
+            self.db.reserved = before;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn release_commits(&mut self, hexes: &[String]) -> anyhow::Result<()> {
+        let before = self.db.reserved.clone();
         self.db.reserved.retain(|r| !hexes.contains(r));
-        self.save()
+        if let Err(error) = self.save() {
+            self.db.reserved = before;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Commit hexes of the coins a swap of `target` darks would consume.
@@ -1566,6 +1583,10 @@ impl Wallet {
     /// time. Pass `0` as the birth height at creation for a wallet that should
     /// always rescan the whole chain.
     pub fn reset_scan(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.has_swap_recovery(),
+            "Swap recovery records exist; reconcile them before resetting wallet state. Nothing was changed."
+        );
         let birth = self.db.birth_height;
         self.db = WalletFile {
             birth_height: birth,
@@ -2426,13 +2447,20 @@ mod tests {
             let again = w.add_invoice(invoice("A-17")).unwrap_err().to_string();
             assert!(again.contains("already has an invoice"), "{again}");
             assert!(again.contains("same payment"), "{again}");
-            assert_eq!(w.invoices().len(), 1, "a refused invoice must not be stored");
+            assert_eq!(
+                w.invoices().len(),
+                1,
+                "a refused invoice must not be stored"
+            );
 
             let empty = w.add_invoice(invoice("   ")).unwrap_err().to_string();
             assert!(empty.contains("reference"), "{empty}");
 
             w.add_invoice(invoice("B-18")).unwrap();
-            assert!(w.close_invoice("B-18", "  ").is_err(), "a closure needs a reason");
+            assert!(
+                w.close_invoice("B-18", "  ").is_err(),
+                "a closure needs a reason"
+            );
             w.close_invoice("B-18", "paid in cash").unwrap();
         }
 
@@ -2552,5 +2580,27 @@ mod tests {
         assert_eq!(w2.scan_from(), 7);
         let restored = WalletKeys::from_mnemonic(&phrase).unwrap();
         assert_eq!(restored.address(), w.address());
+    }
+
+    #[test]
+    fn failed_swap_reservation_edits_preserve_memory_and_disk() {
+        let dir = tmpdir("reservation-rollback");
+        let mut wallet = Wallet::open(&dir, NetworkId::Devnet, "w.seed").unwrap();
+        let first = vec!["11".repeat(32)];
+        wallet.reserve_commits(&first).unwrap();
+        let before = wallet.export_state().unwrap();
+        let disk = fs::read(&wallet.db_path).unwrap();
+        let temporary = wallet.db_path.with_extension("json.tmp");
+        fs::create_dir(&temporary).unwrap();
+        assert!(wallet.release_commits(&first).is_err());
+        assert_eq!(wallet.export_state().unwrap(), before);
+        assert!(wallet.reserve_commits(&["22".repeat(32)]).is_err());
+        assert_eq!(wallet.export_state().unwrap(), before);
+        assert_eq!(fs::read(&wallet.db_path).unwrap(), disk);
+        fs::remove_dir(&temporary).unwrap();
+        wallet.release_commits(&first).unwrap();
+        assert!(!wallet.has_reservations());
+        drop(wallet);
+        fs::remove_dir_all(dir).unwrap();
     }
 }

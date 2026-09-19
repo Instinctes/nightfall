@@ -99,7 +99,7 @@ This document is binding product intent. Protocol numbers that implement it live
 - View keys  
 - Light / mobile-oriented proving path (design constraint)  
 - **Private multi-asset note architecture** (stablecoin-capable by design; issuance policy later)  
-- Swap / P2P-friendly design (delisting-resilient culture)  
+- P2P-friendly design (delisting-resilient culture) — direct atomic swap was withdrawn before 1.0.0, see [SWAP-WITHDRAWN.md](SWAP-WITHDRAWN.md)  
 - Fair genesis seal (0 allocations) enforced in code  
 
 ### v1.1

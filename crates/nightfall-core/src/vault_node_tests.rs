@@ -274,12 +274,19 @@ fn vault_node_child() {
 
 #[test]
 fn isolated_vault_node_lifecycle() {
+    // The clock alone is not a unique name: these run in parallel
+    // threads of one process, and the platform does not hand each of
+    // them a distinct nanosecond. Two fixtures then race for the same
+    // directory and one loses. The counter makes the name unique by
+    // construction; the clock stays so leftovers remain readable.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let root = std::env::temp_dir().join(format!(
-        "nightfall-vault-node-e2e-{}-{nonce}",
+        "nightfall-vault-node-e2e-{}-{nonce}-{seq}",
         std::process::id()
     ));
     fs::create_dir(&root).unwrap();

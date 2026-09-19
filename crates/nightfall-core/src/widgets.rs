@@ -2,6 +2,7 @@
 
 use crate::theme::*;
 use eframe::egui::{self, Color32, Rect, RichText, Rounding, Sense, Stroke, Vec2};
+use std::cell::{Cell, RefCell};
 
 /// Inner padding for every text field in the wallet.
 ///
@@ -88,10 +89,6 @@ pub fn nav_icon(
             line(&[(10.0, 6.0), (4.0, 15.0)]);
             line(&[(12.0, 6.0), (18.0, 15.0)]);
             line(&[(6.0, 18.0), (16.0, 18.0)]);
-        }
-        View::Swap => {
-            line(&[(3.0, 7.0), (19.0, 7.0), (15.0, 3.0)]);
-            line(&[(19.0, 15.0), (3.0, 15.0), (7.0, 19.0)]);
         }
         View::Settings => {
             for (y, x) in [(5.0, 8.0), (11.0, 15.0), (17.0, 6.0)] {
@@ -244,7 +241,7 @@ pub fn radial_wash(painter: &egui::Painter, centre: egui::Pos2, radius: f32, col
     if radius <= 0.0 {
         return;
     }
-    const SEG: usize = 48;
+    const SEG: usize = 64;
     let edge = Color32::from_rgba_premultiplied(0, 0, 0, 0);
 
     let mut mesh = egui::Mesh::default();
@@ -263,32 +260,250 @@ pub fn radial_wash(painter: &egui::Painter, centre: egui::Pos2, radius: f32, col
     painter.add(egui::Shape::mesh(mesh));
 }
 
-/// The two lights across the top of the page.
+/// Fixed room lighting, sampled as a mesh so it remains smooth at every DPI.
+/// The room's colour at a point, `x` and `y` running 0…1 across the window.
 ///
-/// Call once per frame, before anything else is drawn. The radii are tied to
-/// the window width so the effect looks the same in a small window as in a
-/// maximised one — a fixed radius turns into a visible blob when the window
-/// is narrow.
-pub fn page_wash(painter: &egui::Painter, rect: Rect) {
-    let w = rect.width();
-    radial_wash(
-        painter,
-        egui::pos2(rect.min.x + w * 0.12, rect.min.y - w * 0.10),
-        w * 0.62,
-        WASH_A,
+/// Lives on its own so the contrast test can walk the same field the painter
+/// draws. A test that reimplemented this formula would agree with the screen
+/// only until somebody edited one of the two copies.
+///
+/// The lights are roughly half what they were, and that is a legibility
+/// number rather than a taste one. At 0.62/0.65/0.55/0.50 with a violet glow
+/// of 0.55, the brightest point of the room reached RGB (160, 149, 219); a
+/// frosted panel over it left `TEXT_DIM` at 3.8:1 and `TEXT_FAINT` at 3.4:1,
+/// so captions, kickers and the block counter were grey on grey.
+///
+/// These are the brightest lights the contrast budget allows: the room's
+/// brightest point is (120, 110, 164), and on the glass over it the weakest
+/// text tone still measures 4.95:1. Turn them up and
+/// `text_stays_readable_on_every_glass` will say by how much it costs.
+pub fn wash_color(x: f32, y: f32) -> Color32 {
+    let top_left = tint(WASH_A, PINK, 0.34);
+    let top_right = tint(WASH_B, CYAN, 0.36);
+    let bottom_left = tint(BG, ACCENT, 0.38);
+    let bottom_right = tint(BG, PINK, 0.34);
+    let glow = |cx: f32, cy: f32, sx: f32, sy: f32| {
+        (-((x - cx) / sx).powi(2) - ((y - cy) / sy).powi(2)).exp()
+    };
+    let top = lerp_color(top_left, top_right, x);
+    let bottom = lerp_color(bottom_left, bottom_right, x);
+    let base = lerp_color(top, bottom, y);
+    let violet = tint(base, GRAD_A, 0.29 * glow(0.48, 0.02, 0.34, 0.60));
+    tint(violet, CYAN, 0.17 * glow(0.30, 0.55, 0.24, 0.23))
+}
+
+/// Room lighting behind every panel. Painted on the background layer so a
+/// translucent sidebar, top bar and card can frost the same lights, and so
+/// those lights do not scroll with the page.
+/// How opaque the page is. The desktop is meant to be sensed through it.
+///
+/// Chosen by measurement rather than taste: with the page this translucent and
+/// a pure white wallpaper behind it — the worst case there is — the weakest
+/// text tone on the cards still measures 4.54:1, which clears the 4.5:1 small
+/// text needs. `text_stays_readable_on_every_glass` composites exactly that
+/// case, so turning this down will say what it costs.
+pub const PLATE_ALPHA: u8 = 225;
+
+/// The room's gradient as a small texture, so it can be drawn into a shape.
+///
+/// egui clips to a rectangle and nothing else. The lights used to be a mesh
+/// clipped to the plate's *rect*, which painted straight over the rounded
+/// corners and squared them off — leaving the rim stroke to trace a curve that
+/// nothing else followed. That is why the corners still looked square after
+/// the window itself had been rounded for days.
+///
+/// A gradient is exactly what a small texture is good at: 64×64 stretched
+/// across the window is smoother than the 24×16 mesh it replaces, and a
+/// textured `RectShape` takes a rounding, so the shape is right by
+/// construction rather than by clipping.
+fn wash_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    const N: usize = 64;
+    let id = egui::Id::new("nightfall-wash-texture");
+    if let Some(handle) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        return handle;
+    }
+    let last = (N - 1) as f32;
+    let mut pixels = Vec::with_capacity(N * N);
+    for row in 0..N {
+        for col in 0..N {
+            pixels.push(wash_color(col as f32 / last, row as f32 / last));
+        }
+    }
+    let handle = ctx.load_texture(
+        "nightfall-wash",
+        egui::ColorImage {
+            size: [N, N],
+            pixels,
+        },
+        egui::TextureOptions::LINEAR,
     );
-    radial_wash(
-        painter,
-        egui::pos2(rect.min.x + w * 0.92, rect.min.y + w * 0.02),
-        w * 0.48,
-        WASH_B,
+    ctx.data_mut(|d| d.insert_temp(id, handle.clone()));
+    handle
+}
+
+pub fn paint_room(ctx: &egui::Context) {
+    let painter = ctx.layer_painter(egui::LayerId::background());
+    let plate = window_plate(ctx);
+    // One shape: the room's gradient, drawn into a rounded rectangle at the
+    // page's own opacity. Rounded because a `RectShape` takes a rounding,
+    // rather than because something was clipped afterwards.
+    //
+    // No shadow of our own under it either. macOS derives the window's drop
+    // shadow from the alpha we paint and draws it *outside* the frame, where
+    // there is room; ours had to fit inside a 16-point margin, so a 28-point
+    // blur was cut off by the window edge and what remained was its darkest
+    // part — a ring of roughly nine percent black hugging the corner.
+    let wash = wash_texture(ctx);
+    painter.add(egui::Shape::Rect(egui::epaint::RectShape {
+        rect: plate,
+        rounding: Rounding::same(WINDOW_ROUND),
+        // A white tint leaves the texture's own colours alone; the alpha is
+        // what lets the desktop through.
+        fill: with_alpha(Color32::WHITE, PLATE_ALPHA),
+        stroke: Stroke::NONE,
+        blur_width: 0.0,
+        fill_texture_id: wash.id(),
+        uv: Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+    }));
+    // A hairline of caught light around the edge, so the sheet has a rim
+    // rather than simply stopping.
+    painter.rect_stroke(
+        plate,
+        Rounding::same(WINDOW_ROUND),
+        Stroke::new(1.0_f32, with_alpha(BORDER_HI, 90)),
     );
 }
 
+/// How far the glass sheet sits inside the window it is drawn in.
+///
+/// Zero: the window is titled again, so macOS rounds its own corners and casts
+/// its own shadow outside the frame. A margin of ours would only show as a
+/// transparent band around a window that is already the right shape.
+pub const WINDOW_INSET: f32 = 0.0;
+
+/// The window's own corner radius. Larger than a card's, as in the reference.
+pub const WINDOW_ROUND: f32 = 30.0;
+
+/// How far the floating rail stands from the window's left edge.
+///
+/// Small on purpose: the rail is a sheet lying *on* the page, and the closer
+/// it sits to the edge the more it reads as standing proud of it rather than
+/// being embedded in a margin.
+pub const RAIL_LEFT: f32 = 6.0;
+
+/// How far the content sheet is pushed right of the window's own left edge.
+///
+/// Small, and only on the left. It is the strip the rail hangs over: with the
+/// plate flush to the window the rail had nothing to stand proud of and read
+/// as embedded in a margin. The window's own buttons are moved right by the
+/// same amount in `place_window_buttons`, so they stay on the glass rather
+/// than floating beside it in the gap.
+pub const PLATE_LEFT: f32 = 40.0;
+
+/// The rounded sheet the page lives on. The rail is deliberately not on it.
+pub fn window_plate(ctx: &egui::Context) -> Rect {
+    let r = ctx.screen_rect().shrink(WINDOW_INSET);
+    Rect::from_min_max(egui::pos2(r.left() + PLATE_LEFT, r.top()), r.max)
+}
+
+/// Nudge the window's own buttons in from the corner.
+///
+/// macOS draws the close, minimise and zoom buttons itself and places them at
+/// a fixed offset inside the window frame. With the title bar hidden they land
+/// hard in the top-left corner of the glass, tighter than the rest of the
+/// layout breathes. eframe exposes no way to ask, so the three views are moved
+/// directly.
+///
+/// Applied once per window size, never once per frame. An offset added on
+/// every frame is added *again* every frame, and the buttons would walk off
+/// the window within a second. AppKit re-lays them out when the window
+/// resizes, so the trigger is the size changing: read where macOS has just put
+/// them, move them once, leave them alone until the next resize.
+#[cfg(target_os = "macos")]
+pub fn place_window_buttons(ctx: &egui::Context) {
+    use objc2_app_kit::{NSApplication, NSWindowButton};
+    use objc2_foundation::{MainThreadMarker, NSPoint};
+
+    const IN_X: f64 = PLATE_LEFT as f64 + 9.0;
+    const DOWN_Y: f64 = 7.0;
+
+    let size = ctx.screen_rect().size();
+    let key = (size.x.round() as i32, size.y.round() as i32);
+    let id = egui::Id::new("window-buttons-placed-for");
+    if ctx.data(|d| d.get_temp::<(i32, i32)>(id)) == Some(key) {
+        return;
+    }
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    ctx.data_mut(|d| d.insert_temp(id, key));
+    let app = NSApplication::sharedApplication(mtm);
+    for window in app.windows().iter() {
+        for kind in [
+            NSWindowButton::NSWindowCloseButton,
+            NSWindowButton::NSWindowMiniaturizeButton,
+            NSWindowButton::NSWindowZoomButton,
+        ] {
+            let Some(button) = window.standardWindowButton(kind) else {
+                continue;
+            };
+            // AppKit measures from the bottom left, so moving a button down
+            // the screen means subtracting from y.
+            let origin = button.frame().origin;
+            unsafe { button.setFrameOrigin(NSPoint::new(origin.x + IN_X, origin.y - DOWN_Y)) };
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn place_window_buttons(_ctx: &egui::Context) {}
+
+/// Claim the margin around the plate so every panel lands *on* the plate.
+///
+/// Panels measure themselves against the whole window, so without this the
+/// lock screen's header bar started at the window's left edge and hung out
+/// over the desktop, past the rounded corner. Four transparent gutters take
+/// the margin first; everything drawn afterwards sees only the plate.
+pub fn plate_gutters(ctx: &egui::Context) {
+    let clear = || egui::Frame::none().fill(Color32::TRANSPARENT);
+    egui::SidePanel::left("plate-gutter-left")
+        .exact_width(WINDOW_INSET + PLATE_LEFT)
+        .resizable(false)
+        .show_separator_line(false)
+        .frame(clear())
+        .show(ctx, |_| {});
+    egui::SidePanel::right("plate-gutter-right")
+        .exact_width(WINDOW_INSET)
+        .resizable(false)
+        .show_separator_line(false)
+        .frame(clear())
+        .show(ctx, |_| {});
+    egui::TopBottomPanel::top("plate-gutter-top")
+        .exact_height(WINDOW_INSET)
+        .resizable(false)
+        .show_separator_line(false)
+        .frame(clear())
+        .show(ctx, |_| {});
+    egui::TopBottomPanel::bottom("plate-gutter-bottom")
+        .exact_height(WINDOW_INSET)
+        .resizable(false)
+        .show_separator_line(false)
+        .frame(clear())
+        .show(ctx, |_| {});
+}
+
 /// A card whose background is the brand gradient. Used for the balance hero.
-pub fn gradient_card<R>(ui: &mut egui::Ui, height: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+pub fn gradient_card<R>(
+    ui: &mut egui::Ui,
+    height: f32,
+    flash: f32,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+    ui.painter().add(egui::Shape::Rect(
+        glass_card_shadow().as_shape(rect, Rounding::same(ROUND)),
+    ));
     gradient_rect(
         ui.painter(),
         rect,
@@ -296,9 +511,26 @@ pub fn gradient_card<R>(ui: &mut egui::Ui, height: f32, add: impl FnOnce(&mut eg
         Vec2::new(1.0, 0.55),
         brand_gradient,
     );
+    gradient_rect(ui.painter(), rect, ROUND, Vec2::new(0.0, 1.0), |t| {
+        with_alpha(TEXT, ((1.0 - t).powf(2.2) * 28.0) as u8)
+    });
+    if flash > 0.02 {
+        radial_wash(
+            ui.painter(),
+            rect.center(),
+            rect.width().min(rect.height()) * 0.72,
+            with_alpha(PINK, (flash * 90.0) as u8),
+        );
+        radial_wash(
+            ui.painter(),
+            egui::pos2(rect.left() + rect.width() * 0.22, rect.center().y),
+            rect.height() * 0.85,
+            with_alpha(CYAN, (flash * 70.0) as u8),
+        );
+    }
     // Contour detail stays on the right, behind content and clipped to the hero.
-    let painter = ui.painter().with_clip_rect(rect.shrink(10.0));
-    for line in 0..12 {
+    let painter = ui.painter().with_clip_rect(rect.shrink(12.0));
+    for line in 0..10 {
         let points = (0..60)
             .map(|i| {
                 let x = i as f32 / 59.0;
@@ -310,7 +542,7 @@ pub fn gradient_card<R>(ui: &mut egui::Ui, height: f32, add: impl FnOnce(&mut eg
             .collect();
         painter.add(egui::Shape::line(
             points,
-            Stroke::new(1.0_f32, INK.gamma_multiply(0.13)),
+            Stroke::new(1.0_f32, with_alpha(INK, 22)),
         ));
     }
 
@@ -372,42 +604,45 @@ pub(crate) mod card_probe {
     }
 }
 
-/// A surface panel: body that falls off downwards, border, lit top edge.
+thread_local! {
+    static CARD_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static CARD_FLOOR: Cell<f32> = const { Cell::new(0.0) };
+    static ROW_HEIGHTS: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A frosted panel: translucent Nightfall fill, luminous rim, lit top edge.
 ///
-/// Reserving two paint slots before the content and filling them afterwards
-/// is the only way round the ordering problem — a card's height depends on
-/// what is inside it, and the background has to be underneath. `Shape::Noop`
-/// holds the place; `Painter::set` replaces it once the rect is known.
-///
-/// The three pieces are each nearly invisible alone. Together they are the
-/// difference between a panel and a rectangle of a slightly different colour.
+/// The page wash has to show through or this is just a rounder opaque card.
+/// Notices and banners stay opaque (`tint`) so content never prints through a
+/// warning. A 24-point blur still will not fit the 16-point column gap.
 pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let outer = ui.available_width();
+    let depth = CARD_DEPTH.get();
+    CARD_DEPTH.set(depth + 1);
+    let floor = if depth == 0 { CARD_FLOOR.get() } else { 0.0 };
     #[cfg(test)]
     card_probe::enter();
     let drawn = egui::Frame::none()
-        .fill(SURFACE)
-        .stroke(Stroke::new(1.0_f32, BORDER))
+        .fill(glass_surface())
+        .stroke(Stroke::NONE)
         .rounding(Rounding::same(ROUND))
-        .inner_margin(egui::Margin::same(20.0))
-        // A 24-point blur spreads 24 points in every direction, and the gap
-        // between two columns is 16 — so each card's shadow reached across the
-        // gap, over its neighbour's border and under its content. On a dark
-        // surface that reads as a smeared edge, and it is what made two cards
-        // side by side look as though they overlapped.
-        //
-        // Half the blur, half the drop: still a lift, contained within the
-        // gap. See `two_columns`, which now leaves more room than the blur.
-        .shadow(egui::epaint::Shadow {
-            offset: Vec2::new(0.0, 4.0),
-            blur: 12.0,
-            spread: 0.0,
-            color: Color32::from_black_alpha(30),
-        })
+        .inner_margin(egui::Margin::same(22.0))
+        .shadow(glass_card_shadow())
         .show(ui, |ui| {
-            fill_width(ui, (outer - 40.0).max(0.0));
-            add(ui)
+            fill_width(ui, (outer - 44.0).max(0.0));
+            let y0 = ui.cursor().top();
+            let out = add(ui);
+            if floor > 1.0 {
+                let used = ui.cursor().top() - y0;
+                let inner = (floor - 44.0).max(0.0);
+                ui.add_space((inner - used).max(0.0));
+            }
+            out
         });
+    if depth == 0 {
+        ROW_HEIGHTS.with(|h| h.borrow_mut().push(drawn.response.rect.height()));
+    }
+    CARD_DEPTH.set(depth);
     #[cfg(test)]
     card_probe::leave(drawn.response.rect);
     drawn.inner
@@ -439,13 +674,7 @@ pub fn data_row(ui: &mut egui::Ui, key: &str, value: RichText, last: bool) {
 
 /// A one-pixel rule at the current position, no padding of its own.
 pub fn hairline(ui: &mut egui::Ui) {
-    let w = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 1.0), Sense::hover());
-    ui.painter().hline(
-        rect.x_range(),
-        rect.center().y,
-        Stroke::new(1.0_f32, BORDER.gamma_multiply(0.75)),
-    );
+    ui.add_space(1.0);
 }
 
 /// Pin this UI to `width` so a Frame cannot shrink to its text.
@@ -457,19 +686,10 @@ pub fn fill_width(ui: &mut egui::Ui, width: f32) {
     ui.set_width(width.max(0.0));
 }
 
-/// How much the always-on vertical scrollbar steals from the page.
-///
-/// Banners sit *above* the scroll area. If they use the full panel width
-/// and the cards use the panel minus the bar, the warning is 8–12 px wider
-/// than the hero — which is exactly the "not aligned" the screenshot showed.
-pub fn scroll_gutter(ui: &egui::Ui) -> f32 {
-    ui.spacing().scroll.allocated_width()
-}
-
 /// One centred column for banners *and* the page, sharing a single width.
 ///
 /// Glance pages pass `f32::INFINITY` and fill the panel. Form pages pass a
-/// cap (Send, Settings, Swap) so a text field is not 1400 px wide. Capping
+/// cap (Send, Settings) so a text field is not 1400 px wide. Capping
 /// the page alone, with the scan warning still full-bleed, is what made
 /// Settings look inset and off-centre.
 pub fn page_column<R>(
@@ -514,15 +734,13 @@ pub fn two_columns<A, B>(
     right: impl FnOnce(&mut egui::Ui) -> B,
 ) {
     let avail = ui.available_width();
-    if avail < min_column * 2.0 + GAP_MD {
+    if avail < min_column * 2.0 + GAP_LG {
         left(ui);
         ui.add_space(GAP_LG);
         right(ui);
         return;
     }
     ui.scope(|ui| {
-        // Wider than a card's shadow blur, so the two columns keep their own
-        // light. At GAP_MD the shadows met in the middle of the gap.
         ui.spacing_mut().item_spacing.x = GAP_LG;
         ui.columns(2, |cols| {
             let w0 = cols[0].available_width();
@@ -535,6 +753,48 @@ pub fn two_columns<A, B>(
     });
 }
 
+/// Two cards on one row, stretched to the same height so they read as a grid.
+///
+/// `two_columns` cannot do this: Receive stacks two cards in the right column,
+/// and stretching every sheet would leave a half-width card on its own row.
+pub fn paired_cards<A, B>(
+    ui: &mut egui::Ui,
+    min_column: f32,
+    left: impl FnOnce(&mut egui::Ui) -> A,
+    right: impl FnOnce(&mut egui::Ui) -> B,
+) {
+    let avail = ui.available_width();
+    if avail < min_column * 2.0 + GAP_LG {
+        left(ui);
+        ui.add_space(GAP_LG);
+        right(ui);
+        return;
+    }
+    // Each row needs its own memory. `ui.id().with("pair-h")` was the same
+    // for every pair on a page, so Dashboard row 1 and row 2 overwrote one
+    // height and the cards jumped every frame.
+    let id = ui.auto_id_with("pair-h");
+    let floor = ui.ctx().data(|d| d.get_temp::<f32>(id)).unwrap_or(0.0);
+    ROW_HEIGHTS.with(|h| h.borrow_mut().clear());
+    CARD_FLOOR.set(floor);
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = GAP_LG;
+        ui.columns(2, |cols| {
+            let w0 = cols[0].available_width();
+            fill_width(&mut cols[0], w0);
+            left(&mut cols[0]);
+            let w1 = cols[1].available_width();
+            fill_width(&mut cols[1], w1);
+            right(&mut cols[1]);
+        });
+    });
+    CARD_FLOOR.set(0.0);
+    let row_h = ROW_HEIGHTS.with(|h| h.borrow().iter().copied().fold(0.0_f32, f32::max));
+    if row_h > 1.0 && (row_h - floor).abs() > 1.0 {
+        ui.ctx().data_mut(|d| d.insert_temp(id, row_h));
+    }
+}
+
 /// A horizontal rule for separating groups inside a card.
 ///
 /// The web wallet separates rows with a hairline rather than with empty
@@ -542,65 +802,19 @@ pub fn two_columns<A, B>(
 /// that is most of why its cards read as organised while ours read as a list
 /// of things that happen to be near each other.
 pub fn divider(ui: &mut egui::Ui) {
-    ui.add_space(12.0);
-    let w = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 1.0), Sense::hover());
-    ui.painter().hline(
-        rect.x_range(),
-        rect.center().y,
-        Stroke::new(1.0_f32, BORDER.gamma_multiply(0.8)),
-    );
-    ui.add_space(12.0);
+    ui.add_space(24.0);
 }
 
-/// Small, spaced, uppercase — the web wallet's section heading.
-///
-/// egui has no letter-spacing, so the gaps are inserted between characters
-/// with a thin space. It is a hack, and it is the difference between a
-/// heading that looks designed and one that looks like bold text.
+/// A quiet section heading. Keep the real text intact for assistive readers.
 pub fn kicker(ui: &mut egui::Ui, text: &str) {
-    // An ordinary space, and a step brighter than TEXT_FAINT.
-    //
-    // The tracking is wider than it was because the phone's headings are
-    // wider; at thin-space tracking the desktop ones read as small bold text
-    // rather than as labels. It is a plain U+0020 and not one of the typographic
-    // spaces on purpose: U+2005 gives exactly the width wanted and is missing
-    // from the bundled font, so every heading in the wallet rendered as
-    // "S□A□F□E□ T□O□ R□E□U□S□E". A space that is not in the font is not a
-    // space, it is a box.
-    let spaced: String = text.to_uppercase().chars().flat_map(|c| [c, ' ']).collect();
-    ui.label(
-        RichText::new(spaced.trim_end())
-            .size(11.0)
-            .color(TEXT_FAINT.gamma_multiply(1.35))
-            .strong(),
-    );
-}
-
-/// A bordered chip that sits on the page rather than inside a coloured
-/// wash, so it reads as information and not as an alarm.
-pub fn pill(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
-    let galley =
-        ui.painter()
-            .layout_no_wrap(text.to_string(), egui::FontId::proportional(11.0), color);
-    let size = galley.size() + Vec2::new(22.0, 9.0);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
-    ui.painter().rect(
-        rect,
-        Rounding::same(ROUND_PILL),
-        BG,
-        Stroke::new(1.0_f32, color.gamma_multiply(0.4)),
-    );
-    ui.painter()
-        .galley(rect.center() - galley.size() / 2.0, galley, color);
-    resp
+    ui.label(RichText::new(text).size(13.0).color(TEXT).strong());
 }
 
 /// A full-width notice: one colour, one title, one body, optional actions.
 ///
-/// Dashboard, Activity and Swap each drew this frame by hand. The fills
-/// drifted (0.10 vs 0.12) and so did the title size, so the same kind of
-/// fact — "something needs you" — did not look like the same kind of fact.
+/// Dashboard and Activity each drew this frame by hand. The fills drifted
+/// (0.10 vs 0.12) and so did the title size, so the same kind of fact —
+/// "something needs you" — did not look like the same kind of fact.
 pub fn status_banner(
     ui: &mut egui::Ui,
     color: Color32,
@@ -615,8 +829,8 @@ pub fn status_banner(
     // narrower than the hero.
     let outer = ui.available_width();
     egui::Frame::none()
-        .fill(tint(BG, color, 0.16))
-        .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.55)))
+        .fill(glass_alert(color))
+        .stroke(Stroke::NONE)
         .rounding(Rounding::same(ROUND))
         .inner_margin(egui::Margin::same(16.0))
         .show(ui, |ui| {
@@ -628,7 +842,7 @@ pub fn status_banner(
             });
             if !body.is_empty() {
                 ui.add_space(6.0);
-                ui.label(RichText::new(body).size(12.5).color(TEXT_DIM));
+                ui.label(RichText::new(body).size(13.0).color(TEXT));
             }
             actions(ui);
         });
@@ -639,86 +853,13 @@ pub fn status_banner(
 /// A filter box plus a blank card is what made empty pages look unfinished.
 /// The title is the state; the hint is the next action, in one sentence.
 pub fn empty_state(ui: &mut egui::Ui, title: &str, hint: &str) {
-    ui.add_space(18.0);
+    ui.add_space(12.0);
     ui.vertical_centered(|ui| {
-        ui.label(RichText::new(title).size(14.0).color(TEXT_DIM));
+        ui.label(RichText::new(title).size(15.0).color(TEXT));
         ui.add_space(4.0);
-        ui.label(RichText::new(hint).size(11.5).color(TEXT_FAINT));
+        ui.label(RichText::new(hint).size(13.0).color(TEXT_DIM));
     });
-    ui.add_space(18.0);
-}
-
-/// A section label that folds the block under it.
-///
-/// egui's own `CollapsingHeader` draws its title in plain body text with a
-/// triangle pressed against the first letter, and indents everything under it
-/// by 18 points. On a page made of cards that reads as a stray line of debug
-/// text above a column that no longer lines up — which is exactly what "Start
-/// or join a trade" looked like on Swap. This is the wallet's own section
-/// label with a chevron, and no indent.
-pub fn section_fold<R>(
-    ui: &mut egui::Ui,
-    id: &str,
-    text: &str,
-    default_open: bool,
-    body: impl FnOnce(&mut egui::Ui) -> R,
-) -> Option<R> {
-    let id = egui::Id::new(("section-fold", id));
-    let mut state =
-        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, default_open);
-    let openness = state.openness(ui.ctx());
-
-    ui.add_space(GAP_SM);
-    let spaced: String = text.to_uppercase().chars().flat_map(|c| [c, ' ']).collect();
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 18.0), Sense::click());
-    let lit = response.hovered();
-    let colour = if lit {
-        TEXT_DIM
-    } else {
-        TEXT_FAINT.gamma_multiply(1.35)
-    };
-    // A triangle that points right when closed and down when open, turning
-    // through the openness the state is animating. 12 points of box, so it
-    // reads at the same weight as the label beside it.
-    let c = egui::pos2(rect.left() + 5.0, rect.center().y);
-    let a = std::f32::consts::FRAC_PI_2 * openness;
-    let (sin, cos) = a.sin_cos();
-    let turn = |p: egui::Vec2| egui::pos2(c.x + p.x * cos - p.y * sin, c.y + p.x * sin + p.y * cos);
-    ui.painter().add(egui::Shape::convex_polygon(
-        vec![
-            turn(Vec2::new(-2.5, -5.0)),
-            turn(Vec2::new(4.5, 0.0)),
-            turn(Vec2::new(-2.5, 5.0)),
-        ],
-        colour,
-        Stroke::NONE,
-    ));
-    ui.painter().text(
-        egui::pos2(rect.left() + 18.0, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        spaced.trim_end(),
-        egui::FontId::proportional(11.0),
-        colour,
-    );
-    if response.clicked() {
-        state.toggle(ui);
-    }
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    ui.add_space(GAP_SM);
-
-    let out = state.show_body_unindented(ui, body);
-    state.store(ui.ctx());
-    out.map(|r| r.inner)
-}
-
-/// A grouping label between cards on a long page (Settings).
-pub fn section_label(ui: &mut egui::Ui, text: &str) {
-    ui.add_space(GAP_SM);
-    kicker(ui, text);
-    ui.add_space(GAP_SM);
+    ui.add_space(12.0);
 }
 
 /// A card with a title row.
@@ -743,8 +884,8 @@ pub fn titled_card<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui
 pub fn well<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let outer = ui.available_width();
     egui::Frame::none()
-        .fill(SURFACE_LOW)
-        .stroke(Stroke::new(1.0_f32, BORDER.gamma_multiply(0.9)))
+        .fill(glass_inner())
+        .stroke(Stroke::NONE)
         .rounding(Rounding::same(ROUND_SM))
         .inner_margin(egui::Margin::symmetric(16.0, 14.0))
         .show(ui, |ui| {
@@ -762,7 +903,7 @@ pub fn field_label(ui: &mut egui::Ui, label: &str, note: Option<RichText>) {
     ui.horizontal(|ui| {
         // Same size and colour as the label `text_field` draws, so a form
         // built from both does not have two kinds of field label in it.
-        ui.label(RichText::new(label).size(11.5).color(TEXT_FAINT));
+        ui.label(RichText::new(label).size(12.5).color(TEXT_DIM));
         if let Some(note) = note {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(note);
@@ -833,9 +974,12 @@ pub fn metric_grid(ui: &mut egui::Ui, cells: &[(&str, String, Color32)], separat
     // reading; folding it into two rows of two turns it into two readings and
     // leaves half the card empty — which is what Activity's totals did on a
     // perfectly ordinary window.
-    let columns = if ui.available_width() >= 640.0 {
+    // A half-width dashboard column is typically 400–700 points. Four figures
+    // across that is a squeezed row, not a grid. Keep 2×2 in a column; four
+    // across only on a full-width card.
+    let columns = if ui.available_width() >= 780.0 {
         4
-    } else if ui.available_width() >= 320.0 {
+    } else if ui.available_width() >= 280.0 {
         2
     } else {
         1
@@ -859,7 +1003,7 @@ pub fn metric_grid(ui: &mut egui::Ui, cells: &[(&str, String, Color32)], separat
 pub fn stat(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
     ui.vertical(|ui| {
         ui.set_min_height(46.0);
-        ui.label(RichText::new(label).size(11.0).color(TEXT_FAINT));
+        ui.label(RichText::new(label).size(12.0).color(TEXT_DIM));
         ui.add_space(2.0);
         ui.label(
             RichText::new(value)
@@ -955,7 +1099,7 @@ pub fn dot(ui: &mut egui::Ui, color: Color32, animate: bool) {
         .circle_filled(rect.center(), 4.0, color.gamma_multiply(t));
 }
 
-/// Primary action button — a gradient pill.
+/// Primary action button. Colour is reserved for the page's main action.
 pub fn primary_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
     primary_button_width(ui, text, enabled, None)
 }
@@ -996,7 +1140,7 @@ pub fn primary_button_width(
 
     if enabled {
         let hot = resp.hovered();
-        gradient_rect(ui.painter(), rect, ROUND_PILL, Vec2::new(1.0, 0.0), |t| {
+        gradient_rect(ui.painter(), rect, ROUND_SM, Vec2::new(1.0, 0.0), |t| {
             let c = brand_gradient(t * 0.7);
             if hot {
                 lerp_color(c, Color32::WHITE, 0.07)
@@ -1004,15 +1148,16 @@ pub fn primary_button_width(
                 c
             }
         });
+        // Glass buttons: fill only. A 1px top stroke read as a white hairline.
     } else {
         ui.painter()
-            .rect_filled(rect, Rounding::same(ROUND_PILL), SURFACE_HI);
+            .rect_filled(rect, Rounding::same(ROUND_SM), SURFACE_HI);
     }
 
     if resp.has_focus() {
         ui.painter().rect_stroke(
             rect.expand(3.0),
-            Rounding::same(ROUND_PILL),
+            Rounding::same(ROUND_SM),
             Stroke::new(2.0_f32, ACCENT_HI),
         );
     }
@@ -1065,9 +1210,9 @@ pub fn ghost_button_width(ui: &egui::Ui, text: &str) -> f32 {
 pub fn ghost_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(text).color(TEXT))
-            .fill(SURFACE_HI)
-            .stroke(Stroke::new(1.0_f32, BORDER))
-            .rounding(Rounding::same(ROUND_PILL))
+            .fill(glass_inner())
+            .stroke(Stroke::NONE)
+            .rounding(Rounding::same(ROUND_SM))
             .min_size(Vec2::new(0.0, CONTROL_H)),
     )
 }
@@ -1107,9 +1252,9 @@ pub fn button_row(ui: &mut egui::Ui, labels: &[&str], enabled: bool) -> Option<u
                 ui.add_enabled(
                     enabled,
                     egui::Button::new(RichText::new(*label).color(TEXT))
-                        .fill(SURFACE_HI)
-                        .stroke(Stroke::new(1.0_f32, BORDER))
-                        .rounding(Rounding::same(ROUND_PILL))
+                        .fill(glass_inner())
+                        .stroke(Stroke::NONE)
+                        .rounding(Rounding::same(ROUND_SM))
                         // `min_size` is a floor, not a ceiling: a long label
                         // grew the button straight past the width this row
                         // had agreed on. Truncating holds the row together.
@@ -1160,10 +1305,8 @@ pub fn text_field(
 /// A two- or three-way switch: one row, one decision, one highlighted answer.
 ///
 /// egui's `selectable_label` draws the unselected option with no box at all,
-/// so a pair of them reads as one button beside a stray piece of text — which
-/// is what "I give NIGHT / I give Bitcoin" looked like on Swap, the single
-/// most consequential choice in the wallet. Both halves of a switch have to
-/// look like halves of a switch.
+/// so a pair of them reads as one button beside a stray piece of text. Both
+/// halves of a switch have to look like halves of a switch.
 ///
 /// Returns the index pressed, if any.
 pub fn segmented(ui: &mut egui::Ui, id: &str, labels: &[&str], selected: usize) -> Option<usize> {
@@ -1186,9 +1329,9 @@ pub fn segmented(ui: &mut egui::Ui, id: &str, labels: &[&str], selected: usize) 
     );
     ui.painter().rect(
         rect,
-        Rounding::same(ROUND_PILL),
-        SURFACE_LOW,
-        Stroke::new(1.0_f32, BORDER),
+        Rounding::same(ROUND_SM),
+        glass_surface(),
+        Stroke::NONE,
     );
     let mut clicked = None;
     for (index, label) in labels.iter().enumerate() {
@@ -1198,19 +1341,37 @@ pub fn segmented(ui: &mut egui::Ui, id: &str, labels: &[&str], selected: usize) 
         );
         let resp = ui.interact(seg, egui::Id::new(("segmented", id, index)), Sense::click());
         let on = index == selected;
+        resp.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::SelectableLabel,
+                ui.is_enabled(),
+                on,
+                *label,
+            )
+        });
         if on {
             // The chosen half carries the accent. At SURFACE_HI on SURFACE_LOW
             // the difference was one step of grey, and which way round a swap
             // runs is not something to leave to a careful look.
             ui.painter().rect(
                 seg,
-                Rounding::same(ROUND_PILL),
-                tint(SURFACE_HI, ACCENT_HI, 0.28),
-                Stroke::new(1.0_f32, ACCENT_HI),
+                Rounding::same((ROUND_SM - PAD).max(0.0)),
+                glass_inner(),
+                Stroke::NONE,
             );
         } else if resp.hovered() {
-            ui.painter()
-                .rect_filled(seg, Rounding::same(ROUND_PILL), SURFACE);
+            ui.painter().rect_filled(
+                seg,
+                Rounding::same((ROUND_SM - PAD).max(0.0)),
+                glass_hover(),
+            );
+        }
+        if resp.has_focus() {
+            ui.painter().rect_stroke(
+                seg,
+                Rounding::same(ROUND_SM - PAD),
+                Stroke::new(2.0_f32, ACCENT_HI),
+            );
         }
         ui.painter().text(
             seg.center(),
@@ -1250,12 +1411,8 @@ pub fn choice_button(ui: &mut egui::Ui, label: &str, note: &str, primary: bool) 
     } else {
         SURFACE_HI
     };
-    ui.painter().rect(
-        rect,
-        Rounding::same(ROUND_SM),
-        fill,
-        Stroke::new(1.0_f32, if primary { GRAD_A } else { BORDER }),
-    );
+    ui.painter()
+        .rect(rect, Rounding::same(ROUND_SM), fill, Stroke::NONE);
     if resp.has_focus() {
         ui.painter().rect_stroke(
             rect.expand(3.0),
@@ -1302,14 +1459,10 @@ pub fn choice_button(ui: &mut egui::Ui, label: &str, note: &str, primary: bool) 
 /// wallet is open. It is deliberately not a card — it is the window's edge.
 pub fn screen_header(ui: &mut egui::Ui, network: &str, right: &[(&str, Color32)]) {
     egui::Frame::none()
-        .fill(RAIL)
+        .fill(glass_rail())
+        .stroke(Stroke::NONE)
         .inner_margin(egui::Margin::symmetric(GAP_LG, GAP_SM + 2.0))
-        .rounding(Rounding {
-            nw: ROUND_SM,
-            ne: ROUND_SM,
-            sw: 0.0,
-            se: 0.0,
-        })
+        .rounding(Rounding::same(ROUND))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -1339,16 +1492,12 @@ pub fn screen_header(ui: &mut egui::Ui, network: &str, right: &[(&str, Color32)]
 /// full-width list ends short of it and the card appears to have two right
 /// edges — which is what the About card did. The width is taken outside the
 /// frame, where the margins have not been added yet.
-pub fn inset_note<R>(
-    ui: &mut egui::Ui,
-    tone: Color32,
-    add: impl FnOnce(&mut egui::Ui) -> R,
-) -> R {
+pub fn inset_note<R>(ui: &mut egui::Ui, tone: Color32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     const PAD: f32 = 12.0;
     let inner = (ui.available_width() - PAD * 2.0).max(60.0);
     egui::Frame::none()
-        .fill(tint(SURFACE, tone, 0.13))
-        .stroke(Stroke::new(1.0_f32, tone.gamma_multiply(0.35)))
+        .fill(glass_alert(tone))
+        .stroke(Stroke::NONE)
         .rounding(Rounding::same(ROUND_SM))
         .inner_margin(egui::Margin::same(PAD))
         .show(ui, |ui| {
@@ -1388,13 +1537,20 @@ pub fn check(ui: &mut egui::Ui, on: &mut bool, label: &str) -> bool {
     let (fill, stroke) = match (*on, hot) {
         (true, _) => (GRAD_A, GRAD_A),
         (false, true) => (SURFACE_HOVER, ACCENT_HI),
-        (false, false) => (SURFACE_LOW, BORDER),
+        (false, false) => (SURFACE_LOW, with_alpha(TEXT, 35)),
     };
     ui.painter().rect(
         square,
         Rounding::same(5.0),
         if enabled { fill } else { SURFACE_LOW },
-        Stroke::new(1.0_f32, if enabled { stroke } else { BORDER }),
+        Stroke::new(
+            1.0_f32,
+            if enabled {
+                stroke
+            } else {
+                with_alpha(TEXT, 25)
+            },
+        ),
     );
     if *on {
         // A tick drawn as two strokes, not a glyph: the bundled font has no
@@ -1411,14 +1567,19 @@ pub fn check(ui: &mut egui::Ui, on: &mut bool, label: &str) -> bool {
         ));
     }
     ui.painter().galley(
-        egui::pos2(square.right() + GAP, rect.top() + (height - galley.size().y) / 2.0),
+        egui::pos2(
+            square.right() + GAP,
+            rect.top() + (height - galley.size().y) / 2.0,
+        ),
         galley,
         if enabled { TEXT } else { TEXT_FAINT },
     );
     if hot {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, *on, label));
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, *on, label)
+    });
     if resp.clicked() && enabled {
         *on = !*on;
         return true;
@@ -1439,8 +1600,8 @@ pub fn copyable(ui: &mut egui::Ui, value: &str, wrap: bool) -> bool {
     // because egui charges for a border in more places than one.
     let inner = (ui.available_width() - 30.0).max(80.0);
     egui::Frame::none()
-        .fill(SURFACE_LOW)
-        .stroke(Stroke::new(1.0_f32, BORDER))
+        .fill(glass_inner())
+        .stroke(Stroke::NONE)
         .rounding(Rounding::same(ROUND_SM))
         .inner_margin(egui::Margin::symmetric(12.0, 10.0))
         .show(ui, |ui| {
@@ -1449,13 +1610,12 @@ pub fn copyable(ui: &mut egui::Ui, value: &str, wrap: bool) -> bool {
                 // The copy button's room, asked of the style rather than
                 // guessed: a guess that is two points short overflows the card
                 // the moment the value column claims its full width.
-                let icon = ui
-                    .fonts(|f| {
-                        f.layout_no_wrap("⧉".to_string(), egui::FontId::proportional(15.0), TEXT)
+                let icon =
+                    ui.fonts(|f| {
+                        f.layout_no_wrap("Copy".to_string(), egui::FontId::proportional(12.0), TEXT)
                     })
                     .size()
-                    .x
-                    + ui.spacing().button_padding.x * 2.0;
+                    .x + ui.spacing().button_padding.x * 2.0;
                 let avail = (inner - icon - 8.0).max(40.0);
                 ui.allocate_ui_with_layout(
                     Vec2::new(avail, 0.0),
@@ -1478,7 +1638,7 @@ pub fn copyable(ui: &mut egui::Ui, value: &str, wrap: bool) -> bool {
                 );
                 if ui
                     .add(
-                        egui::Button::new(RichText::new("⧉").size(15.0))
+                        egui::Button::new(RichText::new("Copy").size(12.0))
                             .fill(Color32::TRANSPARENT)
                             .stroke(Stroke::NONE),
                     )
@@ -1593,22 +1753,27 @@ impl Toasts {
 
         for toast in self.items.iter().rev() {
             let age = now - toast.created;
-            let alpha = if age > LIFETIME - 0.6 {
+            let fade = if age > LIFETIME - 0.6 {
                 ((LIFETIME - age) / 0.6).clamp(0.0, 1.0) as f32
             } else {
                 1.0
             };
+            let appear = ((age / 0.28).clamp(0.0, 1.0) as f32).powf(0.65);
+            let alpha = fade * appear;
+            let y_off = (1.0 - appear) * 18.0;
 
             let id = egui::Id::new(("toast", toast.created.to_bits()));
             egui::Area::new(id)
-                .fixed_pos(egui::pos2(screen.max.x - 24.0, y))
+                .fixed_pos(egui::pos2(screen.max.x - 24.0, y + y_off))
                 .pivot(egui::Align2::RIGHT_BOTTOM)
                 .interactable(false)
                 .show(ctx, |ui| {
                     ui.set_opacity(alpha);
                     egui::Frame::none()
-                        .fill(SURFACE_HI)
-                        .stroke(Stroke::new(1.0_f32, toast.color.gamma_multiply(0.6)))
+                        // Toasts overlap page text: use opaque frost so the
+                        // message never merges with the content underneath.
+                        .fill(tint(SURFACE, toast.color, 0.14))
+                        .stroke(Stroke::NONE)
                         .rounding(Rounding::same(ROUND_SM))
                         .inner_margin(egui::Margin::symmetric(14.0, 11.0))
                         .shadow(egui::epaint::Shadow {
@@ -1748,25 +1913,25 @@ mod interaction_tests {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::none())
                     .show(ctx, |ui| {
-                    let outer = ui.max_rect();
-                    let mut inner = Rect::NOTHING;
-                    narrow_column(ui, 620.0, |ui| {
-                        inner = ui.max_rect();
-                        ui.label("x");
+                        let outer = ui.max_rect();
+                        let mut inner = Rect::NOTHING;
+                        narrow_column(ui, 620.0, |ui| {
+                            inner = ui.max_rect();
+                            ui.label("x");
+                        });
+                        let left = inner.left() - outer.left();
+                        let right = outer.right() - inner.right();
+                        assert!(
+                            (left - right).abs() <= 2.0,
+                            "at {width}px left pad {left} != right pad {right}"
+                        );
+                        let expected = width.min(620.0);
+                        assert!(
+                            (inner.width() - expected).abs() <= 2.0,
+                            "inner {} at window {width}, expected {expected}",
+                            inner.width()
+                        );
                     });
-                    let left = inner.left() - outer.left();
-                    let right = outer.right() - inner.right();
-                    assert!(
-                        (left - right).abs() <= 2.0,
-                        "at {width}px left pad {left} != right pad {right}"
-                    );
-                    let expected = width.min(620.0);
-                    assert!(
-                        (inner.width() - expected).abs() <= 2.0,
-                        "inner {} at window {width}, expected {expected}",
-                        inner.width()
-                    );
-                });
             });
         }
     }
@@ -1843,6 +2008,125 @@ mod interaction_tests {
                     });
             });
         }
+    }
+
+    #[test]
+    fn two_columns_share_one_row_height() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            let _ = crate::widgets::card_probe::take();
+            let _ = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(ctx, |ui| {
+                        paired_cards(
+                            ui,
+                            280.0,
+                            |ui| {
+                                card(ui, |ui| {
+                                    ui.label("short");
+                                });
+                            },
+                            |ui| {
+                                card(ui, |ui| {
+                                    ui.label("tall");
+                                    ui.label("second line");
+                                    ui.label("third line");
+                                    ui.label("fourth line");
+                                });
+                            },
+                        );
+                    });
+            });
+        }
+        let cards = crate::widgets::card_probe::take();
+        assert_eq!(cards.len(), 2, "{cards:?}");
+        let dh = (cards[0].0.height() - cards[1].0.height()).abs();
+        assert!(
+            dh <= 2.0,
+            "row heights {} vs {}",
+            cards[0].0.height(),
+            cards[1].0.height()
+        );
+        assert!((cards[0].0.top() - cards[1].0.top()).abs() <= 2.0);
+    }
+
+    #[test]
+    fn two_paired_rows_keep_separate_heights() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(900.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        for _ in 0..4 {
+            let _ = crate::widgets::card_probe::take();
+            let _ = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(ctx, |ui| {
+                        paired_cards(
+                            ui,
+                            280.0,
+                            |ui| {
+                                card(ui, |ui| {
+                                    ui.label("a");
+                                });
+                            },
+                            |ui| {
+                                card(ui, |ui| {
+                                    ui.label("b");
+                                });
+                            },
+                        );
+                        ui.add_space(24.0);
+                        paired_cards(
+                            ui,
+                            280.0,
+                            |ui| {
+                                card(ui, |ui| {
+                                    ui.label("c");
+                                    ui.label("c2");
+                                    ui.label("c3");
+                                    ui.label("c4");
+                                    ui.label("c5");
+                                });
+                            },
+                            |ui| {
+                                card(ui, |ui| {
+                                    ui.label("d");
+                                    ui.label("d2");
+                                    ui.label("d3");
+                                    ui.label("d4");
+                                    ui.label("d5");
+                                });
+                            },
+                        );
+                    });
+            });
+        }
+        let cards = crate::widgets::card_probe::take();
+        assert_eq!(cards.len(), 4, "{cards:?}");
+        let h = |i: usize| cards[i].0.height();
+        assert!((h(0) - h(1)).abs() <= 2.0, "row1 {} vs {}", h(0), h(1));
+        assert!((h(2) - h(3)).abs() <= 2.0, "row2 {} vs {}", h(2), h(3));
+        assert!(
+            h(2) > h(0) + 20.0,
+            "rows must not share one floor: short {} tall {}",
+            h(0),
+            h(2)
+        );
     }
 
     #[test]

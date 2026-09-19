@@ -414,17 +414,35 @@ mod tests {
     #[test]
     fn anything_this_builds_is_something_this_can_read_back() {
         let awkward = [
-            "", "Coffee", "Rent — March", "a & b = c?", "100% of it", "kaffee für zwei",
-            "  leading and trailing  ", "a+b", "50%25", "line\tbreak", "ünïcödé ✓",
+            "",
+            "Coffee",
+            "Rent — March",
+            "a & b = c?",
+            "100% of it",
+            "kaffee für zwei",
+            "  leading and trailing  ",
+            "a+b",
+            "50%25",
+            "line\tbreak",
+            "ünïcödé ✓",
             &"m".repeat(MAX_MEMO),
         ];
         for memo in awkward {
-            for invoice in ["", "A-17", "3f2b8c10-0000-4aaa-bbbb-ccccccccdddd", "#7/2026"] {
-                for amount in [None, Some(0), Some(1), Some(150_000_000), Some(MAX_SUPPLY_DARKS)] {
+            for invoice in [
+                "",
+                "A-17",
+                "3f2b8c10-0000-4aaa-bbbb-ccccccccdddd",
+                "#7/2026",
+            ] {
+                for amount in [
+                    None,
+                    Some(0),
+                    Some(1),
+                    Some(150_000_000),
+                    Some(MAX_SUPPLY_DARKS),
+                ] {
                     for expires in [None, Some(0), Some(1_800_000_000)] {
-                        for network in
-                            [NetworkId::Mainnet, NetworkId::Testnet, NetworkId::Devnet]
-                        {
+                        for network in [NetworkId::Mainnet, NetworkId::Testnet, NetworkId::Devnet] {
                             let request = PaymentRequest {
                                 address: address(),
                                 network,

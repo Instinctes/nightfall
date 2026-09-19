@@ -1,8 +1,31 @@
 # NIGHT ↔ BTC swap — what you can lose
 
-**Not for real coins.** The mainnet gate stays closed until the cross-curve
-proof is reviewed outside this project. This page is the loss list the
-interface has to name, not a promise that any of it is safe.
+> **WITHDRAWN — 18 September 2026.** Atomic swap is not part of NIGHTFALLCOIN.
+> It is not in wallet 1.0.0 and is not scheduled for a later release. The code
+> has been removed from the tree. This document is kept as a historical record
+> only; it describes software that no longer exists in the product. See
+> [`SWAP-WITHDRAWN.md`](SWAP-WITHDRAWN.md) for the decision and its reasoning.
+
+**Not for real coins in this build.** The mainnet gate stays closed. Signed
+fee variants, dedicated backup recovery and the full internal failure matrix
+remain incomplete. The operator requested internal verification with no
+external review on 13 September 2026; that supersedes the earlier
+external-review dependency, not these technical gaps. This page lists losses
+the interface must name, not a promise that they have been eliminated. No
+independent review is claimed.
+
+The current Core gate disables **all mainnet swap execution**, not only new
+offers: packet operations, automatic monitoring and manual recovery broadcasts
+are unavailable. Saved records may be inspected read-only. Preserve original
+wallet data and obtain a reviewed recovery procedure if real funds were locked
+by another build; switching to testnet does not recover mainnet funds.
+
+On an unlocked Vault, experimental swaps persist handshake, execution,
+reservations and send intents together in the encrypted journal. **Locking is
+refused while a swap is unfinished**; deadline monitoring does not continue
+while locked. After unlock, both chains are refreshed before a spend. This is
+not a signed fee ladder and not dedicated backup recovery. Finished journals
+are not retired automatically.
 
 There is no independent timed NIGHT refund. Alice can reclaim her NIGHT after
 Bob publishes his Bitcoin refund, which reveals the required share. That is
@@ -44,7 +67,7 @@ as "0 confirmations".
 - Refund NIGHT. There is no such transaction.
 - Talk to a mailbox. A server that can withhold one packet is an operator.
 - Taproot. The abort tree is P2WSH 2-of-2, ECDSA.
-- Start a swap on mainnet.
+- Start, operate or automatically recover a swap on mainnet in this build.
 
 ## If a packet is lost
 

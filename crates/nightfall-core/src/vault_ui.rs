@@ -458,9 +458,20 @@ mod tests {
         let start = ui.last_activity;
         assert!(!ui.observe_activity(true, false, false, start + Duration::from_secs(299)));
         assert!(ui.observe_activity(true, false, true, start + AUTO_LOCK));
+        // Focus alone never empties the boxes — that is what made the wallet
+        // impossible to type a password into after a minimise and restore.
         credentials(&mut ui, PASSWORD);
         assert!(ui.observe_activity(false, false, false, start));
-        assert!(ui.password.is_empty() && ui.confirmation.is_empty());
+        assert!(!ui.password.is_empty());
+        assert!(ui.observe_activity(false, false, false, start + Duration::from_secs(30)));
+        assert!(
+            !ui.password.is_empty(),
+            "an unfocused lock screen has nothing to protect by emptying its own entry box",
+        );
+        // What must hold from the very first frame: a background unlock landing
+        // after focus was lost may not publish keys.
+        assert!(ui.discard_unlock);
+        // Out of sight empties them at once, with no grace at all.
         credentials(&mut ui, PASSWORD);
         assert!(ui.observe_activity(true, true, false, start));
         assert!(!ui.acknowledged && ui.password.is_empty());
@@ -506,22 +517,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unfinished_swaps_block_migration_before_any_vault_marker() {
-        let f = Fixture::new();
-        let mut wallet = f.legacy(false);
-        let swap = nightfall_swap::persist::StoredSwap::new(
-            nightfall_swap::SwapState::new(nightfall_swap::Role::Bob),
-            1,
-            2,
-        );
-        nightfall_swap::persist::save(&f.root, &swap).unwrap();
-        assert!(wallet
-            .prepare_vault(f.lock.clone(), NETWORK, PASSWORD)
-            .is_err());
-        assert_eq!(wallet.custody(), Custody::Legacy);
-        assert!(!f.root.join("core.seed.vault").exists());
-    }
+    // `unfinished_swaps_block_migration_before_any_vault_marker` lived here.
+    // It pinned the rule that vault enrollment refuses while an experimental
+    // atomic swap holds secrets in files the vault does not encrypt. Atomic
+    // swap was withdrawn before 1.0.0 (`docs/SWAP-WITHDRAWN.md`) and nothing
+    // writes those files any more, so the rule and its test went with it. The
+    // neighbouring tests still pin the part that matters: a refused enrollment
+    // never leaves a vault marker behind.
 
     #[test]
     fn enrollment_rejects_a_different_directory_or_network_without_dropping_the_wallet() {
@@ -844,8 +846,29 @@ impl VaultUi {
         activity: bool,
         now: Instant,
     ) -> bool {
-        if !focused || hidden {
+        // Out of sight empties the fields. Focus alone never does.
+        //
+        // These were one condition, and it made the wallet impossible to type
+        // a password into after the window had been minimised and brought
+        // back. First that was blamed on a stale flag, then on a two-second
+        // grace being too short. Both were guesses, and both were wrong. So
+        // the rule is now the one that cannot misfire: on the lock screen
+        // there is nothing to protect by emptying the box. The wallet is
+        // already locked, the characters are masked, and they are not a secret
+        // at rest — they are the thing being handed over. Destroying them is
+        // pure cost.
+        //
+        // What is *not* relaxed, and what a test pinned before this comment
+        // existed: an unlock that completes in the background after focus was
+        // lost must never publish its keys, and an unlocked wallet still locks
+        // itself the moment it stops being looked at. Both happen from the
+        // first frame, with no grace at all.
+        if hidden {
             self.clear_fields();
+            self.discard_unlock = true;
+            return self.custody == Custody::Unlocked;
+        }
+        if !focused {
             self.discard_unlock = true;
             return self.custody == Custody::Unlocked;
         }
@@ -1216,7 +1239,9 @@ impl VaultUi {
                 }
                 if !available {
                     ui.add_space(8.0);
-                    ui.label("Vault enrollment is not available in this build/platform or while a swap operation is running.");
+                    ui.label(
+                        "Vault enrollment is not available in this build or on this platform.",
+                    );
                     return;
                 }
                 if self.custody == Custody::Unlocked {
@@ -1230,7 +1255,9 @@ impl VaultUi {
                 let new_password = matches!(self.custody, Custody::Legacy | Custody::Unlocked)
                     || (self.custody == Custody::Migration && !self.has_snapshot);
                 ui.add_space(GAP_MD);
-                text_field(
+                // Read Enter before TextEdit consumes it.
+                let enter = ui.ctx().input(|i| i.key_pressed(egui::Key::Enter));
+                let password_field = text_field(
                     ui,
                     "vault-password",
                     if new_password {
@@ -1246,8 +1273,12 @@ impl VaultUi {
                     &mut self.password,
                     true,
                 );
+                if self.custody == Custody::Locked && ui.memory(|m| m.focused().is_none()) {
+                    password_field.request_focus();
+                }
+                let mut confirm_focused = false;
                 if new_password {
-                    text_field(
+                    let confirm_field = text_field(
                         ui,
                         "vault-password-confirm",
                         "Password again",
@@ -1255,12 +1286,15 @@ impl VaultUi {
                         &mut self.confirmation,
                         true,
                     );
-                    ui.label(egui::RichText::new("Use a password manager or a long unique passphrase — never your recovery words.").size(11.5).color(TEXT_FAINT));
+                    confirm_focused = confirm_field.has_focus() || confirm_field.lost_focus();
+                    ui.label(egui::RichText::new("Use a password manager or a long unique passphrase — never your recovery words.").size(11.5).color(TEXT_DIM));
                 }
+                let password_focused = password_field.has_focus() || password_field.lost_focus();
+                let password_enter = enter && (password_focused || confirm_focused);
                 let migrating = matches!(self.custody, Custody::Legacy | Custody::Migration);
                 if migrating {
                     ui.add_space(12.0);
-                    crate::widgets::check(ui, &mut self.acknowledged, "I have my offline recovery backup and understand that old backups and experimental swap secrets are not erased or encrypted by this migration.");
+                    crate::widgets::check(ui, &mut self.acknowledged, "I have my offline recovery backup and understand that older backups are not erased or encrypted by this migration.");
                     ui.label("Contacts and preferences are outside Vault. Interrupted legacy save files must be resolved before continuing.");
                 }
                 let (label, requested) = match self.custody {
@@ -1294,6 +1328,17 @@ impl VaultUi {
                     None
                 };
                 ui.add_space(GAP_MD);
+                if password_enter {
+                    match blocker {
+                        Some(reason) => self.error = Some(reason.to_owned()),
+                        None => {
+                            ui.ctx().input_mut(|i| {
+                                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+                            });
+                            action = Some(requested);
+                        }
+                    }
+                }
                 match button_row(ui, &[label, "Clear fields"], true) {
                     Some(0) => match blocker {
                         Some(reason) => self.error = Some(reason.to_owned()),
@@ -1309,7 +1354,7 @@ impl VaultUi {
                     ui.add_space(20.0);
                     ui.separator();
                     ui.heading("Encrypted backups");
-                    ui.label("Save a separate .nfv file with the committed seed, outputs and history. No existing file is overwritten. Contacts, preferences and experimental swap secrets are not included.");
+                    ui.label("Save a separate .nfv file with the committed seed, outputs and history. No existing file is overwritten. Contacts and preferences are not included.");
                     ui.add_space(8.0);
                     ui.add(
                         egui::TextEdit::singleline(&mut self.backup_path)

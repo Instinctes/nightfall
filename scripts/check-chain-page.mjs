@@ -150,7 +150,7 @@ for (const [tool, why] of [
 }
 
 /* The nav link must be on every page that has a nav, or the page is orphaned. */
-const pages = ["index.html", "emission/index.html", "build/index.html", "audit/index.html", "view-key/index.html", "chain/index.html"];
+const pages = ["index.html", "emission/index.html", "build/index.html", "audit/index.html", "view-key/index.html", "chain/index.html", "compare/index.html", "whitepaper/index.html"];
 for (const p of pages) {
     const t = readFileSync(ROOT + "website/public/" + p, "utf8");
     if (t.includes('class="nav-links"') && !t.includes('href="/chain/"')) {

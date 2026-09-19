@@ -1,0 +1,1239 @@
+{
+  "title": "NIGHTFALL",
+  "subtitle": "Private settlement. Verifiable supply.",
+  "edition": "18 September 2026",
+  "version": "1.0.0",
+  "protocol": 8,
+  "wire": 6,
+  "genesis": "061a052d49607ff8f4b306c75d622ebd230cff4ec3a45a6dffc2f7738d4b20de",
+  "commit": "c773743b627494f892a7bd1bf7cc1f38cb0bb006",
+  "sections": [
+    {
+      "id": "abstract",
+      "title": "The case for private settlement",
+      "label": "01 / Thesis",
+      "lead": "A payment system should verify the transfer of value without making every user's financial history public.",
+      "blocks": [
+        {
+          "type": "p",
+          "text": "NIGHTFALLCOIN (NIGHT) is a native proof-of-work currency built around confidential values, non-interactive stealth payments and publicly checkable monetary accounting. Its ledger represents amounts as commitments, authorizes spends with one-time keys and aggregates transaction components into canonically ordered blocks. It is a settlement system, not a general-purpose smart-contract platform."
+        },
+        {
+          "type": "p",
+          "text": "The central design choice is to combine private payment amounts with an explicit supply invariant. Nodes check a relationship between unspent commitments, accumulated kernel excesses, issuance and burned fees. That relationship is useful only together with valid range proofs, signatures, authorization and correct state transitions. An equation by itself is not a security proof."
+        },
+        {
+          "type": "cards",
+          "items": [
+            [
+              "Confidential by construction",
+              "Native transfer amounts and recipient addresses are not published in cleartext."
+            ],
+            [
+              "Accountable monetary rules",
+              "Integer issuance, a fixed ceiling and public fee accounting are enforced by the client."
+            ],
+            [
+              "User-controlled disclosure",
+              "View keys and payment receipts expose different information without granting spending authority."
+            ]
+          ]
+        },
+        {
+          "type": "p",
+          "text": "This paper explains the implementation represented by release 1.0.0, protocol 8 and wire version 6. It also identifies operational trust, unresolved security risks and research objectives. It makes no claim of universal anonymity, hardware neutrality, guaranteed finality or investment performance."
+        },
+        {
+          "type": "callout",
+          "title": "Mainnet exists. Assurance is still developing.",
+          "text": "No independent audit is established by this paper. Atomic swaps were withdrawn before 1.0.0 and removed from the software, so the permanent-lock loss mode they carried is no longer reachable — and no cross-chain exchange is offered in its place. These are present limitations, not footnotes to a launch promise."
+        }
+      ],
+      "sources": [
+        "types",
+        "ledger",
+        "review"
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": "One currency, explicit trust boundaries",
+      "label": "02 / System architecture",
+      "lead": "The wallet, the node and the website perform different jobs. Their security claims should not be interchangeable.",
+      "blocks": [
+        {
+          "type": "flow",
+          "items": [
+            [
+              "Wallet",
+              "Keys, scanning and signing"
+            ],
+            [
+              "Node",
+              "Validation and chain state"
+            ],
+            [
+              "Peers",
+              "Propagation and synchronization"
+            ],
+            [
+              "Proof of work",
+              "Ordering under consensus rules"
+            ]
+          ]
+        },
+        {
+          "type": "p",
+          "text": "A wallet constructs outputs and authorizes spending. A full node maintains the unspent-output set, validates candidate blocks and selects a permitted history by accumulated work. Peers deliver data; their messages are inputs to validation, not authority to create money. Miners assemble blocks and search for an acceptable proof of work."
+        },
+        {
+          "type": "h",
+          "text": "Core and the browser are not equivalent validators"
+        },
+        {
+          "type": "p",
+          "text": "Core combines a local node, wallet and miner. The browser wallet performs key operations locally but obtains chain data through a remote light API. A remote node can withhold or misreport information even though node access alone does not reveal the spending key. A compromised wallet application or device is a separate, stronger threat."
+        },
+        {
+          "type": "table",
+          "headers": [
+            "Boundary",
+            "What crosses it",
+            "What must not be inferred"
+          ],
+          "rows": [
+            [
+              "Wallet to node",
+              "Queries and signed transactions",
+              "Acceptance is not confirmation."
+            ],
+            [
+              "Peer to full node",
+              "Headers, blocks and transactions",
+              "A peer's claims are not validation."
+            ],
+            [
+              "Browser to website",
+              "HTTPS requests and application code",
+              "HTTPS does not make first-party code trustworthy."
+            ],
+            [
+              "Website to light node",
+              "Proxied requests over the configured transport",
+              "A displayed balance is not an independently verified chain."
+            ]
+          ]
+        },
+        {
+          "type": "p",
+          "text": "Consensus rules do not remove implementation or distribution trust. A user still chooses a client binary, its checkpoint policy, an operating system and a way to obtain peers. These dependencies are made explicit throughout this paper."
+        }
+      ],
+      "sources": [
+        "node",
+        "consensus",
+        "review"
+      ]
+    },
+    {
+      "id": "payments",
+      "title": "From an address to a one-time output",
+      "label": "03 / Payment construction",
+      "lead": "Receiving a payment does not require the recipient to participate in an interactive signing session.",
+      "blocks": [
+        {
+          "type": "p",
+          "text": "The address contains a scan public key A and a spend public key B. A sender samples an ephemeral scalar r and publishes Ke = rG. The sender and receiver derive the same shared secret from rA and aKe, where a is the scan secret. Domain-separated derivations produce a blinding scalar, a one-time key offset and payload-encryption material."
+        },
+        {
+          "type": "formula",
+          "lines": [
+            "A = aG       B = sG       Ke = rG",
+            "shared = KDF(rA) = KDF(aKe)",
+            "Ko = B + oG       C = vG + rho H"
+          ],
+          "caption": "Conceptual notation: a is the scan secret; s the spend secret; o a derived offset; rho the commitment blinding scalar. Exact domains and byte encodings are defined in code."
+        },
+        {
+          "type": "p",
+          "text": "The output carries a commitment, range proof, ephemeral key, one-time public key, view tag, encrypted payload and sender signature. The receiver scans for matching outputs, decrypts the value and memo, and checks that the recovered opening recreates the published commitment. A successfully decrypted payload alone is not enough."
+        },
+        {
+          "type": "h",
+          "text": "Why the sender cannot reclaim the payment"
+        },
+        {
+          "type": "p",
+          "text": "The sender knows the derived offset and blinding factor, but not the recipient's spend secret s. Spending requires authorization under Ko, whose secret is s + o. The input verifier obtains Ko from the existing UTXO entry, not from a replacement key supplied by the spender."
+        },
+        {
+          "type": "callout",
+          "title": "A view tag is a scanning hint, not an identity.",
+          "text": "A short tag helps reject non-matching outputs before more work is performed. It neither replaces commitment checks nor proves ownership. Fresh ephemeral randomness is essential; this construction must not be implemented by reusing r."
+        }
+      ],
+      "sources": [
+        "crypto",
+        "ledger"
+      ]
+    },
+    {
+      "id": "cryptography",
+      "title": "A compact cryptographic foundation",
+      "label": "04 / Primitives and composition",
+      "lead": "Established primitives reduce the invention surface. Their integration still requires its own security analysis.",
+      "blocks": [
+        {
+          "type": "table",
+          "headers": [
+            "Component",
+            "Native protocol choice",
+            "Role"
+          ],
+          "rows": [
+            [
+              "Group",
+              "Ristretto over Curve25519",
+              "Prime-order group abstraction and canonical encodings."
+            ],
+            [
+              "Commitment",
+              "Pedersen: C = vG + rho H",
+              "Hide values while permitting additive accounting."
+            ],
+            [
+              "Range proof",
+              "64-bit Bulletproof per output",
+              "Constrain the committed value to the supported non-negative range."
+            ],
+            [
+              "Signatures",
+              "Generator-parameterized Schnorr",
+              "Authorize inputs and bind kernel/output fields."
+            ],
+            [
+              "Hashing",
+              "Domain-separated BLAKE3",
+              "Separate cryptographic messages and derivation purposes."
+            ],
+            [
+              "Payload",
+              "XChaCha20-Poly1305",
+              "Authenticated encryption of value, blinding and padded memo."
+            ],
+            [
+              "Mining",
+              "Argon2id-based Nighthash-v2",
+              "Memory-hard proof-of-work computation."
+            ]
+          ]
+        },
+        {
+          "type": "p",
+          "text": "Commitments and range proofs use the same generator pair from PedersenGens. Binding relies on the assumed hardness of finding the discrete-log relation between G and H. Proof and signature checks must reject invalid encodings and bind the intended context. Bulletproofs require no trusted setup, but that property does not certify Nightfall's application of them."
+        },
+        {
+          "type": "p",
+          "text": "Native payment cryptography stands alone in 1.0.0. The experimental Bitcoin swap adapter, which added secp256k1, a cross-curve proof and a second implementation of the same curve arithmetic, was withdrawn with the feature; that review surface is no longer part of the build."
+        },
+        {
+          "type": "callout",
+          "title": "Security is a composition question.",
+          "text": "Randomness, key derivation, transcript binding, integer arithmetic, message parsing and persistence can invalidate a system assembled from individually sound primitives. This paper is explanatory documentation, not a formal proof of that composition."
+        }
+      ],
+      "sources": [
+        "crypto",
+        "ristretto",
+        "bulletproofs",
+        "argon2"
+      ]
+    },
+    {
+      "id": "accounting",
+      "title": "Confidential value, public accounting",
+      "label": "05 / The supply invariant",
+      "lead": "The ledger checks conservation without publishing each user's balance.",
+      "blocks": [
+        {
+          "type": "formula",
+          "lines": [
+            "sum(outputs) - sum(inputs)",
+            "+ fee G - reward G = sum(kernel excesses)"
+          ],
+          "caption": "Local balance equation. The reward term includes the permitted coinbase value; after subsidy ends, coinbase value is funded by fees rather than new issuance."
+        },
+        {
+          "type": "p",
+          "text": "For an ordinary transfer, output value plus the public fee equals input value. Its remaining commitment difference is a blinding excess. Kernels carry Schnorr signatures relative to H. The verifier requires both the expected excess and valid signatures; merely publishing the publicly computable difference would prove nothing."
+        },
+        {
+          "type": "formula",
+          "lines": [
+            "sum(UTXO commitments) - sum(all kernel excesses)",
+            "= (total minted - total burned fees) G"
+          ],
+          "caption": "Global invariant. UTXO commitments and kernel excesses are group elements; minted and burned values are integer accounting totals."
+        },
+        {
+          "type": "p",
+          "text": "Starting from the defined genesis state, accepted transitions preserve this invariant. Range proofs exclude invalid value encodings; input signatures establish spending authority; UTXO checks prevent double spending; emission rules bound coinbase issuance. Removing any of these checks changes the security argument."
+        },
+        {
+          "type": "h",
+          "text": "What the public website can demonstrate"
+        },
+        {
+          "type": "p",
+          "text": "The network page displays a node's reported totals and invariant result. The browser does not independently replay the ledger or verify the full cryptographic statement. Independent verification requires a validating implementation and an understood policy for trusted local state and historical checkpoints."
+        },
+        {
+          "type": "callout",
+          "title": "The lesson from the discarded v4 construction",
+          "text": "A comparison against a value recomputed from the same public inputs was not evidence of conservation. The current construction adds the necessary knowledge checks and regression coverage. That history is a reason to demand scrutiny, not a claim that future defects are impossible."
+        }
+      ],
+      "sources": [
+        "crypto",
+        "ledger",
+        "review"
+      ]
+    },
+    {
+      "id": "consensus",
+      "title": "Proof of work, with bounded finality",
+      "label": "06 / Ordering and validation",
+      "lead": "Valid history is selected by cumulative work within the rules enforced by the client.",
+      "blocks": [
+        {
+          "type": "p",
+          "text": "Mainnet uses Nighthash-v2 with Argon2id parameters of 32 MiB, one iteration and one lane. The design imposes a memory cost on each hashing instance. It does not establish that GPUs or purpose-built hardware have no advantage, that every CPU earns equally, or that mining is profitable. No hardware-efficiency benchmark is claimed here."
+        },
+        {
+          "type": "table",
+          "headers": [
+            "Rule",
+            "Current mainnet parameter"
+          ],
+          "rows": [
+            [
+              "Target interval",
+              "15 seconds; a target, not a delivery guarantee"
+            ],
+            [
+              "Retarget",
+              "Every block, LWMA-1 over 90 blocks"
+            ],
+            [
+              "Difficulty floor",
+              "2,000"
+            ],
+            [
+              "Timestamp",
+              "Above median of previous 11; no more than 120 seconds into the future"
+            ],
+            [
+              "Coinbase maturity",
+              "1,440 blocks; approximately 6 hours at target spacing"
+            ],
+            [
+              "Rewind bound",
+              "500 blocks of the node's current history"
+            ],
+            [
+              "Compiled checkpoint",
+              "Height 25,000 in the reviewed release"
+            ]
+          ]
+        },
+        {
+          "type": "p",
+          "text": "A miner's proposed block must satisfy shape, ordering, parent linkage, timing, difficulty, proof-of-work, authorization, commitment and issuance checks. Rejected transitions must not partially alter ledger state. Transaction selection in the current mempool sorts candidates by fee and skips conflicts; fees are nevertheless burned during subsidy eras."
+        },
+        {
+          "type": "h",
+          "text": "A checkpoint is a trust decision, not finality magic"
+        },
+        {
+          "type": "p",
+          "text": "The client refuses histories conflicting with its compiled checkpoint and rewinds beyond its bound. These rules constrain which forks it can adopt; they do not prevent an adversary from mining a competing history or guarantee automatic recovery from a deep disagreement. Checkpoint-anchored replay can also skip costly verification of a historical prefix."
+        },
+        {
+          "type": "callout",
+          "title": "Confirmations reduce uncertainty; they do not eliminate it.",
+          "text": "Reorganization exposure depends on competing work, connectivity, client policy and the value at risk. Fifteen-second blocks should not be presented as fifteen-second irreversible settlement."
+        }
+      ],
+      "sources": [
+        "types",
+        "consensus",
+        "argon2"
+      ]
+    },
+    {
+      "id": "emission",
+      "title": "A monetary schedule written in integers",
+      "label": "07 / Issuance and fees",
+      "lead": "No premine, no tail emission, and a ceiling that the integer schedule never quite reaches.",
+      "blocks": [
+        {
+          "type": "formula",
+          "lines": [
+            "era(h) = floor(h / 7,500,000)",
+            "subsidy(h) = floor(600,000,000 / 2^era(h)) darks"
+          ],
+          "caption": "Height h is zero-based. One NIGHT is 100,000,000 darks. The implementation also enforces the remaining supply ceiling."
+        },
+        {
+          "type": "chart",
+          "title": "Cumulative scheduled issuance",
+          "caption": "Share of the 90 million ceiling at the end of each era. These are supply shares, not returns. Heights determine issuance; calendar dates do not."
+        },
+        {
+          "type": "p",
+          "text": "The initial subsidy is 6 NIGHT per block. Each paying era contains 7,500,000 blocks. Integer truncation eventually reduces the subsidy to zero: there are 30 paying eras, with total scheduled issuance of 89,999,999.25 NIGHT. The 90,000,000 ceiling is therefore not a promised terminal balance."
+        },
+        {
+          "type": "table",
+          "headers": [
+            "Period",
+            "New issuance",
+            "Treatment of fees"
+          ],
+          "rows": [
+            [
+              "Subsidy remains positive",
+              "Scheduled subsidy to the miner",
+              "Fees are destroyed; circulation decreases by the burned amount."
+            ],
+            [
+              "Subsidy is zero",
+              "None",
+              "Fees fund the miner's coinbase; no additional issuance or fee burn."
+            ]
+          ]
+        },
+        {
+          "type": "p",
+          "text": "A fair-launch rule does not guarantee a fair distribution of ownership. Access to hardware, energy, information and early participation still matters. Likewise, a fee-only future does not guarantee an adequate security budget: demand for settlement and the economics of securing it remain open empirical questions."
+        }
+      ],
+      "sources": [
+        "types",
+        "ledger",
+        "consensus"
+      ]
+    },
+    {
+      "id": "schedule",
+      "title": "Every era, down to the last dark",
+      "label": "08 / Exact emission schedule",
+      "lead": "All figures are derived using integer darks, not floating-point approximations of a geometric curve.",
+      "blocks": [
+        {
+          "type": "schedule"
+        },
+        {
+          "type": "p",
+          "text": "Era e covers heights e x 7,500,000 through (e + 1) x 7,500,000 - 1. At height 225,000,000 the scheduled subsidy is zero. Fees burned in earlier eras are not reissued. Actual circulating supply can therefore be lower than the cumulative issuance shown."
+        }
+      ],
+      "sources": [
+        "types",
+        "ledger"
+      ]
+    },
+    {
+      "id": "privacy",
+      "title": "Privacy is a threat model, not a slogan",
+      "label": "09 / What observers can learn",
+      "lead": "Hiding amounts and addresses is meaningful. It is not the same as erasing every relationship or concealing every network interaction.",
+      "blocks": [
+        {
+          "type": "table",
+          "headers": [
+            "Observer",
+            "Protected information",
+            "Remaining exposure"
+          ],
+          "rows": [
+            [
+              "Passive chain reader",
+              "Plaintext transfer values and reusable recipient addresses",
+              "Input/output structure, public fees, block timing, coinbase flags and graph information."
+            ],
+            [
+              "Payment counterparty",
+              "Unrelated private keys and undisclosed wallet history",
+              "Its own payment, the address shared with it and out-of-band context."
+            ],
+            [
+              "First-hop peer or network observer",
+              "Some origin information can be obscured by relay/proxy choices",
+              "Timing, topology, fallback paths and correlation across observations."
+            ],
+            [
+              "Light-API operator",
+              "Spending key is not required for serving data",
+              "Requests, submission timing and the ability to misreport or withhold chain data."
+            ],
+            [
+              "Compromised wallet device",
+              "No general protection established",
+              "Keys, decrypted history, signing actions and local backups can be exposed."
+            ]
+          ]
+        },
+        {
+          "type": "h",
+          "text": "Aggregation is not graph erasure"
+        },
+        {
+          "type": "p",
+          "text": "Blocks merge and sort inputs, outputs and kernels rather than retaining their original transaction grouping. Observers who saw transactions before aggregation may retain that grouping. Low activity also limits the ambiguity a block can provide. A block containing a single payment is not a large anonymity set."
+        },
+        {
+          "type": "p",
+          "text": "Cut-through is not applied in this construction. Inputs retain explicit authorization under one-time output keys. Simply removing created-and-spent components would discard evidence needed by the present validation design. This is a constraint of this implementation, not a proof that every future non-interactive design must make the same trade-off."
+        },
+        {
+          "type": "callout",
+          "title": "No universal anonymity claim",
+          "text": "Nightfall does not claim to defeat a global observer, malicious endpoint software or disclosure by a counterparty. No numeric anonymity score or measured resistance to deanonymization is established by this paper."
+        }
+      ],
+      "sources": [
+        "crypto",
+        "ledger",
+        "node",
+        "review"
+      ]
+    },
+    {
+      "id": "disclosure",
+      "title": "Disclosure belongs to the holder",
+      "label": "10 / View keys and receipts",
+      "lead": "Proving one payment should not require handing over the ability to spend or the history of every payment.",
+      "blocks": [
+        {
+          "type": "cards",
+          "columns": 3,
+          "items": [
+            [
+              "Address / nf1",
+              "A destination shared with a sender. Not a spending credential."
+            ],
+            [
+              "View key / nfview1",
+              "Scanning and decryption authority for matching outputs. Financially sensitive, but not a spend key."
+            ],
+            [
+              "Payment receipt",
+              "An opening and signature for one output. A narrower statement than sharing a view key."
+            ]
+          ]
+        },
+        {
+          "type": "p",
+          "text": "A view key contains the scan secret and spend public key. It enables the holder to identify and open matching outputs without the spend secret. Treat it as continuing access to sensitive financial information, including future matching outputs. It is not a harmless public identifier or a revocable web-session token."
+        },
+        {
+          "type": "p",
+          "text": "A receipt discloses an individual commitment opening and a signature by the address's spend key. Verification checks the opening and signature. A verifier still needs appropriate chain evidence to establish inclusion and confirmation; the receipt alone does not establish that the output remains unspent."
+        },
+        {
+          "type": "flow",
+          "items": [
+            [
+              "Choose the statement",
+              "One output or broader viewing"
+            ],
+            [
+              "Verify cryptography",
+              "Opening and signature"
+            ],
+            [
+              "Check chain context",
+              "Inclusion and confirmations"
+            ]
+          ]
+        },
+        {
+          "type": "p",
+          "text": "A recipient should ask what the verifier actually needs before sharing a view key. A receipt can support reconciliation or evidence of a specific transfer; it is not a legal attestation, identity certificate or guarantee of exclusive ownership. Time-window proofs and balance lower bounds remain research objectives, not current receipt features."
+        },
+        {
+          "type": "callout",
+          "title": "Never disclose recovery words for verification.",
+          "text": "A request for proof of payment never justifies sharing the spend seed. Recovery words are not an alternative receipt format."
+        }
+      ],
+      "sources": [
+        "crypto",
+        "wallet",
+        "review"
+      ]
+    },
+    {
+      "id": "wallets",
+      "title": "Self-custody across two interfaces",
+      "label": "11 / Core and web wallet",
+      "lead": "The same asset is available through different operating models, with different failure modes.",
+      "blocks": [
+        {
+          "type": "table",
+          "headers": [
+            "",
+            "Core / desktop",
+            "Web / desktop and mobile"
+          ],
+          "rows": [
+            [
+              "Chain data",
+              "Local node and stored chain state",
+              "Remote light API"
+            ],
+            [
+              "Key operations",
+              "Local application",
+              "Local browser application / WebAssembly"
+            ],
+            [
+              "Mining",
+              "Integrated",
+              "Not a browser mining client"
+            ],
+            [
+              "State retention",
+              "Application data directory",
+              "Browser storage can be cleared or lost"
+            ],
+            [
+              "Main dependency",
+              "Device, client distribution and validation policy",
+              "Those risks plus first-party scripts and remote display trust"
+            ]
+          ]
+        },
+        {
+          "type": "h",
+          "text": "Recovery words are a specific format"
+        },
+        {
+          "type": "p",
+          "text": "Nightfall encodes its 32-byte wallet seed directly as 24 BIP-39 words. It does not derive that seed using BIP-39's PBKDF2 wallet-seed procedure, and it does not support a BIP-39 passphrase or '25th word'. The familiar word encoding does not imply Bitcoin or Ethereum wallet compatibility. Do not reuse another wallet's phrase."
+        },
+        {
+          "type": "p",
+          "text": "The phrase recovers key material, not every piece of application state. Contacts, labels and preferences require separate treatment."
+        },
+        {
+          "type": "callout",
+          "title": "Browser storage is not a secure backup.",
+          "text": "The current web wallet persists exported seed-containing state in localStorage. The website and wallet share an origin. Malicious first-party JavaScript, an extension or a compromised device can expose that state. Separating origins and protecting locked storage are priorities, not shipped guarantees."
+        },
+        {
+          "type": "p",
+          "text": "Wallet interfaces must distinguish spendable, pending and immature funds. A retry is a rebroadcast attempt, not evidence of confirmation. Back up recovery words offline, protect the device and verify the destination before signing."
+        }
+      ],
+      "sources": [
+        "wallet",
+        "crypto",
+        "review",
+        "bip39"
+      ]
+    },
+    {
+      "id": "network",
+      "title": "Propagation without pretending it is anonymity",
+      "label": "12 / Network and light access",
+      "lead": "Privacy, availability and resource limits must be evaluated together.",
+      "blocks": [
+        {
+          "type": "p",
+          "text": "Native peers exchange bounded newline-delimited JSON messages over TCP. Handshakes check the network, wire version and genesis. The implementation caps individual P2P messages at 4 MiB and serialized blocks at 2 MiB. These ceilings are defenses against some resource-exhaustion paths, not a complete denial-of-service analysis."
+        },
+        {
+          "type": "h",
+          "text": "Dandelion-class relay, accurately described"
+        },
+        {
+          "type": "p",
+          "text": "A locally originated transaction initially takes a stem path. Relays probabilistically continue stemming, with a configured probability of 90%, or fluff to a wider set. The current session-based path records an embargo of 12-28 seconds and later fluffs transactions still retained in the mempool. A fallback path for absent live sessions has different delivery behavior."
+        },
+        {
+          "type": "p",
+          "text": "These mechanisms are inspired by Dandelion research; the paper's formal guarantees cannot simply be assigned to this implementation. Topology, adversarial peers, timing and fallback behavior all matter. Delivery still depends on connectivity, and pending-send retry logic remains relevant."
+        },
+        {
+          "type": "table",
+          "headers": [
+            "Transport boundary",
+            "Current behavior",
+            "Limitation"
+          ],
+          "rows": [
+            [
+              "Native outbound peers",
+              "SOCKS5/Tor configured by default",
+              "Unavailable proxy can lead to clearnet fallback; .onion destinations do not use that fallback."
+            ],
+            [
+              "Browser to website",
+              "HTTPS and same-origin proxy",
+              "Does not hide requests from the website operator."
+            ],
+            [
+              "Worker to light upstream",
+              "One configured HTTP upstream",
+              "No upstream TLS or independent failover established in this configuration."
+            ]
+          ]
+        },
+        {
+          "type": "callout",
+          "title": "Decentralized rules are not decentralized operations.",
+          "text": "Independent validation is valuable, but discovery services, hosting and release distribution can remain operational bottlenecks. Multiple names resolving to the same machine do not create independent redundancy."
+        }
+      ],
+      "sources": [
+        "types",
+        "node",
+        "review",
+        "dandelion"
+      ]
+    },
+    {
+      "id": "synchronization",
+      "title": "Synchronization is part of the trust model",
+      "label": "13 / Storage and bootstrap",
+      "lead": "Faster delivery of chain data should not be confused with stronger evidence that the data is correct.",
+      "blocks": [
+        {
+          "type": "p",
+          "text": "The client supports binary chain storage as well as legacy JSON storage. A disk-format change is not a consensus change: block identity is not defined by the choice between those encodings. Operating-system data-directory locks prevent concurrent writers; they neither encrypt keys nor defend against a compromised local account."
+        },
+        {
+          "type": "flow",
+          "items": [
+            [
+              "Obtain archive",
+              "Versioned file and manifest"
+            ],
+            [
+              "Check integrity",
+              "Size and published checksum"
+            ],
+            [
+              "Import and validate",
+              "Client rules and replay policy"
+            ],
+            [
+              "Catch up",
+              "Compare and synchronize with peers"
+            ]
+          ]
+        },
+        {
+          "type": "p",
+          "text": "Bootstrap archives reduce the work of obtaining historical bytes. A checksum confirms agreement with the published checksum, not the honesty of an operator who controls both. The archive is not an independent trust anchor. Its contents remain subject to the client's import and replay policy."
+        },
+        {
+          "type": "h",
+          "text": "Trusted replay must be named"
+        },
+        {
+          "type": "p",
+          "text": "Local validation records and checkpoint-anchored replay can avoid repeating expensive checks. The checkpoint optimization requires a reached mainnet pin with the expected hash. NIGHTFALL_NO_ASSUME_VALID disables that checkpoint-based optimization, not every use of previously validated local state. 'Every proof is checked on every startup' would be inaccurate."
+        },
+        {
+          "type": "p",
+          "text": "Pruned operation retains the state and recent history needed by the supported local policy, including the last 500 block bodies. It cannot replace an archival peer for all historical or light-API requests. If the evidence needed to trust pruned local state is invalid, omitted history may need to be obtained again."
+        },
+        {
+          "type": "callout",
+          "title": "Recovery procedures are a security feature.",
+          "text": "Operators need a documented response to corrupted storage, deep forks, conflicting checkpoints and unavailable archives. Neither a successful download nor a faster progress bar demonstrates independently validated settlement."
+        }
+      ],
+      "sources": [
+        "consensus",
+        "storage",
+        "review"
+      ]
+    },
+    {
+      "id": "swaps",
+      "title": "Atomic swaps: built, reviewed, withdrawn",
+      "label": "14 / Withdrawn interoperability",
+      "lead": "A NIGHT/BTC atomic swap was implemented, reviewed, and withdrawn before 1.0.0. The reason is a property of the chain, not a defect that was fixed.",
+      "blocks": [
+        {
+          "type": "p",
+          "text": "The experimental protocol coordinated Bitcoin P2WSH 2-of-2 transactions, ECDSA adaptor signatures, relative-timelock abort paths and a shared NIGHT spend condition, with a cross-curve proof connecting the two cryptographic domains. It worked. It is not shipped and it is not scheduled."
+        },
+        {
+          "type": "p",
+          "text": "Nightfall has no script language, and that property is what makes the chain private: outputs are commitments and signatures, not programs, so there is no place to express “return this after a deadline”. A Bitcoin lock can refund itself on a relative timelock; a NIGHT lock cannot, and cannot be made to without changing what the chain is. Every swap construction available here is therefore asymmetric, and the asymmetry is where the losses live."
+        },
+        {
+          "type": "table",
+          "headers": [
+            "Outcome",
+            "Bitcoin side",
+            "NIGHT side"
+          ],
+          "rows": [
+            [
+              "Successful exchange",
+              "Alice redeems as intended",
+              "Bob obtains the material to claim."
+            ],
+            [
+              "Bitcoin refund published",
+              "Bob recovers through the abort path",
+              "Alice's recovery depends on the revealed share."
+            ],
+            [
+              "Counterparty never refunds",
+              "A punishment path may exist",
+              "NIGHT remains permanently locked. No party can move it."
+            ],
+            [
+              "Late redeem or reorganization",
+              "The redeem may not confirm",
+              "The disclosed secret cannot be made secret again; one party can hold both assets."
+            ]
+          ]
+        },
+        {
+          "type": "callout",
+          "title": "The two rows that ended it",
+          "text": "A counterparty who cancels and then stops acting leaves NIGHT locked with no key and no timer. A redeem published too late discloses the secret while the cancel confirms. Neither is reachable by better implementation work; both follow from a chain that cannot enforce a timeout on its own outputs."
+        },
+        {
+          "type": "p",
+          "text": "The outstanding fee work was not a patch: raising a fee changes a signature that had to exist before either side funded anything, so a correct treatment is a second protocol — and a finite fee ladder still cannot guarantee inclusion. A source review on 17 September 2026 then found four confirmed defects in an implementation that already looked finished; the defect rate was the finding."
+        },
+        {
+          "type": "p",
+          "text": "The removal is a wallet change: no consensus rule, protocol version, genesis parameter or emission value was altered. The wallet database refuses unknown fields, so the swap journal field and its guards remain defined and a file written by an experimental build still opens. Nothing replaces the feature."
+        }
+      ],
+      "sources": [
+        "swap",
+        "loss",
+        "review"
+      ]
+    },
+    {
+      "id": "assurance",
+      "title": "Evidence with a defined scope",
+      "label": "15 / Verification and review",
+      "lead": "A useful assurance statement names what was tested, against which source, and what was not covered.",
+      "blocks": [
+        {
+          "type": "metrics",
+          "items": [
+            [
+              "277",
+              "Targeted tests passed"
+            ],
+            [
+              "9",
+              "Explicitly ignored"
+            ],
+            [
+              "0",
+              "Failures in that run"
+            ]
+          ]
+        },
+        {
+          "type": "p",
+          "text": "The internal review dated 8 September 2026 records a targeted Rust 1.98.0 test run executed on 7 September across ledger, consensus, storage, wallet and the then-present swap packages. The totals above are evidence from that review, not a fresh full-workspace run performed for this whitepaper, and they predate the removal of the swap subsystem."
+        },
+        {
+          "type": "table",
+          "headers": [
+            "Evidence",
+            "Examples of covered behavior"
+          ],
+          "rows": [
+            [
+              "Ledger regressions",
+              "Thin-air mint rejection, authorization, invalid values and payload tampering."
+            ],
+            [
+              "Consensus regressions",
+              "Emission bounds, fork choice, checkpoint mismatch and rejection without state mutation."
+            ],
+            [
+              "Storage and wallet",
+              "Directory locking, foreign validation records, reorg persistence and output reservation."
+            ]
+          ]
+        },
+        {
+          "type": "p",
+          "text": "The nine ignored cases include a performance measurement, a long soak and Bitcoin-node-dependent integration tests. They are not counted as passes. The review did not establish a fresh Windows runtime assessment, external cryptographic proof, full dependency/CVE audit, server penetration test or active mainnet attack analysis."
+        },
+        {
+          "type": "p",
+          "text": "Native implementation claims are anchored to v1.0.0 and selected code paths were checked against outdated prose. Website configuration and the September review are separately dated; the live site is not part of that release baseline."
+        },
+        {
+          "type": "callout",
+          "title": "Independent review remains outstanding.",
+          "text": "This is an AI-assisted editorial and technical synthesis. It is not an independent audit, a security certification or a guarantee against unknown defects. Reproducible tests support specific claims; they cannot justify a blanket '100% safe' label."
+        }
+      ],
+      "sources": [
+        "review",
+        "ledger",
+        "consensus",
+        "swap"
+      ]
+    },
+    {
+      "id": "risks",
+      "title": "The risks that govern deployment",
+      "label": "16 / Security and economic limitations",
+      "lead": "Read these as present constraints on use, not as problems a future roadmap has already solved.",
+      "blocks": [
+        {
+          "type": "table",
+          "headers": [
+            "Risk",
+            "Consequence",
+            "Required response"
+          ],
+          "rows": [
+            [
+              "Cryptographic or implementation flaw",
+              "Loss, unauthorized spend or invalid issuance may be possible despite passing tests.",
+              "Independent specialist review and adversarial regression work."
+            ],
+            [
+              "Browser origin or device compromise",
+              "Seed-containing state or signing actions can be exposed.",
+              "Protect devices; separate wallet origin and assess locked-storage protection."
+            ],
+            [
+              "Low or concentrated mining work",
+              "Reorganizations, censorship or stalled settlement may become cheaper.",
+              "Measure distribution and stress-test adverse network conditions."
+            ],
+            [
+              "Checkpoint or deep-fork disagreement",
+              "Nodes can refuse a history or diverge rather than recover automatically.",
+              "Document checkpoint policy and operator recovery procedures."
+            ],
+            [
+              "Light-node and hosting concentration",
+              "Misleading balances, request visibility or service interruption.",
+              "Independent upstreams, authenticated transport and clearer client verification."
+            ],
+            [
+              "Unsigned or compromised distribution",
+              "An attacker can replace software and the checksum alongside it.",
+              "Publisher authentication, reproducibility work and safer release provenance."
+            ],
+            [
+              "Future fee-only security budget",
+              "Settlement demand may not support sufficient mining expenditure.",
+              "Analyze economics without promising price, adoption or yield."
+            ]
+          ]
+        },
+        {
+          "type": "p",
+          "text": "This is not an exhaustive risk inventory. No token price, exchange listing, liquidity, investment return or adoption forecast is asserted. Protocol rules and user demand cannot guarantee each other. Users should not infer suitability for a particular financial or operational purpose from the visual polish of a wallet or document."
+        }
+      ],
+      "sources": [
+        "review",
+        "loss",
+        "consensus"
+      ]
+    },
+    {
+      "id": "governance",
+      "title": "Minimal authority, visible responsibility",
+      "label": "17 / Project boundaries",
+      "lead": "No monetary administrator does not mean no human influence. Software and operational decisions still need accountability.",
+      "blocks": [
+        {
+          "type": "p",
+          "text": "The current monetary construction has no premine, special treasury allocation or administrative mint/freeze credential. That is narrower than saying nobody can influence the system. Maintainers choose releases, operators run infrastructure, miners choose which transactions to include and users choose which software and chain rules to accept."
+        },
+        {
+          "type": "cards",
+          "columns": 3,
+          "items": [
+            [
+              "Protect the monetary rules",
+              "Do not present discretionary issuance, special allocations or price-responsive changes as routine maintenance."
+            ],
+            [
+              "Keep disclosure voluntary",
+              "A payment receipt or view key should be a holder's choice, not an invisible prerequisite for native transfers."
+            ],
+            [
+              "Make trust changes explicit",
+              "Checkpoint updates, key formats and consensus changes deserve specifications, review and migration plans."
+            ]
+          ]
+        },
+        {
+          "type": "h",
+          "text": "History cannot be redesigned away"
+        },
+        {
+          "type": "p",
+          "text": "Nightfall has discarded earlier chains. The v4 monetary construction was unsound; later iterations exposed engineering and emission-design problems. The current v8 genesis is a distinct chain. Earlier-genesis balances do not automatically migrate into it. This history should remain discoverable and should make future compatibility decisions more deliberate."
+        },
+        {
+          "type": "p",
+          "text": "In this implementation, protocol-version configuration contributes to genesis identity, while wire version gates network compatibility. A software-version increment does not by itself imply either kind of change. Release documentation must distinguish client updates from chain resets and must not silently reinterpret historical balances."
+        },
+        {
+          "type": "callout",
+          "title": "The intended scope stays narrow.",
+          "text": "Native confidential settlement is the focus. This paper does not announce a general-purpose VM, a custodial bridge, wrapped NIGHT, a token sale, an exchange listing or a delivery calendar."
+        }
+      ],
+      "sources": [
+        "types",
+        "history",
+        "review"
+      ]
+    },
+    {
+      "id": "research",
+      "title": "Progress measured by acceptance criteria",
+      "label": "18 / Research and engineering priorities",
+      "lead": "These are proposed work tracks. None is a promise of a feature, a deadline or a future mainnet activation.",
+      "blocks": [
+        {
+          "type": "table",
+          "headers": [
+            "Track",
+            "Work to investigate",
+            "Evidence before calling it complete"
+          ],
+          "rows": [
+            [
+              "01 / Assurance",
+              "External review of value conservation, authorization, key derivation and cross-curve composition.",
+              "Published scope, findings, fixes and independent retesting; explicit residual risks."
+            ],
+            [
+              "02 / Custody and distribution",
+              "Separate wallet origin, encrypted locked storage and authenticated builds.",
+              "Recovery/migration tests, adversarial origin tests and verifiable release provenance."
+            ],
+            [
+              "03 / Network resilience",
+              "Independent light nodes, upstream TLS and stronger relay evaluation.",
+              "Measured outage recovery, operator diversity and privacy analysis of actual topology/fallbacks."
+            ],
+            [
+              "04 / State and synchronization",
+              "Incremental authenticated state structures and more efficient validation.",
+              "Documented trust model, benchmark methodology, corruption tests and equivalence to validated state."
+            ],
+            [
+              "05 / Private authorization",
+              "Study authorization that permits more pruning without weakening non-interactive ownership.",
+              "A construction, security argument and adversarial evaluation before any consensus proposal."
+            ],
+            [
+              "06 / Cross-chain exchange",
+              "Resolve or explicitly constrain abort and secret-disclosure loss modes.",
+              "End-to-end loss analysis, real-node recovery tests and external review before a mainnet decision."
+            ]
+          ]
+        },
+        {
+          "type": "p",
+          "text": "Performance claims should publish hardware, workload, implementation version and verification cost. Privacy claims should publish the adversary and observation model. A proposed optimization that changes which evidence a node checks is also a trust-policy change, even if the user interface calls it faster sync."
+        },
+        {
+          "type": "callout",
+          "title": "Code, evidence, then a release decision.",
+          "text": "A passing milestone does not automatically authorize mainnet activation. Compatibility, operator recovery and user-loss analysis belong to the decision, not to the post-release checklist."
+        }
+      ],
+      "sources": [
+        "review",
+        "loss",
+        "consensus",
+        "node"
+      ]
+    },
+    {
+      "id": "reference",
+      "title": "Implementation reference",
+      "label": "19 / Parameters and terminology",
+      "lead": "A compact reference for readers moving from this paper to code. The tagged implementation remains authoritative for exact behavior.",
+      "blocks": [
+        {
+          "type": "table",
+          "headers": [
+            "Parameter",
+            "Value in this edition"
+          ],
+          "rows": [
+            [
+              "Native asset / smallest unit",
+              "NIGHT / dark; 100,000,000 darks per NIGHT"
+            ],
+            [
+              "Software baseline",
+              "v1.0.0"
+            ],
+            [
+              "Protocol / wire / magic",
+              "8 / 6 / NFL2"
+            ],
+            [
+              "Scheduled ceiling / terminal issuance",
+              "90,000,000 / 89,999,999.25 NIGHT"
+            ],
+            [
+              "Initial subsidy / halving interval",
+              "6 NIGHT / 7,500,000 blocks"
+            ],
+            [
+              "Target block time / coinbase maturity",
+              "15 seconds / 1,440 blocks"
+            ],
+            [
+              "Mainnet proof of work",
+              "Argon2id: 32 MiB, 1 iteration, 1 lane"
+            ],
+            [
+              "Block / message byte ceilings",
+              "2 MiB / 4 MiB"
+            ],
+            [
+              "Local rewind bound / retained pruned bodies",
+              "500 / 500 blocks"
+            ]
+          ]
+        },
+        {
+          "type": "formula",
+          "lines": [
+            "061a052d49607ff8f4b306c75d622ebd",
+            "230cff4ec3a45a6dffc2f7738d4b20de"
+          ],
+          "caption": "Mainnet genesis hash, shown across two lines. Concatenate without whitespace when comparing."
+        },
+        {
+          "type": "p",
+          "text": "UTXO: an unspent output recorded by the ledger. Commitment: a group element representing a hidden value and blinding factor. Kernel: a signed record of public transaction terms and excess. Range proof: evidence that a committed value is within the allowed interval. Coinbase: the miner's permitted output, subject to maturity. Reorganization: replacement of a suffix of accepted history. Checkpoint: a compiled height/hash constraint. Bootstrap: a delivery format for historical chain data, not a new consensus authority."
+        },
+        {
+          "type": "p",
+          "text": "A view key enables observation, not spending. A receipt proves a limited cryptographic statement, not continuing unspent status. 'Live' denotes a reported or running state; it does not mean independently audited or irreversible."
+        }
+      ],
+      "sources": [
+        "types",
+        "ledger",
+        "consensus",
+        "wallet"
+      ]
+    },
+    {
+      "id": "sources",
+      "title": "Sources and document scope",
+      "label": "20 / Reproducible references",
+      "lead": "Implementation references are pinned to v1.0.0. The website review is dated separately. External literature describes primitives, not an endorsement of Nightfall.",
+      "blocks": [
+        {
+          "type": "references"
+        },
+        {
+          "type": "p",
+          "text": "Editorial status: English edition, 18 September 2026; AI-assisted source synthesis and design revision. Supersedes the 0.9.5 edition, whose chapter on atomic swaps describes a feature that has since been withdrawn. No independent audit was performed in creating this document. The PDF and HTML edition are generated from the same content source."
+        },
+        {
+          "type": "callout",
+          "title": "A durable standard for the project",
+          "text": "Make private settlement understandable. Make monetary rules inspectable. Make every important limitation visible before a user commits funds."
+        }
+      ],
+      "sources": []
+    }
+  ],
+  "references": {
+    "types": {
+      "title": "Protocol identity, monetary constants and PoW parameters",
+      "url": "https://github.com/Instinctes/nightfall/blob/v1.0.0/crates/nightfall-types/src/lib.rs"
+    },
+    "crypto": {
+      "title": "Native cryptography: commitments, stealth, signatures and mnemonic encoding",
+      "url": "https://github.com/Instinctes/nightfall/tree/v1.0.0/crates/nightfall-crypto/src"
+    },
+    "ledger": {
+      "title": "Ledger validation, UTXO authorization and exploit regressions",
+      "url": "https://github.com/Instinctes/nightfall/tree/v1.0.0/crates/nightfall-ledger"
+    },
+    "consensus": {
+      "title": "Consensus, emission, checkpoints, replay and mempool selection",
+      "url": "https://github.com/Instinctes/nightfall/blob/v1.0.0/crates/nightfall-consensus/src/lib.rs"
+    },
+    "node": {
+      "title": "Node runtime: session relay, embargo timers and network behavior",
+      "url": "https://github.com/Instinctes/nightfall/blob/v1.0.0/crates/nightfall-node/src/runtime.rs"
+    },
+    "storage": {
+      "title": "Storage implementation and operating-system directory locks",
+      "url": "https://github.com/Instinctes/nightfall/tree/v1.0.0/crates/nightfall-storage/src"
+    },
+    "wallet": {
+      "title": "Wallet keys, state and receipt implementation",
+      "url": "https://github.com/Instinctes/nightfall/tree/v1.0.0/crates/nightfall-wallet/src"
+    },
+    "swap": {
+      "title": "Why atomic swap was withdrawn before 1.0.0",
+      "url": "https://github.com/Instinctes/nightfall/blob/main/docs/SWAP-WITHDRAWN.md"
+    },
+    "loss": {
+      "title": "Swap loss model, kept as the historical record",
+      "url": "https://github.com/Instinctes/nightfall/blob/main/docs/SWAP-LOSS.md"
+    },
+    "history": {
+      "title": "Project history and discarded chain epochs",
+      "url": "https://github.com/Instinctes/nightfall/blob/v1.0.0/docs/HISTORY.md"
+    },
+    "review": {
+      "title": "Internal security review, 8 September 2026 - scope and open risks",
+      "url": "https://nightfallcoin.org/audit/review-2026-09-08.txt"
+    },
+    "ristretto": {
+      "title": "RFC 9496: The ristretto255 and decaf448 Groups (2023)",
+      "url": "https://www.rfc-editor.org/rfc/rfc9496.html"
+    },
+    "bulletproofs": {
+      "title": "Bunz et al., Bulletproofs: Short Proofs for Confidential Transactions and More (2018)",
+      "url": "https://cs.stanford.edu/people/dabo/pubs/abstracts/bulletproofs.html"
+    },
+    "argon2": {
+      "title": "RFC 9106: Argon2 Memory-Hard Function for Password Hashing and Proof-of-Work Applications (2021)",
+      "url": "https://www.rfc-editor.org/rfc/rfc9106.html"
+    },
+    "dandelion": {
+      "title": "Fanti et al., Dandelion++: Lightweight Cryptocurrency Networking with Formal Anonymity Guarantees (2018)",
+      "url": "https://arxiv.org/abs/1805.11060"
+    },
+    "bip39": {
+      "title": "BIP 39: Mnemonic code for generating deterministic keys",
+      "url": "https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki"
+    }
+  }
+}

@@ -90,7 +90,7 @@ if (existsSync(DL)) {
  * walks *.html and *.js looked straight past them, and Wrangler happily
  * uploaded all five. One of them answered 200 on the apex.
  */
-const ALLOWED_EXT = /\.(html|js|css|json|txt|svg|png|jpg|jpeg|webp|ico|woff2?|wasm|dmg|exe|sh|xml|webmanifest)$/i;
+const ALLOWED_EXT = /\.(html|js|css|json|txt|pdf|svg|png|jpg|jpeg|webp|ico|woff2?|wasm|dmg|exe|sh|xml|webmanifest)$/i;
 const strays = [];
 const sweep = (dir, rel) => {
     for (const e of readdirSync(dir, { withFileTypes: true })) {

@@ -175,14 +175,13 @@ eventually connect. Check it periodically.
 > a block, hide one, or change the rules — every node validates independently.
 > But if none are reachable, the network is invisible to newcomers.
 >
-> Two names are compiled in: `seed.nightfallcoin.org` (live, Vultr Frankfurt)
-> and `seed2.nightfallcoin.org`. seed2 is reserved for a **second machine on a
-> second network** — not a second process on the first seed, and not a miner
-> behind NAT. A name that does not resolve is cheaper than a name that points
-> at the same host and pretends to be redundant. Bring a second VPS up with
-> `scripts/install-seed-node-linux.sh`, point the A record (unproxied) at it,
-> and the compiled name starts working without a new release. **A seed run by
-> somebody else is worth more than a third run by us.**
+> Names compiled in: `seed.nightfallcoin.org` (Contabo, archive + light),
+> `seed2.nightfallcoin.org`, and `seed3.nightfallcoin.org` (OVH Frankfurt,
+> archive, `162.19.255.102`). A name that does not resolve is cheaper than a
+> name that points at the same host and pretends to be redundant. Point the A
+> record (unproxied, `proxied: false`) at the new machine; Cloudflare's proxy
+> is HTTP-only and would hide port 17891. **A seed run by somebody else is
+> worth more than a fourth run by us.**
 
 ---
 

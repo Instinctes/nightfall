@@ -6,8 +6,8 @@
 //! draws each page with the real renderer, scrolls it a screen at a time,
 //! and writes a numbered PNG of each screen: `settings-0.png`, `-1`, `-2`.
 //!
-//! Off unless `NIGHTFALL_UI_SHOTS` names a directory, so a released build
-//! never enters it. It only reads the window it is already drawing: no
+//! Requires a development build and `NIGHTFALL_UI_SHOTS` naming a directory.
+//! It only reads the window it is already drawing: no
 //! wallet file is opened, written or migrated by anything here.
 
 use crate::app::{App, View};
@@ -35,10 +35,12 @@ pub struct Area {
     pub offset: f32,
 }
 
+type CapturePage = (View, &'static str, Option<(&'static str, usize)>);
+
 pub struct Shots {
     dir: PathBuf,
     /// Pages left to capture, in reverse so `pop` walks them in order.
-    todo: Vec<(View, &'static str)>,
+    todo: Vec<CapturePage>,
     page: Option<(View, &'static str)>,
     /// The scroll offset the page is being drawn at for the tile in hand.
     asked: f32,
@@ -47,7 +49,7 @@ pub struct Shots {
     /// The image arrives one frame after the command, and every frame in
     /// between still satisfies "settled" — so without this the shutter fired
     /// twice and the spare image was consumed by the *next* page, which is
-    /// how the Swap page came to be photographed showing Network.
+    /// how one page came to be photographed showing the one before it.
     waiting: bool,
     settle: u32,
     area: Option<Area>,
@@ -56,11 +58,26 @@ pub struct Shots {
 }
 
 impl Shots {
-    /// `None` unless the environment asks for this, which is the whole gate.
+    /// `None` unless both the development build and environment opt in.
     pub fn from_env() -> Option<Self> {
+        if !crate::app::IS_DEV_BUILD {
+            return None;
+        }
         let dir = PathBuf::from(std::env::var_os("NIGHTFALL_UI_SHOTS")?);
         std::fs::create_dir_all(&dir).ok()?;
-        let mut todo: Vec<(View, &'static str)> = View::ALL.to_vec();
+        let mut todo: Vec<_> = View::ALL
+            .into_iter()
+            .map(|(v, name)| (v, name, None))
+            .collect();
+        todo.extend([
+            (View::Send, "Air", Some(("send", 1))),
+            (View::Receive, "Counter", Some(("receive", 1))),
+            (View::Activity, "Proof", Some(("activity", 1))),
+            (View::Settings, "Recovery", Some(("settings", 1))),
+            (View::Settings, "Contacts", Some(("settings", 2))),
+            (View::Settings, "Node-settings", Some(("settings", 3))),
+            (View::Settings, "About", Some(("settings", 4))),
+        ]);
         todo.reverse();
         Some(Self {
             dir,
@@ -142,10 +159,15 @@ pub fn step(app: &mut App, ctx: &egui::Context) {
         match shots.todo.pop() {
             Some(next) => {
                 app.view = next.0;
+                if let Some((key, selected)) = next.2 {
+                    ctx.data_mut(|data| {
+                        data.insert_temp(egui::Id::new(("page-workspace", key)), selected)
+                    });
+                }
                 let Some(shots) = app.shots.as_mut() else {
                     return;
                 };
-                shots.page = Some(next);
+                shots.page = Some((next.0, next.1));
                 shots.asked = 0.0;
                 shots.settle = SETTLE;
                 shots.area = None;
@@ -171,9 +193,13 @@ pub fn step(app: &mut App, ctx: &egui::Context) {
 /// Write one screenful exactly as it was drawn.
 fn write_screen(path: &PathBuf, image: &egui::ColorImage) {
     let (w, h) = (image.size[0] as u32, image.size[1] as u32);
+    // Alpha is kept. The window is transparent outside its rounded plate, and
+    // writing 255 there would claim the desktop is black — a picture that
+    // quietly misstates what it shows is the one thing this module must not
+    // do.
     let mut buf = Vec::with_capacity((w * h * 4) as usize);
     for p in &image.pixels {
-        buf.extend_from_slice(&[p.r(), p.g(), p.b(), 255]);
+        buf.extend_from_slice(&[p.r(), p.g(), p.b(), p.a()]);
     }
     match image::RgbaImage::from_raw(w, h, buf) {
         Some(img) => match img.save(path) {

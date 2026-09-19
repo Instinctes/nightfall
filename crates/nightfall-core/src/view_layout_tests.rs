@@ -4,6 +4,25 @@ use crate::{
 };
 use eframe::egui::{self, Vec2};
 
+#[test]
+fn settings_shortcuts_override_the_previous_section() {
+    let ctx = egui::Context::default();
+    crate::theme::apply(&ctx);
+    let dir = std::env::temp_dir().join(format!("nf-settings-links-{}", std::process::id()));
+    let mut app = App::new(nightfall_types::NetworkId::Devnet, dir);
+    for section in [3, 1] {
+        select_workspace_for_test(&ctx, "settings", 4);
+        open_settings_section(&mut app, &ctx, section);
+        assert!(app.view == View::Settings);
+        assert_eq!(
+            ctx.data(|data| data.get_temp::<usize>(egui::Id::new(("page-workspace", "settings")))),
+            Some(section)
+        );
+        assert!(!app.reveal_mnemonic);
+    }
+    assert!(app.node.is_none());
+}
+
 /// The withheld-payment notice is the longest block of prose on the Activity
 /// page, and the page test above never renders it: that App has no wallet, so
 /// it has no history. Render it directly against a public fixture instead.
@@ -81,7 +100,6 @@ fn all_eight_pages_fit_supported_content_widths() {
                         View::Activity => activity(&mut app, ui),
                         View::Mining => mining(&mut app, ui),
                         View::Network => network(&mut app, ui, ctx),
-                        View::Swap => crate::views_swap::swap(&mut app, ui, ctx),
                         View::Settings => settings(&mut app, ui, ctx),
                     }
                     assert!(
@@ -92,6 +110,58 @@ fn all_eight_pages_fit_supported_content_widths() {
                 });
             });
         }
+    }
+}
+
+/// The new task selectors must not hide half the wallet from layout coverage.
+/// Exercise both sides with the shipped fallback font and the native Mac font.
+#[test]
+fn all_workspaces_fit_with_both_font_sets() {
+    for native in [false, true] {
+        let ctx = egui::Context::default();
+        if native {
+            crate::theme::install_platform_fonts(&ctx);
+        }
+        crate::theme::apply(&ctx);
+        let dir =
+            std::env::temp_dir().join(format!("nf-subview-layout-{}-{native}", std::process::id()));
+        let mut app = App::new(nightfall_types::NetworkId::Devnet, dir);
+        for width in [620.0, 884.0, 1180.0] {
+            for (view, key, count) in [
+                (View::Send, "send", 2),
+                (View::Receive, "receive", 2),
+                (View::Activity, "activity", 2),
+                (View::Settings, "settings", 5),
+            ] {
+                for selected in 0..count {
+                    select_workspace_for_test(&ctx, key, selected);
+                    for _ in 0..2 {
+                        let input = egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                Vec2::new(width, 1600.0),
+                            )),
+                            ..Default::default()
+                        };
+                        let _ = ctx.run(input, |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                let right = ui.max_rect().right();
+                                match view {
+                                    View::Send => send(&mut app, ui, ctx),
+                                    View::Receive => receive(&mut app, ui, ctx),
+                                    View::Activity => activity(&mut app, ui),
+                                    View::Settings => settings(&mut app, ui, ctx),
+                                    _ => unreachable!(),
+                                }
+                                assert!(ui.min_rect().right() <= right + 1.0,
+                                    "{key}/{selected} overflow with native={native} at {width}px: {} > {right}", ui.min_rect().right());
+                            });
+                        });
+                    }
+                }
+            }
+        }
+        assert!(app.node.is_none(), "layout tests never start a node");
     }
 }
 
@@ -342,7 +412,10 @@ fn activity_rows_in_one_list_share_one_width() {
                         // it after each row reports the same number whatever
                         // the rows do. The first version of this test did that
                         // and passed while the screenshot plainly disagreed.
-                        let drawn = ui.scope(|ui| activity_row_for_test(ui, entry, 9_000)).response.rect;
+                        let drawn = ui
+                            .scope(|ui| activity_row_for_test(ui, entry, 9_000))
+                            .response
+                            .rect;
                         widths.push((drawn.width() * 100.0).round() / 100.0);
                     }
                 });
@@ -394,7 +467,8 @@ fn the_air_card_fits_supported_content_widths_in_every_state() {
     };
 
     // Empty, waiting for an answer, reading a request, and showing frames.
-    let states: [(&str, Box<dyn Fn(&mut App)>); 4] = [
+    type AirScenario = (&'static str, Box<dyn Fn(&mut App)>);
+    let states: [AirScenario; 4] = [
         ("empty", Box::new(|_: &mut App| {})),
         (
             "waiting",
@@ -763,13 +837,13 @@ fn card_edges(
                     bottom: 16.0,
                 }))
                 .show(ctx, |ui| {
-                    crate::widgets::page_column(ui, view.content_max_width(), |ui| {
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .scroll_bar_visibility(
-                                egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
-                            )
-                            .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                        )
+                        .show(ui, |ui| {
+                            crate::widgets::page_column(ui, view.content_max_width(), |ui| {
                                 crate::widgets::fill_width(ui, ui.available_width());
                                 page_intro(view, ui);
                                 match view {
@@ -780,10 +854,9 @@ fn card_edges(
                                     View::Activity => activity(app, ui),
                                     View::Mining => mining(app, ui),
                                     View::Network => network(app, ui, ctx),
-                                    View::Swap => crate::views_swap::swap(app, ui, ctx),
                                 }
                             });
-                    });
+                        });
                 });
         });
     };
@@ -889,5 +962,9 @@ fn cards_on_one_page_share_one_left_and_right_edge() {
             }
         }
     }
-    assert!(ragged.is_empty(), "cards do not line up:\n{}", ragged.join("\n"));
+    assert!(
+        ragged.is_empty(),
+        "cards do not line up:\n{}",
+        ragged.join("\n")
+    );
 }

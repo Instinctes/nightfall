@@ -26,9 +26,6 @@ pub fn page_description(view: View) -> &'static str {
         View::Activity => "Payments, mining rewards, confirmation status and receipts.",
         View::Mining => "Manage CPU usage and follow your mining performance.",
         View::Network => "Check connectivity, synchronization and network privacy.",
-        View::Swap => {
-            "Exchange NIGHT and Bitcoin. Follow each step and keep Core running until completion."
-        }
         View::Settings => "Manage backups, privacy and wallet maintenance.",
     }
 }
@@ -36,6 +33,38 @@ pub fn page_description(view: View) -> &'static str {
 /// Kept for the layout test, which measures the description at each width.
 pub fn page_intro(view: View, ui: &mut egui::Ui) {
     let _ = (page_description(view), ui);
+}
+
+/// Keep related tools on their parent page without burying them beneath a
+/// long form or transaction history. Only this non-sensitive selection lives
+/// in egui memory; wallet state and payment drafts stay in App.
+fn workspace_switch(ui: &mut egui::Ui, key: &'static str, labels: &[&str]) -> usize {
+    let id = egui::Id::new(("page-workspace", key));
+    let mut selected = ui
+        .ctx()
+        .data(|data| data.get_temp::<usize>(id))
+        .unwrap_or(0);
+    selected = selected.min(labels.len().saturating_sub(1));
+    if let Some(next) = segmented(ui, key, labels, selected) {
+        selected = next;
+    }
+    ui.ctx().data_mut(|data| data.insert_temp(id, selected));
+    ui.add_space(GAP_MD);
+    selected
+}
+
+fn select_workspace(ctx: &egui::Context, key: &'static str, selected: usize) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new(("page-workspace", key)), selected));
+}
+
+pub(crate) fn open_settings_section(app: &mut App, ctx: &egui::Context, section: usize) {
+    select_workspace(ctx, "settings", section);
+    app.view = View::Settings;
+}
+
+#[cfg(test)]
+pub fn select_workspace_for_test(ctx: &egui::Context, key: &'static str, selected: usize) {
+    select_workspace(ctx, key, selected);
 }
 
 fn night(darks: u64) -> String {
@@ -94,8 +123,8 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
     if loading {
         let outer = ui.available_width();
         egui::Frame::none()
-            .fill(tint(SURFACE, ACCENT, 0.16))
-            .stroke(Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.55)))
+            .fill(glass_alert(ACCENT))
+            .stroke(Stroke::NONE)
             .rounding(Rounding::same(ROUND))
             .inner_margin(egui::Margin::same(16.0))
             .show(ui, |ui| {
@@ -158,7 +187,7 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
                          already on disk.",
                     )
                     .size(12.0)
-                    .color(TEXT_FAINT),
+                    .color(TEXT_DIM),
                 );
             });
         ui.add_space(14.0);
@@ -204,7 +233,7 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
             if offer_resync {
                 ui.add_space(10.0);
                 if ghost_button(ui, "Open Settings to resync").clicked() {
-                    app.view = View::Settings;
+                    open_settings_section(app, ui.ctx(), 3);
                     app.resync_confirm = true;
                 }
             }
@@ -217,13 +246,14 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
             ui,
             WARN,
             "Write down the 24 words",
-            "The hex seed is no longer the backup. Settings → Backup shows the same 24 words the phone and browser wallets use. Anyone who sees them can spend.",
+            "Settings → Recovery shows the same 24 words the phone and browser wallets use. Anyone who sees them can spend. Keep an offline copy in a safe place.",
             false,
             |ui| {
                 ui.add_space(10.0);
                 if ghost_button(ui, "Open Backup").clicked() {
-                    app.view = View::Settings;
-                    app.reveal_mnemonic = true;
+                    open_settings_section(app, ui.ctx(), 1);
+                    // Navigation alone must not expose the recovery phrase.
+                    app.reveal_mnemonic = false;
                 }
             },
         );
@@ -257,7 +287,7 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
     // chips competing with the figure they qualify. The chips used to be the
     // same visual weight as the balance, so "12 NIGHT" and "3 outputs" read
     // as two facts of equal rank.
-    gradient_card(ui, 156.0, |ui| {
+    gradient_card(ui, 156.0, app.coin_flash_amount(ui.ctx()), |ui| {
         ui.label(RichText::new("SPENDABLE").size(11.0).color(INK).strong());
         ui.add_space(2.0);
         ui.horizontal(|ui| {
@@ -298,7 +328,7 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
     // Actions live below the gradient, not on it: a white pill on the light end
     // of the gradient is nearly invisible.
     ui.add_space(GAP_MD);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         // One width for both. "Send" at 75 points beside "Receive" at 92 was
         // two sizes for one pair of equally important choices — and the
         // padding hack that produced it (`"  Receive  "`) is exactly the kind
@@ -332,13 +362,19 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
             )
         } else if syncing {
             (WARN, true, "Scanning…".to_string())
+        } else if connected && (sync_hold != SyncHold::Synced || scanned != tip) {
+            (
+                WARN,
+                true,
+                format!("Catching up · scanned block {}", format_int(scanned)),
+            )
         } else if connected {
             (
                 SUCCESS,
                 false,
                 format!("In sync · block {}", format_int(scanned)),
             )
-        } else if crate::app::IS_DEV_BUILD {
+        } else if crate::app::IS_DEV_BUILD && app.network == NetworkId::Devnet {
             (
                 TEXT_DIM,
                 false,
@@ -354,7 +390,7 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
 
         dot(ui, colour, pulse);
         ui.add_space(2.0);
-        ui.label(RichText::new(text).size(11.5).color(TEXT_FAINT));
+        ui.label(RichText::new(text).size(11.5).color(TEXT_DIM));
     });
 
     if let Some(reason) = peers_zero_reason(app, peers, blocks) {
@@ -472,7 +508,7 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
     // Hero stays full width. These two cards sit *under* it, equal width,
     // same left and right edges. Putting them beside the hero is what left
     // the spendable number in a left column with a dead strip on the right.
-    two_columns(
+    paired_cards(
         ui,
         320.0,
         |ui| {
@@ -512,7 +548,7 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
                          Your share is this machine against that estimate.",
                     )
                     .size(11.0)
-                    .color(TEXT_FAINT),
+                    .color(TEXT_DIM),
                 );
             });
         },
@@ -520,7 +556,7 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
 
     ui.add_space(GAP_LG);
 
-    two_columns(
+    paired_cards(
         ui,
         320.0,
         |ui| {
@@ -621,7 +657,7 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
                         "Every node re-checks that no coin exists which was never mined.",
                     )
                     .size(10.5)
-                    .color(TEXT_FAINT),
+                    .color(TEXT_DIM),
                 );
             });
         },
@@ -683,9 +719,9 @@ fn activity_row(ui: &mut egui::Ui, e: &nightfall_wallet::HistoryEntry, now: u64)
     let mid = (inner - ICON_W - amount_w - GAP * 2.0).max(40.0);
 
     egui::Frame::none()
-        .fill(tint(SURFACE, color, 0.13))
-        .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.22)))
-        .rounding(Rounding::same(ROUND_FIELD))
+        .fill(glass_alert(color))
+        .stroke(Stroke::NONE)
+        .rounding(Rounding::same(ROUND_SM))
         .inner_margin(egui::Margin::symmetric(H_MARGIN, 9.0))
         .show(ui, |ui| {
             ui.set_width(inner);
@@ -734,7 +770,7 @@ fn activity_row(ui: &mut egui::Ui, e: &nightfall_wallet::HistoryEntry, now: u64)
                         // Truncate rather than wrap: a long memo used to push
                         // the row taller and shove everything after it around.
                         ui.add(
-                            egui::Label::new(RichText::new(sub).size(11.0).color(TEXT_FAINT))
+                            egui::Label::new(RichText::new(sub).size(11.0).color(TEXT_DIM))
                                 .truncate(),
                         );
                     },
@@ -755,7 +791,7 @@ fn activity_row(ui: &mut egui::Ui, e: &nightfall_wallet::HistoryEntry, now: u64)
                             ui.label(
                                 RichText::new(format!("fee {}", night(e.fee)))
                                     .size(10.0)
-                                    .color(TEXT_FAINT),
+                                    .color(TEXT_DIM),
                             );
                         }
                     },
@@ -945,7 +981,7 @@ fn air_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                      What is signed is built from exactly these values.",
                 )
                 .size(11.5)
-                .color(TEXT_FAINT),
+                .color(TEXT_DIM),
             );
             ui.add_space(GAP_SM);
             kv(
@@ -1055,7 +1091,7 @@ fn air_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                             format!("code {} of {total}", index + 1)
                         })
                         .size(11.5)
-                        .color(TEXT_FAINT),
+                        .color(TEXT_DIM),
                     );
                 });
             });
@@ -1165,9 +1201,9 @@ pub fn proof_card(ui: &mut egui::Ui, proof: &nightfall_wallet::ReceiptProof) {
     // block past its container. Take them off first.
     let inner = (ui.available_width() - 28.0).max(80.0);
     egui::Frame::none()
-        .fill(tint(SURFACE, tone, 0.13))
-        .stroke(Stroke::new(1.0_f32, tone.gamma_multiply(0.35)))
-        .rounding(Rounding::same(ROUND_FIELD))
+        .fill(glass_alert(tone))
+        .stroke(Stroke::NONE)
+        .rounding(Rounding::same(ROUND_SM))
         .inner_margin(egui::Margin::symmetric(14.0, 12.0))
         .show(ui, |ui| {
             ui.set_width(inner);
@@ -1178,9 +1214,9 @@ pub fn proof_card(ui: &mut egui::Ui, proof: &nightfall_wallet::ReceiptProof) {
 
     ui.add_space(GAP_SM);
     egui::Frame::none()
-        .fill(SURFACE_LOW)
-        .stroke(Stroke::new(1.0_f32, BORDER))
-        .rounding(Rounding::same(ROUND_FIELD))
+        .fill(glass_inner())
+        .stroke(Stroke::NONE)
+        .rounding(Rounding::same(ROUND_SM))
         .inner_margin(egui::Margin::symmetric(14.0, 12.0))
         .show(ui, |ui| {
             ui.set_width(inner);
@@ -1287,7 +1323,7 @@ pub fn payment_request_card(
                 ui.label(
                     RichText::new("Fills in the address and amount below. Nothing is sent yet.")
                         .size(11.0)
-                        .color(TEXT_FAINT),
+                        .color(TEXT_DIM),
                 );
             }
         }
@@ -1296,6 +1332,44 @@ pub fn payment_request_card(
 }
 
 pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
+    // The confirmation owns the payment until it is accepted or dismissed;
+    // navigating to another tool must not leave an invisible modal pending.
+    let mut mode = 0;
+    ui.add_enabled_ui(!app.send_confirm, |ui| {
+        mode = workspace_switch(ui, "send", &["Payment", "Offline signing · Air"]);
+    });
+    if mode == 1 && !app.send_confirm {
+        titled_card(ui, "Prepare an offline payment", |ui| {
+            field_label(ui, "Recipient address", None);
+            ui.add(
+                egui::TextEdit::multiline(&mut app.send_to)
+                    .margin(FIELD_MARGIN)
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY)
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text("nf1…"),
+            );
+            ui.add_space(GAP_SM);
+            field_label(ui, "Amount in NIGHT", None);
+            ui.add(
+                egui::TextEdit::singleline(&mut app.send_amount)
+                    .margin(FIELD_MARGIN)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("0.00000000"),
+            );
+            ui.add_space(GAP_SM);
+            kv(
+                ui,
+                "Fixed fee · NIGHT",
+                RichText::new(night(DEFAULT_FEE_DARKS)).monospace(),
+            );
+            ui.label(RichText::new("Air does not include a memo. Confirm the full recipient address on the offline machine before signing.").size(11.5).color(TEXT_DIM));
+        });
+        app.send_fee = DEFAULT_FEE_DARKS;
+        ui.add_space(GAP_MD);
+        air_card(app, ui, ctx);
+        return;
+    }
     let tip = app.tip_height();
     let maturity = app.maturity();
     let balances = app
@@ -1323,21 +1397,21 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         titled_card(ui, "Recipient", |ui| {
             ui.set_width(ui.available_width());
 
-            field_label(ui, "Address", None);
+            field_label(ui, "Address or payment request", None);
             ui.add(
                 egui::TextEdit::multiline(&mut app.send_to)
                     .margin(FIELD_MARGIN)
                     .desired_rows(2)
                     .desired_width(f32::INFINITY)
                     .font(egui::TextStyle::Monospace)
-                    .hint_text("nf1…"),
+                    .hint_text("nf1… or nightfall:…"),
             );
 
             // Live validation — a wrong address must never reach a signature.
             // Untouched by the redesign: this is the check that stands between a
             // typo and a payment that cannot come back.
             let trimmed = app.send_to.trim().to_string();
-            addr_state = if trimmed.is_empty() {
+            addr_state = if trimmed.is_empty() || trimmed.starts_with("nightfall:") {
                 None
             } else if trimmed == own_address {
                 Some(Err("This is your own address".to_string()))
@@ -1349,9 +1423,11 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             match &addr_state {
                 None => {
                     ui.label(
-                        RichText::new("Paste the nf1 address the recipient shared with you.")
-                            .size(11.0)
-                            .color(TEXT_FAINT),
+                        RichText::new(
+                            "Paste an address or review a nightfall: payment request below.",
+                        )
+                        .size(11.0)
+                        .color(TEXT_DIM),
                     );
                 }
                 Some(Ok(a)) => {
@@ -1403,7 +1479,8 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                     .collect();
                 ui.horizontal_wrapped(|ui| {
                     for (name, addr) in picks {
-                        if ghost_button(ui, &format!("  {name}  ")).clicked() {
+                        let label: String = name.chars().take(40).collect();
+                        if ghost_button(ui, &label).on_hover_text(&addr).clicked() {
                             app.send_to = addr;
                         }
                     }
@@ -1426,8 +1503,8 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                     if ui
                         .add(
                             egui::Button::new(RichText::new("MAX").size(10.5).color(ACCENT_HI))
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::new(1.0_f32, ACCENT_DIM))
+                                .fill(glass_inner())
+                                .stroke(Stroke::NONE)
                                 .rounding(Rounding::same(999.0)),
                         )
                         .on_hover_text("Send everything, minus the fee")
@@ -1439,7 +1516,7 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                     ui.label(
                         RichText::new(format!("Available {}", night(balances.available)))
                             .size(11.0)
-                            .color(TEXT_FAINT),
+                            .color(TEXT_DIM),
                     );
                 });
             });
@@ -1483,7 +1560,7 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 Some(
                     RichText::new(format!("{}/64", app.send_memo.len()))
                         .size(10.5)
-                        .color(TEXT_FAINT),
+                        .color(TEXT_DIM),
                 ),
             );
             ui.add(
@@ -1497,7 +1574,7 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             ui.label(
                 RichText::new("Encrypted. Only the recipient can read it.")
                     .size(10.5)
-                    .color(TEXT_FAINT),
+                    .color(TEXT_DIM),
             );
         });
 
@@ -1544,15 +1621,7 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                     RichText::new(night(app.send_fee)).color(WARN),
                     false,
                 );
-                ui.add_space(8.0);
-                let w = ui.available_width();
-                let (r, _) = ui.allocate_exact_size(Vec2::new(w, 1.0), egui::Sense::hover());
-                ui.painter().hline(
-                    r.x_range(),
-                    r.center().y,
-                    Stroke::new(1.0_f32, BORDER.gamma_multiply(0.9)),
-                );
-                ui.add_space(8.0);
+                ui.add_space(16.0);
                 summary_row(
                     ui,
                     "Leaves your wallet",
@@ -1574,10 +1643,25 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             ui.label(
                 RichText::new("The fee is fixed and destroyed, not paid to a miner. 100% burn.")
                     .size(10.5)
-                    .color(TEXT_FAINT),
+                    .color(TEXT_DIM),
             );
 
             ui.add_space(14.0);
+            if !ready {
+                let reason = if app.send_busy {
+                    "A payment is already being prepared."
+                } else if app.wallet_sync_error.is_some() {
+                    "Resolve the wallet scan warning before sending."
+                } else if !matches!(addr_state, Some(Ok(_))) {
+                    "Enter a valid recipient address to continue."
+                } else if amount_state.is_err() {
+                    "Enter a valid amount to continue."
+                } else {
+                    "The amount and fee must fit your available balance."
+                };
+                ui.label(RichText::new(reason).size(11.5).color(TEXT_DIM));
+                ui.add_space(GAP_SM);
+            }
             if primary_button(ui, "Review payment", ready).clicked() {
                 app.send_confirm = true;
             }
@@ -1596,8 +1680,8 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .frame(
                 egui::Frame::none()
-                    .fill(SURFACE)
-                    .stroke(Stroke::new(1.0_f32, BORDER_HI))
+                    .fill(glass_surface())
+                    .stroke(Stroke::NONE)
                     .rounding(Rounding::same(ROUND))
                     .inner_margin(egui::Margin::same(24.0))
                     .shadow(egui::epaint::Shadow {
@@ -1612,7 +1696,7 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 ui.label(
                     RichText::new("You are about to send")
                         .size(12.0)
-                        .color(TEXT_FAINT),
+                        .color(TEXT_DIM),
                 );
                 ui.add_space(4.0);
                 ui.label(RichText::new(night(amount)).size(36.0).strong());
@@ -1645,9 +1729,9 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 
                 ui.add_space(14.0);
                 egui::Frame::none()
-                    .fill(tint(SURFACE, WARN, 0.16))
-                    .stroke(Stroke::new(1.0_f32, WARN.gamma_multiply(0.4)))
-                    .rounding(Rounding::same(ROUND_FIELD))
+                    .fill(glass_alert(WARN))
+                    .stroke(Stroke::NONE)
+                    .rounding(Rounding::same(ROUND_SM))
                     .inner_margin(egui::Margin::same(12.0))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
@@ -1684,12 +1768,6 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             app.do_send(ctx);
         }
     }
-
-    // Air lives on Send because it is a way of paying, not a separate subject.
-    // Below the ordinary form on purpose: it is the unusual path, and putting
-    // it first would make every payment look complicated.
-    ui.add_space(GAP_LG);
-    air_card(app, ui, ctx);
 }
 
 // --------------------------------------------------------------- receive ---
@@ -1700,6 +1778,11 @@ pub fn receive(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         .lock()
         .map(|w| w.address_string())
         .unwrap_or_default();
+
+    if workspace_switch(ui, "receive", &["Receive NIGHT", "Invoices · Counter"]) == 1 {
+        counter_card(app, ui, ctx, &address);
+        return;
+    }
 
     let (scanned, outputs) = app
         .wallet
@@ -1799,14 +1882,11 @@ pub fn receive(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                          arrived will appear once the scan catches up — nothing is lost."
                     })
                     .size(11.0)
-                    .color(TEXT_FAINT),
+                    .color(TEXT_DIM),
                 );
             });
         },
     );
-
-    ui.add_space(14.0);
-    counter_card(app, ui, ctx, &address);
 }
 
 /// One invoice as the till shows it.
@@ -1850,7 +1930,7 @@ pub fn invoice_row(
         ui.label(
             RichText::new(format!("Closed by you: {note}"))
                 .size(11.0)
-                .color(TEXT_FAINT),
+                .color(TEXT_DIM),
         );
     }
     // Candidates are the honest part of this screen: money that arrived for
@@ -1891,14 +1971,12 @@ fn counter_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, address: 
     let now = now_unix();
     let till = app.wallet.lock().map(|w| w.till(now)).unwrap_or_default();
 
-    titled_card(ui, "Counter", |ui| {
+    titled_card(ui, "Create an invoice", |ui| {
         ui.set_width(ui.available_width());
         ui.label(
             RichText::new(
-                "Ask to be paid for something specific, then watch for it. A payment \
-                 settles an invoice when it quotes that invoice's reference — never \
-                 by amount alone, because two customers owing the same figure would \
-                 otherwise settle each other's bills.",
+                "Give each payment a unique reference. Counter matches that reference in \
+                 the payment memo — equal amounts alone never settle an invoice.",
             )
             .size(12.0)
             .color(TEXT_DIM),
@@ -1931,13 +2009,13 @@ fn counter_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, address: 
                     egui::Layout::top_down(egui::Align::LEFT),
                     |ui| {
                         ui.set_width(each);
-                        ui.label(RichText::new(label).size(11.5).color(TEXT_FAINT));
+                        ui.label(RichText::new(label).size(11.5).color(TEXT_DIM));
                         ui.add_space(5.0);
                         ui.add(
                             egui::TextEdit::singleline(value)
                                 .desired_width(f32::INFINITY)
                                 .margin(egui::Margin::symmetric(12.0, 9.0))
-                                .hint_text(RichText::new(hint).color(TEXT_FAINT)),
+                                .hint_text(RichText::new(hint).color(TEXT_DIM)),
                         );
                     },
                 );
@@ -1981,6 +2059,8 @@ fn counter_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, address: 
         }
 
         if till.is_empty() {
+            divider(ui);
+            empty_state(ui, "Your invoices will appear here", "Add a reference and an optional amount, then share its payment request. A blank amount lets the payer choose.");
             return;
         }
 
@@ -1998,12 +2078,13 @@ fn counter_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, address: 
 
         let mut close: Option<String> = None;
         let mut remove: Option<String> = None;
+        let remove_id = egui::Id::new("counter-confirm-remove");
         for (invoice, state) in &till {
             hairline(ui);
             ui.add_space(6.0);
             invoice_row(ui, invoice, state);
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ghost_button(ui, "Copy request").clicked() {
                     let request = nightfall_wallet::counter::request_for(
                         invoice,
@@ -2021,9 +2102,35 @@ fn counter_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, address: 
                     close = Some(invoice.reference.clone());
                 }
                 if ghost_button(ui, "Remove").clicked() {
-                    remove = Some(invoice.reference.clone());
+                    ctx.data_mut(|data| data.insert_temp(remove_id, invoice.reference.clone()));
                 }
             });
+            if ctx
+                .data(|data| data.get_temp::<String>(remove_id))
+                .as_deref()
+                == Some(invoice.reference.as_str())
+            {
+                ui.add_space(GAP_SM);
+                inset_note(ui, WARN, |ui| {
+                    ui.label(
+                        RichText::new("Remove this invoice from Counter?")
+                            .strong()
+                            .color(WARN),
+                    );
+                    ui.label(RichText::new("This removes the local reference and its accounting record, not a payment on the chain. Keep a backup if you need this record later.").size(11.5).color(TEXT_DIM));
+                    ui.add_space(GAP_SM);
+                    match button_row(ui, &["Keep invoice", "Remove invoice"], true) {
+                        Some(0) => {
+                            ctx.data_mut(|data| data.remove::<String>(remove_id));
+                        }
+                        Some(1) => {
+                            remove = Some(invoice.reference.clone());
+                            ctx.data_mut(|data| data.remove::<String>(remove_id));
+                        }
+                        _ => {}
+                    }
+                });
+            }
             ui.add_space(4.0);
         }
 
@@ -2079,9 +2186,9 @@ pub fn withheld_notice(
     let n = withheld.len();
     let mut rescan = false;
     egui::Frame::none()
-        .fill(tint(SURFACE, DANGER, 0.13))
-        .stroke(Stroke::new(1.0_f32, DANGER.gamma_multiply(0.5)))
-        .rounding(Rounding::same(ROUND_SM))
+        .fill(glass_alert(DANGER))
+        .stroke(Stroke::NONE)
+        .rounding(Rounding::same(ROUND))
         .inner_margin(egui::Margin::symmetric(14.0, 12.0))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -2113,11 +2220,11 @@ pub fn withheld_notice(
             );
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                rescan = ghost_button(ui, "Open Settings → Rescan").clicked();
+                rescan = ghost_button(ui, "Open Settings → Node").clicked();
                 ui.label(
                     RichText::new("rebuilds this wallet from the chain the node has")
                         .size(11.0)
-                        .color(TEXT_FAINT),
+                        .color(TEXT_DIM),
                 );
             });
         });
@@ -2126,6 +2233,10 @@ pub fn withheld_notice(
 }
 
 pub fn activity(app: &mut App, ui: &mut egui::Ui) {
+    if workspace_switch(ui, "activity", &["Transactions", "Proof Cards"]) == 1 {
+        proof_workspace(app, ui);
+        return;
+    }
     let entries: Vec<_> = app
         .wallet
         .lock()
@@ -2167,32 +2278,31 @@ pub fn activity(app: &mut App, ui: &mut egui::Ui) {
     });
     ui.add_space(14.0);
 
+    field_label(ui, "Find a transaction", None);
     ui.horizontal(|ui| {
         ui.add(
             egui::TextEdit::singleline(&mut app.activity_filter)
                 .margin(FIELD_MARGIN)
-                .desired_width(260.0)
+                .desired_width((ui.available_width() - 120.0).max(180.0) - FIELD_MARGIN.sum().x)
                 .hint_text("Filter by memo, direction or txid"),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
                 RichText::new(format!("{} entries", entries.len()))
                     .size(11.5)
-                    .color(TEXT_FAINT),
+                    .color(TEXT_DIM),
             );
         });
     });
     ui.add_space(12.0);
 
-    // A send that is not in a block will not get there by itself: Nightfall
-    // hands a new transaction to exactly one peer and nothing rebroadcasts it.
-    // Before this notice existed, the row just said "pending" forever and the
-    // only way to find out what that meant was to read the source.
+    // Absence from our scanned chain does not prove network-wide rejection.
+    // Never advise paying twice or abandoning reservations from elapsed time.
     let now_for_stuck = now_unix();
     const STUCK_AFTER_SECS: u64 = 30 * 60;
 
     if withheld_notice(ui, &entries, now_for_stuck) {
-        app.view = View::Settings;
+        open_settings_section(app, ui.ctx(), 3);
     }
 
     let stuck: Vec<_> = entries
@@ -2207,9 +2317,9 @@ pub fn activity(app: &mut App, ui: &mut egui::Ui) {
     if let Some(oldest) = stuck.iter().min_by_key(|e| e.timestamp) {
         let n = stuck.len();
         egui::Frame::none()
-            .fill(tint(SURFACE, WARN, 0.13))
-            .stroke(Stroke::new(1.0_f32, WARN.gamma_multiply(0.5)))
-            .rounding(Rounding::same(ROUND_SM))
+            .fill(glass_alert(WARN))
+            .stroke(Stroke::NONE)
+            .rounding(Rounding::same(ROUND))
             .inner_margin(egui::Margin::symmetric(14.0, 12.0))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -2218,9 +2328,9 @@ pub fn activity(app: &mut App, ui: &mut egui::Ui) {
                     ui.add_space(6.0);
                     ui.label(
                         RichText::new(if n == 1 {
-                            "One payment never made it into a block".to_string()
+                            "One payment is still awaiting confirmation".to_string()
                         } else {
-                            format!("{n} payments never made it into a block")
+                            format!("{n} payments are still awaiting confirmation")
                         })
                         .size(13.0)
                         .strong(),
@@ -2229,10 +2339,10 @@ pub fn activity(app: &mut App, ui: &mut egui::Ui) {
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(format!(
-                        "Sent {} and still in no block. A transaction is handed to one \
-                         peer and nothing re-sends it, so this will not confirm on its \
-                         own. The coins were never spent — they are still yours, but this \
-                         wallet is holding them reserved for a payment that died.",
+                        "Sent {} and not yet confirmed in this wallet's scanned chain. \
+                         Check synchronization and the recipient before taking action. \
+                         The original payment may still confirm; sending a replacement \
+                         can pay twice. Its inputs remain reserved.",
                         ago(oldest.timestamp, now_for_stuck)
                     ))
                     .size(11.5)
@@ -2240,13 +2350,13 @@ pub fn activity(app: &mut App, ui: &mut egui::Ui) {
                 );
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ghost_button(ui, "Open Settings → Rescan").clicked() {
-                        app.view = View::Settings;
+                    if ghost_button(ui, "Check network status").clicked() {
+                        app.view = View::Network;
                     }
                     ui.label(
-                        RichText::new("releases the reserved coins, then send again")
+                        RichText::new("Rescan does not cancel a payment.")
                             .size(11.0)
-                            .color(TEXT_FAINT),
+                            .color(TEXT_DIM),
                     );
                 });
             });
@@ -2333,10 +2443,8 @@ pub fn activity(app: &mut App, ui: &mut egui::Ui) {
                                 // any history at all "see the card below" was
                                 // an instruction to go looking.
                                 app.proof_scroll = true;
-                                app.toasts.success(
-                                    ui.ctx(),
-                                    "Receipt copied — the Proof Card below shows what it proves",
-                                );
+                                app.toasts
+                                    .success(ui.ctx(), "Receipt copied — opening its Proof Card");
                             }
                             None => app.toasts.error(ui.ctx(), "Could not build a receipt"),
                         }
@@ -2346,9 +2454,14 @@ pub fn activity(app: &mut App, ui: &mut egui::Ui) {
         }
     });
 
-    ui.add_space(14.0);
+    if app.proof_scroll {
+        select_workspace(ui.ctx(), "activity", 1);
+        ui.ctx().request_repaint();
+    }
+}
 
-    titled_card(ui, "Proof Card", |ui| {
+fn proof_workspace(app: &mut App, ui: &mut egui::Ui) {
+    titled_card(ui, "Check a receipt", |ui| {
         ui.set_width(ui.available_width());
         if std::mem::take(&mut app.proof_scroll) {
             ui.scroll_to_cursor(Some(egui::Align::Min));
@@ -2367,6 +2480,8 @@ pub fn activity(app: &mut App, ui: &mut egui::Ui) {
         let changed = ui
             .add(
                 egui::TextEdit::multiline(&mut app.proof_input)
+                    .margin(FIELD_MARGIN)
+                    .font(egui::TextStyle::Monospace)
                     .desired_rows(3)
                     .desired_width(f32::INFINITY)
                     .hint_text("Paste the receipt JSON"),
@@ -2426,7 +2541,7 @@ pub fn mining(app: &mut App, ui: &mut egui::Ui) {
     card(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
-            dot(ui, if mining { SUCCESS } else { TEXT_FAINT }, mining);
+            dot(ui, if mining { SUCCESS } else { TEXT_DIM }, mining);
             ui.add_space(8.0);
             ui.vertical(|ui| {
                 ui.label(
@@ -2441,7 +2556,7 @@ pub fn mining(app: &mut App, ui: &mut egui::Ui) {
                         "CPU idle".to_string()
                     })
                     .size(13.0)
-                    .color(if mining { ACCENT_HI } else { TEXT_FAINT }),
+                    .color(if mining { ACCENT_HI } else { TEXT_DIM }),
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2490,7 +2605,7 @@ pub fn mining(app: &mut App, ui: &mut egui::Ui) {
             ui.label(
                 RichText::new(format!("{} × 32 MiB RAM", app.mining_threads))
                     .size(11.0)
-                    .color(TEXT_FAINT),
+                    .color(TEXT_DIM),
             );
         });
         ui.add_space(4.0);
@@ -2499,13 +2614,13 @@ pub fn mining(app: &mut App, ui: &mut egui::Ui) {
                 "Each thread holds its own Argon2 workspace. Leave one core for the wallet. Change lands on the next template — no restart.",
             )
             .size(11.0)
-            .color(TEXT_FAINT),
+            .color(TEXT_DIM),
         );
     });
 
     ui.add_space(14.0);
 
-    two_columns(
+    paired_cards(
         ui,
         320.0,
         |ui| {
@@ -2810,7 +2925,11 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 ),
                 (
                     "LISTEN",
-                    format!("{}", app.network.default_p2p_port()),
+                    if crate::app::IS_DEV_BUILD {
+                        "Loopback · auto".into()
+                    } else {
+                        app.network.default_p2p_port().to_string()
+                    },
                     TEXT_DIM,
                 ),
             ],
@@ -2834,8 +2953,8 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             let submit = ui.add_enabled(
                 !app.peer_input.trim().is_empty(),
                 egui::Button::new("Connect")
-                    .fill(SURFACE_HI)
-                    .stroke(Stroke::new(1.0_f32, BORDER))
+                    .fill(glass_inner())
+                    .stroke(Stroke::NONE)
                     .rounding(Rounding::same(ROUND_PILL))
                     .min_size(Vec2::new(0.0, 34.0)),
             );
@@ -2855,16 +2974,18 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         });
         ui.add_space(6.0);
         ui.label(
-            RichText::new(format!(
+            RichText::new(if crate::app::IS_DEV_BUILD {
+                "This preview listens only on loopback ports assigned by the operating system. No public listener or port forwarding is needed. It does not join mainnet.".to_owned()
+            } else { format!(
                 "Live sockets: {peers}. Others reach you on port {}. Forward it to \
                  accept incoming connections. Outbound to a seed is enough to \
                  stay on the tip — you do not have to be dialable. Transactions \
                  leave this node as a Dandelion stem (one random hop), not a \
                  broadcast.",
                 app.network.default_p2p_port()
-            ))
+            ) })
             .size(11.0)
-            .color(TEXT_FAINT),
+            .color(TEXT_DIM),
         );
 
         let known = app.node.as_ref().map(|n| n.peers()).unwrap_or_default();
@@ -2897,7 +3018,7 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 "Self-reported in the handshake — not verified. Only the wire version is enforced.",
             )
             .size(10.5)
-            .color(TEXT_FAINT),
+            .color(TEXT_DIM),
         );
     });
 
@@ -2906,6 +3027,18 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     let tor_on = app.status.as_ref().map(|st| st.tor_proxy).unwrap_or(false);
     titled_card(ui, "Network privacy", |ui| {
         ui.set_width(ui.available_width());
+        if crate::app::IS_DEV_BUILD && app.network == NetworkId::Devnet {
+            kv(
+                ui,
+                "Mode",
+                RichText::new("Local test network").color(ACCENT_HI),
+            );
+            ui.label(RichText::new(
+                "This Devnet preview starts without Tor, public seed discovery or inherited proxy settings. \
+                 Its listener uses loopback. No public-network privacy claim is made for this local test."
+            ).size(12.0).color(TEXT_DIM));
+            return;
+        }
         ui.label(
             RichText::new(
                 "Outbound connections can go through Tor. Your ISP then sees only \
@@ -2959,148 +3092,163 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                  disable. .onion seeds never fall back.",
             )
             .size(11.0)
-            .color(TEXT_FAINT),
+            .color(TEXT_DIM),
         );
     });
 
     ui.add_space(GAP_LG);
 
-    two_columns(
+    paired_cards(
         ui,
         320.0,
         |ui| {
-    titled_card(ui, "Chain", |ui| {
-        kv(
-            ui,
-            "Network",
-            RichText::new(app.network.as_str()).monospace(),
-        );
-        kv(
-            ui,
-            "Protocol version",
-            RichText::new(nightfall_types::PROTOCOL_VERSION.to_string()).monospace(),
-        );
-        kv(
-            ui,
-            "Wallet version",
-            RichText::new(crate::app::WALLET_VERSION).monospace(),
-        );
-        kv(
-            ui,
-            "Blocks",
-            RichText::new(format_int(s.map(|s| s.blocks).unwrap_or(0))).monospace(),
-        );
-        kv(
-            ui,
-            "Tip",
-            RichText::new(short_hex(&s.map(|s| s.tip.clone()).unwrap_or_default())).monospace(),
-        );
-        let tip_full = s.map(|st| st.tip.clone()).unwrap_or_default();
-        if !tip_full.is_empty() && copyable(ui, &tip_full, true) {
-            app.toasts.success(ctx, "Tip hash copied");
-        }
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            let busy = app
-                .chain_check_busy
-                .load(std::sync::atomic::Ordering::SeqCst);
-            if ghost_button(
-                ui,
-                if busy {
-                    "  Checking…  "
-                } else {
-                    "  Same chain as the seed?  "
-                },
-            )
-            .clicked()
-                && !busy
-            {
-                app.start_chain_check();
-            }
-        });
-        ui.add_space(4.0);
-        ui.label(
+            titled_card(ui, "Chain", |ui| {
+                kv(
+                    ui,
+                    "Network",
+                    RichText::new(app.network.as_str()).monospace(),
+                );
+                kv(
+                    ui,
+                    "Protocol version",
+                    RichText::new(nightfall_types::PROTOCOL_VERSION.to_string()).monospace(),
+                );
+                kv(
+                    ui,
+                    "Wallet version",
+                    RichText::new(crate::app::WALLET_VERSION).monospace(),
+                );
+                kv(
+                    ui,
+                    "Blocks",
+                    RichText::new(format_int(s.map(|s| s.blocks).unwrap_or(0))).monospace(),
+                );
+                kv(
+                    ui,
+                    "Tip",
+                    RichText::new(short_hex(&s.map(|s| s.tip.clone()).unwrap_or_default()))
+                        .monospace(),
+                );
+                let tip_full = s.map(|st| st.tip.clone()).unwrap_or_default();
+                if !tip_full.is_empty() && copyable(ui, &tip_full, true) {
+                    app.toasts.success(ctx, "Tip hash copied");
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let busy = app
+                        .chain_check_busy
+                        .load(std::sync::atomic::Ordering::SeqCst);
+                    if ui
+                        .add_enabled_ui(!crate::app::IS_DEV_BUILD, |ui| {
+                            ghost_button(
+                                ui,
+                                if busy {
+                                    "  Checking…  "
+                                } else {
+                                    "  Same chain as the seed?  "
+                                },
+                            )
+                        })
+                        .inner
+                        .on_hover_text(if crate::app::IS_DEV_BUILD {
+                            "An isolated Devnet has no public mainnet tip to compare against."
+                        } else {
+                            "Ask the public seed to compare chain tips."
+                        })
+                        .clicked()
+                        && !busy
+                    {
+                        app.start_chain_check();
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(
             RichText::new(
                 "Asks nightfallcoin.org/network.json. The site sees that you checked — not a private probe.",
             )
             .size(10.5)
-            .color(TEXT_FAINT),
+            .color(TEXT_DIM),
         );
-        if let Some(check) = &app.chain_check {
-            ui.add_space(8.0);
-            if let Some(err) = &check.error {
-                ui.label(RichText::new(err).size(12.0).color(DANGER));
-            } else if check.same {
-                ui.label(
-                    RichText::new(format!(
-                        "Same tip as the public seed (height {}). Genesis {}.",
-                        format_int(check.public_height),
-                        short_hex(&check.genesis)
+                if let Some(check) = &app.chain_check {
+                    ui.add_space(8.0);
+                    if let Some(err) = &check.error {
+                        ui.label(RichText::new(err).size(12.0).color(DANGER));
+                    } else if check.same {
+                        ui.label(
+                            RichText::new(format!(
+                                "Same tip as the public seed (height {}). Genesis {}.",
+                                format_int(check.public_height),
+                                short_hex(&check.genesis)
+                            ))
+                            .size(12.0)
+                            .color(SUCCESS),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new(format!(
+                                "Different tip. Yours {} @ {}. Seed {} @ {}.",
+                                short_hex(&check.our_tip),
+                                format_int(check.our_height),
+                                short_hex(&check.public_tip),
+                                format_int(check.public_height)
+                            ))
+                            .size(12.0)
+                            .color(WARN),
+                        );
+                    }
+                }
+                kv(
+                    ui,
+                    "Total work",
+                    RichText::new(format_int(
+                        s.map(|s| s.total_work).unwrap_or(0).min(u64::MAX as u128) as u64,
                     ))
-                    .size(12.0)
-                    .color(SUCCESS),
+                    .monospace(),
                 );
-            } else {
-                ui.label(
-                    RichText::new(format!(
-                        "Different tip. Yours {} @ {}. Seed {} @ {}.",
-                        short_hex(&check.our_tip),
-                        format_int(check.our_height),
-                        short_hex(&check.public_tip),
-                        format_int(check.public_height)
-                    ))
-                    .size(12.0)
-                    .color(WARN),
+                kv(
+                    ui,
+                    "P2P port",
+                    RichText::new(if crate::app::IS_DEV_BUILD {
+                        "Loopback · automatic".into()
+                    } else {
+                        app.network.default_p2p_port().to_string()
+                    })
+                    .monospace(),
                 );
-            }
-        }
-        kv(
-            ui,
-            "Total work",
-            RichText::new(format_int(
-                s.map(|s| s.total_work).unwrap_or(0).min(u64::MAX as u128) as u64,
-            ))
-            .monospace(),
-        );
-        kv(
-            ui,
-            "P2P port",
-            RichText::new(app.network.default_p2p_port().to_string()).monospace(),
-        );
-        kv(
-            ui,
-            "Mempool",
-            RichText::new(s.map(|s| s.mempool).unwrap_or(0).to_string()).monospace(),
-        );
-    });
+                kv(
+                    ui,
+                    "Mempool",
+                    RichText::new(s.map(|s| s.mempool).unwrap_or(0).to_string()).monospace(),
+                );
+            });
         },
         |ui| {
-    titled_card(ui, "Ledger state", |ui| {
-        kv(
-            ui,
-            "UTXOs",
-            RichText::new(format_int(s.map(|s| s.utxos).unwrap_or(0) as u64)).monospace(),
-        );
-        kv(
-            ui,
-            "Kernels",
-            RichText::new(format_int(s.map(|s| s.kernels).unwrap_or(0))).monospace(),
-        );
-        kv(
-            ui,
-            "UTXO root",
-            RichText::new(short_hex(
-                &s.map(|s| s.utxo_root.clone()).unwrap_or_default(),
-            ))
-            .monospace(),
-        );
-        let ok = s.map(|s| s.supply_ok).unwrap_or(false);
-        kv(
-            ui,
-            "Supply invariant",
-            RichText::new(if ok { "verified" } else { "FAILED" }).color(status_color(ok)),
-        );
-    });
+            titled_card(ui, "Ledger state", |ui| {
+                kv(
+                    ui,
+                    "UTXOs",
+                    RichText::new(format_int(s.map(|s| s.utxos).unwrap_or(0) as u64)).monospace(),
+                );
+                kv(
+                    ui,
+                    "Kernels",
+                    RichText::new(format_int(s.map(|s| s.kernels).unwrap_or(0))).monospace(),
+                );
+                kv(
+                    ui,
+                    "UTXO root",
+                    RichText::new(short_hex(
+                        &s.map(|s| s.utxo_root.clone()).unwrap_or_default(),
+                    ))
+                    .monospace(),
+                );
+                let ok = s.map(|s| s.supply_ok).unwrap_or(false);
+                kv(
+                    ui,
+                    "Supply invariant",
+                    RichText::new(if ok { "verified" } else { "FAILED" }).color(status_color(ok)),
+                );
+            });
         },
     );
 }
@@ -3109,13 +3257,23 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 
 pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     // Width comes from the page shell — banners and these cards share it.
-    {
+    let section = workspace_switch(
+        ui,
+        "settings",
+        &["Vault", "Recovery", "Contacts", "Node", "About"],
+    );
+    if section != 1 {
+        app.recovery_studio.clear();
+        app.reveal_mnemonic = false;
+        app.reveal_seed = false;
+        app.reveal_view_key = false;
+    }
+    if section == 0 {
         app.show_vault_settings(ui, ctx);
-        if app.vault_ui.busy() {
-            return;
-        }
-        ui.add_space(14.0);
-        section_label(ui, "Keys & backup");
+        return;
+    }
+    app.vault_ui.clear_fields();
+    if section == 1 {
         let address = app.wallet.lock().ok().and_then(|wallet| wallet.address());
         app.recovery_studio.show(ui, address.as_ref());
         ui.add_space(14.0);
@@ -3195,7 +3353,7 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 ui.label(
                     RichText::new("Hex seed (same 32 bytes as the words)")
                         .size(11.0)
-                        .color(TEXT_FAINT),
+                        .color(TEXT_DIM),
                 );
                 ui.add_space(4.0);
                 if copyable(ui, &seed, true) {
@@ -3241,10 +3399,9 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 app.reveal_view_key = true;
             }
         });
+    }
 
-        ui.add_space(14.0);
-        section_label(ui, "This node");
-
+    if section == 3 {
         titled_card(ui, "Chain & scan", |ui| {
             ui.set_width(ui.available_width());
             let (scanned, outputs) = app
@@ -3321,7 +3478,7 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             ui.label(
                 RichText::new("Re-reads the chain and replaces local history; notes/receipts may be lost. Export a backup first. Blocked while payments or reservations are pending.")
                     .size(10.5)
-                    .color(TEXT_FAINT),
+                    .color(TEXT_DIM),
             );
 
             ui.add_space(16.0);
@@ -3355,49 +3512,9 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 app.resync_confirm = true;
             }
         });
+    }
 
-        ui.add_space(14.0);
-        section_label(ui, "Swaps");
-
-        titled_card(ui, "Bitcoin node (atomic swaps)", |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(
-                RichText::new(
-                    "bitcoind JSON-RPC. Mode 0600, three lines: url=, user=, password=. \
-                     Needs -txindex=1. This wallet never holds Bitcoin keys.",
-                )
-                .size(12.0)
-                .color(TEXT_DIM),
-            );
-            ui.add_space(GAP_MD);
-            field_label(ui, "Config file", None);
-            if copyable(ui, &app.btc_rpc_path().display().to_string(), true) {
-                app.toasts.success(ctx, "Path copied");
-            }
-            ui.add_space(GAP_SM);
-            if app.bitcoin_rpc_configured() {
-                ui.label(
-                    RichText::new("Configuration saved. Connection and network checks are shown on the Swap page.")
-                        .size(11.5)
-                        .color(TEXT_DIM),
-                );
-                if ghost_button(ui, "Check swap connection").clicked() {
-                    app.view = View::Swap;
-                    app.reveal_seed = false;
-                    app.reveal_mnemonic = false;
-                    app.reveal_view_key = false;
-                }
-            } else if ghost_button(ui, "Write credential template").clicked() {
-                match app.write_bitcoin_rpc_template() {
-                    Ok(msg) => app.toasts.success(ctx, msg),
-                    Err(e) => app.toasts.error(ctx, e),
-                }
-            }
-        });
-
-        ui.add_space(14.0);
-        section_label(ui, "Contacts");
-
+    if section == 2 {
         titled_card(ui, "Address book", |ui| {
             ui.set_width(ui.available_width());
             ui.label(
@@ -3490,9 +3607,7 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                             ui.set_width(name_w);
-                            ui.add(
-                                egui::Label::new(RichText::new(&e.name).size(12.5)).truncate(),
-                            );
+                            ui.add(egui::Label::new(RichText::new(&e.name).size(12.5)).truncate());
                         },
                     );
                     ui.allocate_ui_with_layout(
@@ -3505,7 +3620,7 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                                     RichText::new(short_hex(&e.address))
                                         .monospace()
                                         .size(11.0)
-                                        .color(TEXT_FAINT),
+                                        .color(TEXT_DIM),
                                 )
                                 .truncate(),
                             );
@@ -3518,14 +3633,18 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 });
             }
         });
+    }
 
-        ui.add_space(14.0);
-        section_label(ui, "This machine");
-
+    if section == 3 {
+        ui.add_space(GAP_LG);
         titled_card(ui, "Storage", |ui| {
             ui.set_width(ui.available_width());
             let mut prune = app.prune;
-            if check(ui, &mut prune, "Prune old blocks — keep UTXO + last 500 bodies") {
+            if check(
+                ui,
+                &mut prune,
+                "Prune old blocks — keep UTXO + last 500 bodies",
+            ) {
                 app.set_prune(prune, ctx);
             }
             ui.add_space(4.0);
@@ -3536,7 +3655,7 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                  use the phone/web wallet (light API) or Resync chain from a seed.",
             )
             .size(11.0)
-            .color(TEXT_FAINT),
+            .color(TEXT_DIM),
         );
             if let Some(s) = &app.status {
                 if s.pruned {
@@ -3555,24 +3674,39 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         titled_card(ui, "Window", |ui| {
             ui.set_width(ui.available_width());
             let mut tray = app.close_to_tray;
-            if check(ui, &mut tray, "Close to tray — mining keeps running") {
+            if check(
+                ui,
+                &mut tray,
+                "Closing minimises instead of quitting — mining keeps running",
+            ) {
                 app.set_close_to_tray(tray);
             }
             ui.add_space(4.0);
             ui.label(
                 RichText::new(
-                    "On Windows the process looks gone if the window closes. Tray Show / Quit. \
-                 macOS keeps the dock icon either way.",
+                    "The window goes to the Dock, or to the taskbar on Windows, and clicking \
+                     it there brings the wallet back. The menu-bar item does the same. Turn \
+                     this off and closing the window ends the wallet and stops mining.",
                 )
                 .size(11.0)
-                .color(TEXT_FAINT),
+                .color(TEXT_DIM),
             );
         });
+    }
 
-        ui.add_space(14.0);
-
+    if section == 4 {
         titled_card(ui, "About", |ui| {
             ui.set_width(ui.available_width());
+            kv(
+                ui,
+                "Wallet version",
+                RichText::new(crate::app::WALLET_VERSION).monospace(),
+            );
+            kv(
+                ui,
+                "Network",
+                RichText::new(app.network.as_str()).monospace(),
+            );
             kv(
                 ui,
                 "Max supply",
@@ -3607,21 +3741,21 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 
             ui.add_space(12.0);
             inset_note(ui, WARN, |ui| {
-                    ui.label(
-                        RichText::new("Not independently audited.")
-                            .size(12.0)
-                            .color(WARN)
-                            .strong(),
-                    );
-                    ui.add_space(3.0);
-                    ui.label(
-                        RichText::new(
-                            "Amounts and addresses are hidden. The transaction graph is still \
+                ui.label(
+                    RichText::new("Not independently audited.")
+                        .size(12.0)
+                        .color(WARN)
+                        .strong(),
+                );
+                ui.add_space(3.0);
+                ui.label(
+                    RichText::new(
+                        "Amounts and addresses are hidden. The transaction graph is still \
                          linkable. Do not treat NIGHT as money you can afford to lose.",
-                        )
-                        .size(11.0)
-                        .color(TEXT_DIM),
-                    );
+                    )
+                    .size(11.0)
+                    .color(TEXT_DIM),
+                );
             });
         });
 

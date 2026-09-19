@@ -133,6 +133,10 @@ impl WalletState {
                     wallet.resendable().is_empty(),
                     "This restored state still holds payments that would be broadcast automatically. Nothing was written."
                 );
+                anyhow::ensure!(
+                    !wallet.has_swap_recovery(),
+                    "This backup contains swap recovery records. Dedicated chain reconciliation is required before restoration; the original backup was not changed."
+                );
                 *wallet
             }
         };
@@ -284,8 +288,11 @@ impl WalletState {
                 "Vault enrollment belongs to another network."
             );
         }
-        anyhow::ensure!(!nightfall_swap::persist::list(datadir)?.iter().any(|swap| !swap.is_finished()),
-            "Finish all experimental swaps before enabling Vault. Swap secrets are not covered by Vault.");
+        // Vault enrollment used to refuse while an experimental atomic swap was
+        // still running, because a swap kept its secrets in separate session
+        // files the vault never encrypted. Atomic swap was withdrawn before
+        // 1.0.0 (see `docs/SWAP-WITHDRAWN.md`); nothing writes those files any
+        // more, so there is nothing left outside the vault to wait for.
         if !self.is_vault() {
             // Retire the in-memory legacy writer before creating the marker.
             // An error must never restore that writer behind the vault's back.
@@ -317,9 +324,10 @@ impl WalletState {
 
     pub fn unlock_vault(&mut self, password: &str) -> anyhow::Result<()> {
         match &mut self.inner {
-            Backend::Vault(store) => store.unlock(password),
+            Backend::Vault(store) => store.unlock(password)?,
             _ => anyhow::bail!("No encrypted vault is available."),
         }
+        Ok(())
     }
 
     pub fn lock_vault(&mut self) {
@@ -407,20 +415,24 @@ impl WalletState {
             .unwrap_or_default()
     }
 
-    /// Free outputs a swap was holding.
-    ///
-    /// The reserving half lives on `Wallet` and is exercised there; it gets a
-    /// wrapper here once the app actually builds a NIGHT lock. Releasing is
-    /// needed already: a swap file removed without it would strand the coins
-    /// with nothing left to free them.
+    // Output reservation. No screen reserves an output in 1.0.0 — the atomic
+    // swap that would have was withdrawn — but the wallet file still carries
+    // the flag, `check_rescan_allowed` still refuses while anything is
+    // reserved, and `vault_node_tests` drives the whole reserve → refuse
+    // rescan → release lifecycle against a real vault on disk. Keeping the
+    // wrappers behind `cfg(test)` keeps that regression test without shipping
+    // an entry point no screen can reach.
+    #[cfg(test)]
     pub fn release_commits(&mut self, hexes: &[String]) -> anyhow::Result<()> {
         self.update(|w| w.release_commits(hexes))
     }
 
+    #[cfg(test)]
     pub fn reserve_commits(&mut self, hexes: &[String]) -> anyhow::Result<()> {
         self.update(|w| w.reserve_commits(hexes))
     }
 
+    #[cfg(test)]
     pub fn pick_commit_hexes_at(
         &self,
         target: u64,
@@ -429,61 +441,6 @@ impl WalletState {
     ) -> anyhow::Result<Vec<String>> {
         let w = self.require_wallet()?;
         w.pick_commit_hexes_at(target, tip, maturity)
-    }
-
-    /// Pay `to` from specific outputs (including reserved swap coins).
-    pub fn prepare_from_commits(
-        &mut self,
-        node: &NodeHandle,
-        commits: &[String],
-        to: &Address,
-        amount_darks: u64,
-        fee_darks: u64,
-        memo: &str,
-    ) -> anyhow::Result<Transaction> {
-        anyhow::ensure!(
-            !self.is_vault(),
-            "Experimental swap signing is not integrated with Vault."
-        );
-        self.require_wallet()?;
-        let (tip, maturity) = {
-            let shared = node.shared();
-            let guard = shared
-                .lock()
-                .map_err(|_| anyhow::anyhow!("node state lock poisoned"))?;
-            (
-                guard.chain.tip_height().map(|h| h.0).unwrap_or(0),
-                guard.chain.ledger.coinbase_maturity,
-            )
-        };
-        self.update(|wallet| {
-            wallet.create_payment_from_commits_at(
-                commits,
-                to,
-                amount_darks,
-                fee_darks,
-                memo,
-                tip,
-                maturity,
-            )
-        })
-    }
-
-    pub fn record_swap_payment(&mut self, tx: &Transaction, amount: u64) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !self.is_vault(),
-            "Experimental swap payments are not integrated with Vault."
-        );
-        self.update(|wallet| {
-            if !wallet
-                .history()
-                .iter()
-                .any(|h| h.txid == tx.txid().to_hex())
-            {
-                wallet.record_send(tx, amount, "swap-lock".into())?;
-            }
-            Ok(())
-        })
     }
 
     pub fn output_count(&self) -> usize {
@@ -614,7 +571,11 @@ impl WalletState {
         // saved. Check again even with an empty mempool before reporting success.
         require_canonical_scan(wallet, &guard)?;
         for (txid, tx) in wallet.resendable() {
-            // Swap locks have deadlines; only the swap worker may retry them.
+            // A lock left behind by the withdrawn atomic swap must never go
+            // back on the wire on its own. It had a deadline that has long
+            // since passed, its counterparty may already have refunded, and
+            // nothing monitors the other chain any more. Only a person who
+            // understands what that payment was may republish it.
             if wallet
                 .history()
                 .iter()
@@ -713,6 +674,12 @@ impl WalletState {
     /// Validate before changing either the wallet or the node's chain files.
     pub fn check_rescan_allowed(&self) -> anyhow::Result<()> {
         let wallet = self.require_wallet()?;
+        // Atomic swap was withdrawn before 1.0.0, but a wallet file written by
+        // an experimental build can still carry journal records, and a rescan
+        // clears the reservations those records depend on. The check is a
+        // no-op on every wallet that never ran one.
+        anyhow::ensure!(!wallet.has_swap_recovery(),
+            "Rescan is blocked while swap recovery records exist. Reconcile their chain state first.");
         anyhow::ensure!(
             !wallet.history().iter().any(|entry| entry.is_pending()),
             "Rescan is blocked while payments are pending. Resolve them and preserve an encrypted backup first."
@@ -720,17 +687,6 @@ impl WalletState {
         anyhow::ensure!(
             !wallet.has_reservations(),
             "Rescan is blocked while outputs are reserved. Resolve the reservations first."
-        );
-        // A rescan clears reservations. Never unlock coins belonging to an
-        // unfinished trade, or another payment could invalidate its recovery.
-        let datadir = self
-            .seed_path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("Wallet folder unavailable"))?;
-        let swaps = nightfall_swap::persist::list(datadir)?;
-        anyhow::ensure!(
-            !swaps.iter().any(|s| !s.is_finished()),
-            "Finish or safely close active swaps before rescanning the wallet."
         );
         Ok(())
     }

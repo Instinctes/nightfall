@@ -26,7 +26,15 @@ pub const WALLET_VERSION: &str = match option_env!("NIGHTFALL_DEV_VERSION") {
     Some(version) => version,
     None => env!("CARGO_PKG_VERSION"),
 };
-pub const IS_DEV_BUILD: bool = option_env!("NIGHTFALL_DEV_VERSION").is_some();
+pub const IS_DEV_BUILD: bool = option_env!("NIGHTFALL_DEV_VERSION").is_some()
+    || option_env!("NIGHTFALL_DEV_PROFILE").is_some();
+/// The isolated preview cannot inherit the historical mainnet opt-in.
+pub const IS_ISOLATED_DEV_PROFILE: bool = option_env!("NIGHTFALL_DEV_PROFILE").is_some();
+pub const DEV_DATA_SUBDIR: &str = if IS_ISOLATED_DEV_PROFILE {
+    "wallet-1.0.0-dev.2"
+} else {
+    "wallet-1.0-dev"
+};
 
 /// A development build that is allowed to open mainnet.
 ///
@@ -45,7 +53,8 @@ pub const IS_DEV_BUILD: bool = option_env!("NIGHTFALL_DEV_VERSION").is_some();
 /// no longer read that wallet — it is a one-way door, and the way back is an
 /// encrypted backup made beforehand. The banner in `mainnet_dev_warning` says
 /// so on every page, and the build's own README says it first.
-pub const IS_DEV_MAINNET: bool = option_env!("NIGHTFALL_DEV_MAINNET").is_some();
+pub const IS_DEV_MAINNET: bool =
+    !IS_ISOLATED_DEV_PROFILE && option_env!("NIGHTFALL_DEV_MAINNET").is_some();
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -55,19 +64,17 @@ pub enum View {
     Activity,
     Mining,
     Network,
-    Swap,
     Settings,
 }
 
 impl View {
-    pub const ALL: [(View, &'static str); 8] = [
+    pub const ALL: [(View, &'static str); 7] = [
         (View::Dashboard, "Dashboard"),
         (View::Send, "Send"),
         (View::Receive, "Receive"),
         (View::Activity, "Activity"),
         (View::Mining, "Mining"),
         (View::Network, "Network"),
-        (View::Swap, "Swap"),
         (View::Settings, "Settings"),
     ];
 
@@ -79,7 +86,6 @@ impl View {
     pub fn content_max_width(self) -> f32 {
         match self {
             View::Send | View::Settings => 720.0,
-            View::Swap => 860.0,
             _ => f32::INFINITY,
         }
     }
@@ -218,44 +224,9 @@ pub struct App {
     pub book_name: String,
     pub book_addr: String,
 
-    // Swap
-    pub swap_draft: nightfall_swap::ui::Draft,
-    /// Packet to hand to the counterparty, rendered for copying.
-    pub swap_packet_out: String,
-    /// Packet pasted from the counterparty, before it is believed.
-    pub swap_packet_in: String,
-    /// Why the pasted packet was refused. Every rejection names its reason.
-    pub swap_import_error: Option<String>,
-    pub swap_start_error: Option<String>,
-    /// Live handshakes, by swap id. Reloaded from `{datadir}/swaps/{id}.secret`.
-    pub swap_sessions: std::collections::HashMap<String, nightfall_swap::session::Session>,
-    /// Bitcoin addresses the user supplies, because this wallet holds NIGHT
-    /// and not Bitcoin. Where a refund, a redeem and a punish would pay.
-    pub swap_btc_refund: String,
-    pub swap_btc_redeem: String,
-    pub swap_btc_punish: String,
-
-    /// Bob's funding input for TX_lock, as typed.
-    pub swap_funding: nightfall_swap::ui::FundingDraft,
-    /// The signed transaction pasted back from the user's Bitcoin wallet.
-    pub swap_signed_hex: String,
-    pub swap_lock_note: Option<Result<String, String>>,
-
-    /// Last driver pass. Open swaps are ticked on this cadence, not every frame.
-    pub last_swap_tick: Option<Instant>,
-    /// Last driver error, shown on the swap tab.
-    pub swap_tick_note: Option<String>,
-    pub swap_job: Option<std::thread::JoinHandle<crate::swap_worker::Report>>,
-    pub swap_report: crate::swap_worker::Report,
-
-    /// A destructive button was pressed once; it asks before it acts.
-    ///
-    /// The action itself is kept, not its wording. Recovering it from the
-    /// confirmation text meant every new button had to be added to a string
-    /// comparison, and forgetting to would silently run the *wrong*
-    /// transaction. The id is text so this crate needs no uuid dependency.
-    pub swap_confirm: Option<(String, nightfall_swap::ui::Action)>,
-
+    // Atomic swap between NIGHT and Bitcoin was carried through most of the
+    // 1.0.0 cycle and withdrawn before release. `docs/SWAP-WITHDRAWN.md` has
+    // the reasoning. Its state lived here; nothing replaced it.
     /// First observation of the chain load: (when, how many blocks).
     ///
     /// The estimate is built from what this machine is actually doing, not
@@ -269,6 +240,11 @@ pub struct App {
     pub wallet_load_error: Option<String>,
     tray: Option<Tray>,
     pending_chain_check: Option<Arc<Mutex<Option<ChainCheck>>>>,
+    /// History ids already observed, so a lock/unlock does not chime for old coins.
+    activity_seen: std::collections::HashSet<String>,
+    activity_primed: bool,
+    /// Context time when a receive/mine flash started.
+    coin_flash_at: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -399,26 +375,6 @@ impl App {
             address_book: AddressBook::load(&datadir),
             book_name: String::new(),
             book_addr: String::new(),
-            swap_draft: nightfall_swap::ui::Draft {
-                give_night: false,
-                ..Default::default()
-            },
-            swap_sessions: std::collections::HashMap::new(),
-            swap_btc_refund: String::new(),
-            swap_btc_redeem: String::new(),
-            swap_btc_punish: String::new(),
-            swap_funding: nightfall_swap::ui::FundingDraft::default(),
-            swap_signed_hex: String::new(),
-            swap_lock_note: None,
-            swap_packet_out: String::new(),
-            swap_packet_in: String::new(),
-            swap_import_error: None,
-            swap_start_error: None,
-            swap_confirm: None,
-            last_swap_tick: None,
-            swap_tick_note: None,
-            swap_job: None,
-            swap_report: Default::default(),
             load_started: None,
             onboarding: if initial_restore {
                 Some(Onboarding::resume())
@@ -430,6 +386,9 @@ impl App {
             wallet_load_error,
             tray: None,
             pending_chain_check: None,
+            activity_seen: std::collections::HashSet::new(),
+            activity_primed: false,
+            coin_flash_at: None,
         };
         if custody == Custody::Legacy && app.wallet_load_error.is_none() {
             app.start_node();
@@ -539,9 +498,6 @@ impl App {
     }
 
     pub fn set_prune(&mut self, on: bool, ctx: &egui::Context) {
-        if on && !self.swap_maintenance_allowed(ctx) {
-            return;
-        }
         if !on && self.prune {
             if let Some(s) = &self.status {
                 if s.pruned {
@@ -577,9 +533,6 @@ impl App {
     }
 
     pub fn resync_chain(&mut self, ctx: &egui::Context) {
-        if !self.swap_maintenance_allowed(ctx) {
-            return;
-        }
         let Some(node) = self.node.clone() else {
             self.toasts.error(ctx, "Node is not running");
             return;
@@ -798,6 +751,65 @@ impl App {
         }
     }
 
+    pub fn coin_flash_amount(&self, ctx: &egui::Context) -> f32 {
+        let Some(started) = self.coin_flash_at else {
+            return 0.0;
+        };
+        let t = (ctx.input(|i| i.time) - started) as f32;
+        if t >= 1.15 {
+            0.0
+        } else {
+            ctx.request_repaint();
+            (1.0 - t / 1.15).clamp(0.0, 1.0).powf(1.25)
+        }
+    }
+
+    fn note_incoming(&mut self, ctx: &egui::Context) {
+        let Ok(wallet) = self.wallet.lock() else {
+            return;
+        };
+        if !matches!(
+            wallet.custody(),
+            crate::wallet_state::Custody::Unlocked | crate::wallet_state::Custody::Legacy
+        ) {
+            self.activity_primed = false;
+            self.activity_seen.clear();
+            return;
+        }
+        let mut arrived = 0u64;
+        let mut mined = false;
+        for entry in wallet.history() {
+            if !self.activity_seen.insert(entry.txid.clone()) {
+                continue;
+            }
+            match entry.direction {
+                nightfall_wallet::Direction::Mined | nightfall_wallet::Direction::Received => {
+                    arrived = arrived.saturating_add(entry.amount);
+                    mined |= entry.direction == nightfall_wallet::Direction::Mined;
+                }
+                nightfall_wallet::Direction::Sent => {}
+            }
+        }
+        drop(wallet);
+        if !self.activity_primed {
+            self.activity_primed = true;
+            return;
+        }
+        if arrived == 0 {
+            return;
+        }
+        crate::feedback::play_coin_chime();
+        self.coin_flash_at = Some(ctx.input(|i| i.time));
+        ctx.request_repaint();
+        let amount = arrived as f64 / DARKS_PER_NIGHT as f64;
+        if mined {
+            self.toasts.success(ctx, format!("Mined {amount:.8} NIGHT"));
+        } else {
+            self.toasts
+                .success(ctx, format!("Received {amount:.8} NIGHT"));
+        }
+    }
+
     fn drain_sync_signal(&mut self, ctx: &egui::Context) {
         let taken = self.sync_signal.lock().ok().and_then(|mut s| s.take());
         if let Some(result) = taken {
@@ -811,8 +823,11 @@ impl App {
                 }
                 Err(e) => {
                     self.send_confirm = false;
-                    self.wallet_sync_error = Some(e.clone());
-                    self.toasts.error(ctx, format!("Sync failed: {e}"));
+                    // The persistent banner is the source of truth for a
+                    // scan failure. A simultaneous toast covered the lower
+                    // dashboard cards on startup and repeated every retry,
+                    // making the warning harder to read rather than clearer.
+                    self.wallet_sync_error = Some(e);
                 }
             }
         }
@@ -896,100 +911,175 @@ impl App {
 
     // ---------------------------------------------------------------- chrome --
 
-    fn sidebar(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("nav")
-            .exact_width(246.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(RAIL)
-                    .inner_margin(egui::Margin::symmetric(16.0, 20.0)),
-            )
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add_space(2.0);
-                    logo(ui, 36.0);
-                    ui.add_space(9.0);
-                    ui.vertical(|ui| {
+    /// Room for the overlapping rail plus the gap before the main canvas.
+    /// Where the page's content starts, measured inside the plate.
+    ///
+    /// The rail floats over the plate's left edge, so the reserve is simply
+    /// how far the rail reaches past that edge, plus a gap. It used to be a
+    /// fraction of the window, which was a different quantity that happened
+    /// to look right at one size.
+    fn nav_reserve_for(width: f32) -> f32 {
+        let rail_right =
+            crate::widgets::WINDOW_INSET + crate::widgets::RAIL_LEFT + Self::rail_width_for(width);
+        let plate_left = crate::widgets::WINDOW_INSET + crate::widgets::PLATE_LEFT;
+        (rail_right - plate_left + 28.0).max(24.0)
+    }
+
+    fn rail_width_for(width: f32) -> f32 {
+        if width < 1100.0 {
+            208.0
+        } else {
+            224.0
+        }
+    }
+
+    /// Room at the top of the plate for the window buttons and the drag strip.
+    ///
+    /// This used to be macOS' own title bar. The window has no title bar now —
+    /// it has a strip we draw and handle ourselves — so the clearance is the
+    /// same on every platform, and it is the inset plus that strip because the
+    /// plate starts inside the window.
+    /// Room at the top for the window's own close/minimise/zoom buttons.
+    ///
+    /// The title bar is hidden but the buttons are still there, drawn by macOS
+    /// over our content in the top-left corner. Nothing of ours may sit under
+    /// them.
+    fn title_clearance() -> f32 {
+        #[cfg(target_os = "macos")]
+        {
+            38.0
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            0.0
+        }
+    }
+
+    #[allow(deprecated)]
+    fn sidebar(&mut self, ui: &mut egui::Ui) {
+        let height = ui.available_height();
+        egui::Frame::none()
+            .fill(glass_rail())
+            // A rim, not a drop shadow.
+            //
+            // Half of this sheet hangs over the desktop, and a shadow of
+            // near-black INK painted onto transparent pixels is a dark haze
+            // with nothing behind it to soften into. On a bright wallpaper
+            // that is the "black line beside the navigation". macOS already
+            // casts one shadow for the whole window silhouette, this sheet
+            // included, so a second one here only ever showed as an outline.
+            .stroke(Stroke::new(1.0_f32, with_alpha(BORDER_HI, 70)))
+            .rounding(Rounding::same(ROUND))
+            .inner_margin(egui::Margin::symmetric(14.0, 18.0))
+            .show(ui, |ui| {
+                fill_width(ui, ui.available_width());
+                // `height` is the outside of the sheet, including its margins.
+                ui.set_min_height((height - 36.0).max(0.0));
+                // Reserve the footer as a real rectangle. A bottom-up layout
+                // sharing the navigation's space can paint over Settings when
+                // the window is short; separate rectangles make that state
+                // impossible.
+                let inner = ui.max_rect();
+                let footer_height = 122.0_f32.min(inner.height() * 0.30);
+                let footer_top = (inner.bottom() - footer_height).max(inner.top());
+                let nav_rect =
+                    egui::Rect::from_min_max(inner.min, egui::pos2(inner.right(), footer_top));
+                let footer_rect =
+                    egui::Rect::from_min_max(egui::pos2(inner.left(), footer_top), inner.max);
+                ui.allocate_ui_at_rect(nav_rect, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.horizontal(|ui| {
                         ui.add_space(2.0);
-                        ui.label(RichText::new("NIGHTFALL").size(17.0).color(TEXT).strong());
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            ui.label(RichText::new("CORE WALLET").size(9.5).color(ACCENT_HI));
-                            ui.label(RichText::new(WALLET_VERSION).size(9.5).color(TEXT_DIM));
+                        logo(ui, 32.0);
+                        ui.add_space(9.0);
+                        ui.vertical(|ui| {
+                            ui.add_space(2.0);
+                            ui.label(RichText::new("NIGHTFALL").size(17.0).color(TEXT).strong());
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                ui.label(RichText::new("CORE WALLET").size(9.5).color(ACCENT_HI));
+                                ui.label(RichText::new(WALLET_VERSION).size(9.5).color(TEXT_DIM));
+                            });
                         });
                     });
+
+                    ui.add_space(12.0);
+
+                    for (view, label) in View::ALL {
+                        let group = match view {
+                            View::Dashboard => Some("Wallet"),
+                            View::Mining => Some("Tools"),
+                            View::Settings => Some("Preferences"),
+                            _ => None,
+                        };
+                        if let Some(group) = group {
+                            ui.add_space(6.0);
+                            ui.label(RichText::new(group).size(11.5).color(TEXT_DIM));
+                            ui.add_space(2.0);
+                        }
+                        let selected = self.view == view;
+                        let w = ui.available_width();
+                        let (rect, resp) =
+                            ui.allocate_exact_size(Vec2::new(w, 32.0), egui::Sense::click());
+                        resp.widget_info(|| {
+                            egui::WidgetInfo::selected(
+                                egui::WidgetType::SelectableLabel,
+                                true,
+                                selected,
+                                label,
+                            )
+                        });
+
+                        if selected {
+                            ui.painter().rect(
+                                rect,
+                                Rounding::same(ROUND_SM),
+                                glass_inner(),
+                                Stroke::NONE,
+                            );
+                        } else if resp.hovered() {
+                            ui.painter().rect(
+                                rect,
+                                Rounding::same(ROUND_SM),
+                                glass_hover(),
+                                Stroke::NONE,
+                            );
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+
+                        let fg = if selected { TEXT } else { TEXT_DIM };
+                        nav_icon(
+                            ui.painter(),
+                            view,
+                            egui::pos2(rect.min.x + 15.0, rect.center().y - 11.0),
+                            fg,
+                        );
+                        let galley = ui.painter().layout_no_wrap(
+                            label.to_string(),
+                            egui::FontId::proportional(14.0),
+                            fg,
+                        );
+                        ui.painter().galley(
+                            egui::pos2(rect.min.x + 46.0, rect.center().y - galley.size().y / 2.0),
+                            galley,
+                            fg,
+                        );
+
+                        if resp.has_focus() {
+                            ui.painter().rect_stroke(
+                                rect,
+                                Rounding::same(ROUND_SM),
+                                Stroke::new(2.0_f32, ACCENT_HI),
+                            );
+                        }
+                        if resp.clicked() {
+                            self.view = view;
+                            self.reveal_seed = false;
+                            self.reveal_mnemonic = false;
+                            self.reveal_view_key = false;
+                        }
+                    }
                 });
-
-                ui.add_space(22.0);
-
-                for (view, label) in View::ALL {
-                    let selected = self.view == view;
-                    let w = ui.available_width();
-                    let (rect, resp) =
-                        ui.allocate_exact_size(Vec2::new(w, 42.0), egui::Sense::click());
-                    resp.widget_info(|| {
-                        egui::WidgetInfo::selected(
-                            egui::WidgetType::SelectableLabel,
-                            true,
-                            selected,
-                            label,
-                        )
-                    });
-
-                    if selected {
-                        gradient_rect(ui.painter(), rect, ROUND_SM, Vec2::new(1.0, 0.0), |t| {
-                            brand_gradient(t * 0.5).gamma_multiply(0.30)
-                        });
-                        // Accent bar marking the current section.
-                        let bar = egui::Rect::from_min_size(
-                            rect.min + Vec2::new(0.0, 9.0),
-                            Vec2::new(3.0, rect.height() - 18.0),
-                        );
-                        ui.painter()
-                            .rect_filled(bar, Rounding::same(2.0), ACCENT_HI);
-                    } else if resp.hovered() {
-                        ui.painter().rect_filled(
-                            rect,
-                            Rounding::same(ROUND_SM),
-                            SURFACE_HI.gamma_multiply(0.7),
-                        );
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-
-                    let fg = if selected { TEXT } else { TEXT_DIM };
-                    nav_icon(
-                        ui.painter(),
-                        view,
-                        egui::pos2(rect.min.x + 15.0, rect.center().y - 11.0),
-                        fg,
-                    );
-                    let galley = ui.painter().layout_no_wrap(
-                        label.to_string(),
-                        egui::FontId::proportional(14.0),
-                        fg,
-                    );
-                    ui.painter().galley(
-                        egui::pos2(rect.min.x + 50.0, rect.center().y - galley.size().y / 2.0),
-                        galley,
-                        fg,
-                    );
-
-                    if resp.has_focus() {
-                        ui.painter().rect_stroke(
-                            rect,
-                            Rounding::same(ROUND_SM),
-                            Stroke::new(2.0_f32, ACCENT_HI),
-                        );
-                    }
-                    if resp.clicked() {
-                        self.view = view;
-                        self.reveal_seed = false;
-                        self.reveal_mnemonic = false;
-                        self.reveal_view_key = false;
-                    }
-                    ui.add_space(3.0);
-                }
 
                 // Foot of the rail: which network, and whether the supply adds up.
                 //
@@ -1003,178 +1093,264 @@ impl App {
                 // The formula moved into the hover. It explains the line above
                 // it rather than reporting anything, and at 9.5px under a status
                 // it competed with the status for the same glance.
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    let loading = self.status.as_ref().map(|s| s.loading).unwrap_or(false);
-                    let supply_ok = self.status.as_ref().map(|s| s.supply_ok).unwrap_or(false);
+                ui.allocate_ui_at_rect(footer_rect, |ui| {
+                    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                        let loading = self.status.as_ref().map(|s| s.loading).unwrap_or(false);
+                        let supply_ok = self.status.as_ref().map(|s| s.supply_ok).unwrap_or(false);
 
-                    // Colour follows the truth. While the chain loads nothing
-                    // has been checked yet, and the old code passed ok = true
-                    // for that case — a green dot and green lettering next to
-                    // the word "loading". Green here means the sum was
-                    // recomputed and balanced. Until it has been, this is dim.
-                    let (label, colour) = if loading {
-                        ("Checking supply…", TEXT_DIM)
-                    } else if supply_ok {
-                        ("Supply verified", SUCCESS)
-                    } else {
-                        ("Supply UNVERIFIED", DANGER)
-                    };
+                        // Colour follows the truth. While the chain loads nothing
+                        // has been checked yet, and the old code passed ok = true
+                        // for that case — a green dot and green lettering next to
+                        // the word "loading". Green here means the sum was
+                        // recomputed and balanced. Until it has been, this is dim.
+                        let (label, colour) = if self.status.is_none() {
+                            ("Waiting for node", TEXT_DIM)
+                        } else if loading {
+                            ("Checking supply…", TEXT_DIM)
+                        } else if supply_ok {
+                            ("Supply verified", SUCCESS)
+                        } else {
+                            ("Supply not verified", DANGER)
+                        };
 
-                    ui.add_space(2.0);
-                    let resp = ui
-                        .horizontal(|ui| {
-                            dot(ui, colour, loading);
-                            ui.add_space(6.0);
-                            ui.label(RichText::new(label).size(11.5).color(colour))
-                        })
-                        .inner;
-                    resp.on_hover_text(
+                        ui.add_space(2.0);
+                        let resp = ui
+                            .horizontal(|ui| {
+                                dot(ui, colour, loading);
+                                ui.add_space(6.0);
+                                ui.label(RichText::new(label).size(11.5).color(colour))
+                            })
+                            .inner;
+                        resp.on_hover_text(
                         "Σ UTXO − Σ excess = (minted − burned)·G\n\nEvery node recomputes this \
                          over the whole UTXO set and refuses a block that breaks it. One coin \
                          minted out of nowhere and the equation stops balancing.",
                     );
 
-                    ui.add_space(9.0);
-                    ui.horizontal(|ui| {
-                        let net = self.network.as_str();
-                        let color = match self.network {
-                            NetworkId::Mainnet => SUCCESS,
-                            NetworkId::Testnet => WARN,
-                            NetworkId::Devnet => ACCENT_HI,
-                        };
-                        badge(ui, &net.to_uppercase(), color);
-                        ui.label(
-                            RichText::new(format!(
-                                "protocol v{}",
-                                nightfall_types::PROTOCOL_VERSION
-                            ))
-                            .size(10.0)
-                            .color(TEXT_FAINT),
-                        );
-                    });
+                        ui.add_space(9.0);
+                        ui.horizontal(|ui| {
+                            let net = self.network.as_str();
+                            let color = match self.network {
+                                NetworkId::Mainnet => SUCCESS,
+                                NetworkId::Testnet => WARN,
+                                NetworkId::Devnet => ACCENT_HI,
+                            };
+                            badge(ui, &net.to_uppercase(), color);
+                            ui.label(
+                                RichText::new(format!(
+                                    "protocol v{}",
+                                    nightfall_types::PROTOCOL_VERSION
+                                ))
+                                .size(10.0)
+                                .color(TEXT_FAINT),
+                            );
+                        });
 
-                    ui.add_space(12.0);
-                    let w = ui.available_width();
-                    let (r, _) = ui.allocate_exact_size(Vec2::new(w, 1.0), egui::Sense::hover());
-                    ui.painter().hline(
-                        r.x_range(),
-                        r.center().y,
-                        Stroke::new(1.0_f32, BORDER.gamma_multiply(0.8)),
-                    );
+                        ui.add_space(12.0);
+                    });
                 });
             });
     }
 
+    fn float_sidebar(&mut self, ctx: &egui::Context) {
+        // The rail deliberately stands outside the plate, so it is placed
+        // against the window rather than against the gutter-trimmed page.
+        let work = ctx.screen_rect();
+        // The rail is a floating sheet in the reference composition. Keep a
+        // generous breathing space above and below it so it never becomes a
+        // full-height strip, even when the window is maximised.
+        let edge = (work.height() * 0.10).clamp(40.0, 120.0);
+        let top = edge + Self::title_clearance();
+        let bottom = edge;
+        // Keep the rail near the left edge while retaining a small breathing
+        // line at every size. The content axis is reserved independently, so
+        // moving this sheet never compresses the page cards.
+        // Far enough from the window's own edge that the rail's shadow can
+        // finish before it. At 24 points a 28-point blur was cut off by the
+        // frame, and a clipped shadow ends on its darkest values — a dark
+        // seam down the left side, and an alpha edge macOS then built its own
+        // window shadow from.
+        let left = crate::widgets::WINDOW_INSET + crate::widgets::RAIL_LEFT;
+        let rail_width = Self::rail_width_for(work.width());
+        let pos = egui::pos2(work.left() + left, work.top() + top);
+        let height = (work.height() - top - bottom).max(240.0);
+        egui::Area::new(egui::Id::new("nightfall-nav"))
+            .fixed_pos(pos)
+            .order(egui::Order::Foreground)
+            .movable(false)
+            .interactable(true)
+            .show(ctx, |ui| {
+                ui.set_min_size(Vec2::new(rail_width, height));
+                ui.set_max_size(Vec2::new(rail_width, height));
+                self.sidebar(ui);
+            });
+    }
+
     fn topbar(&mut self, ctx: &egui::Context) {
+        let reserve = Self::nav_reserve_for(ctx.available_rect().width());
         egui::TopBottomPanel::top("top")
-            .exact_height(60.0)
+            .exact_height(94.0 + Self::title_clearance())
+            .show_separator_line(false)
             .frame(
                 egui::Frame::none()
-                    .fill(BG)
-                    .inner_margin(egui::Margin::symmetric(24.0, 12.0)),
+                    .fill(Color32::TRANSPARENT)
+                    .inner_margin(egui::Margin {
+                        left: reserve,
+                        right: 24.0,
+                        top: Self::title_clearance(),
+                        bottom: 8.0,
+                    }),
             )
             .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    let title = View::ALL
-                        .iter()
-                        .find(|(v, _)| *v == self.view)
-                        .map(|(_, l)| *l)
-                        .unwrap_or("");
-                    // Title and its one-line description together. The
-                    // description used to float in the content area between
-                    // the warning banner and the first card, belonging to
-                    // neither — a sentence in the middle of nothing. It is a
-                    // subtitle, so it sits under the title.
-                    ui.vertical(|ui| {
-                        ui.add_space(-2.0);
-                        ui.label(RichText::new(title).size(20.0).strong());
-                        ui.label(
-                            RichText::new(views::page_description(self.view))
-                                .size(11.5)
-                                .color(TEXT_FAINT),
-                        );
-                    });
+                let bar = ui.spacing().scroll.allocated_width();
+                let width = (ui.available_width() - bar).max(0.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(width, ui.available_height()),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        fill_width(ui, width);
+                        egui::Frame::none()
+                            .fill(glass_surface())
+                            .stroke(Stroke::NONE)
+                            .rounding(Rounding::same(ROUND))
+                            .inner_margin(egui::Margin::symmetric(22.0, 12.0))
+                            .show(ui, |ui| {
+                                fill_width(ui, (width - 44.0).max(0.0));
+                                ui.horizontal_centered(|ui| {
+                                    let title = View::ALL
+                                        .iter()
+                                        .find(|(v, _)| *v == self.view)
+                                        .map(|(_, l)| *l)
+                                        .unwrap_or("");
+                                    let detail_width = (ui.available_width() - 255.0).max(220.0);
+                                    ui.allocate_ui_with_layout(
+                                        Vec2::new(detail_width, 54.0),
+                                        egui::Layout::top_down(egui::Align::LEFT),
+                                        |ui| {
+                                            ui.set_width(detail_width);
+                                            ui.add_space(-2.0);
+                                            ui.label(RichText::new(title).size(24.0).strong());
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(views::page_description(
+                                                        self.view,
+                                                    ))
+                                                    .size(13.0)
+                                                    .color(TEXT_DIM),
+                                                )
+                                                .truncate(),
+                                            )
+                                            .on_hover_text(views::page_description(self.view));
+                                        },
+                                    );
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let loading = self.status.as_ref().map(|s| s.loading).unwrap_or(false);
-                        let mining = self.is_mining();
-                        let btn = egui::Button::new(
-                            RichText::new(if loading {
-                                "Loading chain…"
-                            } else if mining {
-                                "Stop mining"
-                            } else {
-                                "Start mining"
-                            })
-                            .strong()
-                            .color(if mining {
-                                TEXT
-                            } else {
-                                Color32::WHITE
-                            }),
-                        )
-                        .fill(if mining { SURFACE_HI } else { ACCENT })
-                        .stroke(if mining {
-                            Stroke::new(1.0_f32, BORDER_HI)
-                        } else {
-                            Stroke::NONE
-                        })
-                        .rounding(Rounding::same(ROUND_SM))
-                        .min_size(Vec2::new(126.0, 34.0));
-                        if ui.add_enabled(!loading, btn).clicked() && !loading {
-                            self.set_mining(!mining);
-                            if mining {
-                                self.hashrate.current = 0.0;
-                            }
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            let loading = self
+                                                .status
+                                                .as_ref()
+                                                .map(|s| s.loading)
+                                                .unwrap_or(false);
+                                            if self.vault_ui.custody == Custody::Unlocked
+                            && ghost_button(ui, "Lock wallet")
+                                .on_hover_text("Lock immediately · ⌘L on macOS, Ctrl+L elsewhere")
+                                .clicked()
+                        {
+                            self.request_vault(crate::vault_ui::Action::Lock, ctx);
                         }
+                                            ui.add_space(4.0);
 
-                        ui.add_space(14.0);
-
-                        // Chain height + sync indicator
-                        let syncing = self.syncing.load(Ordering::SeqCst);
-                        let blocks = self.status.as_ref().map(|s| s.blocks).unwrap_or(0);
-                        ui.horizontal(|ui| {
-                            dot(
-                                ui,
-                                if self.status_error.is_some() {
-                                    DANGER
-                                } else if syncing {
-                                    WARN
-                                } else {
-                                    SUCCESS
-                                },
-                                syncing,
-                            );
-                            ui.add_space(2.0);
-                            ui.label(
-                                RichText::new(format!("{} blocks", format_int(blocks)))
-                                    .size(12.5)
-                                    .color(TEXT_DIM),
-                            );
-                        });
-
-                        if mining {
-                            ui.add_space(14.0);
-                            ui.label(
-                                RichText::new(format_hashrate(self.hashrate.current))
-                                    .size(12.5)
-                                    .color(ACCENT_HI),
-                            );
-                        }
-                    });
-                });
+                                            // Chain height + sync indicator
+                                            let syncing = self.syncing.load(Ordering::SeqCst);
+                                            let blocks =
+                                                self.status.as_ref().map(|s| s.blocks).unwrap_or(0);
+                                            ui.horizontal(|ui| {
+                                                dot(
+                                                    ui,
+                                                    if self.status_error.is_some() {
+                                                        DANGER
+                                                    } else if self.status.is_none() || loading {
+                                                        TEXT_DIM
+                                                    } else if syncing
+                                                        || self.wallet_sync_error.is_some()
+                                                    {
+                                                        WARN
+                                                    } else if IS_DEV_BUILD {
+                                                        ACCENT_HI
+                                                    } else {
+                                                        SUCCESS
+                                                    },
+                                                    syncing,
+                                                );
+                                                ui.add_space(2.0);
+                                                ui.label(
+                                                    RichText::new(if self.status.is_none() {
+                                                        "Node starting".into()
+                                                    } else if IS_DEV_BUILD && !IS_DEV_MAINNET {
+                                                        format!(
+                                                            "Local · {} blocks",
+                                                            format_int(blocks)
+                                                        )
+                                                    } else {
+                                                        format!("{} blocks", format_int(blocks))
+                                                    })
+                                                    .size(12.5)
+                                                    .color(TEXT_DIM),
+                                                );
+                                            });
+                                        },
+                                    );
+                                });
+                            });
+                    },
+                );
             });
     }
 }
 
 impl eframe::App for App {
+    /// Clear to nothing, so the desktop shows through outside the plate.
+    ///
+    /// This is what kept the window a rectangle. `with_transparent(true)` only
+    /// asks for a surface with an alpha channel; what is *written* into that
+    /// channel every frame is this. eframe's default is `rgba(12, 12, 12, 180)`
+    /// — a dark grey at seventy percent — so the whole window was flooded with
+    /// it and the rounded plate sat inside a visible dark box. The rounded
+    /// corners, the shadow and the rail's overhang were all being drawn
+    /// correctly the whole time, onto an opaque background.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply(ctx);
+        paint_room(ctx);
+        // Before any early return below: a screen that cannot be moved or
+        // closed is a trap, and the lock screen and onboarding are screens.
+
+        // Claims the margin so every panel below lands on the plate rather
+        // than on the window. Without it the lock screen's header hung out
+        // past the rounded corner.
+        crate::widgets::place_window_buttons(ctx);
+        crate::widgets::plate_gutters(ctx);
+        // Out of sight is *observed*, never remembered.
+        //
+        // This was a remembered flag, set when the window was minimised and
+        // cleared only by the menu-bar item's Show. Restore it from the Dock
+        // instead — which is the way the operating system offers, and the one
+        // an owner reaches for — and nothing cleared it. `observe_activity`
+        // begins with `if !focused || hidden { self.clear_fields() }`, so a
+        // stale flag wiped the password field on every single frame: the
+        // wallet came back and could not be typed into, as fast as anyone
+        // could type. Asking the window each frame makes the whole question of
+        // who resets it disappear.
+        self.window_hidden = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
         if let Some(error) = &self.wallet_load_error {
             egui::CentralPanel::default()
                 .frame(
                     egui::Frame::none()
-                        .fill(BG)
+                        .fill(Color32::TRANSPARENT)
                         .inner_margin(egui::Margin::same(28.0)),
                 )
                 .show(ctx, |ui| wallet_load_error_panel(ui, error));
@@ -1182,6 +1358,12 @@ impl eframe::App for App {
         }
         self.handle_tray(ctx);
         if self.vault_gate(ctx) {
+            return;
+        }
+        if self.vault_ui.custody == Custody::Unlocked
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::L))
+        {
+            self.request_vault(crate::vault_ui::Action::Lock, ctx);
             return;
         }
         let access = self.wallet_scan_access.clone();
@@ -1193,7 +1375,7 @@ impl eframe::App for App {
             self.recovery_studio.clear();
         }
         self.poll_status();
-        self.tick_swaps(ctx);
+        self.note_incoming(ctx);
         self.drain_sync_signal(ctx);
 
         // Keep the UI live for hashrate, tray clicks, and sync animation.
@@ -1203,7 +1385,7 @@ impl eframe::App for App {
             egui::CentralPanel::default()
                 .frame(
                     egui::Frame::none()
-                        .fill(BG)
+                        .fill(Color32::TRANSPARENT)
                         .inner_margin(egui::Margin::same(28.0)),
                 )
                 .show(ctx, |ui| {
@@ -1227,49 +1409,58 @@ impl eframe::App for App {
                     // up a wallet could not back out of it.
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                        )
                         .show(ui, |ui| views::onboarding(self, ui, ctx));
                 });
             self.toasts.show(ctx);
             return;
         }
 
-        self.sidebar(ctx);
+        self.float_sidebar(ctx);
         self.topbar(ctx);
+        // The toolbar's lock must conceal page data in this same frame.
+        if self.vault_ui.busy() || self.vault_ui.needs_lock() {
+            ctx.request_repaint();
+            return;
+        }
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin {
-                left: 24.0,
-                right: 24.0,
-                top: 4.0,
-                bottom: 16.0,
-            }))
+            .frame(
+                egui::Frame::none()
+                    .fill(Color32::TRANSPARENT)
+                    .inner_margin(egui::Margin {
+                        left: Self::nav_reserve_for(ctx.available_rect().width()),
+                        right: 24.0,
+                        top: 16.0,
+                        bottom: 28.0,
+                    }),
+            )
             .show(ctx, |ui| {
-                // The lights go down first, over the panel's flat fill and
-                // under everything else. Painted at panel level rather than
-                // inside the scroll area on purpose: this is the lighting of
-                // the room, and it must not slide up and down with the
-                // content the way a background image would.
-                page_wash(ui.painter(), ui.clip_rect());
-
-                // One column for banners and the page. Same left edge, same
-                // right edge, same cap — so the scan warning cannot be a
-                // different width from the cards under it.
+                let forced = self.shots.as_ref().and_then(|s| s.offset());
+                let mut area = egui::ScrollArea::vertical()
+                    .id_salt(("page-scroll", self.view as u8))
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(
+                        egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                    );
+                if let Some(offset) = forced {
+                    area = area.vertical_scroll_offset(offset);
+                }
+                let drawn = area.show(ui, |ui| {
                 page_column(ui, self.view.content_max_width(), |ui| {
-                    // The always-on scrollbar lives in the scroll area below.
-                    // Inset banners by the same gutter so their right edge
-                    // matches the hero, not the bar.
-                    let gutter = scroll_gutter(ui);
-                    let banner_w = (ui.available_width() - gutter).max(0.0);
+                    let banner_w = ui.available_width();
 
                     if let Some(error) = &self.wallet_sync_error {
-                        let detailed = matches!(self.view, View::Dashboard | View::Send);
+                        let detailed = matches!(self.view, View::Send);
                         egui::Frame::none()
-                            .fill(tint(BG, WARN, 0.16))
-                            .stroke(Stroke::new(1.0_f32, WARN.gamma_multiply(0.35)))
-                            .inner_margin(egui::Margin::symmetric(14.0, 10.0))
-                            .rounding(Rounding::same(ROUND_FIELD))
+                            .fill(glass_alert(WARN))
+                            .stroke(Stroke::NONE)
+                            .inner_margin(egui::Margin::symmetric(16.0, 12.0))
+                            .rounding(Rounding::same(ROUND))
                             .show(ui, |ui| {
-                                fill_width(ui, (banner_w - 28.0).max(0.0));
+                                fill_width(ui, (banner_w - 32.0).max(0.0));
                                 egui::CollapsingHeader::new(
                                     RichText::new(
                                         "Wallet scan incomplete — balances and confirmations may be stale",
@@ -1284,8 +1475,8 @@ impl eframe::App for App {
                                 .id_salt(("scan-warning", self.view as u8))
                                 .default_open(detailed)
                                 .show(ui, |ui| {
-                                    ui.label(RichText::new(error).size(12.0).color(TEXT_DIM));
-                                    ui.label(RichText::new("Sending is blocked until a valid scan completes. Preserve an encrypted backup; do not clear pending payments or swap reservations to bypass this warning.").size(12.0).color(TEXT_DIM));
+                                    ui.label(RichText::new(error).size(13.0).color(TEXT));
+                                    ui.label(RichText::new("Sending is blocked until a valid scan completes. Preserve an encrypted backup; do not clear pending payments or reservations to bypass this warning.").size(13.0).color(TEXT));
                                 });
                             });
                         ui.add_space(GAP_SM);
@@ -1297,10 +1488,10 @@ impl eframe::App for App {
                     // lasts as long as the build does.
                     if IS_DEV_MAINNET {
                         egui::Frame::none()
-                            .fill(tint(BG, DANGER, 0.18))
-                            .stroke(Stroke::new(1.0_f32, DANGER.gamma_multiply(0.5)))
-                            .rounding(Rounding::same(ROUND_FIELD))
-                            .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                            .fill(glass_alert(DANGER))
+                            .stroke(Stroke::NONE)
+                            .rounding(Rounding::same(ROUND))
+                            .inner_margin(egui::Margin::symmetric(16.0, 12.0))
                             .show(ui, |ui| {
                                 fill_width(ui, (banner_w - 28.0).max(0.0));
                                 ui.label(
@@ -1319,10 +1510,10 @@ impl eframe::App for App {
 
                     if let Some(err) = self.status_error.clone() {
                         egui::Frame::none()
-                            .fill(tint(BG, DANGER, 0.16))
-                            .stroke(Stroke::new(1.0_f32, DANGER.gamma_multiply(0.5)))
-                            .rounding(Rounding::same(ROUND_SM))
-                            .inner_margin(egui::Margin::same(12.0))
+                            .fill(glass_alert(DANGER))
+                            .stroke(Stroke::NONE)
+                            .rounding(Rounding::same(ROUND))
+                            .inner_margin(egui::Margin::same(14.0))
                             .show(ui, |ui| {
                                 fill_width(ui, (banner_w - 24.0).max(0.0));
                                 ui.label(RichText::new(format!("Node error: {err}")).color(DANGER));
@@ -1330,44 +1521,26 @@ impl eframe::App for App {
                         ui.add_space(12.0);
                     }
 
-                    // Dev-only: the page walker drives the scroll so it can
-                    // photograph a page taller than the window. `None` in
-                    // every normal run, which leaves the area untouched.
-                    let forced = self.shots.as_ref().and_then(|s| s.offset());
-                    let mut area = egui::ScrollArea::vertical()
-                        .id_salt(("page-scroll", self.view as u8))
-                        .auto_shrink([false, false])
-                        // Always reserve the bar. With the default the bar appears
-                        // only once the page overflows, which takes ~10px of width
-                        // away mid-session — every right-aligned column then shifts
-                        // sideways as you scroll. Reserving it costs a sliver of
-                        // width and makes the layout stop moving.
-                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible);
-                    if let Some(offset) = forced {
-                        area = area.vertical_scroll_offset(offset);
-                    }
-                    let drawn = area.show(ui, |ui| {
-                        fill_width(ui, ui.available_width());
-                        views::page_intro(self.view, ui);
-                        match self.view {
-                            View::Dashboard => views::dashboard(self, ui),
-                            View::Send => views::send(self, ui, ctx),
-                            View::Receive => views::receive(self, ui, ctx),
-                            View::Activity => views::activity(self, ui),
-                            View::Mining => views::mining(self, ui),
-                            View::Network => views::network(self, ui, ctx),
-                            View::Swap => crate::views_swap::swap(self, ui, ctx),
-                            View::Settings => views::settings(self, ui, ctx),
-                        }
-                    });
-                    if let Some(shots) = self.shots.as_mut() {
-                        shots.note(crate::ui_shots::Area {
-                            viewport: drawn.inner_rect,
-                            content: drawn.content_size.y,
-                            offset: drawn.state.offset.y,
-                        });
+                    fill_width(ui, ui.available_width());
+                    views::page_intro(self.view, ui);
+                    match self.view {
+                        View::Dashboard => views::dashboard(self, ui),
+                        View::Send => views::send(self, ui, ctx),
+                        View::Receive => views::receive(self, ui, ctx),
+                        View::Activity => views::activity(self, ui),
+                        View::Mining => views::mining(self, ui),
+                        View::Network => views::network(self, ui, ctx),
+                        View::Settings => views::settings(self, ui, ctx),
                     }
                 });
+                });
+                if let Some(shots) = self.shots.as_mut() {
+                    shots.note(crate::ui_shots::Area {
+                        viewport: drawn.inner_rect,
+                        content: drawn.content_size.y,
+                        offset: drawn.state.offset.y,
+                    });
+                }
             });
 
         self.toasts.show(ctx);
@@ -1396,7 +1569,9 @@ impl App {
         self.reveal_mnemonic = false;
         self.reveal_view_key = false;
         self.recovery_studio.clear();
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(Color32::TRANSPARENT))
+            .show(ctx, |ui| {
             ui.add_space(28.0);
             narrow_column(ui, 620.0, |ui| {
                 titled_card(ui, "UPDATING WALLET", |ui| {
@@ -1415,13 +1590,9 @@ impl App {
     }
 
     pub fn request_vault(&mut self, action: crate::vault_ui::Action, ctx: &egui::Context) {
-        if self.swap_job.is_some() && action != crate::vault_ui::Action::Lock {
-            self.vault_ui.error =
-                Some("Wait for the current swap operation before changing wallet storage.".into());
-            return;
-        }
         if action == crate::vault_ui::Action::Lock || action == crate::vault_ui::Action::Prepare {
             self.clear_wallet_views();
+            ctx.data_mut(|data| data.remove::<String>(egui::Id::new("counter-confirm-remove")));
         }
         self.vault_ui.start(
             action,
@@ -1462,9 +1633,6 @@ impl App {
         self.book_name.zeroize();
         self.book_addr.zeroize();
         self.activity_filter.zeroize();
-        self.swap_packet_in.zeroize();
-        self.swap_packet_out.zeroize();
-        self.swap_signed_hex.zeroize();
         self.toasts.clear();
         if let Ok(mut signal) = self.sync_signal.try_lock() {
             *signal = None;
@@ -1473,7 +1641,7 @@ impl App {
 
     pub fn show_vault_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.vault_ui.refresh(&self.wallet);
-        let available = cfg!(unix) && self.data_lock.is_some() && self.swap_job.is_none();
+        let available = cfg!(unix) && self.data_lock.is_some();
         if let Some(action) = self.vault_ui.show(ui, available) {
             self.request_vault(action, ctx);
         }
@@ -1516,13 +1684,23 @@ impl App {
             || (self.vault_ui.custody == Custody::Migration && self.onboarding.is_none())
             || (self.vault_ui.custody == Custody::Empty && self.onboarding.is_none());
         if blocked {
+            if self.shots.is_some() {
+                // Dev capture only: photograph the live chrome with empty
+                // fixture data. Production never takes this branch.
+                return false;
+            }
             self.wallet_paused.store(true, Ordering::SeqCst);
             ctx.request_repaint_after(Duration::from_millis(100));
             egui::CentralPanel::default()
                 .frame(
                     egui::Frame::none()
-                        .fill(BG)
-                        .inner_margin(egui::Margin::same(28.0)),
+                        .fill(Color32::TRANSPARENT)
+                        .inner_margin(egui::Margin {
+                            left: 28.0,
+                            right: 28.0,
+                            top: 28.0 + Self::title_clearance(),
+                            bottom: 28.0,
+                        }),
                 )
                 .show(ctx, |ui| {
                     let tip = self.tip_height();
@@ -1547,9 +1725,14 @@ impl App {
                         ],
                     );
                     ui.add_space(GAP_XL);
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        narrow_column(ui, 620.0, |ui| self.show_vault_settings(ui, ctx));
-                    });
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                        )
+                        .show(ui, |ui| {
+                            narrow_column(ui, 620.0, |ui| self.show_vault_settings(ui, ctx));
+                        });
                 });
         } else if self.view != View::Settings {
             self.vault_ui.clear_fields();
@@ -1595,7 +1778,8 @@ impl App {
         if let Some(tray) = &self.tray {
             match tray.poll() {
                 Some(TrayAction::Show) => {
-                    self.window_hidden = false;
+                    // No flag to clear here: it is read from the window.
+                    ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(ViewportCommand::Focus);
                 }
@@ -1609,13 +1793,25 @@ impl App {
         if self.want_quit {
             return;
         }
-        if ctx.input(|i| i.viewport().close_requested())
-            && self.close_to_tray
-            && self.tray.is_some()
-        {
+        if ctx.input(|i| i.viewport().close_requested()) && self.close_to_tray {
+            // Minimised, not hidden — and that is a measured distinction, not
+            // a preference.
+            //
+            // `Visible(false)` took the last window off the screen, and with
+            // it the event loop: a probe logging a heartbeat every forty
+            // frames printed nothing more after the window went away, and the
+            // process was gone seconds later. So "close to tray" did not keep
+            // the wallet running in the background at all — it ended it. And
+            // the way back was supposed to be the menu-bar item, whose polling
+            // lives in `update`, in the very loop that had just stopped. A
+            // window nobody could restore and a menu that could never answer.
+            //
+            // A minimised window keeps the loop, the process and the mining
+            // alive — verified the same way — and the operating system itself
+            // brings it back from the Dock or the taskbar, with no polling of
+            // ours in the path.
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
-            self.window_hidden = true;
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
         }
     }
 }
@@ -1658,7 +1854,11 @@ fn load_backup_acked(datadir: &std::path::Path) -> bool {
 }
 
 fn load_close_to_tray(datadir: &std::path::Path) -> bool {
-    load_flag(datadir, "close_to_tray", true)
+    // Off by default, so the red button and the yellow one mean different
+    // things: red closes the wallet, yellow puts it in the Dock and mining
+    // carries on. With this on they both minimised, which is one button too
+    // many for one behaviour.
+    load_flag(datadir, "close_to_tray", false)
 }
 
 fn load_mining_threads(datadir: &std::path::Path) -> usize {
@@ -1750,7 +1950,7 @@ pub fn parse_amount(s: &str) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_amount;
+    use super::{parse_amount, App};
     use nightfall_types::DARKS_PER_NIGHT;
 
     #[test]
@@ -1772,6 +1972,34 @@ mod tests {
         assert!(parse_amount("-1").is_err());
         assert!(parse_amount("abc").is_err());
         assert!(parse_amount("0.123456789").is_err());
+    }
+
+    /// The page never runs under the rail that floats over it.
+    ///
+    /// This used to pin the old formula's output — a fraction of the window
+    /// width — which stopped meaning anything once the rail became a sheet
+    /// standing outside the plate. The number to hold is not 286.7; it is that
+    /// the content starts clear of wherever the rail actually reaches, at
+    /// every width, with a gap wide enough to read as a gap.
+    #[test]
+    fn the_page_starts_clear_of_the_floating_rail() {
+        for width in [940.0_f32, 1024.0, 1100.0, 1280.0, 1600.0, 1920.0, 2560.0] {
+            let rail_right = crate::widgets::WINDOW_INSET
+                + crate::widgets::RAIL_LEFT
+                + App::rail_width_for(width);
+            let plate_left = crate::widgets::WINDOW_INSET + crate::widgets::PLATE_LEFT;
+            let overhang = rail_right - plate_left;
+            let reserve = App::nav_reserve_for(width);
+            assert!(
+                reserve >= overhang + 20.0,
+                "at {width}px the page starts {reserve} into the plate while the \
+                 rail reaches {overhang} — the first card would sit under it",
+            );
+        }
+        // The rail itself gets out of the way on a narrow window.
+        assert_eq!(App::rail_width_for(1024.0), 208.0);
+        assert_eq!(App::rail_width_for(1280.0), 224.0);
+        assert!(App::nav_reserve_for(1024.0) < App::nav_reserve_for(1280.0));
     }
 
     /// The two spellings that used to depend on which wallet you were holding.

@@ -18,9 +18,6 @@ nightfall-storage = { workspace = true }
 nightfall-node = { path = "../nightfall-node" }
 nightfall-p2p = { workspace = true }
 nightfall-wallet = { path = "../nightfall-wallet" }
-nightfall-swap = { path = "../nightfall-swap" }
-# Only to parse the Bitcoin addresses the user types; this wallet holds NIGHT.
-bitcoin = { workspace = true }
 anyhow = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }
@@ -38,3 +35,18 @@ zeroize = { workspace = true }
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 tray-icon = "0.19"
+
+# Only to move the window's own close/minimise/zoom buttons a little further in
+# from the corner. macOS owns their position and eframe exposes no way to ask.
+# Both crates are already in the lock file by way of winit, so no new version
+# is pinned here.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.2.2", features = [
+    "NSApplication",
+    "NSResponder",
+    "NSView",
+    "NSWindow",
+] }
+objc2-foundation = "0.2.2"
+
+

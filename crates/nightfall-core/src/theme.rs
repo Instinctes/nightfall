@@ -1,6 +1,7 @@
 //! Design tokens and global styling.
 //!
-//! Deep violet, soft elevation, large radii. egui has no gradient primitive, so
+//! Original Nightfall violet palette with native macOS typography.
+//! egui has no gradient primitive, so
 //! [`crate::widgets::gradient_rect`] tessellates one by hand.
 
 use eframe::egui::{self, Color32, FontFamily, FontId, Rounding, Stroke, TextStyle};
@@ -42,6 +43,9 @@ pub const SURFACE_HOVER: Color32 = Color32::from_rgb(0x51, 0x45, 0x73);
 /// Sunken element: text fields, code blocks. Below the card on purpose.
 pub const SURFACE_LOW: Color32 = Color32::from_rgb(0x29, 0x21, 0x3D);
 
+/// Pinned by `original_nightfall_palette_is_preserved`. Its last consumer was
+/// the withdrawn swap page; the token stays because the brand does.
+#[allow(dead_code)]
 pub const BORDER: Color32 = Color32::from_rgb(0x4A, 0x3F, 0x6B);
 pub const BORDER_HI: Color32 = Color32::from_rgb(0x80, 0x6D, 0x9E);
 
@@ -94,10 +98,9 @@ pub const WARN: Color32 = Color32::from_rgb(0xFF, 0xC8, 0x5C);
 pub const DANGER: Color32 = Color32::from_rgb(0xFF, 0x7B, 0x8A);
 
 // --- geometry -------------------------------------------------------------
-/// Cards. Matches the web wallet's `--r-lg`, so the two surfaces read as
-/// one product rather than two that happen to share a palette.
+/// Glass sheets: large corners like the frosted slabs in the UI language.
 pub const ROUND: f32 = 28.0;
-/// Buttons, inputs, chips.
+/// Nested tiles, nav pills, chips. Not a capsule — inputs use ROUND_FIELD.
 pub const ROUND_SM: f32 = 16.0;
 /// Fully rounded pills.
 pub const ROUND_PILL: f32 = 999.0;
@@ -108,6 +111,42 @@ pub const ROUND_PILL: f32 = 999.0;
 /// like a pill you could press, which is why the lock screen's password field
 /// competed with the button under it instead of leading to it.
 pub const ROUND_FIELD: f32 = 10.0;
+
+/// Use fonts supplied by macOS without redistributing Apple's font files.
+/// Other platforms (and machines without these fonts) keep egui's fallbacks.
+/// Called once at startup, never on the repaint path.
+pub fn install_platform_fonts(ctx: &egui::Context) {
+    #[cfg(target_os = "macos")]
+    {
+        let mut fonts = egui::FontDefinitions::default();
+        for (name, path, family) in [
+            (
+                "macOS UI",
+                "/System/Library/Fonts/SFNS.ttf",
+                FontFamily::Proportional,
+            ),
+            (
+                "macOS Mono",
+                "/System/Library/Fonts/Menlo.ttc",
+                FontFamily::Monospace,
+            ),
+        ] {
+            if let Ok(bytes) = std::fs::read(path) {
+                fonts
+                    .font_data
+                    .insert(name.into(), egui::FontData::from_owned(bytes));
+                fonts
+                    .families
+                    .entry(family)
+                    .or_default()
+                    .insert(0, name.into());
+            }
+        }
+        ctx.set_fonts(fonts);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = ctx;
+}
 
 pub fn apply(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
@@ -136,11 +175,16 @@ pub fn apply(ctx: &egui::Context) {
     let v = &mut style.visuals;
     v.dark_mode = true;
     v.override_text_color = Some(TEXT);
-    v.panel_fill = BG;
+    // Transparent, so that a panel which forgets its own frame cannot flood
+    // the whole window rectangle with an opaque fill — which is what several
+    // of them did, including the lock screen, and what put a hard square
+    // corner outside the rounded plate. `widgets::paint_room` is the one
+    // place the page's background comes from.
+    v.panel_fill = Color32::TRANSPARENT;
     v.window_fill = SURFACE;
-    v.extreme_bg_color = SURFACE_LOW;
-    v.faint_bg_color = SURFACE_HI;
-    v.window_stroke = Stroke::new(1.0_f32, BORDER);
+    v.extreme_bg_color = glass_surface();
+    v.faint_bg_color = glass_inner();
+    v.window_stroke = Stroke::NONE;
     v.window_rounding = Rounding::same(ROUND);
     v.selection.bg_fill = ACCENT_DIM;
     v.selection.stroke = Stroke::new(1.0_f32, ACCENT_HI);
@@ -149,45 +193,68 @@ pub fn apply(ctx: &egui::Context) {
     // Text fields inherit these. Buttons override with a pill of their own, so
     // the radius here is the field radius — see `ROUND_FIELD`.
     let w = &mut v.widgets;
-    w.noninteractive.bg_fill = SURFACE;
-    w.noninteractive.weak_bg_fill = SURFACE;
-    w.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    w.noninteractive.bg_fill = glass_surface();
+    w.noninteractive.weak_bg_fill = glass_surface();
+    w.noninteractive.bg_stroke = Stroke::NONE;
     w.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT_DIM);
     w.noninteractive.rounding = Rounding::same(ROUND_FIELD);
 
-    // A field is sunk into the card, not raised off it. It used to be filled
-    // with SURFACE_HI — lighter than the card — so an empty input was the
-    // brightest object on the screen and pulled the eye away from whatever the
-    // screen was actually asking.
-    w.inactive.bg_fill = SURFACE_LOW;
-    w.inactive.weak_bg_fill = SURFACE_LOW;
-    w.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    w.inactive.bg_fill = glass_surface();
+    w.inactive.weak_bg_fill = glass_surface();
+    w.inactive.bg_stroke = Stroke::NONE;
     w.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
     w.inactive.rounding = Rounding::same(ROUND_FIELD);
 
-    w.hovered.bg_fill = SURFACE_LOW;
-    w.hovered.weak_bg_fill = SURFACE_LOW;
-    w.hovered.bg_stroke = Stroke::new(1.0_f32, BORDER_HI);
+    w.hovered.bg_fill = glass_hover();
+    w.hovered.weak_bg_fill = glass_hover();
+    w.hovered.bg_stroke = Stroke::NONE;
     w.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT);
     w.hovered.rounding = Rounding::same(ROUND_FIELD);
     w.hovered.expansion = 0.0;
 
-    // Focused. A 2-point accent edge, so which field has the keyboard is
-    // visible from across the room rather than inferred from the caret.
-    w.active.bg_fill = SURFACE_LOW;
-    w.active.weak_bg_fill = SURFACE_LOW;
+    w.active.bg_fill = glass_inner();
+    w.active.weak_bg_fill = glass_inner();
     w.active.bg_stroke = Stroke::new(2.0_f32, ACCENT_HI);
     w.active.fg_stroke = Stroke::new(1.0_f32, TEXT);
     w.active.rounding = Rounding::same(ROUND_FIELD);
 
-    w.open.bg_fill = SURFACE_HI;
-    w.open.bg_stroke = Stroke::new(1.0_f32, BORDER_HI);
+    w.open.bg_fill = glass_inner();
+    w.open.bg_stroke = Stroke::NONE;
 
     style.spacing.item_spacing = egui::vec2(GAP_SM, GAP_SM);
     style.spacing.button_padding = egui::vec2(16.0, 9.0);
     style.spacing.window_margin = egui::Margin::same(18.0);
     style.spacing.interact_size.y = CONTROL_H;
-    style.spacing.scroll.bar_width = 8.0;
+    // The scroll bar, on glass.
+    //
+    // A solid bar paints its trough with `extreme_bg_color`, and that is
+    // `glass_surface()` here — so the trough became a lit panel and read as a
+    // bright scratch down the right-hand side of every page, in front of the
+    // content rather than behind it.
+    //
+    // A floating bar has a trough whose opacity can be set, and egui's own
+    // documentation names this exact arrangement: allocate a little width so
+    // the layout still reserves the column, then keep the handle faintly
+    // visible. The reservation is the point — an appearing-and-disappearing
+    // bar shifts every right-aligned value sideways as you scroll, which is
+    // why this was `AlwaysVisible` in the first place. `allocated_width()`
+    // returns `floating_allocated_width` in this mode, so `scroll_gutter`
+    // keeps measuring the same thing.
+    style.spacing.scroll = egui::style::ScrollStyle::floating();
+    style.spacing.scroll.bar_width = 9.0;
+    style.spacing.scroll.floating_width = 5.0;
+    style.spacing.scroll.floating_allocated_width = 9.0;
+    style.spacing.scroll.bar_inner_margin = 6.0;
+    style.spacing.scroll.handle_min_length = 36.0;
+    style.spacing.scroll.foreground_color = true;
+    // No trough at all until the pointer is on the bar itself.
+    style.spacing.scroll.dormant_background_opacity = 0.0;
+    style.spacing.scroll.active_background_opacity = 0.0;
+    style.spacing.scroll.interact_background_opacity = 0.10;
+    // The handle stays readable without becoming a second border.
+    style.spacing.scroll.dormant_handle_opacity = 0.30;
+    style.spacing.scroll.active_handle_opacity = 0.55;
+    style.spacing.scroll.interact_handle_opacity = 0.85;
 
     ctx.set_style(style);
 }
@@ -215,6 +282,74 @@ pub fn tint(base: Color32, color: Color32, amount: f32) -> Color32 {
     lerp_color(base, color, amount)
 }
 
+/// Token RGB with an explicit alpha. Palette tests pin the RGB channels;
+/// this never changes them. Used for frosted panels so the page lights show
+/// through without inventing a second set of brand colours.
+pub fn with_alpha(color: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+}
+
+/// Violet frost over the room gradient. The pastel pigment softens the
+/// sheets without the bright white borders of a conventional glass effect.
+///
+/// The pigment and the alpha are the two numbers that decide whether anything
+/// written on this sheet can be read. Frosted at `GRAD_A 0.30` and alpha 132,
+/// a panel over the brightest part of the room came out at RGB (160, 149, 219)
+/// — and `TEXT_DIM` on that is 3.8:1, `TEXT_FAINT` 3.4:1, both under the 4.5:1
+/// that small text needs. On screen that read as grey-on-grey, and the warning
+/// banner was the worst of it. `text_stays_readable_on_every_glass` pins these
+/// two numbers against the room's brightest point; change one and it will say
+/// so with the ratio it measured.
+pub fn glass_surface() -> Color32 {
+    with_alpha(tint(SURFACE, GRAD_A, 0.06), 205)
+}
+
+/// Light caught by selected navigation items and secondary controls.
+pub fn glass_inner() -> Color32 {
+    with_alpha(tint(SURFACE_HI, GRAD_A, 0.02), 232)
+}
+
+/// Hover differs by *density*, not by pigment.
+///
+/// A hover state that adds pigment lightens the sheet, and a lighter sheet is
+/// a worse background for the text already on it — hover was the last thing
+/// left failing the contrast test. Raising the alpha instead always moves the
+/// sheet towards its opaque token, which already passes, so this cue cannot
+/// make anything harder to read whatever the room is doing behind it.
+pub fn glass_hover() -> Color32 {
+    with_alpha(tint(SURFACE_HI, GRAD_A, 0.02), 240)
+}
+
+/// The floating navigation sheet is denser than the content cards.
+pub fn glass_rail() -> Color32 {
+    // Opaque, on purpose. The page is the sheet the desktop shows through
+    // now; if the rail were translucent too, the only thing behind its
+    // overhanging half would be the wallpaper, and the navigation would sit
+    // on whatever photograph the owner happens to use.
+    tint(RAIL, GRAD_A, 0.08)
+}
+
+/// Alert glass: dark surface washed with the status colour.
+///
+/// Washed *lightly*. Every status colour in this palette is brighter than the
+/// surface, so tinting the panel towards the tone lifts the panel and the tone
+/// is then written on top of it: at `0.22` the warning banner was `WARN` on a
+/// panel that `WARN` had helped to lighten, 2.7:1, and a warning nobody can
+/// read is worse than no warning. The tone belongs in the rim and the text.
+pub fn glass_alert(tone: Color32) -> Color32 {
+    with_alpha(tint(SURFACE, tone, 0.02), 246)
+}
+
+/// Contained card shadow: kept inside the column gap.
+pub fn glass_card_shadow() -> egui::epaint::Shadow {
+    egui::epaint::Shadow {
+        offset: egui::vec2(0.0, 8.0),
+        blur: 16.0,
+        spread: 0.0,
+        color: with_alpha(INK, 48),
+    }
+}
+
 /// Linear interpolation between two colours.
 pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
@@ -240,6 +375,60 @@ pub fn brand_gradient(t: f32) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn original_nightfall_palette_is_preserved() {
+        // UI refinements must not silently turn Nightfall into a graphite theme.
+        for (actual, expected) in [
+            (BG, [0x24, 0x1D, 0x36]),
+            (RAIL, [0x2B, 0x23, 0x40]),
+            (SURFACE, [0x36, 0x2D, 0x50]),
+            (SURFACE_HI, [0x44, 0x3A, 0x62]),
+            (SURFACE_HOVER, [0x51, 0x45, 0x73]),
+            (SURFACE_LOW, [0x29, 0x21, 0x3D]),
+            (BORDER, [0x4A, 0x3F, 0x6B]),
+            (BORDER_HI, [0x80, 0x6D, 0x9E]),
+            (WASH_A, [0x2C, 0x24, 0x42]),
+            (WASH_B, [0x31, 0x23, 0x45]),
+            (TEXT, [0xF6, 0xF2, 0xFF]),
+            (TEXT_DIM, [0xD4, 0xC9, 0xE4]),
+            (TEXT_FAINT, [0xC8, 0xBC, 0xDB]),
+            (ACCENT, [0x76, 0x50, 0xD8]),
+            (ACCENT_HI, [0xDE, 0xC4, 0xFF]),
+            (ACCENT_DIM, [0x58, 0x40, 0x7B]),
+            (INK, [0x25, 0x1C, 0x3A]),
+            (GRAD_A, [0xBD, 0xA2, 0xFF]),
+            (PINK, [0xE7, 0x9C, 0xEF]),
+            (CYAN, [0x78, 0xDB, 0xEC]),
+        ] {
+            assert_eq!([actual.r(), actual.g(), actual.b()], expected);
+        }
+    }
+
+    #[test]
+    fn glass_keeps_nightfall_rgb() {
+        // Opaque round-trip is exact. Translucent values are stored
+        // premultiplied by egui; RGB tokens themselves stay untouched.
+        assert_eq!(with_alpha(SURFACE, 255), SURFACE);
+        assert_eq!(with_alpha(RAIL, 255), RAIL);
+        assert_eq!(with_alpha(PINK, 36).a(), 36);
+        assert_eq!(with_alpha(CYAN, 30).a(), 30);
+        assert!(glass_surface().a() < 255);
+        assert!(glass_inner().a() < 255);
+        assert!(glass_alert(WARN).a() < 255);
+        assert!(glass_hover().a() < 255);
+        // The rail is the one sheet that is *not* see-through, and that is the
+        // decision rather than an oversight. Half of it hangs over the
+        // desktop: were it translucent, the only thing behind that half would
+        // be the owner's wallpaper, and the navigation would be legible or not
+        // depending on which photograph they happen to use. The page is what
+        // the desktop shows through — see `widgets::PLATE_ALPHA`.
+        assert_eq!(
+            glass_rail().a(),
+            255,
+            "the rail carries navigation over the desktop and stays opaque",
+        );
+    }
+
     fn luminance(c: Color32) -> f64 {
         let channel = |v: u8| {
             let n = f64::from(v) / 255.0;
@@ -311,5 +500,107 @@ mod tests {
                 assert!((luminance(text) + 0.05) / (luminance(surface) + 0.05) >= 4.5);
             }
         }
+    }
+
+    fn contrast(a: Color32, b: Color32) -> f64 {
+        let (x, y) = (luminance(a), luminance(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    /// Lay a translucent colour over an opaque one, the way the screen does.
+    ///
+    /// egui keeps translucent colours premultiplied, so the source term is
+    /// already `colour × alpha` and only the destination is weighted.
+    fn over(fg: Color32, bg: Color32) -> Color32 {
+        let a = f32::from(fg.a()) / 255.0;
+        let mix = |f: u8, b: u8| (f32::from(f) + f32::from(b) * (1.0 - a)).round() as u8;
+        Color32::from_rgb(
+            mix(fg.r(), bg.r()),
+            mix(fg.g(), bg.g()),
+            mix(fg.b(), bg.b()),
+        )
+    }
+
+    /// The brightest point the room lighting reaches.
+    fn brightest_wash() -> Color32 {
+        let mut best = crate::widgets::wash_color(0.0, 0.0);
+        for row in 0..=60 {
+            for col in 0..=60 {
+                let c = crate::widgets::wash_color(col as f32 / 60.0, row as f32 / 60.0);
+                if luminance(c) > luminance(best) {
+                    best = c;
+                }
+            }
+        }
+        best
+    }
+
+    /// Text has to be readable on the glass, not on the token behind it.
+    ///
+    /// `readable_text_tokens_meet_normal_text_contrast` above passed the whole
+    /// time the interface was unreadable, because it measures `TEXT_DIM`
+    /// against `SURFACE` — and `SURFACE` is not what anybody sees. What they
+    /// see is `glass_surface()`, translucent, lying over a lit room. Measured
+    /// on the running window, a caption came out at 3.5:1, the block counter
+    /// at 2.4:1 and the warning banner at 2.7:1, while this file's own
+    /// contrast test was green.
+    ///
+    /// So this one composites: the brightest point the lighting reaches, the
+    /// glass over it, and the text on that. Every tone that carries words must
+    /// clear 4.5:1, which is what small text needs — and the small text is
+    /// exactly what failed.
+    #[test]
+    fn text_stays_readable_on_every_glass() {
+        // The page is translucent now, so the worst background is no longer
+        // the brightest point of our own room — it is that point with a pure
+        // white wallpaper showing through it. A wallpaper is the one thing in
+        // this picture nobody here chooses, so it has to be assumed hostile.
+        let room = over(
+            with_alpha(brightest_wash(), crate::widgets::PLATE_ALPHA),
+            Color32::WHITE,
+        );
+        let mut faults = Vec::new();
+        let sheets = [
+            ("glass_surface", glass_surface()),
+            ("glass_inner", glass_inner()),
+            ("glass_hover", glass_hover()),
+            ("glass_rail", glass_rail()),
+        ];
+        for (sheet_name, sheet) in sheets {
+            let panel = over(sheet, room);
+            for (text_name, text) in [
+                ("TEXT", TEXT),
+                ("TEXT_DIM", TEXT_DIM),
+                ("TEXT_FAINT", TEXT_FAINT),
+            ] {
+                let ratio = contrast(text, panel);
+                if ratio < 4.5 {
+                    faults.push(format!(
+                        "{text_name} on {sheet_name} is {ratio:.2}:1 over the room's \
+                         brightest point {room:?} (panel {panel:?})"
+                    ));
+                }
+            }
+        }
+        // A status banner writes its own colour on its own glass, and every
+        // status colour here is lighter than the surface — so a panel tinted
+        // towards the tone lifts itself towards the very text it carries.
+        for (tone_name, tone) in [("WARN", WARN), ("DANGER", DANGER), ("SUCCESS", SUCCESS)] {
+            let panel = over(glass_alert(tone), room);
+            for (text_name, text) in [("its own tone", tone), ("TEXT", TEXT)] {
+                let ratio = contrast(text, panel);
+                if ratio < 4.5 {
+                    faults.push(format!(
+                        "{text_name} on glass_alert({tone_name}) is {ratio:.2}:1 \
+                         (panel {panel:?})"
+                    ));
+                }
+            }
+        }
+        assert!(
+            faults.is_empty(),
+            "unreadable on glass:\n{}",
+            faults.join("\n")
+        );
     }
 }
