@@ -1,7 +1,7 @@
-# NIGHTFALLCOIN Core Wallet 1.0.4
+# NIGHTFALLCOIN Core Wallet 1.0.5
 
 A mainnet full node, miner and wallet in one desktop application. Download
-[v1.0.4](https://github.com/Instinctes/nightfall/releases/tag/v1.0.4) or build:
+[v1.0.5](https://github.com/Instinctes/nightfall/releases/tag/v1.0.5) or build:
 
 ```bash
 cargo build --locked --release -p nightfall-core
@@ -21,13 +21,32 @@ migration is required from 0.9.2.
 | Send | Recipient address, NIGHT amount, memo and full-address review |
 | Receive | Share an nf1 address or QR code |
 | Activity | Payments, mining rewards, confirmations and receipts |
-| Mining | Start/stop mining and set CPU threads |
+| Mining | Start/stop mining, CPU threads and persistent Reward-Sound setting |
 | Network | Peers, connectivity, Tor and relay information |
 | Settings | Backups, view key, address book and maintenance |
 
 Core scans automatically. Mined coins unlock after 1,440 blocks; the standard
 wallet payment fee is 0.001 NIGHT, burned while subsidy remains. An outgoing
 connection is sufficient to sync; inbound mainnet peers use TCP 17891.
+
+At startup one progress screen stays visible until the node and wallet agree.
+Later scans run in the background without replacing the page. A changed scan
+anchor is repaired automatically; no repeated rescan confirmation is needed.
+If history is pruned or peers are unavailable, use Connection details to inspect
+the cause. Core cannot reconstruct missing archive blocks from wallet files.
+
+Routine reorgs and scan retries stay silent in the interface while internal logs
+and spending checks remain active. A new live mining reward has one centered
+animation, without the old balance flash and duplicate toast. Catch-up history
+stays quiet. Mining → **Reward-Sound** enables or disables the synthesized bell;
+it is on by default and the selection survives restarts. Linux playback needs
+`pw-play`, `paplay` or `aplay` installed.
+
+Payments made pending by a reorg or imported backup stay withheld. Activity
+allows reviewing and retrying the exact saved transaction once, without signing
+a second payment or enabling automatic relay. A rescan does not cancel it.
+Air remembers the exact signed answer to each request inside the wallet;
+snapshots with this journal require version 1.0.5 or newer.
 
 ## Wallet data
 

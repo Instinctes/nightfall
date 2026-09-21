@@ -28,6 +28,54 @@ pub enum Action {
     VerifyBackup,
 }
 
+#[cfg(all(test, any(unix, windows)))]
+mod platform_provision_test {
+    use super::*;
+
+    #[test]
+    fn encrypted_setup_runs_on_supported_desktop_platforms() {
+        let root = std::env::temp_dir().join(format!(
+            "nightfall-platform-setup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let lock = Arc::new(nightfall_storage::dirlock::acquire(&root).unwrap());
+        let wallet = Arc::new(Mutex::new(WalletState::empty()));
+        let paused = Arc::new(AtomicBool::new(true));
+        let mut ui = VaultUi::default();
+        ui.start_provision(
+            wallet.clone(),
+            paused.clone(),
+            Some(lock.clone()),
+            NetworkId::Devnet,
+            crate::onboarding::ProvisionRequest {
+                source: crate::onboarding::ProvisionSource::Words(Zeroizing::new(
+                    nightfall_crypto::WalletKeys::from_seed([17; 32]).to_mnemonic(),
+                )),
+                password: Zeroizing::new("public platform fixture password".into()),
+            },
+            egui::Context::default(),
+        );
+        assert!(ui.busy(), "{:?}", ui.error);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while ui.busy() {
+            assert!(Instant::now() < deadline);
+            ui.poll(&wallet, &paused);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ui.error.is_none(), "{:?}", ui.error);
+        assert_eq!(wallet.lock().unwrap().custody(), Custody::Locked);
+        assert!(!root.join("core.seed.outputs.json").exists());
+        drop(wallet);
+        drop(lock);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -777,6 +825,7 @@ pub struct PaymentRequest {
     pub amount: u64,
     pub fee: u64,
     pub memo: Zeroizing<String>,
+    pub retry_txid: Option<String>,
 }
 
 pub struct VaultUi {
@@ -1065,7 +1114,7 @@ impl VaultUi {
         if self.busy() {
             return;
         }
-        let Some(data_lock) = data_lock.filter(|_| cfg!(unix)) else {
+        let Some(data_lock) = data_lock.filter(|_| cfg!(any(unix, windows))) else {
             self.error = Some(
                 "Encrypted setup requires a supported platform and the wallet directory lock."
                     .into(),
@@ -1143,15 +1192,17 @@ impl VaultUi {
                         }
                     }
                 };
-                let payment = state
-                    .send(
+                let payment = match request.retry_txid {
+                    Some(txid) => state.retry_withheld(&request.node, &txid),
+                    None => state.send(
                         &request.node,
                         &request.to,
                         request.amount,
                         request.fee,
                         &request.memo,
-                    )
-                    .map_err(|error| error.to_string());
+                    ),
+                }
+                .map_err(|error| error.to_string());
                 let result = payment.as_ref().map(|_| ()).map_err(Clone::clone);
                 ctx.request_repaint();
                 JobResult {

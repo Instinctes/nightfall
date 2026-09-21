@@ -507,7 +507,20 @@ impl WalletState {
     /// history underneath a scan in progress. Rescanning that one block finds
     /// nothing new.
     pub fn sync_from_node(&mut self, node: &NodeHandle) -> anyhow::Result<u32> {
+        let (found, _) = self.scan_without_relay(node, usize::MAX)?;
+        Self::resend_pending(self.require_wallet()?, node)?;
+        Ok(found)
+    }
+
+    /// Read a bounded batch without broadcasting. Used on an isolated copy by
+    /// the background worker; only a committed live wallet may relay payments.
+    pub fn scan_without_relay(
+        &mut self,
+        node: &NodeHandle,
+        max_pages: usize,
+    ) -> anyhow::Result<(u32, bool)> {
         let mut found: u32 = 0;
+        let mut pages = 0;
         loop {
             let wallet = self.require_wallet()?;
             // A wallet written before the scan anchor existed cannot prove
@@ -520,15 +533,8 @@ impl WalletState {
             // and the only one it considers sound, and which writes the anchor
             // on its way out. Every later page is an ordinary 1024-block one.
             //
-            // This covers a *missing* anchor only. A wallet whose anchor no
-            // longer matches the chain has not lost provenance, it has been
-            // told that the history under it changed, and that is a decision
-            // rather than a repair: the node may be on a competing branch of
-            // the same height, and quietly re-scanning onto it would move
-            // someone's wallet to whichever branch their node happened to
-            // prefer. It stops, says so, and refuses to spend until a person
-            // resolves it — see the "another valid branch" case in
-            // `vault_node_tests`, which exists to hold this line.
+            // Changed anchors are repaired by the Core worker's separate
+            // canonical pass. This incremental API still refuses bad provenance.
             let (from, page_size) = canonical_scan_request(
                 wallet.needs_canonical_pass(),
                 wallet.birth_height(),
@@ -574,6 +580,7 @@ impl WalletState {
 
             let was_full_page = page.len() == page_size;
             found = found.saturating_add(self.update(|wallet| wallet.scan_blocks(&page))?);
+            pages += 1;
 
             if !was_full_page {
                 break; // the page ran out before the limit: this was the tail
@@ -588,9 +595,51 @@ impl WalletState {
                  Refusing to loop. This is a bug, not a chain problem.",
                 page.len()
             );
+            if pages >= max_pages {
+                return Ok((found, true));
+            }
         }
-        Self::resend_pending(self.require_wallet()?, node)?;
-        Ok(found)
+        Ok((found, false))
+    }
+
+    /// The serialized base is zeroized when the edit finishes. The copy has no
+    /// filesystem path and cannot publish or broadcast before the host commits.
+    pub fn scan_candidate(&self) -> anyhow::Result<(zeroize::Zeroizing<String>, Self)> {
+        let base = zeroize::Zeroizing::new(self.require_wallet()?.export_state()?);
+        let copy = Wallet::import_state(&base)?;
+        Ok((
+            base,
+            Self {
+                inner: Backend::Legacy(Box::new(copy)),
+                seed_path: PathBuf::new(),
+            },
+        ))
+    }
+
+    /// A concurrent payment, invoice edit, or custody transition wins. Discard
+    /// stale work instead of overwriting a reservation with an older scan.
+    pub fn commit_scan(&mut self, base: &str, candidate: Self) -> anyhow::Result<bool> {
+        let current = zeroize::Zeroizing::new(self.require_wallet()?.export_state()?);
+        if current.as_str() != base {
+            return Ok(false);
+        }
+        let Backend::Legacy(wallet) = candidate.inner else {
+            anyhow::bail!("Invalid scan candidate");
+        };
+        let next = zeroize::Zeroizing::new(wallet.export_state()?);
+        if next.as_str() == base {
+            return Ok(true);
+        }
+        self.update(|live| live.adopt_scan_state(*wallet))?;
+        Ok(true)
+    }
+
+    pub fn relay_pending(&self, node: &NodeHandle) -> anyhow::Result<()> {
+        Self::resend_pending(self.require_wallet()?, node)
+    }
+
+    pub fn scan_anchor(&self) -> &str {
+        self.wallet().map(Wallet::scan_anchor).unwrap_or("")
     }
 
     /// Put unconfirmed payments back on the wire.
@@ -619,6 +668,9 @@ impl WalletState {
         }
         // The node may have changed while the final page was decrypted and
         // saved. Check again even with an empty mempool before reporting success.
+        if guard.chain.block_count() == 0 && !wallet.has_scanned_history() {
+            return Ok(());
+        }
         require_canonical_scan(wallet, &guard)?;
         for (txid, tx) in wallet.resendable() {
             // A lock left behind by the withdrawn atomic swap must never go
@@ -636,6 +688,48 @@ impl WalletState {
             let _ = guard.submit_tx(tx);
         }
         Ok(())
+    }
+
+    /// Explicit, one-shot retry of an already saved withheld payment. It stays
+    /// quarantined for subsequent background passes and never selects new coins.
+    pub fn retry_withheld(&mut self, node: &NodeHandle, txid: &str) -> anyhow::Result<String> {
+        let wallet = self.require_wallet()?;
+        let shared = node.shared();
+        let mut guard = shared
+            .lock()
+            .map_err(|_| anyhow::anyhow!("node state lock poisoned"))?;
+        require_canonical_scan(wallet, &guard)?;
+        let entry = wallet
+            .history()
+            .iter()
+            .find(|entry| {
+                entry.txid == txid
+                    && entry.direction == nightfall_wallet::Direction::Sent
+                    && entry.needs_owner_decision()
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("This payment is no longer pending and withheld. Refresh Activity.")
+            })?;
+        anyhow::ensure!(
+            entry.memo != "swap-lock",
+            "Withdrawn swap payments cannot be retried here."
+        );
+        let tx: Transaction = serde_json::from_str(entry.raw.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("This old payment has no saved transaction to retry.")
+        })?)?;
+        anyhow::ensure!(
+            tx.txid().to_hex() == txid && tx.total_fee() == entry.fee,
+            "Saved transaction does not match the payment record. Nothing was broadcast."
+        );
+        guard
+            .submit_tx(tx)
+            .map_err(|error| anyhow::anyhow!("The node refused this saved payment: {error}"))?;
+        Ok(txid.to_owned())
+    }
+
+    #[cfg(test)]
+    pub fn quarantine_for_test(&mut self) -> anyhow::Result<usize> {
+        self.update(Wallet::quarantine_pending_sends)
     }
 
     /// Hand the network a transaction that was built somewhere else.
@@ -721,6 +815,16 @@ impl WalletState {
         })
     }
 
+    pub fn prepare_air_payment(
+        &mut self,
+        intent: &nightfall_wallet::air::Intent,
+        maturity: u64,
+    ) -> anyhow::Result<Transaction> {
+        self.update(|wallet| {
+            wallet.prepare_air_payment(intent, maturity, nightfall_storage::now_unix())
+        })
+    }
+
     /// Validate before changing either the wallet or the node's chain files.
     pub fn check_rescan_allowed(&self) -> anyhow::Result<()> {
         let wallet = self.require_wallet()?;
@@ -743,6 +847,23 @@ impl WalletState {
 
     pub fn rescan(&mut self, node: &NodeHandle) -> anyhow::Result<u32> {
         self.check_rescan_allowed()?;
+        // Refuse unavailable history before resetting any durable wallet data.
+        let from = self.require_wallet()?.birth_height();
+        {
+            let shared = node.shared();
+            let guard = shared
+                .lock()
+                .map_err(|_| anyhow::anyhow!("node state lock poisoned"))?;
+            require_finished_replay(guard.is_loading())?;
+            anyhow::ensure!(
+                !guard.chain.is_pruned() || from >= guard.chain.first_height,
+                "This node is pruned. Use an archive node before rescanning; nothing was reset."
+            );
+            anyhow::ensure!(
+                guard.chain.block_by_height(from).is_some(),
+                "The node cannot supply the rescan's starting block; nothing was reset."
+            );
+        }
         self.update(|w| w.reset_scan())?;
         self.sync_from_node(node)
     }
@@ -772,27 +893,10 @@ impl WalletState {
         }
     }
 
-    /// Accept the chain the node is on, deliberately.
-    ///
-    /// When the history under the scan position changes, the wallet stops and
-    /// refuses to spend. That refusal is right — a competing branch of the same
-    /// height is a decision with money attached, and a wallet that quietly
-    /// re-scans onto whichever branch its node prefers has made that decision
-    /// for its owner. What was missing is the other half: a way for the owner
-    /// to make it. Without one the wallet is simply stuck, and a wallet holding
-    /// pending payments cannot even rescan, because `check_rescan_allowed`
-    /// refuses while any exist.
-    ///
-    /// So this is the same canonical pass a rescan ends in, without discarding
-    /// what is already known and without that precondition. Pending payments
-    /// are exactly what a reorg calls into question, and `reconcile_with`
-    /// answers the question properly: an output the chain does not contain is
-    /// dropped, a send whose inputs are no longer consumed goes back to
-    /// unconfirmed rather than silently staying settled. Nothing is
-    /// rebroadcast here.
-    ///
-    /// Only for a wallet whose anchor has actually broken; anything else is a
-    /// plain scan and should go through one.
+    /// Reconcile the wallet with a complete, locally validated canonical range.
+    /// Core runs this automatically on its detached scan candidate. Pending
+    /// reservations and local metadata survive; no transaction is broadcast.
+    /// A confirmed payment revived by the changed chain is quarantined.
     pub fn reconcile_with_chain(&mut self, node: &NodeHandle) -> anyhow::Result<u32> {
         anyhow::ensure!(
             self.chain_moved_under_scan(node),

@@ -12,6 +12,7 @@ mod backup_recovery;
 mod feedback;
 mod onboarding;
 mod recovery_studio;
+mod reward;
 mod theme;
 mod tray;
 mod ui_shots;

@@ -1745,6 +1745,10 @@ pub struct Toasts {
 }
 
 impl Toasts {
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
     pub fn clear(&mut self) {
         self.items.clear();
     }

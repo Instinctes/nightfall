@@ -12,7 +12,7 @@ use nightfall_ledger::{build_transfer, Payment, Spendable, Transaction};
 use nightfall_storage::write_secret_file;
 use nightfall_types::{Amount, NetworkId};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, Zeroizing};
@@ -212,6 +212,13 @@ impl HistoryEntry {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AirSignature {
+    intent: String,
+    raw: String,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WalletFile {
@@ -272,6 +279,9 @@ struct WalletFile {
     /// one that predates the field, because this struct denies unknown fields.
     #[serde(default)]
     invoices: Vec<counter::Invoice>,
+    /// Durable answers for the offline signer, retained across rescans.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    air_signed: BTreeMap<String, AirSignature>,
     /// Swap handshake and executor checkpoints belong in the encrypted wallet,
     /// never in a plaintext sidecar. Omitted for wallets without swap records.
     #[serde(default, skip_serializing_if = "swap_journal::Journal::is_empty")]
@@ -322,6 +332,10 @@ impl Drop for Wallet {
             if let Some(raw) = &mut entry.raw {
                 raw.zeroize();
             }
+        }
+        for answer in self.db.air_signed.values_mut() {
+            answer.intent.zeroize();
+            answer.raw.zeroize();
         }
     }
 }
@@ -533,6 +547,43 @@ impl Wallet {
         self.db.scanned_to
     }
 
+    /// Publish an isolated scan candidate without changing identity or storage.
+    /// The host must check that no edit occurred since it copied the candidate.
+    pub fn adopt_scan_state(&mut self, mut candidate: Wallet) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !candidate.persist
+                && candidate.network == self.network
+                && candidate.keys.seed == self.keys.seed
+                && candidate.address() == self.address(),
+            "Scan candidate belongs to a different wallet."
+        );
+        let previous = std::mem::replace(&mut self.db, std::mem::take(&mut candidate.db));
+        if let Err(error) = self.save() {
+            self.db = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// The block hash supplied by the last anchored scan. A light client trusts
+    /// its node for this hash; storing it detects changes, not invalid proof of work.
+    pub fn scan_anchor(&self) -> &str {
+        &self.db.scanned_tip
+    }
+
+    /// A deliberate light rescan retains outgoing records but clears chain
+    /// observations. That exact state can establish its first anchor at birth.
+    pub fn needs_light_rebuild(&self) -> bool {
+        self.db.scanned_tip.is_empty()
+            && self.has_scanned_history()
+            && !(self.db.scanned_to == self.db.birth_height
+                && self.db.outputs.is_empty()
+                && self.db.reserved.is_empty()
+                && self.db.history.iter().all(|entry| {
+                    entry.direction == Direction::Sent && entry.is_pending() && entry.quarantined
+                }))
+    }
+
     /// Distinguish observations from a fresh wallet's requested birth height.
     /// An old empty scan can also have missed payments on a replacement chain.
     pub fn has_scanned_history(&self) -> bool {
@@ -691,6 +742,113 @@ impl Wallet {
             db: state.db,
             persist: false,
         })
+    }
+
+    /// Ingest a contiguous page whose boundary hashes were checked against one
+    /// trusted node. Call on a candidate and persist it before publishing it.
+    /// The range includes the previous scan height, so its first hash must
+    /// still equal our saved anchor. This is continuity, not consensus validation.
+    pub fn ingest_anchored_scan_page(
+        &mut self,
+        outputs: &[LightOutput],
+        spent_hex: &[String],
+        from: u64,
+        scanned_to: u64,
+        from_hash: &str,
+        scanned_hash: &str,
+    ) -> anyhow::Result<u32> {
+        anyhow::ensure!(
+            !self.persist,
+            "Anchored light scans require an in-memory candidate."
+        );
+        let first_hash = decode32(from_hash).context("Invalid scan start hash.")?;
+        let last_hash = decode32(scanned_hash).context("Invalid scan end hash.")?;
+        anyhow::ensure!(
+            from == self.scan_from() && scanned_to >= from,
+            "Scan page does not continue the saved wallet position."
+        );
+        anyhow::ensure!(scanned_to - from < 1024, "Scan page exceeds 1024 blocks.");
+        anyhow::ensure!(
+            from != scanned_to || first_hash == last_hash,
+            "A single-block scan page must have the same start and end hash."
+        );
+        anyhow::ensure!(!self.needs_light_rebuild(),
+            "Saved scan history has no block anchor. Preserve a backup and explicitly rebuild the scan before sending.");
+        if self.db.scanned_tip.is_empty() {
+            anyhow::ensure!(
+                from == self.db.birth_height,
+                "An initial anchored scan must begin at the wallet birth height."
+            );
+        } else {
+            anyhow::ensure!(decode32(&self.db.scanned_tip) == Some(first_hash),
+                "The chain changed below the scan position. Preserve a backup and rebuild the scan before sending.");
+        }
+        let mut seen = BTreeSet::new();
+        for output in outputs {
+            anyhow::ensure!(
+                (from..=scanned_to).contains(&output.height),
+                "Scan output lies outside the requested block range."
+            );
+            let candidate = output
+                .as_candidate()
+                .context("Malformed scan output encoding.")?;
+            anyhow::ensure!(
+                seen.insert(candidate.commit.0),
+                "Duplicate scan output commitment."
+            );
+            // Encrypted amount (8), blind (32), memo (64), AEAD tag (16).
+            anyhow::ensure!(
+                candidate.payload.len() == 120,
+                "Invalid scan output payload length."
+            );
+            for point in [
+                candidate.commit.0,
+                candidate.ephemeral_pk,
+                candidate.output_pk,
+            ] {
+                anyhow::ensure!(
+                    curve25519_dalek::ristretto::CompressedRistretto(point)
+                        .decompress()
+                        .is_some(),
+                    "Invalid scan output curve point."
+                );
+            }
+        }
+        anyhow::ensure!(
+            spent_hex.iter().all(|value| decode32(value).is_some()),
+            "Malformed spent-output commitment."
+        );
+        // Every fallible page preflight precedes mutation. The enclosing Vault
+        // candidate provides rollback if encryption or persistence later fails.
+        let found = self.ingest_scan_page(outputs, spent_hex, scanned_to)?;
+        self.db.scanned_tip = hex::encode(last_hash);
+        self.save()?;
+        Ok(found)
+    }
+
+    /// Rebuild chain discoveries without erasing local invoices or signed sends.
+    /// Every old send is withheld and pending until the new scan observes its
+    /// inputs. An absent transaction is never permission to spend those inputs.
+    pub fn begin_light_rescan(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.persist,
+            "Light rescans require an in-memory candidate."
+        );
+        anyhow::ensure!(
+            !self.has_swap_recovery() && !self.has_reservations(),
+            "Resolve swap recovery records and reservations before rebuilding the scan."
+        );
+        self.db.outputs.clear();
+        self.db
+            .history
+            .retain(|entry| entry.direction == Direction::Sent);
+        for entry in &mut self.db.history {
+            entry.height = None;
+            entry.quarantined = true;
+        }
+        self.db.scanned_to = self.db.birth_height;
+        self.db.scanned_tip.clear();
+        self.save()
     }
 
     /// Ingest one light-client `scan_feed` page. Used by phones.
@@ -1080,6 +1238,9 @@ impl Wallet {
                 !e.spent_commits.is_empty() && e.spent_commits.iter().all(|c| spent.contains(c));
             if !still_spent {
                 e.height = None;
+                // A reorg may revive an old payment. Keep its inputs reserved,
+                // but do not send it again merely because the chain changed.
+                e.quarantined = true;
             }
         }
 
@@ -1603,9 +1764,57 @@ impl Wallet {
         self.db = WalletFile {
             birth_height: birth,
             scanned_to: birth,
+            invoices: std::mem::take(&mut self.db.invoices),
+            air_signed: std::mem::take(&mut self.db.air_signed),
             ..Default::default()
         };
         self.save()
+    }
+
+    /// Sign once per request. The reservation and exact answer are committed
+    /// together; repeating a request cannot select another set of inputs.
+    pub fn prepare_air_payment(
+        &mut self,
+        intent: &air::Intent,
+        maturity: u64,
+        now: u64,
+    ) -> anyhow::Result<Transaction> {
+        let canonical = air::Intent::parse(&intent.to_text())?;
+        let intent = &canonical;
+        intent.check(self.network, now)?;
+        let text = intent.to_text();
+        if let Some(saved) = self.db.air_signed.get(&intent.nonce) {
+            anyhow::ensure!(
+                saved.intent == text,
+                "This Air nonce was already used for a different request."
+            );
+            return Ok(serde_json::from_str(&saved.raw)?);
+        }
+        anyhow::ensure!(
+            self.db.air_signed.len() < 4096,
+            "Air signing history is full. No new payment was signed."
+        );
+        anyhow::ensure!(intent.to != self.address(), "That is your own address.");
+        let plain = zeroize::Zeroizing::new(self.export_state()?);
+        let mut candidate = Self::import_state(&plain)?;
+        let tx = candidate.create_payment_at(
+            &intent.to,
+            intent.amount_darks,
+            intent.fee_darks,
+            "",
+            intent.tip_height,
+            maturity,
+        )?;
+        candidate.record_send(&tx, intent.amount_darks, String::new())?;
+        candidate.db.air_signed.insert(
+            intent.nonce.clone(),
+            AirSignature {
+                intent: text,
+                raw: serde_json::to_string(&tx)?,
+            },
+        );
+        self.adopt_scan_state(candidate)?;
+        Ok(tx)
     }
 }
 
@@ -2359,6 +2568,226 @@ mod tests {
             .record_send(&tx, 1_000, "public fixture".into())
             .unwrap();
         (wallet, blocks, tx)
+    }
+
+    fn light_outputs(blocks: &[Block]) -> Vec<LightOutput> {
+        blocks
+            .iter()
+            .flat_map(|block| {
+                block.body.outputs.iter().map(|output| LightOutput {
+                    height: block.header.height.0,
+                    timestamp: block.header.timestamp_unix,
+                    commit: hex::encode(output.commit.0),
+                    ephemeral_pk: hex::encode(output.ephemeral_pk),
+                    output_pk: hex::encode(output.output_pk),
+                    view_tag: output.view_tag,
+                    payload: hex::encode(&output.payload),
+                    coinbase: output.features.is_coinbase(),
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn anchored_light_scan_validates_the_whole_page_before_advancing() {
+        let (source, blocks, _) = pending_scan_fixture();
+        let mut wallet =
+            Wallet::in_memory(source.network, WalletKeys::from_seed(source.keys.seed), 0);
+        let outputs = light_outputs(&blocks);
+        let first = blocks[0].hash().to_hex();
+        let last = blocks[1].hash().to_hex();
+        let before = wallet.export_state().unwrap();
+        for kind in 0..6 {
+            let mut invalid = outputs.clone();
+            match kind {
+                0 => invalid[0].commit = "bad".into(),
+                1 => invalid[0].height = 2,
+                2 => invalid[0].payload = "00".into(),
+                3 => invalid[0].ephemeral_pk = "ff".repeat(32),
+                4 => invalid.push(invalid[0].clone()),
+                _ => invalid[0].output_pk = "bad".into(),
+            }
+            assert!(wallet
+                .ingest_anchored_scan_page(&invalid, &[], 0, 1, &first, &last)
+                .is_err());
+            assert_eq!(wallet.export_state().unwrap(), before);
+        }
+        assert!(wallet
+            .ingest_anchored_scan_page(&outputs, &["bad".into()], 0, 1, &first, &last)
+            .is_err());
+        assert_eq!(wallet.export_state().unwrap(), before);
+        assert_eq!(
+            wallet
+                .ingest_anchored_scan_page(&outputs, &[], 0, 1, &first, &last)
+                .unwrap(),
+            1
+        );
+        assert_eq!(wallet.scan_anchor(), last);
+        assert_eq!(wallet.scanned_to(), 1);
+        let saved = wallet.export_state().unwrap();
+        assert!(wallet
+            .ingest_anchored_scan_page(&[], &[], 1, 1, &first, &first)
+            .is_err());
+        assert!(wallet
+            .ingest_anchored_scan_page(&[], &[], 2, 2, &last, &last)
+            .is_err());
+        assert!(wallet
+            .ingest_anchored_scan_page(&[], &[], 1, 1, &last, &first)
+            .is_err());
+        assert_eq!(wallet.export_state().unwrap(), saved);
+        assert_eq!(
+            wallet
+                .ingest_anchored_scan_page(&light_outputs(&blocks[1..]), &[], 1, 1, &last, &last)
+                .unwrap(),
+            0
+        );
+        assert_eq!(wallet.export_state().unwrap(), saved);
+    }
+
+    #[test]
+    fn light_rebuild_preserves_invoices_and_withholds_every_saved_send() {
+        let (mut wallet, blocks, tx) = pending_scan_fixture();
+        let invoice = counter::Invoice {
+            reference: "public-invoice".into(),
+            amount_darks: Some(123),
+            description: "retained during recovery".into(),
+            created_unix: 1,
+            expires_unix: None,
+            closed_note: Some("settled in cash".into()),
+        };
+        wallet.add_invoice(invoice.clone()).unwrap();
+        // A snapshot predating anchors must not silently adopt today's hash.
+        wallet.db.scanned_tip.clear();
+        assert!(wallet.needs_light_rebuild());
+        let first = blocks[0].hash().to_hex();
+        let last = blocks[1].hash().to_hex();
+        let before = wallet.export_state().unwrap();
+        assert!(wallet
+            .ingest_anchored_scan_page(&[], &[], 1, 1, &last, &last)
+            .is_err());
+        assert_eq!(wallet.export_state().unwrap(), before);
+        // Even a previously confirmed payment must be quarantined by rebuild.
+        wallet
+            .db
+            .history
+            .iter_mut()
+            .find(|entry| entry.direction == Direction::Sent)
+            .unwrap()
+            .height = Some(1);
+        wallet.begin_light_rescan().unwrap();
+        assert!(!wallet.needs_light_rebuild());
+        assert_eq!(wallet.invoices(), &[invoice]);
+        assert_eq!(wallet.history().len(), 1);
+        assert!(wallet.history()[0].is_pending() && wallet.history()[0].quarantined);
+        assert_eq!(
+            wallet.history()[0].raw.as_deref(),
+            Some(serde_json::to_string(&tx).unwrap().as_str())
+        );
+        let mut reopened = Wallet::import_state(&wallet.export_state().unwrap()).unwrap();
+        reopened
+            .ingest_anchored_scan_page(&light_outputs(&blocks), &[], 0, 1, &first, &last)
+            .unwrap();
+        assert!(reopened.resendable().is_empty());
+        assert!(
+            reopened.select_coins_at(1, 2000, 1440).is_err(),
+            "rebuild must not release signed inputs"
+        );
+        reopened
+            .reserve_commits(&[tx.inputs[0].commit.to_hex()])
+            .unwrap();
+        let reserved = reopened.export_state().unwrap();
+        assert!(reopened.begin_light_rescan().is_err());
+        assert_eq!(reopened.export_state().unwrap(), reserved);
+        reopened
+            .release_commits(&[tx.inputs[0].commit.to_hex()])
+            .unwrap();
+        reopened
+            .put_swap_checkpoint("00000000-0000-4000-8000-000000000001", 0, "public fixture")
+            .unwrap();
+        let journal = reopened.export_state().unwrap();
+        assert!(reopened.begin_light_rescan().is_err());
+        assert_eq!(reopened.export_state().unwrap(), journal);
+    }
+
+    #[test]
+    fn air_answer_is_durable_idempotent_and_bound_to_the_entire_intent() {
+        let (mut wallet, _, _) = pending_scan_fixture();
+        // Start with the public fixture coin available for the Air request.
+        wallet.db.history.clear();
+        wallet.db.outputs[0].spent = false;
+        // A repeated request must succeed from its saved answer even if all
+        // available coins are reserved, so no invented coin is needed.
+        let intent = air::Intent {
+            network: NetworkId::Devnet,
+            to: WalletKeys::from_seed([1; 32]).address(),
+            amount_darks: 1000,
+            fee_darks: 10,
+            tip_height: 2000,
+            nonce: "12".repeat(32),
+            expires_unix: 5000,
+        };
+        let signed = wallet.prepare_air_payment(&intent, 10, 100).unwrap();
+        let mut reopened = Wallet::import_state(&wallet.export_state().unwrap()).unwrap();
+        let retry = reopened.prepare_air_payment(&intent, 10, 101).unwrap();
+        assert_eq!(
+            serde_json::to_string(&signed).unwrap(),
+            serde_json::to_string(&retry).unwrap()
+        );
+        assert_eq!(
+            reopened
+                .history()
+                .iter()
+                .filter(|entry| entry.direction == Direction::Sent)
+                .count(),
+            1
+        );
+        let before = reopened.export_state().unwrap();
+        let mut changed = intent.clone();
+        changed.amount_darks += 1;
+        assert!(reopened.prepare_air_payment(&changed, 10, 102).is_err());
+        assert!(reopened.prepare_air_payment(&intent, 10, 5001).is_err());
+        assert_eq!(reopened.export_state().unwrap(), before);
+        let invoice = counter::Invoice {
+            reference: "kept".into(),
+            amount_darks: None,
+            description: "public invoice".into(),
+            created_unix: 1,
+            expires_unix: None,
+            closed_note: None,
+        };
+        reopened.add_invoice(invoice.clone()).unwrap();
+        // Low-level reset is also used by recovery tools; it must keep both
+        // local invoices and the nonce journal, which the chain cannot recover.
+        reopened.reset_scan().unwrap();
+        assert_eq!(reopened.invoices(), &[invoice]);
+        assert_eq!(
+            reopened
+                .prepare_air_payment(&intent, 10, 103)
+                .unwrap()
+                .txid(),
+            signed.txid()
+        );
+    }
+
+    #[test]
+    fn automatically_reconciled_payments_are_not_revived_on_the_wire() {
+        let (mut wallet, blocks, tx) = pending_scan_fixture();
+        wallet
+            .db
+            .history
+            .iter_mut()
+            .find(|entry| entry.direction == Direction::Sent)
+            .unwrap()
+            .height = Some(1);
+        wallet.scan_blocks(&blocks).unwrap();
+        let send = wallet
+            .history()
+            .iter()
+            .find(|entry| entry.txid == tx.txid().to_hex())
+            .unwrap();
+        assert!(send.is_pending() && send.quarantined);
+        assert!(wallet.resendable().is_empty());
+        assert!(wallet.select_coins_at(1, 2000, 10).is_err());
     }
 
     #[test]

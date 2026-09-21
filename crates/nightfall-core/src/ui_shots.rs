@@ -69,7 +69,9 @@ impl Shots {
             .into_iter()
             .map(|(v, name)| (v, name, None))
             .collect();
+        todo.insert(0, (View::Dashboard, "Startup", None));
         todo.extend([
+            (View::Mining, "Mining-reward", None),
             (View::Send, "Air", Some(("send", 1))),
             (View::Receive, "Counter", Some(("receive", 1))),
             (View::Activity, "Proof", Some(("activity", 1))),
@@ -94,6 +96,14 @@ impl Shots {
     /// The scroll offset the page should be drawn at this frame.
     pub fn offset(&self) -> Option<f32> {
         self.page.map(|_| self.asked)
+    }
+
+    pub fn capturing_startup(&self) -> bool {
+        self.page.is_some_and(|(_, name)| name == "Startup")
+    }
+
+    pub fn capturing_reward(&self) -> bool {
+        self.page.is_some_and(|(_, name)| name == "Mining-reward")
     }
 
     /// Called by `App::update` once the scroll area has been drawn.

@@ -114,6 +114,22 @@ fn vault_node_child() {
         );
         alice.release_commits(&reserved).unwrap();
         alice.check_rescan_allowed().unwrap();
+        // A missing archive range must not erase the authenticated snapshot.
+        let full_chain = node.shared().lock().unwrap().chain.clone();
+        node.shared().lock().unwrap().chain.prune_keep(2).unwrap();
+        let before_rescan = fs::read(root.join("alice/core.seed.vault/wallet.nfv")).unwrap();
+        assert!(alice
+            .rescan(&node)
+            .unwrap_err()
+            .to_string()
+            .contains("pruned"));
+        assert_eq!(
+            fs::read(root.join("alice/core.seed.vault/wallet.nfv")).unwrap(),
+            before_rescan
+        );
+        node.shared().lock().unwrap().chain = full_chain;
+        let (old_base, mut old_scan) = alice.scan_candidate().unwrap();
+        old_scan.scan_without_relay(&node, 1).unwrap();
         let before_payment_chain = node.shared().lock().unwrap().chain.clone();
         let txid = alice
             .send(
@@ -129,6 +145,15 @@ fn vault_node_child() {
             .iter()
             .any(|entry| entry.txid == txid && entry.is_pending() && entry.raw.is_some()));
         assert_eq!(node.shared().lock().unwrap().mempool.txs.len(), 1);
+        let after_send = fs::read(root.join("alice/core.seed.vault/wallet.nfv")).unwrap();
+        assert!(
+            !alice.commit_scan(&old_base, old_scan).unwrap(),
+            "A scan started before the payment must not overwrite its reservation"
+        );
+        assert_eq!(
+            fs::read(root.join("alice/core.seed.vault/wallet.nfv")).unwrap(),
+            after_send
+        );
         let pending_snapshot = fs::read(root.join("alice/core.seed.vault/wallet.nfv")).unwrap();
         assert!(alice.check_rescan_allowed().is_err());
         assert!(alice.rescan(&node).is_err());
@@ -300,7 +325,31 @@ fn vault_node_child() {
             "rescan is not the way out when payments are pending",
         );
 
-        alice.reconcile_with_chain(&node).unwrap();
+        // The production worker repairs the changed anchor automatically.
+        // The direct incremental API still refuses unsupported provenance.
+        let shared_wallet = Arc::new(std::sync::Mutex::new(alice));
+        let signal = Arc::new(std::sync::Mutex::new(None));
+        let syncing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let access = Arc::new(std::sync::Mutex::new(()));
+        let repaired = std::sync::atomic::AtomicU64::new(0);
+        crate::app::run_wallet_scan(
+            &shared_wallet,
+            &node,
+            &signal,
+            &syncing,
+            &paused,
+            &access,
+            &repaired,
+        );
+        assert_eq!(repaired.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(signal.lock().unwrap().take().unwrap().is_ok());
+        assert!(node.shared().lock().unwrap().mempool.txs.is_empty());
+        alice = Arc::try_unwrap(shared_wallet)
+            .ok()
+            .unwrap()
+            .into_inner()
+            .unwrap();
         assert!(
             !alice.chain_moved_under_scan(&node),
             "reconciling must leave the wallet agreeing with the node",
@@ -311,6 +360,40 @@ fn vault_node_child() {
         // ...and the offer is only on the table while it is true.
         let err = alice.reconcile_with_chain(&node).unwrap_err().to_string();
         assert!(err.contains("nothing to reconcile"), "{err}");
+        let tip = node.status_snapshot().unwrap().tip_height;
+        let recipient = WalletKeys::from_seed([9; 32]).address();
+        let held = alice
+            .prepare_payment(&recipient, 1000, 100, "withheld retry", tip, 10)
+            .unwrap();
+        let withdrawn = alice
+            .prepare_payment(&recipient, 1000, 100, "swap-lock", tip, 10)
+            .unwrap();
+        alice.quarantine_for_test().unwrap();
+        alice.sync_from_node(&node).unwrap();
+        assert!(node.shared().lock().unwrap().mempool.txs.is_empty());
+        let saved = fs::read(&snapshot_path).unwrap();
+        assert!(alice
+            .retry_withheld(&node, &withdrawn.txid().to_hex())
+            .is_err());
+        assert!(node.shared().lock().unwrap().mempool.txs.is_empty());
+        assert_eq!(
+            alice.retry_withheld(&node, &held.txid().to_hex()).unwrap(),
+            held.txid().to_hex()
+        );
+        assert_eq!(node.shared().lock().unwrap().mempool.txs.len(), 1);
+        assert_eq!(
+            fs::read(&snapshot_path).unwrap(),
+            saved,
+            "Retry must neither create a payment nor enable automatic relay"
+        );
+        assert!(
+            alice
+                .history()
+                .iter()
+                .find(|entry| entry.txid == held.txid().to_hex())
+                .unwrap()
+                .quarantined
+        );
     } else {
         assert_eq!(phase, "reopen");
         alice.sync_from_node(&node).unwrap();

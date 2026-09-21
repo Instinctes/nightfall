@@ -193,53 +193,7 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(14.0);
     }
 
-    // Mining is held back while the chain is behind or on a fork. The old
-    // label always said "1 block behind" on a fork, which is why a node
-    // stranded for days looked one block late.
-    let hold_banner = match sync_hold {
-        SyncHold::CatchingUp(n) if n > 0 => Some((
-            ACCENT,
-            format!(
-                "Catching up — {} block{} behind",
-                format_int(n),
-                if n == 1 { "" } else { "s" }
-            ),
-            "Mining starts by itself once this reaches zero. A block built on an outdated tip cannot be accepted by anyone — it would only split the chain.".to_string(),
-            false,
-        )),
-        SyncHold::CompetingTip { reorging } => Some((
-            WARN,
-            if reorging {
-                "On a competing tip — reorg in progress".to_string()
-            } else {
-                "On a competing tip — waiting to reorg".to_string()
-            },
-            "BLOCKS is frozen because the next network block does not connect here. The \"1 behind\" figure was a hold, not a distance.".to_string(),
-            false,
-        )),
-        SyncHold::DeadBranch { gap } => Some((
-            DANGER,
-            "Stuck on a dead branch".to_string(),
-            format!(
-                "This tip diverged {} blocks back — past the 500-block reorg limit. Resync the chain file in Settings. The seed and wallet stay. Coinbase mined on this branch is gone.",
-                format_int(gap)
-            ),
-            true,
-        )),
-        _ => None,
-    };
-    if let Some((color, title, body, offer_resync)) = hold_banner {
-        status_banner(ui, color, &title, &body, true, |ui| {
-            if offer_resync {
-                ui.add_space(10.0);
-                if ghost_button(ui, "Open Settings to resync").clicked() {
-                    open_settings_section(app, ui.ctx(), 3);
-                    app.resync_confirm = true;
-                }
-            }
-        });
-        ui.add_space(14.0);
-    }
+    // Chain catch-up and reorgs are background state, not user alerts.
 
     if !app.backup_acked {
         status_banner(
@@ -254,27 +208,6 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
                     open_settings_section(app, ui.ctx(), 1);
                     // Navigation alone must not expose the recovery phrase.
                     app.reveal_mnemonic = false;
-                }
-            },
-        );
-        ui.add_space(14.0);
-    }
-
-    // Mining with no peers is how you end up on a private fork without
-    // noticing. Say so loudly, before hours of work get discarded.
-    if app.is_mining() && peers == 0 && !loading {
-        status_banner(
-            ui,
-            WARN,
-            "Mining alone — not connected to anyone",
-            "You are building your own chain. If another miner is running on the \
-             same genesis, one of the two chains will be discarded when you finally \
-             connect — and everything mined on the lighter one is lost.",
-            true,
-            |ui| {
-                ui.add_space(10.0);
-                if ghost_button(ui, "Connect to a peer").clicked() {
-                    app.view = View::Network;
                 }
             },
         );
@@ -349,7 +282,6 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
         // nobody to be in sync *with*, the only honest thing to report is that
         // there is nobody.
         ui.add_space(6.0);
-        let syncing = app.syncing.load(std::sync::atomic::Ordering::SeqCst);
         let connected = peers > 0;
         let scanned = app.wallet.lock().map(|w| w.scanned_to()).unwrap_or(0);
 
@@ -368,12 +300,10 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
             // it is behind is the stable fact worth showing; a pass running is
             // how it stops being behind, not separate news.
             (
-                WARN,
-                true,
-                format!("Catching up · scanned block {}", format_int(scanned)),
+                TEXT_DIM,
+                false,
+                "Connected · updating automatically".to_string(),
             )
-        } else if syncing {
-            (WARN, true, "Scanning…".to_string())
         } else if connected {
             (
                 SUCCESS,
@@ -959,9 +889,18 @@ fn air_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                                 )
                             }
                             Some(intent) => {
-                                match signed.accept(&intent, app.network, &mut app.air_log) {
+                                let mut accepted = app.air_log.clone();
+                                match intent.check(app.network, now_unix()).and_then(|_| {
+                                    signed.accept(&intent, app.network, &mut accepted)
+                                }) {
                                     Err(problem) => app.air_error = Some(problem.to_string()),
-                                    Ok(()) => app.air_note = Some(broadcast(app, &signed.payload)),
+                                    Ok(()) => match broadcast(app, &signed.payload) {
+                                        Ok(note) => {
+                                            app.air_log = accepted;
+                                            app.air_note = Some(note);
+                                        }
+                                        Err(problem) => app.air_error = Some(problem),
+                                    },
                                 }
                             }
                         },
@@ -1018,16 +957,10 @@ fn air_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 app.air_error = None;
                 app.air_note = None;
                 let maturity = app.maturity();
-                let built = app.wallet.lock().map(|mut w| {
-                    w.prepare_payment(
-                        &intent.to,
-                        intent.amount_darks,
-                        intent.fee_darks,
-                        "",
-                        intent.tip_height,
-                        maturity,
-                    )
-                });
+                let built = app
+                    .wallet
+                    .lock()
+                    .map(|mut w| w.prepare_air_payment(&intent, maturity));
                 match built {
                     Err(_) => app.air_error = Some("The wallet is busy.".into()),
                     Ok(Err(problem)) => app.air_error = Some(problem.to_string()),
@@ -1112,15 +1045,19 @@ fn air_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 }
 
 /// Hand a foreign transaction to the node, and say what happened.
-fn broadcast(app: &mut App, payload: &[u8]) -> String {
+fn broadcast(app: &mut App, payload: &[u8]) -> Result<String, String> {
     let Some(node) = app.node.clone() else {
-        return "This machine has no node running, so there is nothing to broadcast with."
-            .to_owned();
+        return Err(
+            "This machine has no node running. Start the node, then retry this same signed answer."
+                .to_owned(),
+        );
     };
     let tx: nightfall_ledger::Transaction = match serde_json::from_slice(payload) {
         Ok(tx) => tx,
         Err(problem) => {
-            return format!("That is not a transaction this wallet can read: {problem}")
+            return Err(format!(
+                "That is not a transaction this wallet can read: {problem}"
+            ))
         }
     };
     match app
@@ -1128,12 +1065,15 @@ fn broadcast(app: &mut App, payload: &[u8]) -> String {
         .lock()
         .map(|mut w| w.broadcast_foreign(&node, tx))
     {
-        Err(_) => "The wallet is busy.".to_owned(),
-        Ok(Err(problem)) => problem.to_string(),
+        Err(_) => Err("The wallet is busy.".to_owned()),
+        Ok(Err(problem)) => Err(problem.to_string()),
         Ok(Ok(txid)) => {
             app.air_pending = None;
             app.air_frames.clear();
-            format!("Handed to the network. Transaction {}", short_hex(&txid))
+            Ok(format!(
+                "Handed to the network. Transaction {}",
+                short_hex(&txid)
+            ))
         }
     }
 }
@@ -1659,7 +1599,7 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 let reason = if app.send_busy {
                     "A payment is already being prepared."
                 } else if app.wallet_sync_error.is_some() {
-                    "Resolve the wallet scan warning before sending."
+                    "Updating your wallet in the background…"
                 } else if !matches!(addr_state, Some(Ok(_))) {
                     "Enter a valid recipient address to continue."
                 } else if amount_state.is_err() {
@@ -2170,74 +2110,27 @@ fn counter_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, address: 
 
 // -------------------------------------------------------------- activity ---
 
-/// Payments a restored backup carried in, which this wallet is withholding.
-///
-/// They are deliberately kept out of the stuck-payment notice further down.
-/// A withheld payment is pending and almost always older than half an hour,
-/// so that notice would describe it as a payment this wallet made and lost —
-/// which is exactly what it is not. This wallet never sent it; it read it out
-/// of a file and is refusing to put it back on the wire.
-///
-/// Returns true when the owner asked for the rescan screen.
+/// Optional details in Activity, never a reorg alert or an automatic popup.
 pub fn withheld_notice(
     ui: &mut egui::Ui,
     entries: &[nightfall_wallet::HistoryEntry],
-    now: u64,
+    _now: u64,
 ) -> bool {
-    let withheld: Vec<_> = entries
+    let count = entries
         .iter()
-        .filter(|e| e.direction == Direction::Sent && e.needs_owner_decision())
-        .collect();
-    let Some(oldest) = withheld.iter().min_by_key(|e| e.timestamp) else {
+        .filter(|entry| entry.direction == Direction::Sent && entry.needs_owner_decision())
+        .count();
+    if count == 0 {
         return false;
-    };
-    let n = withheld.len();
-    let mut rescan = false;
-    egui::Frame::none()
-        .fill(glass_alert(DANGER))
-        .stroke(Stroke::NONE)
-        .rounding(Rounding::same(ROUND))
-        .inner_margin(egui::Margin::symmetric(14.0, 12.0))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                dot(ui, DANGER, true);
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(if n == 1 {
-                        "One payment from your backup is unresolved".to_string()
-                    } else {
-                        format!("{n} payments from your backup are unresolved")
-                    })
-                    .size(13.0)
-                    .strong(),
-                );
-            });
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(format!(
-                    "Recorded {} in the backup you restored, and held back since. This \
-                     wallet will not broadcast them on its own. A backup is a photograph \
-                     of one moment: by now each of these may have confirmed, expired, or \
-                     had its coins spent another way, and the file cannot tell you which. \
-                     Check each against the chain before you spend.",
-                    ago(oldest.timestamp, now)
-                ))
-                .size(11.5)
-                .color(TEXT_DIM),
-            );
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                rescan = ghost_button(ui, "Open Settings → Node").clicked();
-                ui.label(
-                    RichText::new("rebuilds this wallet from the chain the node has")
-                        .size(11.0)
-                        .color(TEXT_DIM),
-                );
-            });
+    }
+    let mut connection = false;
+    egui::CollapsingHeader::new(format!("{count} saved payment(s) awaiting confirmation"))
+        .default_open(false).show(ui, |ui| {
+            ui.label("These saved payments remain reserved. Wallet history updates automatically. A retry below sends the original transaction once and never creates another payment.");
+            connection = ghost_button(ui, "Connection details").clicked();
         });
-    ui.add_space(12.0);
-    rescan
+    ui.add_space(8.0);
+    connection
 }
 
 pub fn activity(app: &mut App, ui: &mut egui::Ui) {
@@ -2310,7 +2203,40 @@ pub fn activity(app: &mut App, ui: &mut egui::Ui) {
     const STUCK_AFTER_SECS: u64 = 30 * 60;
 
     if withheld_notice(ui, &entries, now_for_stuck) {
-        open_settings_section(app, ui.ctx(), 3);
+        app.view = View::Network;
+    }
+    let retryable: Vec<_> = entries
+        .iter()
+        .filter(|entry| {
+            entry.needs_owner_decision()
+                && entry.direction == Direction::Sent
+                && entry.memo != "swap-lock"
+                && entry.raw.is_some()
+        })
+        .collect();
+    if !retryable.is_empty() {
+        egui::CollapsingHeader::new("Review withheld payments").show(ui, |ui| {
+            ui.label("Retrying broadcasts the original saved transaction once. It creates no new payment and keeps the inputs reserved. Only retry if you still intend to pay the original recipient.");
+            for entry in retryable {
+                ui.push_id(&entry.txid, |ui| {
+                    ui.add_space(GAP_SM);
+                    ui.label(format!("{} · fee {}", Amount(entry.amount), Amount(entry.fee)));
+                    ui.label(RichText::new(&entry.txid).monospace().size(11.0));
+                    if !entry.memo.is_empty() { ui.label(&entry.memo); }
+                    if app.retry_payment.as_deref() == Some(entry.txid.as_str()) {
+                        ui.label("Broadcast this exact saved payment to its original recipient?");
+                        ui.horizontal_wrapped(|ui| {
+                            if primary_button(ui, "Confirm one retry", app.wallet_sync_error.is_none() && app.node.is_some()).clicked() {
+                                app.retry_withheld(&entry.txid, ui.ctx());
+                            }
+                            if ghost_button(ui, "Cancel").clicked() { app.retry_payment = None; }
+                        });
+                    } else if ghost_button(ui, "Review retry").clicked() {
+                        app.retry_payment = Some(entry.txid.clone());
+                    }
+                });
+            }
+        });
     }
 
     let stuck: Vec<_> = entries
@@ -2548,6 +2474,22 @@ pub fn mining(app: &mut App, ui: &mut egui::Ui) {
 
     card(ui, |ui| {
         ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            let mut enabled = app.reward_sound;
+            if ui
+                .checkbox(&mut enabled, "Reward-Sound")
+                .on_hover_text(
+                    "Play a quiet chime for each new mining reward. Saved for the next launch.",
+                )
+                .changed()
+            {
+                app.set_reward_sound(enabled);
+            }
+        });
+        if let Some(error) = &app.reward_sound_error {
+            ui.label(RichText::new(error).size(11.5).color(TEXT_DIM));
+        }
+        ui.add_space(12.0);
         ui.horizontal(|ui| {
             dot(ui, if mining { SUCCESS } else { TEXT_DIM }, mining);
             ui.add_space(8.0);
@@ -3453,7 +3395,15 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 );
             }
             ui.add_space(12.0);
-            if ghost_button(ui, "Rescan from genesis").clicked() {
+            if ui
+                .add_enabled(
+                    !pruned && !app.syncing.load(std::sync::atomic::Ordering::SeqCst),
+                    egui::Button::new("Rescan from genesis"),
+                )
+                .clicked()
+            {
+                app.startup_complete = false;
+                app.last_sync_at = None;
                 if let Some(node) = app.node.clone() {
                     let wallet = std::sync::Arc::clone(&app.wallet);
                     let signal = std::sync::Arc::clone(&app.sync_signal);

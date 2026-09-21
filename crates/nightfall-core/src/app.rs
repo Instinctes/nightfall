@@ -13,7 +13,7 @@ use nightfall_node::{NodeConfig, NodeHandle, StatusSnap};
 use nightfall_storage::now_unix;
 use nightfall_types::{NetworkId, DARKS_PER_NIGHT};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zeroize::Zeroize;
@@ -128,6 +128,8 @@ impl HashrateMeter {
     }
 }
 
+type StatusReply = Arc<Mutex<Option<Result<StatusSnap, String>>>>;
+
 pub struct App {
     pub network: NetworkId,
     pub datadir: PathBuf,
@@ -135,9 +137,8 @@ pub struct App {
     pub wallet: Arc<Mutex<WalletState>>,
     pub vault_ui: crate::vault_ui::VaultUi,
     pub wallet_paused: Arc<AtomicBool>,
-    /// Outer lock: scans may hold the wallet for minutes. Frames only try this
-    /// gate and render a lock-free progress panel if a scan owns it. Hold it
-    /// through the entire frame; probing the wallet mutex alone races a scan.
+    /// Serializes short snapshot/commit operations with frames. Trial decryption
+    /// happens on an isolated wallet without holding this gate.
     pub wallet_scan_access: Arc<Mutex<()>>,
     data_lock: Option<Arc<nightfall_storage::dirlock::DirLock>>,
     pub view: View,
@@ -155,18 +156,17 @@ pub struct App {
     /// Set by the background sync thread when new outputs arrive.
     pub sync_signal: Arc<Mutex<Option<Result<u32, String>>>>,
     pub syncing: Arc<AtomicBool>,
-    /// The scan worker's next pass must reconcile onto the node's chain rather
-    /// than scan the next page. Set only by an explicit action in the scan
-    /// warning; cleared by the worker that honours it.
-    pub reconcile_requested: Arc<AtomicBool>,
-    /// The wallet's anchor no longer matches the node, sampled once per poll so
-    /// the banner does not take the node lock on every frame.
-    pub scan_anchor_broken: bool,
-    pub reconcile_confirm: bool,
+    scan_repair_epoch: Arc<AtomicU64>,
+    observed_repair_epoch: u64,
+    pub startup_complete: bool,
+    startup_ready_since: Option<Instant>,
+    startup_connection_view: bool,
+    pending_status: Option<StatusReply>,
     pub last_sync_at: Option<u64>,
     /// A detected scan failure remains visible until a successful canonical
     /// scan; it must not disappear with a toast or a successful node poll.
     pub wallet_sync_error: Option<String>,
+    pub retry_payment: Option<String>,
 
     // Send form
     pub send_to: String,
@@ -253,6 +253,9 @@ pub struct App {
     activity_primed: bool,
     /// Context time when a receive/mine flash started.
     coin_flash_at: Option<f64>,
+    rewards: crate::reward::Rewards,
+    pub reward_sound: bool,
+    pub reward_sound_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -341,11 +344,15 @@ impl App {
             sync_signal: Arc::new(Mutex::new(None)),
             wallet_scan_access: Arc::new(Mutex::new(())),
             syncing: Arc::new(AtomicBool::new(false)),
-            reconcile_requested: Arc::new(AtomicBool::new(false)),
-            scan_anchor_broken: false,
-            reconcile_confirm: false,
+            scan_repair_epoch: Arc::new(AtomicU64::new(0)),
+            observed_repair_epoch: 0,
+            startup_complete: false,
+            startup_ready_since: None,
+            startup_connection_view: false,
+            pending_status: None,
             last_sync_at: None,
             wallet_sync_error: None,
+            retry_payment: None,
             send_to: String::new(),
             send_amount: String::new(),
             send_memo: String::new(),
@@ -400,6 +407,9 @@ impl App {
             activity_seen: std::collections::HashSet::new(),
             activity_primed: false,
             coin_flash_at: None,
+            rewards: Default::default(),
+            reward_sound: load_flag(&datadir, "reward_sound", true),
+            reward_sound_error: None,
         };
         if custody == Custody::Legacy && app.wallet_load_error.is_none() {
             app.start_node();
@@ -481,7 +491,8 @@ impl App {
         if let Some(error) = &self.vault_ui.error {
             ui.colored_label(DANGER, error);
         }
-        let available = cfg!(unix) && self.data_lock.is_some() && !self.vault_ui.busy();
+        let available =
+            cfg!(any(unix, windows)) && self.data_lock.is_some() && !self.vault_ui.busy();
         let request = self
             .onboarding
             .as_mut()
@@ -543,6 +554,29 @@ impl App {
         }
     }
 
+    pub fn set_reward_sound(&mut self, enabled: bool) {
+        use std::io::Write;
+        let result = (|| -> std::io::Result<()> {
+            std::fs::create_dir_all(&self.datadir)?;
+            let mut file = std::fs::File::create(self.datadir.join("reward_sound"))?;
+            file.write_all(if enabled { b"1" } else { b"0" })?;
+            file.sync_all()
+        })();
+        match result {
+            Ok(()) => {
+                self.reward_sound = enabled;
+                self.reward_sound_error = None;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "cannot save reward sound preference");
+                self.reward_sound_error = Some(
+                    "The sound setting could not be saved. Check the data folder permissions."
+                        .into(),
+                );
+            }
+        }
+    }
+
     pub fn resync_chain(&mut self, ctx: &egui::Context) {
         let Some(node) = self.node.clone() else {
             self.toasts.error(ctx, "Node is not running");
@@ -554,6 +588,9 @@ impl App {
         let syncing = self.syncing.clone();
         let signal = self.sync_signal.clone();
         self.resync_confirm = false;
+        self.startup_complete = false;
+        self.startup_connection_view = false;
+        self.last_sync_at = None;
         std::thread::spawn(move || {
             let Ok(_access) = access.lock() else {
                 return;
@@ -643,7 +680,7 @@ impl App {
     /// The scan is tied to the node's tip, not to a timer. A 3-second poll
     /// meant a payment could sit on disk for three seconds after the block
     /// arrived, and a reorg could be missed for the same window. `wait_tip_change`
-    /// wakes this thread the moment the chain moves; a 30-second timeout is
+    /// wakes this thread the moment the chain moves; a 5-second timeout is
     /// only a safety net if a notify is lost.
     fn spawn_sync_worker(&self, node: Arc<NodeHandle>) {
         let wallet = Arc::clone(&self.wallet);
@@ -651,7 +688,7 @@ impl App {
         let syncing = Arc::clone(&self.syncing);
         let paused = Arc::clone(&self.wallet_paused);
         let access = Arc::clone(&self.wallet_scan_access);
-        let reconcile = Arc::clone(&self.reconcile_requested);
+        let repair_epoch = Arc::clone(&self.scan_repair_epoch);
         let data_lock = self.data_lock.clone();
 
         std::thread::spawn(move || {
@@ -659,55 +696,112 @@ impl App {
             let mut seen = node.tip_generation();
             // First pass: pick up whatever is already on disk.
             run_wallet_scan(
-                &wallet, &node, &signal, &syncing, &paused, &access, &reconcile,
+                &wallet,
+                &node,
+                &signal,
+                &syncing,
+                &paused,
+                &access,
+                &repair_epoch,
             );
             loop {
-                seen = node.wait_tip_change(seen, Duration::from_secs(30));
+                seen = node.wait_tip_change(seen, Duration::from_secs(5));
                 run_wallet_scan(
-                    &wallet, &node, &signal, &syncing, &paused, &access, &reconcile,
+                    &wallet,
+                    &node,
+                    &signal,
+                    &syncing,
+                    &paused,
+                    &access,
+                    &repair_epoch,
                 );
             }
         });
     }
 }
 
-fn run_wallet_scan(
+pub(crate) fn run_wallet_scan(
     wallet: &Arc<Mutex<WalletState>>,
     node: &NodeHandle,
     signal: &Arc<Mutex<Option<Result<u32, String>>>>,
     syncing: &Arc<AtomicBool>,
     paused: &Arc<AtomicBool>,
     access: &Arc<Mutex<()>>,
-    reconcile: &Arc<AtomicBool>,
+    repair_epoch: &AtomicU64,
 ) {
     if paused.load(Ordering::SeqCst) {
         return;
     }
-    let Ok(_access) = access.lock() else {
-        return;
-    };
     syncing.store(true, Ordering::SeqCst);
-    let result = {
-        let mut w = match wallet.lock() {
-            Ok(w) => w,
-            Err(_) => {
-                syncing.store(false, Ordering::SeqCst);
-                return;
+    let result = (|| -> anyhow::Result<u32> {
+        let mut found = 0u32;
+        loop {
+            let (base, mut candidate) = {
+                let _access = access
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("scan lock poisoned"))?;
+                let w = wallet
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("wallet lock poisoned"))?;
+                anyhow::ensure!(
+                    !paused.load(Ordering::SeqCst) && w.can_scan(),
+                    "Wallet is locked."
+                );
+                w.scan_candidate()?
+            };
+            // Neither the live wallet nor the frame gate is held while the
+            // chain is copied and outputs are decrypted. The saved UI remains
+            // usable, and any concurrent edit is checked before publication.
+            let status = node.status_snapshot()?;
+            anyhow::ensure!(!status.loading, "Verifying the saved blockchain…");
+            anyhow::ensure!(
+                !status.reorg_in_flight,
+                "Waiting for the node to finish changing branches…"
+            );
+            let changed = candidate.chain_moved_under_scan(node);
+            let (count, more) = if changed {
+                anyhow::ensure!(
+                    status.blocks_behind == 0,
+                    "Downloading the current chain before checking wallet history…"
+                );
+                (candidate.reconcile_with_chain(node)?, false)
+            } else {
+                candidate.scan_without_relay(node, 1)?
+            };
+            let relay = {
+                let _access = access
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("scan lock poisoned"))?;
+                let mut w = wallet
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("wallet lock poisoned"))?;
+                anyhow::ensure!(
+                    !paused.load(Ordering::SeqCst) && w.can_scan(),
+                    "Wallet is locked."
+                );
+                if !w.commit_scan(&base, candidate)? {
+                    continue; // A payment or metadata edit won; scan its new state.
+                }
+                if changed {
+                    repair_epoch.fetch_add(1, Ordering::SeqCst);
+                    tracing::info!("wallet history reconciled in the background");
+                }
+                found = found.saturating_add(count);
+                if more {
+                    None
+                } else {
+                    Some(w.scan_candidate()?.1)
+                }
+            };
+            if let Some(relay) = relay {
+                if !changed && !paused.load(Ordering::SeqCst) {
+                    relay.relay_pending(node)?;
+                }
+                return Ok(found);
             }
-        };
-        if paused.load(Ordering::SeqCst) || !w.can_scan() {
-            syncing.store(false, Ordering::SeqCst);
-            return;
         }
-        // An explicit reconciliation replaces this pass and only this pass.
-        // Taken with `swap`, so a request cannot be honoured twice and cannot
-        // be lost between the check and the act.
-        if reconcile.swap(false, Ordering::SeqCst) {
-            w.reconcile_with_chain(node).map_err(|e| e.to_string())
-        } else {
-            w.sync_from_node(node).map_err(|e| e.to_string())
-        }
-    };
+    })()
+    .map_err(|e| e.to_string());
     syncing.store(false, Ordering::SeqCst);
     if let Ok(mut slot) = signal.lock() {
         *slot = Some(result);
@@ -750,39 +844,89 @@ impl App {
     }
 
     fn poll_status(&mut self) {
-        let due = self
-            .last_status_poll
-            .map(|t| t.elapsed() >= Duration::from_millis(700))
-            .unwrap_or(true);
-        if !due {
-            return;
-        }
-        self.last_status_poll = Some(Instant::now());
-        self.take_chain_check();
-
-        // Sampled here rather than in the banner: answering it takes the node
-        // lock, and a banner is drawn every frame.
-        self.scan_anchor_broken = match (&self.node, self.wallet.try_lock()) {
-            (Some(node), Ok(w)) => w.chain_moved_under_scan(node),
-            _ => self.scan_anchor_broken,
-        };
-        if !self.scan_anchor_broken {
-            self.reconcile_confirm = false;
-        }
-
-        if let Some(node) = &self.node {
-            match node.status_snapshot() {
-                Ok(s) => {
-                    self.hashrate.sample(s.hashes_total);
-                    if !self.is_mining() {
+        // Node snapshots include a UTXO commitment and can wait for replay.
+        // Neither operation belongs on the UI thread.
+        let reply = self
+            .pending_status
+            .as_ref()
+            .and_then(|slot| slot.try_lock().ok().and_then(|mut reply| reply.take()));
+        if let Some(reply) = reply {
+            self.pending_status = None;
+            match reply {
+                Ok(status) => {
+                    self.hashrate.sample(status.hashes_total);
+                    if !status.mining {
                         self.hashrate.current = 0.0;
                     }
-                    self.status = Some(s);
+                    self.status = Some(status);
                     self.status_error = None;
                 }
-                Err(e) => self.status_error = Some(e.to_string()),
+                Err(error) => self.status_error = Some(error),
             }
         }
+        self.take_chain_check();
+        let due = self
+            .last_status_poll
+            .map(|time| time.elapsed() >= Duration::from_millis(700))
+            .unwrap_or(true);
+        if due && self.pending_status.is_none() {
+            if let Some(node) = self.node.clone() {
+                self.last_status_poll = Some(Instant::now());
+                let slot: StatusReply = Arc::new(Mutex::new(None));
+                let output = slot.clone();
+                std::thread::spawn(move || {
+                    let result = node.status_snapshot().map_err(|error| error.to_string());
+                    if let Ok(mut reply) = output.lock() {
+                        *reply = Some(result);
+                    }
+                });
+                self.pending_status = Some(slot);
+            }
+        }
+    }
+
+    fn startup_gate(&mut self, now: Instant) -> bool {
+        if self.startup_complete
+            || self.onboarding.is_some()
+            || self.node.is_none()
+            || self.shots.is_some()
+        {
+            return false;
+        }
+        let ready = self.wallet_sync_error.is_none()
+            && self.last_sync_at.is_some()
+            && self.status.as_ref().is_some_and(|status| {
+                !status.loading
+                    && !status.reorg_in_flight
+                    && !status.stalled_on_fork
+                    && status.blocks_behind == 0
+                    && (self.network == NetworkId::Devnet || status.live_peers > 0)
+                    && self.wallet.try_lock().ok().is_some_and(|wallet| {
+                        wallet.scanned_to() == status.tip_height
+                            && (wallet.scan_anchor() == status.tip
+                                || (self.network == NetworkId::Devnet
+                                    && status.blocks == 0
+                                    && wallet.scan_anchor().is_empty()))
+                    })
+            });
+        self.settle_startup(ready, now)
+    }
+
+    fn settle_startup(&mut self, ready: bool, now: Instant) -> bool {
+        if self.startup_complete {
+            return false;
+        }
+        if ready {
+            let since = self.startup_ready_since.get_or_insert(now);
+            if now.saturating_duration_since(*since) >= Duration::from_secs(2) {
+                self.startup_complete = true;
+                self.startup_connection_view = false;
+                return false;
+            }
+        } else {
+            self.startup_ready_since = None;
+        }
+        !self.startup_connection_view
     }
 
     pub fn coin_flash_amount(&self, ctx: &egui::Context) -> f32 {
@@ -807,21 +951,34 @@ impl App {
             crate::wallet_state::Custody::Unlocked | crate::wallet_state::Custody::Legacy
         ) {
             self.activity_primed = false;
-            self.activity_seen.clear();
+            self.rewards.conceal();
             return;
         }
+        let repair_epoch = self.scan_repair_epoch.load(Ordering::SeqCst);
+        let repaired = repair_epoch != self.observed_repair_epoch;
+        self.observed_repair_epoch = repair_epoch;
+        let quiet = repaired
+            || !self.startup_complete
+            || self
+                .status
+                .as_ref()
+                .is_some_and(|s| s.sync_hold != nightfall_node::SyncHold::Synced);
+        if quiet {
+            self.rewards.conceal();
+            self.activity_primed = false;
+            self.coin_flash_at = None;
+        }
+        self.rewards.observe(wallet.history(), quiet);
         let mut arrived = 0u64;
-        let mut mined = false;
         for entry in wallet.history() {
             if !self.activity_seen.insert(entry.txid.clone()) {
                 continue;
             }
             match entry.direction {
-                nightfall_wallet::Direction::Mined | nightfall_wallet::Direction::Received => {
+                nightfall_wallet::Direction::Received => {
                     arrived = arrived.saturating_add(entry.amount);
-                    mined |= entry.direction == nightfall_wallet::Direction::Mined;
                 }
-                nightfall_wallet::Direction::Sent => {}
+                nightfall_wallet::Direction::Mined | nightfall_wallet::Direction::Sent => {}
             }
         }
         drop(wallet);
@@ -836,31 +993,24 @@ impl App {
         self.coin_flash_at = Some(ctx.input(|i| i.time));
         ctx.request_repaint();
         let amount = arrived as f64 / DARKS_PER_NIGHT as f64;
-        if mined {
-            self.toasts.success(ctx, format!("Mined {amount:.8} NIGHT"));
-        } else {
-            self.toasts
-                .success(ctx, format!("Received {amount:.8} NIGHT"));
-        }
+        self.toasts
+            .success(ctx, format!("Received {amount:.8} NIGHT"));
     }
 
-    fn drain_sync_signal(&mut self, ctx: &egui::Context) {
+    fn drain_sync_signal(&mut self, _ctx: &egui::Context) {
         let taken = self.sync_signal.lock().ok().and_then(|mut s| s.take());
         if let Some(result) = taken {
             match result {
                 Ok(n) => {
                     self.wallet_sync_error = None;
                     self.last_sync_at = Some(now_unix());
-                    if n > 0 {
-                        self.toasts.success(ctx, format!("Found {n} new output(s)"));
-                    }
+                    tracing::debug!(outputs = n, "wallet scan saved");
                 }
                 Err(e) => {
                     self.send_confirm = false;
-                    // The persistent banner is the source of truth for a
-                    // scan failure. A simultaneous toast covered the lower
-                    // dashboard cards on startup and repeated every retry,
-                    // making the warning harder to read rather than clearer.
+                    if self.wallet_sync_error.as_deref() != Some(e.as_str()) {
+                        tracing::warn!(error = %e, "wallet scan will retry in the background");
+                    }
                     self.wallet_sync_error = Some(e);
                 }
             }
@@ -869,8 +1019,7 @@ impl App {
 
     pub fn do_send(&mut self, ctx: &egui::Context) {
         if self.wallet_sync_error.is_some() {
-            self.toasts.error(ctx, "Sending is blocked until the wallet completes a valid chain scan. Preserve a backup before recovery.");
-            return;
+            return; // The send controls stay disabled during background recovery.
         }
         let Some(node) = self.node.clone() else {
             self.toasts.error(ctx, "Node is not running");
@@ -897,6 +1046,7 @@ impl App {
                 amount: amount_darks,
                 fee: self.send_fee,
                 memo: zeroize::Zeroizing::new(self.send_memo.trim().to_string()),
+                retry_txid: None,
             },
             ctx.clone(),
         );
@@ -907,6 +1057,29 @@ impl App {
                 self.toasts.error(ctx, error);
             }
         }
+    }
+
+    pub fn retry_withheld(&mut self, txid: &str, ctx: &egui::Context) {
+        let Some(node) = self.node.clone() else {
+            return;
+        };
+        if self.vault_ui.busy() || self.wallet_sync_error.is_some() {
+            return;
+        }
+        self.vault_ui.start_payment(
+            self.wallet.clone(),
+            self.wallet_paused.clone(),
+            crate::vault_ui::PaymentRequest {
+                node,
+                to: Default::default(),
+                amount: 0,
+                fee: 0,
+                memo: Default::default(),
+                retry_txid: Some(txid.to_owned()),
+            },
+            ctx.clone(),
+        );
+        self.retry_payment = None;
     }
 
     fn payment_feedback(&mut self, result: Result<String, String>, ctx: &egui::Context) {
@@ -1296,7 +1469,16 @@ impl App {
                                             ui.add_space(4.0);
 
                                             // Chain height + sync indicator
-                                            let syncing = self.syncing.load(Ordering::SeqCst);
+                                            let syncing = loading
+                                                || self.status.as_ref().is_some_and(|s| {
+                                                    s.blocks_behind > 0
+                                                        || s.reorg_in_flight
+                                                        || self
+                                                            .wallet
+                                                            .lock()
+                                                            .map(|w| w.scanned_to() != s.tip_height)
+                                                            .unwrap_or(true)
+                                                });
                                             let blocks =
                                                 self.status.as_ref().map(|s| s.blocks).unwrap_or(0);
                                             ui.horizontal(|ui| {
@@ -1304,18 +1486,14 @@ impl App {
                                                     ui,
                                                     if self.status_error.is_some() {
                                                         DANGER
-                                                    } else if self.status.is_none() || loading {
+                                                    } else if self.status.is_none() || syncing {
                                                         TEXT_DIM
-                                                    } else if syncing
-                                                        || self.wallet_sync_error.is_some()
-                                                    {
-                                                        WARN
                                                     } else if IS_DEV_BUILD {
                                                         ACCENT_HI
                                                     } else {
                                                         SUCCESS
                                                     },
-                                                    syncing,
+                                                    false,
                                                 );
                                                 ui.add_space(2.0);
                                                 ui.label(
@@ -1400,22 +1578,41 @@ impl eframe::App for App {
             self.request_vault(crate::vault_ui::Action::Lock, ctx);
             return;
         }
-        let access = self.wallet_scan_access.clone();
-        let Ok(_frame_access) = access.try_lock() else {
+        self.poll_status();
+        self.drain_sync_signal(ctx);
+        if self
+            .shots
+            .as_ref()
+            .is_some_and(|shots| shots.capturing_startup())
+        {
+            let used = self.scan_wait_panel(ctx);
+            if let Some(shots) = self.shots.as_mut() {
+                shots.note(crate::ui_shots::Area {
+                    viewport: used,
+                    content: 0.0,
+                    offset: 0.0,
+                });
+            }
+            crate::ui_shots::step(self, ctx);
+            return;
+        }
+        if self.startup_gate(Instant::now()) {
             self.scan_wait_panel(ctx);
+            return;
+        }
+        let access = self.wallet_scan_access.clone();
+        let Ok(_frame_access) = access.lock() else {
             return;
         };
         if self.view != View::Settings || self.window_hidden || !ctx.input(|i| i.raw.focused) {
             self.recovery_studio.clear();
         }
-        self.poll_status();
         self.note_incoming(ctx);
-        self.drain_sync_signal(ctx);
 
         // Keep the UI live for hashrate, tray clicks, and sync animation.
         ctx.request_repaint_after(Duration::from_millis(500));
 
-        if self.onboarding.is_some() {
+        if self.onboarding.is_some() && self.shots.is_none() {
             egui::CentralPanel::default()
                 .frame(
                     egui::Frame::none()
@@ -1476,128 +1673,67 @@ impl eframe::App for App {
                 let mut area = egui::ScrollArea::vertical()
                     .id_salt(("page-scroll", self.view as u8))
                     .auto_shrink([false, false])
-                    .scroll_bar_visibility(
-                        egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
-                    );
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible);
                 if let Some(offset) = forced {
                     area = area.vertical_scroll_offset(offset);
                 }
                 let drawn = area.show(ui, |ui| {
-                page_column(ui, self.view.content_max_width(), |ui| {
-                    let banner_w = ui.available_width();
+                    page_column(ui, self.view.content_max_width(), |ui| {
+                        let banner_w = ui.available_width();
 
-                    if let Some(error) = &self.wallet_sync_error {
-                        let detailed = matches!(self.view, View::Send);
-                        egui::Frame::none()
-                            .fill(glass_alert(WARN))
-                            .stroke(Stroke::NONE)
-                            .inner_margin(egui::Margin::symmetric(16.0, 12.0))
-                            .rounding(Rounding::same(ROUND))
-                            .show(ui, |ui| {
-                                fill_width(ui, (banner_w - 32.0).max(0.0));
-                                egui::CollapsingHeader::new(
-                                    RichText::new(
-                                        "Wallet scan incomplete — balances and confirmations may be stale",
-                                    )
-                                    .color(WARN)
-                                    .size(12.5),
-                                )
-                                // Per page, so the open state on Dashboard does not
-                                // decide the state on Receive — a shared id made
-                                // `default_open` apply once, to whichever page was
-                                // shown first, and the rest inherited it.
-                                .id_salt(("scan-warning", self.view as u8))
-                                .default_open(detailed)
+                        // A development build looking at real money says so, on every
+                        // page, in the colour reserved for things that cannot be
+                        // undone. It is not a toast and it does not dismiss: the risk
+                        // lasts as long as the build does.
+                        if IS_DEV_MAINNET {
+                            egui::Frame::none()
+                                .fill(glass_alert(DANGER))
+                                .stroke(Stroke::NONE)
+                                .rounding(Rounding::same(ROUND))
+                                .inner_margin(egui::Margin::symmetric(16.0, 12.0))
                                 .show(ui, |ui| {
-                                    ui.label(RichText::new(error).size(13.0).color(TEXT));
-                                    ui.label(RichText::new("Sending is blocked until a valid scan completes. Preserve an encrypted backup; do not clear pending payments or reservations to bypass this warning.").size(13.0).color(TEXT));
-                                    // A changed history below the scan position
-                                    // is the one case the wallet cannot resolve
-                                    // by itself, and it must not: a competing
-                                    // branch of the same height is a decision
-                                    // with money attached. It used to leave no
-                                    // way to make that decision either — a
-                                    // wallet holding pending payments cannot
-                                    // even rescan — so it simply stopped. This
-                                    // is that decision, made on purpose.
-                                    if self.scan_anchor_broken {
-                                        ui.add_space(GAP_SM);
-                                        if self.reconcile_confirm {
-                                            ui.label(RichText::new(
-                                                "This reads the whole chain your node follows and makes this wallet agree with it:                                                  anything that chain does not contain is dropped, and a payment whose inputs it no                                                  longer spends goes back to unconfirmed. Nothing is broadcast. Export an encrypted                                                  backup first — this cannot be undone from inside the wallet.",
-                                            ).size(13.0).color(TEXT));
-                                            ui.add_space(GAP_SM);
-                                            ui.horizontal(|ui| {
-                                                if primary_button(ui, "Reconcile with this chain", true).clicked() {
-                                                    self.reconcile_requested
-                                                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                                                    self.reconcile_confirm = false;
-                                                    self.toasts.info(ctx, "Reconciling — this reads the whole chain and takes a while");
-                                                }
-                                                if ghost_button(ui, "Cancel").clicked() {
-                                                    self.reconcile_confirm = false;
-                                                }
-                                            });
-                                        } else if ghost_button(ui, "Reconcile with this chain…").clicked() {
-                                            self.reconcile_confirm = true;
-                                        }
-                                    }
-                                });
-                            });
-                        ui.add_space(GAP_SM);
-                    }
-
-                    // A development build looking at real money says so, on every
-                    // page, in the colour reserved for things that cannot be
-                    // undone. It is not a toast and it does not dismiss: the risk
-                    // lasts as long as the build does.
-                    if IS_DEV_MAINNET {
-                        egui::Frame::none()
-                            .fill(glass_alert(DANGER))
-                            .stroke(Stroke::NONE)
-                            .rounding(Rounding::same(ROUND))
-                            .inner_margin(egui::Margin::symmetric(16.0, 12.0))
-                            .show(ui, |ui| {
-                                fill_width(ui, (banner_w - 28.0).max(0.0));
-                                ui.label(
-                                    RichText::new(format!(
+                                    fill_width(ui, (banner_w - 28.0).max(0.0));
+                                    ui.label(
+                                        RichText::new(format!(
                                         "Development build {WALLET_VERSION} on mainnet, using your \
                                          real wallet directory. Once it saves, the released 0.9.5 \
                                          app can no longer read this wallet — an encrypted backup \
                                          is the only way back. Never run both at once.",
                                     ))
-                                    .color(DANGER)
-                                    .size(12.5),
-                                );
-                            });
-                        ui.add_space(GAP_SM);
-                    }
+                                        .color(DANGER)
+                                        .size(12.5),
+                                    );
+                                });
+                            ui.add_space(GAP_SM);
+                        }
 
-                    if let Some(err) = self.status_error.clone() {
-                        egui::Frame::none()
-                            .fill(glass_alert(DANGER))
-                            .stroke(Stroke::NONE)
-                            .rounding(Rounding::same(ROUND))
-                            .inner_margin(egui::Margin::same(14.0))
-                            .show(ui, |ui| {
-                                fill_width(ui, (banner_w - 24.0).max(0.0));
-                                ui.label(RichText::new(format!("Node error: {err}")).color(DANGER));
-                            });
-                        ui.add_space(12.0);
-                    }
+                        if let Some(err) = self.status_error.clone() {
+                            egui::Frame::none()
+                                .fill(glass_alert(DANGER))
+                                .stroke(Stroke::NONE)
+                                .rounding(Rounding::same(ROUND))
+                                .inner_margin(egui::Margin::same(14.0))
+                                .show(ui, |ui| {
+                                    fill_width(ui, (banner_w - 24.0).max(0.0));
+                                    ui.label(
+                                        RichText::new(format!("Node error: {err}")).color(DANGER),
+                                    );
+                                });
+                            ui.add_space(12.0);
+                        }
 
-                    fill_width(ui, ui.available_width());
-                    views::page_intro(self.view, ui);
-                    match self.view {
-                        View::Dashboard => views::dashboard(self, ui),
-                        View::Send => views::send(self, ui, ctx),
-                        View::Receive => views::receive(self, ui, ctx),
-                        View::Activity => views::activity(self, ui),
-                        View::Mining => views::mining(self, ui),
-                        View::Network => views::network(self, ui, ctx),
-                        View::Settings => views::settings(self, ui, ctx),
-                    }
-                });
+                        fill_width(ui, ui.available_width());
+                        views::page_intro(self.view, ui);
+                        match self.view {
+                            View::Dashboard => views::dashboard(self, ui),
+                            View::Send => views::send(self, ui, ctx),
+                            View::Receive => views::receive(self, ui, ctx),
+                            View::Activity => views::activity(self, ui),
+                            View::Mining => views::mining(self, ui),
+                            View::Network => views::network(self, ui, ctx),
+                            View::Settings => views::settings(self, ui, ctx),
+                        }
+                    });
                 });
                 if let Some(shots) = self.shots.as_mut() {
                     shots.note(crate::ui_shots::Area {
@@ -1608,6 +1744,14 @@ impl eframe::App for App {
                 }
             });
 
+        if self
+            .shots
+            .as_ref()
+            .is_some_and(|shots| shots.capturing_reward())
+        {
+            self.rewards.preview(ctx.input(|input| input.time));
+        }
+        self.rewards.show(ctx, self.reward_sound);
         self.toasts.show(ctx);
         crate::ui_shots::step(self, ctx);
     }
@@ -1634,24 +1778,63 @@ impl App {
         self.reveal_mnemonic = false;
         self.reveal_view_key = false;
         self.recovery_studio.clear();
+        let status = self.status.clone();
+        let scanned = self
+            .wallet
+            .try_lock()
+            .ok()
+            .map(|wallet| wallet.scanned_to());
+        let can_view_connection = self.wallet_scan_access.try_lock().is_ok();
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(Color32::TRANSPARENT))
+            .frame(egui::Frame::none().fill(Color32::TRANSPARENT).inner_margin(egui::Margin::same(24.0)))
             .show(ctx, |ui| {
-            ui.add_space(28.0);
-            narrow_column(ui, 620.0, |ui| {
-                titled_card(ui, "UPDATING WALLET", |ui| {
-                    ui.spinner();
-                    ui.heading("Scanning the local chain");
-                    ui.label("Balances and Activity will return after the scan is saved. No estimated balance is shown while it is being updated.");
-                    ui.add_space(12.0);
-                    if self.vault_ui.custody == Custody::Unlocked && ui.button("Lock wallet").clicked() {
-                        self.request_vault(crate::vault_ui::Action::Lock, ctx);
-                    }
-                    ui.label("Locking hides the wallet immediately; an active scan finishes before its in-memory keys are released.");
+                ui.add_space((ui.available_height() * 0.12).min(100.0));
+                narrow_column(ui, 640.0, |ui| {
+                    titled_card(ui, "NIGHTFALL · GETTING READY", |ui| {
+                        ui.vertical_centered(|ui| {
+                            logo(ui, 64.0);
+                            ui.add_space(20.0);
+                            ui.label(RichText::new("Your wallet is catching up").size(26.0).color(TEXT));
+                            ui.add_space(10.0);
+                            ui.label(RichText::new("Everything happens automatically. Your wallet opens when the blockchain and your balance agree.").color(TEXT_DIM));
+                            ui.add_space(24.0);
+                            ui.spinner();
+                            ui.add_space(12.0);
+                        });
+                        let (phase, current, total) = match &status {
+                            Some(s) if s.loading => ("Verifying saved blocks", s.blocks, s.loading_total),
+                            Some(s) if s.reorg_in_flight || s.stalled_on_fork => ("Checking the current chain", s.tip_height, s.best_peer_height),
+                            Some(s) if s.live_peers == 0 && self.network != NetworkId::Devnet => ("Connecting to the network", s.tip_height, 0),
+                            Some(s) if s.blocks_behind > 0 => ("Downloading missing blocks", s.tip_height, s.best_peer_height),
+                            Some(s) => ("Checking your wallet history", scanned.unwrap_or(0), s.tip_height),
+                            None => ("Starting the node", 0, 0),
+                        };
+                        ui.label(RichText::new(phase).size(16.0).color(TEXT));
+                        if total > 0 {
+                            let progress = (current as f64 / total as f64).clamp(0.0, 1.0) as f32;
+                            ui.add(egui::ProgressBar::new(progress).fill(ACCENT).desired_width(ui.available_width())
+                                .text(format!("{} / {} blocks", format_int(current), format_int(total))));
+                        } else {
+                            ui.label(RichText::new("Waiting for a verified chain update…").color(TEXT_DIM));
+                        }
+                        ui.add_space(18.0);
+                        if let Some(s) = &status {
+                            ui.label(RichText::new(format!("{} connected peers  ·  {}", s.live_peers, self.network)).size(12.0).color(TEXT_FAINT));
+                        }
+                        ui.add_space(20.0);
+                        ui.horizontal_wrapped(|ui| {
+                            if self.vault_ui.custody == Custody::Unlocked && ghost_button(ui, "Lock wallet").clicked() {
+                                self.request_vault(crate::vault_ui::Action::Lock, ctx);
+                            }
+                            if ui.add_enabled(can_view_connection, egui::Button::new("Connection details")).clicked() {
+                                self.startup_connection_view = true;
+                                self.view = View::Network;
+                            }
+                        });
+                    });
                 });
-            });
-            ui.min_rect()
-        }).inner
+                ui.min_rect()
+            }).inner
     }
 
     pub fn request_vault(&mut self, action: crate::vault_ui::Action, ctx: &egui::Context) {
@@ -1670,6 +1853,14 @@ impl App {
     }
 
     fn clear_wallet_views(&mut self) {
+        self.rewards.conceal();
+        self.activity_primed = false;
+        self.coin_flash_at = None;
+        self.retry_payment = None;
+        self.startup_complete = false;
+        self.startup_ready_since = None;
+        self.startup_connection_view = false;
+        self.last_sync_at = None;
         self.reveal_seed = false;
         self.reveal_mnemonic = false;
         self.reveal_view_key = false;
@@ -1706,7 +1897,7 @@ impl App {
 
     pub fn show_vault_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.vault_ui.refresh(&self.wallet);
-        let available = cfg!(unix) && self.data_lock.is_some();
+        let available = cfg!(any(unix, windows)) && self.data_lock.is_some();
         if let Some(action) = self.vault_ui.show(ui, available) {
             self.request_vault(action, ctx);
         }
@@ -2079,7 +2270,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_failure_stays_visible_until_success_and_discards_confirmation() {
+    fn scan_failure_blocks_spending_until_success_without_popups() {
         use super::*;
         let root =
             std::env::temp_dir().join(format!("nightfall-scan-warning-{}", std::process::id()));
@@ -2091,6 +2282,7 @@ mod tests {
         app.drain_sync_signal(&ctx);
         assert!(!app.send_confirm);
         assert!(app.wallet_sync_error.is_some());
+        assert!(app.toasts.is_empty());
         app.drain_sync_signal(&ctx);
         app.poll_status();
         assert!(app.wallet_sync_error.is_some());
@@ -2098,8 +2290,51 @@ mod tests {
         *app.sync_signal.lock().unwrap() = Some(Ok(0));
         app.drain_sync_signal(&ctx);
         assert!(app.wallet_sync_error.is_none());
+        assert!(app.toasts.is_empty());
         assert!(app.last_sync_at.is_some());
         assert!(app.node.is_none());
+    }
+
+    #[test]
+    fn startup_stays_visible_across_scan_gaps_and_never_flashes_back_after_ready() {
+        use super::*;
+        let root =
+            std::env::temp_dir().join(format!("nightfall-startup-latch-{}", std::process::id()));
+        let mut app = App::new(NetworkId::Devnet, root);
+        let start = Instant::now();
+        assert!(app.settle_startup(false, start));
+        assert!(app.settle_startup(true, start + Duration::from_secs(1)));
+        assert!(app.settle_startup(false, start + Duration::from_secs(2)));
+        assert!(app.settle_startup(true, start + Duration::from_secs(3)));
+        assert!(app.settle_startup(true, start + Duration::from_millis(4900)));
+        assert!(!app.settle_startup(true, start + Duration::from_secs(5)));
+        assert!(!app.settle_startup(false, start + Duration::from_secs(6)));
+        app.clear_wallet_views();
+        assert!(app.settle_startup(false, start + Duration::from_secs(7)));
+        assert!(app.last_sync_at.is_none());
+    }
+
+    #[test]
+    fn reward_sound_defaults_on_and_persists_both_toggle_directions() {
+        use super::*;
+        let root =
+            std::env::temp_dir().join(format!("nightfall-reward-pref-{}", std::process::id()));
+        assert!(!root.exists());
+        let mut app = App::new(NetworkId::Devnet, root.clone());
+        assert!(app.reward_sound);
+        app.set_reward_sound(false);
+        assert!(!app.reward_sound && app.reward_sound_error.is_none());
+        drop(app);
+        let mut reopened = App::new(NetworkId::Devnet, root.clone());
+        assert!(!reopened.reward_sound);
+        reopened.set_reward_sound(true);
+        assert!(load_flag(&root, "reward_sound", false));
+        std::fs::remove_file(root.join("reward_sound")).unwrap();
+        std::fs::create_dir(root.join("reward_sound")).unwrap();
+        reopened.set_reward_sound(false);
+        assert!(reopened.reward_sound && reopened.reward_sound_error.is_some());
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

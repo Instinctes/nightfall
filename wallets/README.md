@@ -1,19 +1,19 @@
-# NIGHTFALLCOIN 1.0.4 — mainnet wallets
+# NIGHTFALLCOIN 1.0.5 — mainnet wallets
 
-Current release: [v1.0.4](https://github.com/Instinctes/nightfall/releases/tag/v1.0.4).
+Current release: [v1.0.5](https://github.com/Instinctes/nightfall/releases/tag/v1.0.5).
 Protocol v8, wire v6, mainnet genesis `061a052d…`. Same chain and data format as
 0.9.2. No reset, migration or seed service upgrade is required.
 
 | Platform | Core download | Minimum |
 |---|---|---|
-| Apple Silicon | `NIGHTFALLCOIN-Core-1.0.4-macOS-arm64.dmg` | macOS 11 |
-| Intel Mac | `NIGHTFALLCOIN-Core-1.0.4-macOS-intel.dmg` | macOS 10.15 |
-| Windows x64 | `nightfall-core-1.0.4-windows-x64.exe` | Windows 10 |
-| Linux x64 | `nightfall-core-1.0.4-linux-x64` | GTK/X11 libraries required |
+| Apple Silicon | `NIGHTFALLCOIN-Core-1.0.5-macOS-arm64.dmg` | macOS 11 |
+| Intel Mac | `NIGHTFALLCOIN-Core-1.0.5-macOS-intel.dmg` | macOS 10.15 |
+| Windows x64 | `nightfall-core-1.0.5-windows-x64.exe` | Windows 10 |
+| Linux x64 | `nightfall-core-1.0.5-linux-x64` | GTK/X11 libraries required |
 | Mobile/browser | [Web wallet](https://nightfallcoin.org/wallet/) | Modern browser |
 
-Check the matching `SHA256SUMS-1.0.4.txt`, `SHA256SUMS-1.0.4-windows.txt`
-or `SHA256SUMS-1.0.4-linux.txt` before running a download. macOS bundles are
+Check the matching `SHA256SUMS-1.0.5.txt`, `SHA256SUMS-1.0.5-windows.txt`
+or `SHA256SUMS-1.0.5-linux.txt` before running a download. macOS bundles are
 ad-hoc signed for integrity checks, not Developer-ID signed or notarized.
 Windows binaries do not have a publisher signing certificate.
 

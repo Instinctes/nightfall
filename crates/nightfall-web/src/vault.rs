@@ -45,6 +45,57 @@ fn unlock_browser_vault(vault: &mut Vault, password: &str) -> Result<(), String>
     Ok(())
 }
 
+fn restore_browser_backup(bytes: &[u8], password: &str) -> Result<Vault, String> {
+    let mut vault = Vault::from_bytes(bytes).map_err(|error| error.to_string())?;
+    unlock_browser_vault(&mut vault, password)?;
+    vault
+        .wallet_mut()
+        .map_err(|error| error.to_string())?
+        .quarantine_imported_sends()
+        .map_err(|error| error.to_string())?;
+    vault.snapshot().map_err(|error| error.to_string())?;
+    Ok(vault)
+}
+
+fn require_current_scan(wallet: &Wallet, tip: u64) -> Result<(), &'static str> {
+    if wallet.scan_anchor().is_empty() || wallet.needs_light_rebuild() {
+        return Err("Complete an anchored chain scan before sending.");
+    }
+    if wallet.scanned_to() != tip {
+        return Err(
+            "The wallet scan does not match the node's current height. Synchronize before sending.",
+        );
+    }
+    Ok(())
+}
+
+fn pending_transaction(wallet: &Wallet, txid: &str) -> Result<String, &'static str> {
+    let entry = wallet
+        .history()
+        .iter()
+        .find(|entry| entry.txid == txid)
+        .ok_or("This wallet has no payment with that transaction ID.")?;
+    if entry.direction != nightfall_wallet::Direction::Sent
+        || !entry.is_pending()
+        || entry.quarantined
+        || entry.memo == "swap-lock"
+    {
+        return Err("This payment cannot be broadcast again from this wallet.");
+    }
+    // The stored record, its raw transaction and the requested ID must agree.
+    let valid = wallet
+        .resendable()
+        .into_iter()
+        .any(|(id, transaction)| id == txid && transaction.txid().to_hex() == txid);
+    if !valid {
+        return Err("The saved payment has no valid transaction to broadcast.");
+    }
+    entry
+        .raw
+        .clone()
+        .ok_or("The saved payment has no transaction to broadcast.")
+}
+
 fn height(value: f64) -> Result<u64, JsError> {
     if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > 9_007_199_254_740_991.0
     {
@@ -60,6 +111,13 @@ pub struct BrowserVault {
 
 #[wasm_bindgen]
 impl BrowserVault {
+    #[wasm_bindgen(js_name = mainnetGenesis)]
+    pub fn mainnet_genesis() -> Result<String, JsError> {
+        let config = nightfall_types::GenesisConfig::fair_launch(NetworkId::Mainnet);
+        let bytes = serde_json::to_vec(&config).map_err(err)?;
+        Ok(nightfall_crypto::genesis_commitment(&bytes).to_hex())
+    }
+
     #[wasm_bindgen(constructor)]
     pub fn from_encrypted(bytes: &[u8]) -> Result<BrowserVault, JsError> {
         Ok(Self {
@@ -73,6 +131,22 @@ impl BrowserVault {
         let wallet = import_browser_legacy(state).map_err(err)?;
         Ok(Self {
             inner: Vault::create(&wallet, password).map_err(err)?,
+        })
+    }
+
+    /// Backup recovery never grants permission to rebroadcast old payments.
+    #[wasm_bindgen(js_name = fromBackup)]
+    pub fn from_backup(bytes: &[u8], password: &str) -> Result<BrowserVault, JsError> {
+        Ok(Self {
+            inner: restore_browser_backup(bytes, password).map_err(err)?,
+        })
+    }
+
+    /// Independent candidate. Persist its snapshot before replacing the live
+    /// object; no operation on the fork publishes to the source session.
+    pub fn fork(&self) -> Result<BrowserVault, JsError> {
+        Ok(Self {
+            inner: self.inner.begin_edit().map_err(err)?,
         })
     }
 
@@ -242,7 +316,9 @@ impl BrowserVault {
         let w = self.inner.wallet().map_err(err)?;
         Ok(
             json!({"address":w.address_string(), "birth_height":w.birth_height(),
-            "scanned_to":w.scanned_to(), "scan_from":w.scan_from(), "outputs":w.spendable_count()})
+            "scanned_to":w.scanned_to(), "scan_from":w.scan_from(), "outputs":w.spendable_count(),
+            "scan_anchor":w.scan_anchor(), "needs_rebuild":w.needs_light_rebuild(),
+            "pending":w.unconfirmed_sends().len(), "withheld":w.quarantined().len()})
             .to_string(),
         )
     }
@@ -257,20 +333,63 @@ impl BrowserVault {
     }
 
     pub fn history(&self) -> Result<String, JsError> {
-        let rows: Vec<_> = self.inner.wallet().map_err(err)?.history().iter().take(80).map(|e| json!({
+        let wallet = self.inner.wallet().map_err(err)?;
+        let rows: Vec<_> = wallet.history().iter().take(80).map(|e| json!({
             "direction":e.direction.label(), "amount":Amount(e.amount).decimal_string(), "fee":Amount(e.fee).decimal_string(),
             "memo":e.memo, "height":e.height, "pending":e.is_pending(), "timestamp":e.timestamp, "txid":e.txid,
+            "quarantined":e.quarantined, "retryable":pending_transaction(wallet, &e.txid).is_ok(),
         })).collect();
         serde_json::to_string(&rows).map_err(err)
     }
 
     #[wasm_bindgen(js_name = resetScan)]
     pub fn reset_scan(&mut self) -> Result<(), JsError> {
+        self.begin_rescan()
+    }
+
+    /// Mutate a fork, persist it, then replace the live session. Old outgoing
+    /// records and invoices survive; every old send is withheld until scanned.
+    #[wasm_bindgen(js_name = beginRescan)]
+    pub fn begin_rescan(&mut self) -> Result<(), JsError> {
         self.inner
             .wallet_mut()
             .map_err(err)?
-            .reset_scan()
+            .begin_light_rescan()
             .map_err(err)
+    }
+
+    #[wasm_bindgen(js_name = pendingTransaction)]
+    pub fn pending_transaction(&self, txid: &str) -> Result<String, JsError> {
+        pending_transaction(self.inner.wallet().map_err(err)?, txid).map_err(err)
+    }
+
+    /// Ingest only pages whose headers the host checked against one trusted
+    /// node. This authenticates continuity, not proof of work. Use on a fork.
+    #[wasm_bindgen(js_name = ingestAnchoredPage)]
+    pub fn ingest_anchored_page(
+        &mut self,
+        outputs: &str,
+        spent: &str,
+        from: f64,
+        scanned_to: f64,
+        from_hash: &str,
+        scanned_hash: &str,
+    ) -> Result<String, JsError> {
+        let from = height(from)?;
+        let scanned_to = height(scanned_to)?;
+        if outputs.len() > 4 * 1024 * 1024 || spent.len() > 4 * 1024 * 1024 {
+            return Err(err("Scan page exceeds the size limit."));
+        }
+        let lights = lights_from_json(outputs)?;
+        let spent: Vec<String> =
+            serde_json::from_str(spent).map_err(|_| err("Invalid spent-output list."))?;
+        let wallet = self.inner.wallet_mut().map_err(err)?;
+        let found = wallet
+            .ingest_anchored_scan_page(&lights, &spent, from, scanned_to, from_hash, scanned_hash)
+            .map_err(err)?;
+        Ok(json!({"found":found, "scanned_to":wallet.scanned_to(),
+            "scan_anchor":wallet.scan_anchor()})
+        .to_string())
     }
 
     #[wasm_bindgen(js_name = ingestPage)]
@@ -333,6 +452,7 @@ impl BrowserVault {
 
         let mut candidate = self.inner.begin_edit().map_err(err)?;
         let wallet = candidate.wallet_mut().map_err(err)?;
+        require_current_scan(wallet, tip).map_err(err)?;
         if addr == wallet.address() {
             return Err(err("That is your own address."));
         }
@@ -352,6 +472,27 @@ impl BrowserVault {
             fee: Amount(DEFAULT_FEE).decimal_string(),
             sealed,
         })
+    }
+
+    /// Canonical review text without signing or reserving any input.
+    #[wasm_bindgen(js_name = paymentDetails)]
+    pub fn payment_details(&self, to: &str, amount: &str, memo: &str) -> Result<String, JsError> {
+        if to.len() > 256 || amount.len() > 64 || memo.len() > 64 {
+            return Err(err(
+                "Payment field exceeds the size limit (memo: 64 UTF-8 bytes).",
+            ));
+        }
+        let address = Address::decode(to).map_err(err)?;
+        let wallet = self.inner.wallet().map_err(err)?;
+        if address == wallet.address() {
+            return Err(err("That is your own address."));
+        }
+        let darks = parse_amount(amount)?;
+        let total = darks
+            .checked_add(DEFAULT_FEE)
+            .ok_or_else(|| err("Amount exceeds the supported range."))?;
+        Ok(json!({"address": address.encode(), "amount": Amount(darks).decimal_string(),
+            "fee": Amount(DEFAULT_FEE).decimal_string(), "total": Amount(total).decimal_string(), "memo": memo}).to_string())
     }
 
     /// Adopt a prepared payment whose ciphertext is already stored.
@@ -423,6 +564,138 @@ mod tests {
 
     fn wallet() -> Wallet {
         Wallet::in_memory(NetworkId::Mainnet, WalletKeys::from_seed([59; 32]), 0)
+    }
+
+    fn funded_wallet() -> Wallet {
+        let mut wallet = wallet();
+        let (output, _) = nightfall_crypto::create_output(
+            &wallet.address(),
+            1_000_000,
+            "public unfunded fixture",
+            wallet.network.proof_context(),
+        )
+        .unwrap();
+        let output = nightfall_wallet::LightOutput {
+            height: 0,
+            timestamp: 1,
+            commit: output.commit.to_hex(),
+            ephemeral_pk: output
+                .ephemeral_pk
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+            output_pk: output
+                .output_pk
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+            view_tag: output.view_tag,
+            payload: output.payload.iter().map(|b| format!("{b:02x}")).collect(),
+            coinbase: false,
+        };
+        let anchor = "42".repeat(32);
+        wallet
+            .ingest_anchored_scan_page(&[output], &[], 0, 0, &anchor, &anchor)
+            .unwrap();
+        wallet
+    }
+
+    #[test]
+    fn browser_send_gate_requires_an_anchor_and_the_current_node_height() {
+        assert!(require_current_scan(&wallet(), 0).is_err());
+        let wallet = funded_wallet();
+        assert!(require_current_scan(&wallet, 0).is_ok());
+        assert!(require_current_scan(&wallet, 1).is_err());
+        let mut state: serde_json::Value =
+            serde_json::from_str(&wallet.export_state().unwrap()).unwrap();
+        state["db"]["scanned_to"] = json!(2);
+        let ahead = Wallet::import_state(&state.to_string()).unwrap();
+        assert!(require_current_scan(&ahead, 1).is_err());
+    }
+
+    #[test]
+    fn prepared_send_on_a_browser_fork_does_not_move_the_source() {
+        let wallet = funded_wallet();
+        let original = BrowserVault {
+            inner: Vault::create(&wallet, PASSWORD).unwrap(),
+        };
+        let before = original.inner.wallet().unwrap().export_state().unwrap();
+        let mut candidate = original.fork().unwrap();
+        let prepared = candidate
+            .prepare_send(
+                &WalletKeys::from_seed([60; 32]).address().encode(),
+                "0.001",
+                "public fixture",
+                0.0,
+                100.0,
+            )
+            .unwrap();
+        let txid = prepared.txid();
+        let raw = prepared.tx();
+        candidate.commit(prepared).unwrap();
+        assert_eq!(
+            original.inner.wallet().unwrap().export_state().unwrap(),
+            before
+        );
+        assert_eq!(candidate.pending_transaction(&txid).unwrap(), raw);
+        let bytes = candidate.snapshot().unwrap();
+        let mut reopened = Vault::from_bytes(&bytes).unwrap();
+        reopened.unlock(PASSWORD, NetworkId::Mainnet).unwrap();
+        assert_eq!(
+            pending_transaction(reopened.wallet().unwrap(), &txid).unwrap(),
+            raw
+        );
+    }
+
+    #[test]
+    fn backup_import_withholds_confirmed_and_pending_transactions_without_changing_source() {
+        let mut wallet = funded_wallet();
+        let transaction = wallet
+            .create_payment(
+                &WalletKeys::from_seed([60; 32]).address(),
+                1000,
+                10,
+                "public fixture",
+            )
+            .unwrap();
+        wallet
+            .record_send_at(&transaction, 1000, "public fixture".into(), 100)
+            .unwrap();
+        let txid = transaction.txid().to_hex();
+        let raw = pending_transaction(&wallet, &txid).unwrap();
+        for confirmed in [false, true] {
+            let mut state: serde_json::Value =
+                serde_json::from_str(&wallet.export_state().unwrap()).unwrap();
+            if confirmed {
+                state["db"]["history"][0]["height"] = json!(0);
+            }
+            let wallet = Wallet::import_state(&state.to_string()).unwrap();
+            let source = Vault::create(&wallet, PASSWORD).unwrap();
+            let bytes = source.sealed_bytes().to_vec();
+            let restored = restore_browser_backup(&bytes, PASSWORD).unwrap();
+            assert_eq!(source.sealed_bytes(), bytes);
+            let entry = restored
+                .wallet()
+                .unwrap()
+                .history()
+                .iter()
+                .find(|entry| entry.txid == txid)
+                .unwrap();
+            assert!(entry.quarantined);
+            assert_eq!(entry.raw.as_deref(), Some(raw.as_str()));
+            assert!(pending_transaction(restored.wallet().unwrap(), &txid).is_err());
+        }
+        let mut state: serde_json::Value =
+            serde_json::from_str(&wallet.export_state().unwrap()).unwrap();
+        state["db"]["history"][0]["memo"] = json!("swap-lock");
+        assert!(
+            pending_transaction(&Wallet::import_state(&state.to_string()).unwrap(), &txid).is_err()
+        );
+        state["db"]["history"][0]["memo"] = json!("ordinary");
+        state["db"]["history"][0]["raw"] = json!("not a transaction");
+        assert!(
+            pending_transaction(&Wallet::import_state(&state.to_string()).unwrap(), &txid).is_err()
+        );
     }
 
     #[test]

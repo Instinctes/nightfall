@@ -724,6 +724,8 @@ fn parse_database(bytes: &[u8]) -> anyhow::Result<WalletFile> {
         /// that comment was put there to prevent and did not.
         #[serde(default)]
         invoices: Vec<crate::counter::Invoice>,
+        #[serde(default)]
+        air_signed: std::collections::BTreeMap<String, crate::AirSignature>,
     }
     let db: Database = serde_json::from_slice(bytes)
         .context("Invalid or unsupported legacy database; original preserved")?;
@@ -745,6 +747,7 @@ fn parse_database(bytes: &[u8]) -> anyhow::Result<WalletFile> {
         // them would have lost a merchant's open invoices at the moment they
         // encrypted their wallet.
         invoices: db.invoices,
+        air_signed: db.air_signed,
         // Legacy plaintext databases must never contain encrypted swap recovery
         // records. Database's deny_unknown_fields rejects such an input above.
         swap_journal: Default::default(),
