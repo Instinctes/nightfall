@@ -50,7 +50,8 @@ PipeWire, PulseAudio or ALSA player (`pw-play`, `paplay` or `aplay`).
 
 The completed glass-style web wallet lives at https://wallet.nightfallcoin.org/.
 It stores an encrypted vault on the device, supports encrypted backups, and
-requires an anchored mainnet scan before spending. Existing browser wallets
+requires an anchored mainnet scan before spending. Changed scan anchors recover
+automatically after checking archive availability, without replaying old sends. Existing browser wallets
 move through the separate, read-only exporter at
 https://nightfallcoin.org/wallet/migrate/. Original browser data is retained.
 The home-screen icon and standalone manifest are included for iPhone and other

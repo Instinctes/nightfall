@@ -1,4 +1,4 @@
-# Browser wallet origin migration — 1.0.4
+# Browser wallet origin migration — 1.0.5
 
 The production destination is **https://wallet.nightfallcoin.org/**. Browser
 storage belongs to an origin. The new origin cannot read the old wallet stored
@@ -46,3 +46,11 @@ Run `node scripts/check-wallet-migration.mjs` for synthetic model checks. These
 cover pending-payment mismatches, unsafe numbers, concurrent changes, encrypted
 reopen/address verification failures and read-only behavior. They use no real
 wallets and do not replace browser/WASM validation or a live deployment check.
+
+The current wallet automatically rebuilds a changed or missing scan anchor.
+It first checks that archive history is available, preserves outgoing records,
+withholds old sends and never broadcasts during recovery. Each background pass
+allows one rebuild; an unstable node is retried on a later pass. Routine scan
+errors are logged and shown as neutral progress, without dialogs or warnings.
+The light-wallet trust assumption is unchanged: the configured node supplies
+chain data, and the browser does not independently verify proof of work.
