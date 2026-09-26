@@ -46,7 +46,7 @@ const pages = [];
 (function walk(dir, rel = "") {
     for (const e of readdirSync(dir, { withFileTypes: true })) {
         // The wallet has its own versioning, and downloads/ is release binaries.
-        if (["wallet", "pkg", "downloads"].includes(e.name) || e.name.startsWith(".")) continue;
+        if (["wallet", "wallet-origin", "pkg", "downloads"].includes(e.name) || e.name.startsWith(".")) continue;
         if (e.isDirectory()) walk(dir + e.name + "/", rel + e.name + "/");
         else if (e.name.endsWith(".html")) pages.push(rel + e.name);
     }

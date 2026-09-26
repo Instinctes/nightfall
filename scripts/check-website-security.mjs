@@ -137,9 +137,13 @@ try {
     await walletRequest('/favicon-32.png', {}, 200);
     await walletRequest('/vault-store.js', {}, 200);
     await walletRequest('/storage-check/', {}, 200);
-    // The 1.0 wallet under development, and the pieces it loads.
-    await walletRequest('/preview/', {}, 200);
-    await walletRequest('/preview/app.js', {}, 200);
+    // The retired preview cannot mutate the production vault with old logic.
+    const preview = await walletRequest('/preview/', {}, 308);
+    assert.equal(preview.headers.get('location'), '/');
+    await walletRequest('/preview/app.js', {}, 410);
+    await walletRequest('/app.js', {}, 200);
+    await walletRequest('/session.js', {}, 200);
+    await walletRequest('/style.css', {}, 200);
     await walletRequest('/pkg/nightfall_web.js', {}, 200);
     await walletRequest('/pkg/nightfall_web_bg.wasm', {}, 200);
     await walletRequest('/storage-check.html', {}, 404);

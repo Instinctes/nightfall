@@ -109,7 +109,8 @@ if (vs.size > 1) {
 const channels = JSON.parse(
     readFileSync(join(here, "..", "website/public/releases.json"), "utf8"),
 );
-const release = channels.web_wallet;
+// The frozen apex client and the new isolated-origin client release separately.
+const release = channels.legacy_web_wallet ?? channels.web_wallet;
 if (!release) {
     note("releases.json has no web_wallet version — nothing pins the shell cache");
 }
