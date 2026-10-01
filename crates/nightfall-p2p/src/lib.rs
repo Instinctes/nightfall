@@ -116,6 +116,10 @@ pub fn default_listen_addr(network: NetworkId) -> String {
     format!("0.0.0.0:{}", network.default_p2p_port())
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PeerMsg {
@@ -153,6 +157,12 @@ pub enum PeerMsg {
         pruned: bool,
         #[serde(default)]
         first_height: u64,
+        /// Supports explicit Dandelion stem-phase transaction relay.
+        ///
+        /// `serde(default)` is deliberate: pre-capability peers omit this
+        /// field and are therefore treated as incapable rather than guessed.
+        #[serde(default)]
+        dandelion_stem_v1: bool,
     },
     HelloOk {
         wire: u32,
@@ -179,6 +189,9 @@ pub enum PeerMsg {
         pruned: bool,
         #[serde(default)]
         first_height: u64,
+        /// Supports explicit Dandelion stem-phase transaction relay.
+        #[serde(default)]
+        dandelion_stem_v1: bool,
     },
     /// Ask a peer for the addresses it knows.
     GetPeers,
@@ -210,6 +223,13 @@ pub enum PeerMsg {
     },
     Tx {
         tx: Transaction,
+        /// `true` while the transaction is in the Dandelion stem phase.
+        ///
+        /// False is omitted from the wire representation so ordinary
+        /// transaction messages remain compatible with older Nightfall nodes.
+        /// Older serde readers also ignore the additional `stem` field.
+        #[serde(default, skip_serializing_if = "is_false")]
+        stem: bool,
     },
     GetStatus,
     Status {
@@ -345,6 +365,10 @@ pub struct PeerIntro {
     pub pruned: bool,
     /// Lowest height whose body the peer can still serve. 0 for an archive.
     pub first_height: u64,
+    /// Port the remote peer advertised for inbound connections.
+    pub listen_port: u16,
+    /// Explicitly negotiated Dandelion stem-relay support.
+    pub dandelion_stem_v1: bool,
 }
 
 impl PeerIntro {
@@ -377,6 +401,7 @@ pub fn handshake(
             listen_port,
             pruned,
             first_height,
+            dandelion_stem_v1: true,
         },
     )?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -387,8 +412,10 @@ pub fn handshake(
             genesis: g,
             height: h,
             tip: t,
+            listen_port: peer_listen_port,
             pruned: peer_pruned,
             first_height: peer_first,
+            dandelion_stem_v1: peer_dandelion_stem_v1,
             ..
         } => {
             if wire != WIRE_VERSION {
@@ -418,6 +445,8 @@ pub fn handshake(
                 tip: t,
                 pruned: peer_pruned,
                 first_height: peer_first,
+                listen_port: peer_listen_port,
+                dandelion_stem_v1: peer_dandelion_stem_v1,
             })
         }
         PeerMsg::Error { message } => Err(std::io::Error::other(message)),
@@ -462,7 +491,28 @@ pub fn broadcast_block(stream: &mut TcpStream, block: &Block) -> std::io::Result
 }
 
 pub fn broadcast_tx(stream: &mut TcpStream, tx: &Transaction) -> std::io::Result<()> {
-    write_msg(stream, &PeerMsg::Tx { tx: tx.clone() })
+    write_msg(
+        stream,
+        &PeerMsg::Tx {
+            tx: tx.clone(),
+            stem: false,
+        },
+    )
+}
+
+/// Send a transaction in the Dandelion stem phase.
+///
+/// This deliberately uses the existing `tx` wire message with one optional
+/// field. `stem: false` is omitted, and older peers ignore `stem: true`, so a
+/// mixed-version network degrades to ordinary diffusion rather than splitting.
+pub fn broadcast_stem_tx(stream: &mut TcpStream, tx: &Transaction) -> std::io::Result<()> {
+    write_msg(
+        stream,
+        &PeerMsg::Tx {
+            tx: tx.clone(),
+            stem: true,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -485,5 +535,137 @@ mod directory_tests {
         assert!(!is_directory_addr("abcd.onion:17891"));
         assert!(!is_directory_addr("no-port"));
         assert!(!is_directory_addr(""));
+    }
+}
+
+#[cfg(test)]
+mod dandelion_wire_tests {
+    use super::*;
+    use nightfall_ledger::Transaction;
+
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum LegacyPeerMsg {
+        Tx { tx: Transaction },
+    }
+
+    fn empty_test_tx() -> Transaction {
+        // Wire compatibility does not require a consensus-valid transaction.
+        // The P2P codec must preserve arbitrary serialized Transaction values;
+        // consensus validation happens after decoding.
+        Transaction {
+            version: 8,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            kernels: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ordinary_tx_keeps_the_legacy_wire_shape() {
+        let encoded = serde_json::to_value(PeerMsg::Tx {
+            tx: empty_test_tx(),
+            stem: false,
+        })
+        .unwrap();
+
+        assert_eq!(encoded.get("type").and_then(|v| v.as_str()), Some("tx"));
+        assert!(
+            encoded.get("stem").is_none(),
+            "false stem flag must not alter ordinary transaction wire format"
+        );
+    }
+
+    #[test]
+    fn legacy_reader_ignores_the_new_stem_field() {
+        let encoded = serde_json::to_value(PeerMsg::Tx {
+            tx: empty_test_tx(),
+            stem: true,
+        })
+        .unwrap();
+
+        assert_eq!(encoded.get("stem").and_then(|v| v.as_bool()), Some(true));
+
+        let legacy: LegacyPeerMsg = serde_json::from_value(encoded).unwrap();
+        match legacy {
+            LegacyPeerMsg::Tx { tx } => assert_eq!(tx.version, 8),
+        }
+    }
+
+    #[test]
+    fn new_reader_treats_legacy_tx_as_fluff() {
+        let mut encoded = serde_json::to_value(PeerMsg::Tx {
+            tx: empty_test_tx(),
+            stem: true,
+        })
+        .unwrap();
+
+        encoded.as_object_mut().unwrap().remove("stem");
+
+        let decoded: PeerMsg = serde_json::from_value(encoded).unwrap();
+
+        match decoded {
+            PeerMsg::Tx { stem, .. } => assert!(!stem),
+            other => panic!("expected tx, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod dandelion_capability_tests {
+    use super::*;
+
+    fn hello(capable: bool) -> PeerMsg {
+        PeerMsg::Hello {
+            wire: WIRE_VERSION,
+            network: NetworkId::Devnet,
+            genesis: "00".repeat(32),
+            height: 7,
+            tip: "11".repeat(32),
+            agent: "test".into(),
+            listen_port: 17891,
+            pruned: false,
+            first_height: 0,
+            dandelion_stem_v1: capable,
+        }
+    }
+
+    #[test]
+    fn legacy_hello_defaults_to_no_stem_capability() {
+        let mut value = serde_json::to_value(hello(true)).unwrap();
+
+        value.as_object_mut().unwrap().remove("dandelion_stem_v1");
+
+        let decoded: PeerMsg = serde_json::from_value(value).unwrap();
+
+        match decoded {
+            PeerMsg::Hello {
+                dandelion_stem_v1, ..
+            } => assert!(!dandelion_stem_v1),
+            other => panic!("expected hello, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_hello_explicitly_advertises_stem_capability() {
+        let value = serde_json::to_value(hello(true)).unwrap();
+
+        assert_eq!(
+            value.get("dandelion_stem_v1").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn capability_false_is_preserved() {
+        let value = serde_json::to_value(hello(false)).unwrap();
+        let decoded: PeerMsg = serde_json::from_value(value).unwrap();
+
+        match decoded {
+            PeerMsg::Hello {
+                dandelion_stem_v1, ..
+            } => assert!(!dandelion_stem_v1),
+            other => panic!("expected hello, got {other:?}"),
+        }
     }
 }

@@ -1,5 +1,9 @@
 //! Nightfall full node library — embeddable by Core Wallet and `nightfalld`.
 
+pub mod dandelion;
+
+#[cfg(test)]
+mod dandelion_adversarial_tests;
 pub mod mobile;
 pub mod rpc;
 pub mod runtime;

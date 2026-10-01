@@ -81,7 +81,7 @@ touching P2P, persistence or chain selection, run two nodes.
 | Area | Why it matters |
 |------|----------------|
 | **Cut-through** | The single biggest privacy gap. Needs a spend-authorisation scheme that does not publish a per-input signature. |
-| **Dandelion++** | No network-layer privacy today. |
+| **Dandelion++ hardening / independent review** | Dandelion++ routing, stempool separation, embargo recovery and capability negotiation are implemented; larger-network testing and independent privacy review remain valuable. |
 | **UTXO snapshots / headers-first sync** | Initial sync replays and re-verifies every block; memory-hard PoW makes that expensive. |
 | **Merkle Mountain Range** | The UTXO root is recomputed per block, O(n log n). An MMR would make it incremental. |
 | **Independent review of the cryptography** | The most valuable contribution anyone could make right now. |

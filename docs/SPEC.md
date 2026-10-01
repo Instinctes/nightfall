@@ -390,7 +390,12 @@ Deliberately listed in the spec so they are not forgotten.
   is obscured by aggregation but not erased.** Closing the remaining gap needs
   a proof system that can authorise a spend without publishing a per-input
   signature.
-- **Dandelion-class stem/fluff** on the existing `Tx` message (not a separate stem graph). Optional SOCKS5/Tor for outbound dials. See `docs/PRIVACY.md`.
+- **Dandelion++ transaction relay.** Negotiated peers carry an explicit stem
+  phase over the backward-compatible `Tx` message. Routing is epoch-stable,
+  stem transactions remain in a separate non-mineable stempool, failed stem
+  writes receive at most one route repair, and a randomized 12–28 s embargo is
+  the availability fallback before public diffusion. Legacy peers remain
+  fluff-compatible. See `docs/PRIVACY.md` and `docs/DANDELION-PP-V2.md`.
 
 - **UTXO root is O(n log n) per block.** A Merkle Mountain Range would make it
   incremental.

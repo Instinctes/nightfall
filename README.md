@@ -215,7 +215,7 @@ changed.** There is no fork and no migration.
 **What is not true yet:**
 
 - **The transaction graph is obscured, not erased.** Spent outputs stay visible. Cut-through would delete the per-input signature that makes non-interactive payments safe; the two are mutually exclusive and we chose payments that work without both parties online.
-- **Network-layer privacy is stem/fluff, not magic.** A new transaction is forwarded to one random peer first (Dandelion-class). Older nodes still fluff immediately. Tor is optional (`--proxy 127.0.0.1:9050` / `NIGHTFALL_PROXY`). See [docs/PRIVACY.md](docs/PRIVACY.md).
+- **Network-layer privacy is Dandelion++, not magic.** Capable peers use epoch-stable stem routing, a separate non-mineable stempool, fail-safe embargo recovery, route repair and logical-peer deduplication before diffusion. Legacy peers do not negotiate stem capability. Tor remains optional (`--proxy 127.0.0.1:9050` / `NIGHTFALL_PROXY`). See [docs/PRIVACY.md](docs/PRIVACY.md) and [docs/DANDELION-PP-V2.md](docs/DANDELION-PP-V2.md).
 - **Not audited by anyone outside the project.** See [Honest status](#honest-status).
 - **A checkpoint skips re-hashing old proof of work.** You are trusting the
   binary's pin. Off with `NIGHTFALL_NO_ASSUME_VALID=1`.
@@ -429,7 +429,7 @@ Before this carries real value it needs:
 
 1. **An independent audit.** The cryptography was written and reviewed by the same party. That is a conflict of interest, and passing tests are not a substitute — every fault that has bitten this network so far was found by real nodes disagreeing, while the suite passed.
 2. **A larger network.** A young chain with little hashrate can be out-mined. True of every new proof-of-work network.
-3. **Full Dandelion++** (separate stem graph). Stem/fluff over the existing `Tx` message is already in.
+3. **Independent Dandelion++ review and larger-network testing.** The separate stem graph, capability negotiation, stempool and embargo recovery are implemented; their privacy assumptions still need independent review.
 4. **Cut-through**, or a spend-authorisation scheme that does not need a per-input signature.
 
 If you find something wrong, see [SECURITY.md](SECURITY.md). Private

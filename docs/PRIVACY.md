@@ -21,10 +21,10 @@ use the tools below.
 
 | Property | Status |
 |---|---|
-| Dandelion-class stem/fluff | **On.** A new transaction is sent to **one** random peer first, then fluffed. |
-| First hop to an old node | That node broadcasts. Stem only helps when the next hop also stems. |
+| Dandelion++ stem/fluff | **On for negotiated peers.** Transactions use epoch-stable routes, a separate non-mineable stempool, bounded route repair and randomized fail-safe embargo before diffusion. |
+| Legacy peers | Stem capability is negotiated explicitly. Legacy sessions are not selected as Dandelion stem routes; legacy transaction messages remain fluff-compatible. |
 | Tor / SOCKS5 | **Default** (`127.0.0.1:9050`). If Tor is down, clearnet fallback. `.onion` never falls back. `NIGHTFALL_PROXY=off` disables. |
-| Dandelion++ fluff via Tor | Combine both. Stem hides the origin from peers; Tor hides the peers from the ISP. |
+| Dandelion++ + Tor | They protect against different observers: Dandelion++ reduces origin exposure to relay peers; Tor/SOCKS5 hides outbound peer destinations from the local network path. |
 
 ### Tor
 
@@ -65,7 +65,7 @@ for “see this one payment.”
 | Addresses off-chain | yes | yes (stealth) |
 | Supply independently proven | **yes** — `Σ UTXO − Σ excess = (minted − burned)·G` | no (ring-size / decoy assumptions) |
 | Mandatory privacy | yes | yes |
-| Network-layer default | stem/fluff + optional Tor | Dandelion++ |
+| Network-layer default | Dandelion++ + optional Tor | Dandelion++ |
 | Anonymity set today | every tx **in the same block**; network is small | protocol-scale, years of usage |
 | Independent audit | not yet | multiple |
 

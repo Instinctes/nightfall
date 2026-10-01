@@ -44,8 +44,11 @@ These are documented, deliberate, and already on the roadmap:
   input paid which output within a block, but spent outputs remain visible.
   Cut-through would remove the per-input signature that makes non-interactive
   payments safe. See [`docs/SPEC.md`](docs/SPEC.md) §7.
-- **No network-layer privacy.** No Dandelion++. The first relaying node is
-  probably the origin.
+- **Network-layer privacy is improved, not guaranteed.** Negotiated
+  Dandelion++ uses epoch-stable stem routing, a separate stempool, randomized
+  embargo recovery and bounded route repair. Tor/SOCKS5 remains a separate
+  transport-layer option. See [`docs/PRIVACY.md`](docs/PRIVACY.md) and
+  [`docs/DANDELION-PP-V2.md`](docs/DANDELION-PP-V2.md).
 - **Initial sync is slow.** Memory-hard PoW makes verification expensive by
   design; there are no UTXO snapshots yet.
 - **Small network.** A young chain with little hashrate can be out-mined. This

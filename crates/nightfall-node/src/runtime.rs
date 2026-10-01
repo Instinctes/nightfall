@@ -1,19 +1,22 @@
 //! Node state, P2P server, and the mining loop.
 
+use crate::dandelion::{repair_failed_stem, DandelionRouter, RelayMode, StemInsert, StemPool};
 use crate::rpc;
 use crate::session::{
-    fanout_block, fluff_tx, inbound_key, outbound_key, stem_tx, SessionHandle, SessionPool,
+    fanout_block, fluff_tx, inbound_key, outbound_key, stem_tx_to_observed, SessionHandle,
+    SessionPool, StemFailureQueue, StemSendFailure,
 };
 use nightfall_consensus::{Block, BlockTemplate, Chain, Mempool, PRUNE_KEEP_BLOCKS};
 use nightfall_crypto::{default_threads, mine_parallel, Address};
 use nightfall_ledger::Transaction;
 use nightfall_p2p::{
-    broadcast_block, connect_peer_via, dialable_addr, handshake, is_directory_addr,
-    looks_like_dial_target, read_msg, write_msg, PeerMsg, SocksProxy, DEFAULT_TOR_PROXY,
-    MAX_BLOCKS_PER_REQUEST, MAX_PEERS_PER_MSG,
+    broadcast_block, broadcast_stem_tx, broadcast_tx, connect_peer_via, dialable_addr, handshake,
+    is_directory_addr, looks_like_dial_target, read_msg, write_msg, PeerMsg, SocksProxy,
+    DEFAULT_TOR_PROXY, MAX_BLOCKS_PER_REQUEST, MAX_PEERS_PER_MSG,
 };
 use nightfall_storage::{now_unix, ChainStore};
 use nightfall_types::NetworkId;
+use rand::{rngs::OsRng, Rng};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::BufReader;
@@ -200,11 +203,15 @@ pub struct NodeInner {
     pub proxy: Option<SocksProxy>,
     /// Last successful outbound went through the SOCKS proxy.
     pub last_tor_ok: Arc<AtomicBool>,
-    /// Transactions in the Dandelion stem phase, waiting to fluff.
+    /// Epoch-stable Dandelion++ privacy graph.
+    pub dandelion_router: DandelionRouter,
+    /// Transactions still inside the anonymity phase.
     ///
-    /// Keyed by txid. The embargo is a few tens of seconds so a stem that
-    /// dies mid-path still reaches the network.
-    pub stem_embargo: HashMap<String, u64>,
+    /// These are deliberately separate from `mempool`: miners must not see
+    /// them until diffusion starts or the fail-safe embargo expires.
+    pub stempool: StemPool<Transaction>,
+    /// Delivery failures reported by asynchronous stem socket writers.
+    pub stem_failures: StemFailureQueue,
     /// Addresses that completed a handshake this process. Gossip from
     /// `GetPeers` is not enough — that is how a `peers.json` filled with
     /// Tor exits and produced 51 hung SYN_SENT while the seed sat one
@@ -319,14 +326,118 @@ impl NodeInner {
 
     pub fn submit_tx(&mut self, tx: Transaction) -> Result<String, String> {
         self.chain.precheck_tx(&tx).map_err(|e| e.to_string())?;
+
         let id = tx.txid().to_hex();
-        if !self.mempool.insert(tx.clone(), now_unix()) {
+
+        if self.mempool.first_seen(&id).is_some() || self.stempool.contains(&id) {
             return Ok(id);
         }
-        // Origin always stems: the first hop is one random peer, not a
-        // broadcast that paints this node as the sender.
-        propagate_from_inner(self, &tx, None, true);
+
+        let now = now_unix();
+        let outbound = self.sessions.dandelion_outbound_keys();
+
+        // Own transactions always enter stem phase, regardless of this node's
+        // relay/diffuser role for other people's transactions.
+        self.dandelion_router.refresh(now, &outbound);
+
+        if let Some(route) = self.dandelion_router.route_for(now, None, &outbound) {
+            match self.stempool.insert_local_with_remote_preemption(
+                id.clone(),
+                tx.clone(),
+                route.clone(),
+                embargo_deadline(),
+            ) {
+                StemInsert::Inserted => {
+                    if stem_tx_to_observed(&self.sessions, &route, &tx, Some(&self.stem_failures)) {
+                        return Ok(id);
+                    }
+
+                    // The selected live socket vanished between route
+                    // selection and send. Repair through the startup fallback.
+                    self.stempool.remove(&id);
+                }
+                StemInsert::Duplicate => return Ok(id),
+                StemInsert::Full => {
+                    // Remote entries are preemptible for local origins.
+                    // Reaching Full here therefore means the pool contains no
+                    // remote slot that can safely be displaced.
+                }
+            }
+        }
+
+        // During startup there may be dialable peers but no established
+        // outbound session yet. Preserve at least a one-hop stem rather than
+        // deterministically selecting peers[0].
+        let dialable = self.dialable_peers();
+
+        if let Some(addr) = pick_fallback_stem_peer(&dialable) {
+            let route = format!("dial:{addr}");
+
+            match self.stempool.insert_local_with_remote_preemption(
+                id.clone(),
+                tx.clone(),
+                route,
+                embargo_deadline(),
+            ) {
+                StemInsert::Inserted => {
+                    fallback_stem_tx(&addr, &tx, self);
+                    return Ok(id);
+                }
+                StemInsert::Duplicate => return Ok(id),
+                StemInsert::Full => {
+                    // Same invariant as above: only local-origin entries
+                    // remain when no remote victim can be preempted.
+                }
+            }
+        }
+
+        // No stem path exists. Availability wins: enter ordinary diffusion.
+        // From this point the transaction is intentionally mineable.
+        if !self.mempool.insert(tx.clone(), now) {
+            if self.mempool.first_seen(&id).is_some() {
+                return Ok(id);
+            }
+            return Err("mempool is full".into());
+        }
+
+        let live = self.sessions.all();
+
+        if live.is_empty() {
+            fallback_fluff_tx(&dialable, &tx, self);
+        } else {
+            fluff_tx(&live, &tx, None);
+        }
+
         Ok(id)
+    }
+
+    /// Remove stem entries represented by a newly accepted aggregate block.
+    ///
+    /// Nightfall blocks destroy transaction boundaries, so matching uses spent
+    /// input commitments and created output commitments just like Mempool.
+    pub(crate) fn remove_stem_included(&mut self, block: &Block) -> usize {
+        let spent: HashSet<[u8; 32]> = block
+            .body
+            .inputs
+            .iter()
+            .map(|input| input.commit.0)
+            .collect();
+        let created: HashSet<[u8; 32]> = block
+            .body
+            .outputs
+            .iter()
+            .map(|output| output.commit.0)
+            .collect();
+
+        self.stempool.drop_where(|tx| {
+            tx.inputs
+                .iter()
+                .any(|input| spent.contains(&input.commit.0))
+                || tx
+                    .outputs
+                    .iter()
+                    .any(|output| created.contains(&output.commit.0))
+        })
     }
 
     /// Addresses a stranger may be told to dial. Seeds plus nodes that
@@ -466,10 +577,20 @@ fn fallback_dial_block(peers: &[String], block: &Block, inner: &NodeInner) {
     }
 }
 
-fn fallback_stem_tx(peers: &[String], tx: &Transaction, inner: &NodeInner) {
-    let Some(addr) = peers.iter().next().cloned() else {
-        return;
-    };
+fn pick_fallback_stem_peer(peers: &[String]) -> Option<String> {
+    if peers.is_empty() {
+        return None;
+    }
+
+    let mut rng = OsRng;
+    Some(peers[rng.gen_range(0..peers.len())].clone())
+}
+
+/// Startup-only one-hop stem when no persistent outbound session exists yet.
+///
+/// The fail-safe stempool embargo remains armed. If this dial or write dies,
+/// the transaction later enters ordinary diffusion.
+fn fallback_stem_tx(addr: &str, tx: &Transaction, inner: &NodeInner) {
     let network = inner.network;
     let genesis = inner.chain.genesis_hash;
     let height = inner.chain.tip_height().map(|h| h.0).unwrap_or(0);
@@ -478,18 +599,88 @@ fn fallback_stem_tx(peers: &[String], tx: &Transaction, inner: &NodeInner) {
     let pruned = inner.chain.is_pruned();
     let first_h = inner.chain.first_height;
     let proxy = inner.proxy.clone();
+    let failures = inner.stem_failures.clone();
+
     let tx = tx.clone();
+    let txid = tx.txid().to_hex();
+    let addr = addr.to_string();
+    let failure_route = format!("dial:{addr}");
+
     thread::spawn(move || {
-        if let Ok((mut s, _tor)) = connect_peer_via(&addr, 3000, proxy.as_ref()) {
-            if handshake(&mut s, network, genesis, height, tip, port, pruned, first_h).is_ok() {
-                let _ = nightfall_p2p::broadcast_tx(&mut s, &tx);
+        let outcome = (|| -> std::io::Result<()> {
+            let (mut stream, _tor) = connect_peer_via(&addr, 3000, proxy.as_ref())?;
+
+            let intro = handshake(
+                &mut stream,
+                network,
+                genesis,
+                height,
+                tip,
+                port,
+                pruned,
+                first_h,
+            )?;
+
+            if !intro.dandelion_stem_v1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "peer lacks Dandelion stem v1",
+                ));
             }
+
+            broadcast_stem_tx(&mut stream, &tx)
+        })();
+
+        if let Err(e) = outcome {
+            tracing::debug!("fallback stem {addr} failed: {e}");
+
+            failures.push(StemSendFailure {
+                txid,
+                route: failure_route,
+            });
         }
     });
 }
 
-/// Probability a relay stays in the stem phase (Dandelion++).
-const DANDELION_STEM_P: f64 = 0.90;
+/// Last-resort ordinary diffusion when no live socket exists.
+///
+/// Once a transaction reaches this function it has already left stem phase and
+/// is therefore allowed in the mining mempool.
+fn fallback_fluff_tx(peers: &[String], tx: &Transaction, inner: &NodeInner) {
+    let network = inner.network;
+    let genesis = inner.chain.genesis_hash;
+    let height = inner.chain.tip_height().map(|h| h.0).unwrap_or(0);
+    let tip = inner.chain.tip_hash();
+    let port = inner.listen_port;
+    let pruned = inner.chain.is_pruned();
+    let first_h = inner.chain.first_height;
+
+    for addr in peers.iter().take(4) {
+        let addr = addr.clone();
+        let proxy = inner.proxy.clone();
+        let tx = tx.clone();
+
+        thread::spawn(move || {
+            if let Ok((mut stream, _tor)) = connect_peer_via(&addr, 3000, proxy.as_ref()) {
+                if handshake(
+                    &mut stream,
+                    network,
+                    genesis,
+                    height,
+                    tip,
+                    port,
+                    pruned,
+                    first_h,
+                )
+                .is_ok()
+                {
+                    let _ = broadcast_tx(&mut stream, &tx);
+                }
+            }
+        });
+    }
+}
+
 const DANDELION_EMBARGO_MIN: u64 = 12;
 const DANDELION_EMBARGO_MAX: u64 = 28;
 
@@ -498,60 +689,285 @@ fn embargo_deadline() -> u64 {
     now_unix() + DANDELION_EMBARGO_MIN + (rand::random::<u64>() % span)
 }
 
-fn propagate_from_inner(
-    inner: &mut NodeInner,
-    tx: &Transaction,
-    from_key: Option<&str>,
-    origin: bool,
-) {
-    let stem = origin || rand::random::<f64>() < DANDELION_STEM_P;
-    let live = inner.sessions.all();
-    if stem && stem_tx(&live, tx, from_key) {
-        inner
-            .stem_embargo
-            .insert(tx.txid().to_hex(), embargo_deadline());
-        return;
+fn handle_incoming_fluff(state: &SharedState, tx: &Transaction, from_key: &str) {
+    let id = tx.txid().to_hex();
+
+    let newly = {
+        let Ok(mut g) = state.lock() else {
+            return;
+        };
+
+        // Seeing ordinary diffusion is the proof that the anonymity phase has
+        // ended. Cancel this node's outstanding embargo first.
+        g.stempool.remove(&id);
+
+        match g.chain.precheck_tx(tx) {
+            Ok(()) => g.mempool.insert(tx.clone(), now_unix()),
+            Err(e) => {
+                tracing::debug!("reject fluff tx: {e}");
+                false
+            }
+        }
+    };
+
+    if newly {
+        let live = state.lock().map(|g| g.sessions.all()).unwrap_or_default();
+
+        fluff_tx(&live, tx, Some(from_key));
     }
-    if live.is_empty() {
-        fallback_stem_tx(&inner.dialable_peers(), tx, inner);
-        return;
-    }
-    fluff_tx(&live, tx, from_key);
-    inner.stem_embargo.remove(&tx.txid().to_hex());
 }
 
-fn propagate_tx(state: &SharedState, tx: &Transaction, from_key: Option<&str>, origin: bool) {
-    if let Ok(mut g) = state.lock() {
-        propagate_from_inner(&mut g, tx, from_key, origin);
+enum IncomingStemAction {
+    Drop,
+    None,
+    Stem(String),
+    Fluff,
+}
+
+fn handle_incoming_stem(state: &SharedState, tx: &Transaction, from_key: &str) {
+    let id = tx.txid().to_hex();
+    let now = now_unix();
+
+    let action = {
+        let Ok(mut g) = state.lock() else {
+            return;
+        };
+
+        if let Err(e) = g.chain.precheck_tx(tx) {
+            tracing::debug!("reject stem tx: {e}");
+            return;
+        }
+
+        // A transaction that has already reached normal diffusion never goes
+        // backwards into the anonymity phase.
+        if g.mempool.first_seen(&id).is_some() {
+            g.stempool.remove(&id);
+            return;
+        }
+
+        // Dandelion++ loop circuit breaker. Receiving the same stem twice
+        // means the anonymity graph has cycled back to this node. Diffuse it
+        // rather than silently dropping it and waiting for every embargo.
+        if g.stempool.contains(&id) {
+            g.stempool.remove(&id);
+
+            if g.mempool.insert(tx.clone(), now) {
+                IncomingStemAction::Fluff
+            } else {
+                IncomingStemAction::None
+            }
+        } else {
+            let source_peer_id = g
+                .sessions
+                .get(from_key)
+                .map(|session| session.peer_id)
+                .unwrap_or_else(|| from_key.to_string());
+
+            let outbound = g
+                .sessions
+                .dandelion_outbound_keys_except_peer(Some(source_peer_id.as_str()));
+
+            g.dandelion_router.refresh(now, &outbound);
+
+            if g.dandelion_router.mode() == RelayMode::Fluff {
+                if g.mempool.insert(tx.clone(), now) {
+                    IncomingStemAction::Fluff
+                } else {
+                    IncomingStemAction::None
+                }
+            } else {
+                let route =
+                    g.dandelion_router
+                        .route_for(now, Some(source_peer_id.as_str()), &outbound);
+
+                match route {
+                    Some(route) => match g.stempool.insert_new_from(
+                        id.clone(),
+                        tx.clone(),
+                        Some(source_peer_id.clone()),
+                        route.clone(),
+                        embargo_deadline(),
+                    ) {
+                        StemInsert::Inserted => IncomingStemAction::Stem(route),
+
+                        StemInsert::Duplicate => {
+                            g.stempool.remove(&id);
+
+                            if g.mempool.insert(tx.clone(), now) {
+                                IncomingStemAction::Fluff
+                            } else {
+                                IncomingStemAction::None
+                            }
+                        }
+
+                        StemInsert::Full => IncomingStemAction::Drop,
+                    },
+
+                    None => {
+                        // No valid outbound Dandelion edge exists. Diffusion
+                        // is safer than black-holing a payment.
+                        if g.mempool.insert(tx.clone(), now) {
+                            IncomingStemAction::Fluff
+                        } else {
+                            IncomingStemAction::None
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    match action {
+        IncomingStemAction::Drop => {}
+        IncomingStemAction::None => {}
+
+        IncomingStemAction::Fluff => {
+            let live = state.lock().map(|g| g.sessions.all()).unwrap_or_default();
+
+            fluff_tx(&live, tx, Some(from_key));
+        }
+
+        IncomingStemAction::Stem(route) => {
+            let (sessions, failures) = match state.lock() {
+                Ok(g) => (Arc::clone(&g.sessions), g.stem_failures.clone()),
+                Err(_) => return,
+            };
+
+            if stem_tx_to_observed(&sessions, &route, tx, Some(&failures)) {
+                return;
+            }
+
+            // Peer churn raced route selection. Do not leave a guaranteed-dead
+            // stem sitting around until its timer; promote immediately.
+            let promoted = {
+                let Ok(mut g) = state.lock() else {
+                    return;
+                };
+
+                if g.stempool.remove(&id).is_some() && g.chain.precheck_tx(tx).is_ok() {
+                    g.mempool.insert(tx.clone(), now_unix())
+                } else {
+                    false
+                }
+            };
+
+            if promoted {
+                let live = state.lock().map(|g| g.sessions.all()).unwrap_or_default();
+
+                fluff_tx(&live, tx, Some(from_key));
+            }
+        }
+    }
+}
+
+fn retry_failed_stems(state: &SharedState, now: u64) {
+    let failures = match state.lock() {
+        Ok(g) => g.stem_failures.drain(),
+        Err(_) => return,
+    };
+
+    for failure in failures {
+        let retry = {
+            let Ok(mut g) = state.lock() else {
+                return;
+            };
+
+            let source_peer_id = g
+                .stempool
+                .get(&failure.txid)
+                .and_then(|entry| entry.source.clone());
+
+            let outbound = g
+                .sessions
+                .dandelion_outbound_keys_except_peer(source_peer_id.as_deref());
+
+            let NodeInner {
+                dandelion_router,
+                stempool,
+                ..
+            } = &mut *g;
+
+            repair_failed_stem(
+                dandelion_router,
+                stempool,
+                &failure.txid,
+                &failure.route,
+                now,
+                &outbound,
+            )
+        };
+
+        let Some((route, tx)) = retry else {
+            // No safe alternate edge, stale failure, or already repaired.
+            // Keep the original randomized embargo armed.
+            continue;
+        };
+
+        let (sessions, failures) = match state.lock() {
+            Ok(g) => (Arc::clone(&g.sessions), g.stem_failures.clone()),
+            Err(_) => return,
+        };
+
+        if !stem_tx_to_observed(&sessions, &route, &tx, Some(&failures)) {
+            // The alternate vanished between route repair and scheduling.
+            // Do not repeatedly reroute: the existing embargo is the final
+            // privacy-preserving availability mechanism.
+            tracing::debug!("repaired Dandelion route {route} vanished before send");
+        }
     }
 }
 
 fn spawn_dandelion_fluff(state: SharedState) {
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(2));
+
         let now = now_unix();
+
+        retry_failed_stems(&state, now);
+
         let due: Vec<Transaction> = {
             let Ok(mut g) = state.lock() else {
                 continue;
             };
-            let ids: Vec<String> = g
-                .stem_embargo
-                .iter()
-                .filter(|(_, t)| **t <= now)
-                .map(|(id, _)| id.clone())
-                .collect();
-            let mut txs = Vec::new();
-            for id in ids {
-                g.stem_embargo.remove(&id);
-                if let Some(tx) = g.mempool.txs.get(&id).cloned() {
-                    txs.push(tx);
+
+            let entries = g.stempool.take_due(now);
+            let mut promoted = Vec::new();
+
+            for entry in entries {
+                let tx = entry.value;
+                let id = tx.txid().to_hex();
+
+                // The ledger may have changed while the tx was anonymous.
+                // Never diffuse or mine a transaction that is no longer valid.
+                if let Err(e) = g.chain.precheck_tx(&tx) {
+                    tracing::debug!("dropping expired invalid stem {id}: {e}");
+                    continue;
+                }
+
+                if g.mempool.first_seen(&id).is_some() {
+                    continue;
+                }
+
+                if g.mempool.insert(tx.clone(), now) {
+                    promoted.push(tx);
                 }
             }
-            txs
+
+            promoted
         };
+
         for tx in due {
-            if let Ok(g) = state.lock() {
-                fluff_tx(&g.sessions.all(), &tx, None);
+            let Ok(g) = state.lock() else {
+                continue;
+            };
+
+            let live = g.sessions.all();
+
+            if live.is_empty() {
+                let peers = g.dialable_peers();
+                fallback_fluff_tx(&peers, &tx, &g);
+            } else {
+                fluff_tx(&live, &tx, None);
             }
         }
     });
@@ -587,7 +1003,7 @@ pub struct StatusSnap {
     pub live_peers: usize,
     /// Outbound P2P is going through SOCKS5 (typically Tor).
     pub tor_proxy: bool,
-    /// Transaction relay uses Dandelion-class stem/fluff.
+    /// Transaction relay uses negotiated Dandelion++ stem/fluff.
     pub dandelion: bool,
     /// Why the last outbound dial failed, if we have no live peers.
     pub last_dial_error: Option<String>,
@@ -782,7 +1198,9 @@ impl NodeHandle {
             tip_notify: Arc::clone(&tip_notify),
             proxy: parse_proxy_cfg(cfg.proxy.as_deref())?,
             last_tor_ok: Arc::new(AtomicBool::new(false)),
-            stem_embargo: HashMap::new(),
+            dandelion_router: DandelionRouter::default(),
+            stempool: StemPool::default(),
+            stem_failures: StemFailureQueue::default(),
             prune_keep,
         };
         let state: SharedState = Arc::new(Mutex::new(inner));
@@ -974,6 +1392,9 @@ impl NodeHandle {
             g.best_peer_seen = 0;
             g.behind_since = now_unix();
             g.mempool = Mempool::default();
+            g.stempool = StemPool::default();
+            g.dandelion_router = DandelionRouter::default();
+            g.stem_failures = StemFailureQueue::default();
             g.bump_tip();
             (g.sessions.all(), backup)
         };
@@ -1402,6 +1823,20 @@ fn open_outbound_session(state: &SharedState, addr: &str) -> anyhow::Result<()> 
         our_pruned,
         our_first,
     )?;
+
+    // Direct TCP can identify the remote by observed IP + its advertised
+    // listening port. Through SOCKS/Tor the socket peer is the proxy, so the
+    // dial target itself is the least-wrong stable identity.
+    let peer_id = if used_tor {
+        addr.to_string()
+    } else {
+        stream
+            .peer_addr()
+            .ok()
+            .and_then(|observed| dialable_addr(&observed.to_string(), intro.listen_port))
+            .unwrap_or_else(|| addr.to_string())
+    };
+
     let (peer_h, peer_tip) = (intro.height, intro.tip.clone());
     note_peer_height(state, peer_h);
     // Remember who can answer for the whole chain. A pruned peer relays new
@@ -1427,7 +1862,8 @@ fn open_outbound_session(state: &SharedState, addr: &str) -> anyhow::Result<()> 
         let mut g = state.lock().unwrap();
         let key = outbound_key(addr);
         g.session_height.insert(key.clone(), peer_h);
-        g.sessions.insert(key, write_clone, true)
+        g.sessions
+            .insert_with_identity(key, write_clone, true, intro.dandelion_stem_v1, peer_id)
     };
     tracing::info!("outbound session {addr} height={peer_h}");
 
@@ -1839,7 +2275,7 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
         (g.network, g.chain.genesis_hash)
     };
 
-    let (session_key, peer_height) = match read_msg(&mut reader)? {
+    let (session_key, peer_height, peer_dandelion_stem_v1, peer_id) = match read_msg(&mut reader)? {
         PeerMsg::Hello {
             wire,
             network: net,
@@ -1847,6 +2283,7 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
             listen_port,
             height: peer_height,
             agent,
+            dandelion_stem_v1: peer_dandelion_stem_v1,
             ..
         } => {
             // Inbound never checked this, only outbound did — so the wire
@@ -1917,9 +2354,17 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
                     g.peer_agents.insert(addr, agent.clone());
                 }
             }
-            // Always key inbound sockets by the observed connection, never
-            // by the advertised listen address. See `outbound_key`.
+            // Socket identity remains the observed connection so an
+            // inbound cannot overwrite an outbound. Privacy routing separately
+            // uses a logical identity based on the peer's advertised listener.
             let session_key = inbound_key(&peer_label);
+
+            let peer_id = dialable_addr(&peer_label, listen_port).unwrap_or_else(|| {
+                peer_label
+                    .parse::<std::net::SocketAddr>()
+                    .map(|addr| addr.ip().to_string())
+                    .unwrap_or_else(|_| peer_label.clone())
+            });
             note_peer_height(&state, peer_height);
             if let Ok(mut g) = state.lock() {
                 g.session_height.insert(session_key.clone(), peer_height);
@@ -1946,9 +2391,10 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
                     listen_port: our_port,
                     pruned: our_pruned,
                     first_height: our_first,
+                    dandelion_stem_v1: true,
                 },
             )?;
-            (session_key, peer_height)
+            (session_key, peer_height, peer_dandelion_stem_v1, peer_id)
         }
         other => {
             write_msg(
@@ -1987,7 +2433,13 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
     }
     let sess = {
         let g = state.lock().unwrap();
-        g.sessions.insert(session_key.clone(), hello_writer, false)
+        g.sessions.insert_with_identity(
+            session_key.clone(),
+            hello_writer,
+            false,
+            peer_dandelion_stem_v1,
+            peer_id,
+        )
     };
     // First gift: who else answers. A new install that only knows the
     // seed must leave this socket with somewhere else to dial.
@@ -2121,6 +2573,7 @@ fn peer_io_loop(
                     match g.chain.apply_block(block.clone(), now_unix()) {
                         Ok(()) => {
                             g.mempool.remove_included(&block);
+                            g.remove_stem_included(&block);
                             g.mempool.expire(now_unix());
                             g.bump_tip();
                             let _ = g.persist();
@@ -2145,19 +2598,18 @@ fn peer_io_loop(
                 }
             }
 
-            PeerMsg::Tx { tx } => {
-                let newly = {
-                    let mut g = state.lock().unwrap();
-                    match g.chain.precheck_tx(&tx) {
-                        Ok(()) => g.mempool.insert(tx.clone(), now_unix()),
-                        Err(e) => {
-                            tracing::debug!("reject tx: {e}");
-                            false
-                        }
+            PeerMsg::Tx { tx, stem } => {
+                if stem && sess.dandelion_stem_v1 {
+                    handle_incoming_stem(state, &tx, sess.key.as_str());
+                } else {
+                    if stem && !sess.dandelion_stem_v1 {
+                        tracing::debug!(
+                            "peer {} sent an unnegotiated stem; treating it as fluff",
+                            sess.key
+                        );
                     }
-                };
-                if newly {
-                    propagate_tx(state, &tx, Some(sess.key.as_str()), false);
+
+                    handle_incoming_fluff(state, &tx, sess.key.as_str());
                 }
             }
 

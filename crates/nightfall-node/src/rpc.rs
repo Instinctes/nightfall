@@ -186,6 +186,7 @@ pub(crate) fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
                     "utxo_root": chain.ledger.utxo_root().to_hex(),
                     "supply_invariant_ok": supply_ok,
                     "mempool": g.mempool.len(),
+                    "stempool": g.stempool.len(),
                     "peers": g.sessions.len(),
                     "known_peers": g.peer_addrs.len(),
                     "live_peers": g.sessions.len(),
@@ -466,6 +467,7 @@ pub(crate) fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
             match g.chain.apply_block(block.clone(), now_unix()) {
                 Ok(()) => {
                     g.mempool.remove_included(&block);
+                    g.remove_stem_included(&block);
                     let _ = g.persist();
                     let response = json!({
                         "height": block.header.height.0,
