@@ -107,6 +107,43 @@ fn a_fresh_ahead_peer_holds_mining() {
 }
 
 #[test]
+fn a_fresh_ahead_peer_holds_mining_however_long_the_sync_takes() {
+    // The catch-up escape must NOT apply while a live peer is known to be
+    // ahead. Every initial sync is longer than MAX_CATCHUP_WAIT_SECS, so
+    // letting the window expire here starts mining at the low historical
+    // difficulty of a stale tip and forks the node onto a private chain.
+    //
+    // Observed on mainnet: a node 196,000 blocks behind mined block 94,080
+    // eleven minutes after receiving that height from a peer, then could never
+    // reorg back. 1,491 blocks were mined during one resync.
+    let start = 1_800_000_000;
+    let now = start + MAX_CATCHUP_WAIT_SECS + 1;
+    assert_eq!(
+        mining_should_wait(94_080, 94_080, 290_000, now, start, now),
+        Some(195_920),
+        "a node with a fresh peer 195,920 blocks ahead must keep waiting"
+    );
+
+    // Still true much later -- a long sync is not evidence of isolation.
+    let much_later = start + 86_400;
+    assert_eq!(
+        mining_should_wait(94_080, 94_080, 290_000, much_later, start, much_later),
+        Some(195_920)
+    );
+}
+
+#[test]
+fn an_ahead_peer_going_stale_still_releases_mining() {
+    // The escape must survive for the case it was written for: the peer
+    // stops answering, its height ages past the TTL, and an otherwise
+    // isolated node must not stay bricked.
+    let start = 1_800_000_000;
+    let seen = start;
+    let now = seen + PEER_HEIGHT_TTL_SECS + MAX_CATCHUP_WAIT_SECS + 1;
+    assert_eq!(mining_should_wait(94_080, 94_080, 290_000, seen, start, now), None);
+}
+
+#[test]
 fn gossip_does_not_fill_the_dial_list() {
     // A peers.json of 60 Tor exits used to launch 60 stay_connected threads.
     let seeds = vec!["seed.nightfallcoin.org:17891".into()];

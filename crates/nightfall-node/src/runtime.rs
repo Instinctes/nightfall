@@ -2926,9 +2926,19 @@ pub fn mining_should_wait(
     if best_peer_height <= our_height {
         return None;
     }
-    if now.saturating_sub(behind_since) > MAX_CATCHUP_WAIT_SECS {
-        return None;
-    }
+    // No catch-up escape here on purpose.
+    //
+    // MAX_CATCHUP_WAIT_SECS exists so an ISOLATED node is not bricked, and
+    // isolation is already decided above by `peer_fresh`. Reaching this point
+    // means a peer confirmed a greater height within PEER_HEIGHT_TTL_SECS, so
+    // we are syncing, not alone -- and any initial sync takes far longer than
+    // the 10 minute window. Applying the escape here made a node start mining
+    // while hundreds of thousands of blocks behind, at the low historical
+    // difficulty of its own stale tip, which forks it onto a private chain
+    // exactly as this function's own doc comment warns.
+    //
+    // If the peer really does go away, its height goes stale, `peer_fresh`
+    // turns false, and the escape above still applies.
     Some(best_peer_height - our_height)
 }
 
