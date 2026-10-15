@@ -17,15 +17,12 @@ name: Release
 on:
   push:
     tags: ["v*"]
-  # Lets the Windows artefacts be rebuilt for an existing tag without moving it.
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Existing tag to attach binaries to (e.g. v0.4.0)"
-        required: true
+  # Tag-push releases only: an input-tag dispatch would attest the wrong source ref.
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -129,6 +126,17 @@ jobs:
         env:
           INPUT_TAG: ${{ github.event.inputs.tag }}
 
+      - name: Sign build provenance (Windows)
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/*
+
+      - name: Verify signed release origin (Windows)
+        shell: pwsh
+        run: python scripts/check_release_provenance.py --tag "$env:GITHUB_REF_NAME" --platform windows --directory dist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Attach to release
         shell: bash
         run: |
@@ -146,8 +154,8 @@ jobs:
               --title "NIGHTFALLCOIN Core ${TAG#v}" \
               --notes "Binaries built by this workflow. Verify the SHA256 before running anything."
           fi
-          # --clobber so re-running for a tag replaces rather than fails.
-          gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          # Immutable-by-convention: same-tag assets are not silently replaced.
+          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INPUT_TAG: ${{ github.event.inputs.tag }}
@@ -206,6 +214,16 @@ jobs:
         env:
           INPUT_TAG: ${{ github.event.inputs.tag }}
 
+      - name: Sign build provenance (Linux)
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/*
+
+      - name: Verify signed release origin (Linux)
+        run: python3 scripts/check_release_provenance.py --tag "$GITHUB_REF_NAME" --platform linux --directory dist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Attach to release
         run: |
           TAG="${INPUT_TAG:-${GITHUB_REF_NAME}}"
@@ -219,7 +237,7 @@ jobs:
               --notes "Binaries built by this workflow. Verify the SHA256 before running anything." \
               || true
           fi
-          gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INPUT_TAG: ${{ github.event.inputs.tag }}
