@@ -139,7 +139,7 @@ reorganisations.
 |--|--|
 | Block time | 15 seconds |
 | Block reward | 6 NIGHT, halving every 7,500,000 blocks |
-| Algorithm | Argon2id, 32 MiB per hash — CPU only, no GPU or ASIC advantage |
+| Algorithm | Argon2id, 32 MiB per hash — built against ASICs; GPUs are faster than CPUs |
 | Typical laptop | a few hundred hashes per second |
 
 The wallet warns you in orange if it is mining with **no peers**, and holds
@@ -246,6 +246,13 @@ Every coin that will ever exist has to be mined. See
 Nighthash-v2 is **Argon2id**: one hash needs 32 MiB of randomly addressed
 memory. Purpose-built hardware would need that much fast RAM per parallel core,
 which is where ASIC economics stop working.
+
+It does **not** shut out graphics cards. A GPU has gigabytes of fast memory,
+enough for hundreds of 32 MiB hashes at once, and Argon2id is limited mostly by
+memory bandwidth — where GPUs are strongest. A current NVIDIA card can be
+roughly ten times faster than a desktop CPU. Third-party GPU miners exist; they
+are not part of this project, and nothing in the protocol favours or forbids
+them. A block is valid whatever hardware found it.
 
 ```console
 # measured on an Apple M3 Pro, 10 mining threads
