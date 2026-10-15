@@ -28,7 +28,8 @@ days. Same chain, genesis, protocol v8 and wire v6; no consensus rule changed.
   three-block fork and not reachable from outside (as the #40 node, on WSL2,
   was not). With 1.0.5 code it stays stuck — first on "expected blocks", and with
   only that fixed on "unexpected height", exactly as in the report. With 1.0.6
-  it rejoins.
+  it rejoins. (It mines 620 real blocks, so it is run by name rather than in
+  CI: `cargo test --release -p nightfall-node --test far_behind_fork -- --ignored`.)
 - **"Dead branch" means a dead branch.** 1.0.5 called a node on a dead branch
   whenever it was stuck *and* far behind, and reported the lag as the depth of
   the fork. Only a real rewind past the 500-block limit is called that now.

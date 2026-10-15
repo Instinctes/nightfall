@@ -83,7 +83,11 @@ fn install(node: &NodeHandle, chain: Chain) {
     state.persist().unwrap();
 }
 
+// Mines 620 real blocks and runs two nodes: about three minutes on a laptop,
+// far longer on a CI runner's debug build. Run it by name, in release:
+//   cargo test --release -p nightfall-node --test far_behind_fork -- --ignored
 #[test]
+#[ignore = "two real nodes and 620 mined blocks; too slow for CI debug builds — run it by name"]
 fn a_node_far_behind_on_a_short_fork_rejoins_the_network() {
     // Timestamps 15 s apart, ending now: steady difficulty, nothing in the
     // future, so the chain is one a real node would accept.
