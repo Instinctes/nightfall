@@ -26,6 +26,31 @@ use the tools below.
 | Tor / SOCKS5 | **Default** (`127.0.0.1:9050`). If Tor is down, clearnet fallback. `.onion` never falls back. `NIGHTFALL_PROXY=off` disables. |
 | Dandelion++ fluff via Tor | Combine both. Stem hides the origin from peers; Tor hides the peers from the ISP. |
 
+### Strict outbound P2P: fail closed
+
+Set `NIGHTFALL_P2P_REQUIRE_PROXY=1` before starting
+the node to require a SOCKS5 proxy for new outbound
+P2P connections.
+
+If the proxy is missing, unreachable or refuses
+CONNECT, outbound P2P fails rather than connecting
+directly. The normal fallback is unchanged when
+strict mode is not enabled.
+
+`0`, `false`, `off` and empty disable strict mode.
+Other values enable it.
+
+Use with a working proxy, for example
+`NIGHTFALL_PROXY=127.0.0.1:9050`.
+Setting the proxy to `off` while requiring it
+disables outbound P2P.
+
+This setting does not protect inbound P2P,
+HTTP directory requests, browser wallet traffic
+or other applications. Already-open connections
+are not terminated. It is not a complete
+anonymity guarantee.
+
 ### Tor
 
 ```bash

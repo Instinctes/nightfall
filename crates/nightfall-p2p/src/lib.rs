@@ -275,28 +275,63 @@ pub fn connect_peer(addr: &str, timeout_ms: u64) -> std::io::Result<TcpStream> {
 
 /// Dial `addr`, optionally through SOCKS5.
 ///
-/// Returns `(stream, used_tor)`. If the proxy is down, a clearnet destination
-/// falls back to a direct connect. `.onion` never falls back — that would
-/// leak the name to DNS.
+/// Returns `(stream, used_tor)`. Default policy permits direct fallback;
+/// strict outbound policy refuses it. `.onion` never falls back.
+/// Opt-in fail-closed outbound P2P policy.
+///
+/// The existing fallback remains unchanged unless
+/// NIGHTFALL_P2P_REQUIRE_PROXY is enabled.
 pub fn connect_peer_via(
     addr: &str,
     timeout_ms: u64,
     proxy: Option<&SocksProxy>,
 ) -> std::io::Result<(TcpStream, bool)> {
+    // Unknown and non-UTF8 values enable strict mode.
+    // A typo must not silently allow clearnet.
+    let required = std::env::var_os("NIGHTFALL_P2P_REQUIRE_PROXY")
+        .map(|v| {
+            !matches!(
+                v.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "off"
+            )
+        })
+        .unwrap_or(false);
+
+    connect_peer_via_policy(addr, timeout_ms, proxy, required)
+}
+
+fn connect_peer_via_policy(
+    addr: &str,
+    timeout_ms: u64,
+    proxy: Option<&SocksProxy>,
+    require_proxy: bool,
+) -> std::io::Result<(TcpStream, bool)> {
+    if require_proxy && proxy.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "outbound P2P requires SOCKS5; no proxy configured",
+        ));
+    }
+
     let onion = addr.contains(".onion");
+
     if let Some(p) = proxy {
         match p.connect(addr, timeout_ms) {
             Ok(s) => return Ok((s, true)),
-            Err(e) if onion => return Err(e),
+            Err(e) if onion || require_proxy => {
+                return Err(e);
+            }
             Err(_) => {}
         }
     }
+
     if onion {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AddrNotAvailable,
-            "onion destinations require a working SOCKS5 proxy",
+            "onion destinations require SOCKS5",
         ));
     }
+
     Ok((connect_direct(addr, timeout_ms)?, false))
 }
 
@@ -560,5 +595,136 @@ mod interleave_tests {
         let mut client = TcpStream::connect(addr).unwrap();
         assert!(request_blocks(&mut client, 7, 1).is_err());
         server.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod proxy_fail_closed_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    #[test]
+    fn strict_without_proxy_never_reaches_target() {
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let addr = target.local_addr().unwrap().to_string();
+
+        let err = connect_peer_via_policy(&addr, 300, None, true).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            target.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn dead_proxy_never_triggers_strict_fallback() {
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let addr = target.local_addr().unwrap().to_string();
+
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = SocksProxy::parse(&dead.local_addr().unwrap().to_string()).unwrap();
+        drop(dead);
+
+        assert!(connect_peer_via_policy(&addr, 300, Some(&proxy), true).is_err());
+        assert_eq!(
+            target.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn legacy_mode_retains_explicit_fallback() {
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = target.local_addr().unwrap().to_string();
+
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = SocksProxy::parse(&dead.local_addr().unwrap().to_string()).unwrap();
+        drop(dead);
+
+        let (_stream, used_tor) = connect_peer_via_policy(&addr, 300, Some(&proxy), false).unwrap();
+
+        assert!(!used_tor);
+        target.accept().unwrap();
+    }
+
+    #[test]
+    fn strict_live_proxy_uses_socks() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = SocksProxy::parse(&listener.local_addr().unwrap().to_string()).unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+
+            let mut greeting = [0u8; 3];
+            socket.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            socket.write_all(&[5, 0]).unwrap();
+
+            let mut header = [0u8; 4];
+            socket.read_exact(&mut header).unwrap();
+            assert_eq!(header, [5, 1, 0, 3]);
+
+            let mut len = [0u8; 1];
+            socket.read_exact(&mut len).unwrap();
+
+            let mut rest = vec![0u8; len[0] as usize + 2];
+            socket.read_exact(&mut rest).unwrap();
+
+            assert_eq!(&rest[..len[0] as usize], b"seed.example");
+
+            socket.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+        });
+
+        let (stream, used_tor) =
+            connect_peer_via_policy("seed.example:17891", 2_000, Some(&proxy), true).unwrap();
+
+        assert!(used_tor);
+        drop(stream);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn strict_connect_rejection_never_dials_target() {
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let addr = target.local_addr().unwrap().to_string();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = SocksProxy::parse(&listener.local_addr().unwrap().to_string()).unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+
+            let mut greeting = [0u8; 3];
+            socket.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            socket.write_all(&[5, 0]).unwrap();
+
+            let mut header = [0u8; 4];
+            socket.read_exact(&mut header).unwrap();
+            assert_eq!(header, [5, 1, 0, 1]);
+
+            let mut tail = [0u8; 6];
+            socket.read_exact(&mut tail).unwrap();
+
+            socket.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+        });
+
+        assert!(connect_peer_via_policy(&addr, 2_000, Some(&proxy), true).is_err());
+        server.join().unwrap();
+
+        assert_eq!(
+            target.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn onion_never_uses_clearnet() {
+        assert!(connect_peer_via_policy("example.onion:17891", 300, None, false,).is_err());
     }
 }
