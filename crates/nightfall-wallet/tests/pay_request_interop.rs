@@ -205,7 +205,7 @@ fn deterministic_adversarial_roundtrips_and_parameter_injection() {
 
     for trial in 0..3_072 {
         let request = PaymentRequest {
-            address: address.clone(),
+            address: address,
 
             network: networks[rng.index(networks.len())],
 
