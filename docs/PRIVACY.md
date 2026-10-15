@@ -51,6 +51,38 @@ or other applications. Already-open connections
 are not terminated. It is not a complete
 anonymity guarantee.
 
+### Sovereign privacy lockdown (experimental)
+
+Set `NIGHTFALL_PRIVACY_LOCKDOWN=1` to enable
+fail-closed outbound privacy protection.
+
+Properties:
+
+- New outgoing Nightfall P2P connections require SOCKS5.
+- No direct P2P fallback when SOCKS5 fails.
+- The direct HTTPS peer-directory bootstrap is disabled.
+- Built-in P2P seeds remain accessible through SOCKS5.
+- Manual peer entry cannot resolve hostnames without
+  a configured proxy.
+- The default networking policy remains unchanged.
+
+Use `NIGHTFALL_PROXY=127.0.0.1:9050`
+with a functioning SOCKS5 proxy.
+
+When the proxy is unavailable, outbound P2P fails closed.
+
+Restart the node when changing the environment.
+Already-open connections are not terminated automatically.
+
+This is not a complete anonymity or traffic-isolation
+guarantee. Inbound connections, other applications,
+browser-wallet requests and operating-system activity
+remain outside its security boundary.
+
+Unlike `NIGHTFALL_P2P_REQUIRE_PROXY=1`, this mode
+also suppresses the node's known direct HTTP
+peer-directory request.
+
 ### Tor
 
 ```bash

@@ -269,6 +269,27 @@ pub fn read_msg(reader: &mut BufReader<TcpStream>) -> std::io::Result<PeerMsg> {
 /// Local Tor SOCKS by default. Opt out with `--proxy off`.
 pub const DEFAULT_TOR_PROXY: &str = "127.0.0.1:9050";
 
+/// Experimental fail-closed privacy lockdown.
+/// Unknown values enable rather than weaken protection.
+fn privacy_flag_enabled(raw: Option<&std::ffi::OsStr>) -> bool {
+    let Some(value) = raw else {
+        return false;
+    };
+
+    let value = value.to_string_lossy();
+
+    !value.is_empty()
+        && !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        )
+}
+
+pub fn privacy_lockdown_enabled() -> bool {
+    let value = std::env::var_os("NIGHTFALL_PRIVACY_LOCKDOWN");
+    privacy_flag_enabled(value.as_deref())
+}
+
 pub fn connect_peer(addr: &str, timeout_ms: u64) -> std::io::Result<TcpStream> {
     connect_peer_via(addr, timeout_ms, None).map(|(s, _)| s)
 }
@@ -288,14 +309,15 @@ pub fn connect_peer_via(
 ) -> std::io::Result<(TcpStream, bool)> {
     // Unknown and non-UTF8 values enable strict mode.
     // A typo must not silently allow clearnet.
-    let required = std::env::var_os("NIGHTFALL_P2P_REQUIRE_PROXY")
-        .map(|v| {
-            !matches!(
-                v.to_string_lossy().trim().to_ascii_lowercase().as_str(),
-                "" | "0" | "false" | "off"
-            )
-        })
-        .unwrap_or(false);
+    let required = privacy_lockdown_enabled()
+        || std::env::var_os("NIGHTFALL_P2P_REQUIRE_PROXY")
+            .map(|v| {
+                !matches!(
+                    v.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+                    "" | "0" | "false" | "off"
+                )
+            })
+            .unwrap_or(false);
 
     connect_peer_via_policy(addr, timeout_ms, proxy, required)
 }
@@ -726,5 +748,24 @@ mod proxy_fail_closed_tests {
     #[test]
     fn onion_never_uses_clearnet() {
         assert!(connect_peer_via_policy("example.onion:17891", 300, None, false,).is_err());
+    }
+}
+
+#[cfg(test)]
+mod sovereign_privacy_lockdown_tests {
+    use super::privacy_flag_enabled;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn opt_in_is_fail_closed_for_unknown_values() {
+        assert!(!privacy_flag_enabled(None));
+
+        for text in ["", "0", "false", "FALSE", " off "] {
+            assert!(!privacy_flag_enabled(Some(OsStr::new(text))), "{text}");
+        }
+
+        for text in ["1", "true", "on", "typo", " ", "2"] {
+            assert!(privacy_flag_enabled(Some(OsStr::new(text))), "{text}");
+        }
     }
 }

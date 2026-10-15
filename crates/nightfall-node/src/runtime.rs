@@ -1015,6 +1015,11 @@ impl NodeHandle {
             .ok()
             .and_then(|g| g.proxy.clone())
             .is_some();
+        // A manual lookup must not bypass the privacy policy.
+        if !using_proxy && nightfall_p2p::privacy_lockdown_enabled() {
+            anyhow::bail!("privacy lockdown: configure SOCKS5 before adding a peer");
+        }
+
         if !using_proxy {
             use std::net::ToSocketAddrs;
             let resolved = addr
@@ -1653,6 +1658,13 @@ fn spawn_directory_bootstrap(
     configured: Option<String>,
     genesis_hex: String,
 ) {
+    // The directory uses direct HTTPS, not P2P SOCKS5.
+    // Lockdown must never contact it directly.
+    if nightfall_p2p::privacy_lockdown_enabled() {
+        tracing::warn!("privacy lockdown: direct HTTPS peer directory disabled");
+        return;
+    }
+
     let url = match configured.as_deref().map(str::trim) {
         Some("off") | Some("none") | Some("false") => return,
         Some(s) if !s.is_empty() => s.to_string(),
