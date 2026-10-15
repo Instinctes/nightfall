@@ -428,6 +428,9 @@ pub fn handshake(
     }
 }
 
+/// Most unrelated messages tolerated while waiting for one `Blocks` reply.
+const MAX_INTERLEAVED: usize = 64;
+
 pub fn request_blocks(
     stream: &mut TcpStream,
     from_height: u64,
@@ -435,14 +438,36 @@ pub fn request_blocks(
 ) -> std::io::Result<Vec<Block>> {
     write_msg(stream, &PeerMsg::GetBlocks { from_height, limit })?;
     let mut reader = BufReader::new(stream.try_clone()?);
-    match read_msg(&mut reader)? {
-        PeerMsg::Blocks { blocks } => Ok(blocks),
-        PeerMsg::Error { message } => Err(std::io::Error::other(message)),
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "expected blocks",
-        )),
+    // The answering node treats this connection as a normal session: it sends
+    // its address book right after the handshake, answers our `GetPeers` with
+    // a second one, and its status ticker asks `GetStatus` every few seconds.
+    // Until 1.0.6 the first of those to arrive was read as the reply, the
+    // request failed with "expected blocks", and a node trying to leave a fork
+    // never got the peer's chain (issue #40). Skip what is not the answer;
+    // also skip the tail of a line a previous reader left half-read.
+    for _ in 0..MAX_INTERLEAVED {
+        match read_msg(&mut reader) {
+            Ok(PeerMsg::Blocks { blocks }) => return Ok(blocks),
+            Ok(PeerMsg::Error { message }) => return Err(std::io::Error::other(message)),
+            Ok(_) => continue,
+            Err(e) if is_unparseable_line(&e) => continue,
+            Err(e) => return Err(e),
+        }
     }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "expected blocks",
+    ))
+}
+
+/// A complete line that is not a message we understand — as opposed to a
+/// closed, truncated or oversized stream, which must still fail.
+fn is_unparseable_line(e: &std::io::Error) -> bool {
+    if e.kind() != std::io::ErrorKind::InvalidData {
+        return false;
+    }
+    let text = e.to_string();
+    !(text.contains("exceeds") || text.contains("truncated") || text.contains("non-utf8"))
 }
 
 pub fn broadcast_block(stream: &mut TcpStream, block: &Block) -> std::io::Result<()> {
@@ -485,5 +510,55 @@ mod directory_tests {
         assert!(!is_directory_addr("abcd.onion:17891"));
         assert!(!is_directory_addr("no-port"));
         assert!(!is_directory_addr(""));
+    }
+}
+
+#[cfg(test)]
+mod interleave_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// Issue #40: unsolicited session traffic arrives before the reply.
+    #[test]
+    fn a_blocks_reply_is_found_behind_unrelated_messages() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            // Wait for the request, then answer the way a real node's session
+            // can: address book, status probe, half a line, then the reply.
+            let request = read_msg(&mut reader).unwrap();
+            assert!(matches!(request, PeerMsg::GetBlocks { from_height: 7, .. }));
+            write_msg(
+                &mut sock,
+                &PeerMsg::Peers {
+                    addrs: vec!["1.2.3.4:17891".into()],
+                },
+            )
+            .unwrap();
+            write_msg(&mut sock, &PeerMsg::GetStatus).unwrap();
+            sock.write_all(b"\"tail of a line\"}\n").unwrap();
+            write_msg(&mut sock, &PeerMsg::Blocks { blocks: vec![] }).unwrap();
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        let blocks = request_blocks(&mut client, 7, 1).unwrap();
+        assert!(blocks.is_empty());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_closed_stream_still_fails() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            let _ = read_msg(&mut reader);
+            drop(sock);
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        assert!(request_blocks(&mut client, 7, 1).is_err());
+        server.join().unwrap();
     }
 }

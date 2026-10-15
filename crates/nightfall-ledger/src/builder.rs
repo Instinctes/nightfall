@@ -6,7 +6,7 @@ use nightfall_crypto::{
     Commitment, KernelFeature, WalletKeys,
 };
 
-use crate::tx::{Input, Transaction, TxError};
+use crate::tx::{Input, Transaction, TxError, MAX_INPUTS, MAX_OUTPUTS};
 
 pub const TX_VERSION: u32 = 2;
 
@@ -84,6 +84,12 @@ pub fn build_transfer(
     if spendables.is_empty() {
         return Err(BuildError::NoInputs);
     }
+    if spendables.len() > MAX_INPUTS {
+        return Err(BuildError::Tx(TxError::TooManyInputs));
+    }
+    if payments.len().saturating_add(1) > MAX_OUTPUTS {
+        return Err(BuildError::Tx(TxError::TooManyOutputs));
+    }
     let in_sum: u64 = spendables.iter().map(|s| s.value).sum();
     let pay_sum: u64 = payments.iter().map(|p| p.amount).sum();
     let needed = pay_sum
@@ -155,6 +161,10 @@ pub fn build_transfer(
     }
 
     let _ = owner; // owner is implied by the per-output spend secrets
+
+    // Transaction builders must never return a transaction that the ledger
+    // will reject solely because its shape exceeds consensus limits.
+    tx.check_shape()?;
     Ok(tx)
 }
 
@@ -170,4 +180,40 @@ pub enum BuildError {
     OutputFailed,
     #[error(transparent)]
     Tx(#[from] TxError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transfer_builder_rejects_more_than_consensus_input_limit() {
+        let owner = WalletKeys::from_seed([1u8; 32]);
+        let recipient = WalletKeys::from_seed([2u8; 32]).address();
+
+        let spendable = Spendable {
+            commit: Commitment::new(1, &Scalar::ONE),
+            value: 1,
+            blind: Scalar::ONE,
+            spend_secret: Scalar::ONE,
+        };
+        let spendables = vec![spendable; MAX_INPUTS + 1];
+
+        let err = build_transfer(
+            &owner,
+            &spendables,
+            &[Payment {
+                to: recipient,
+                amount: 1,
+                memo: String::new(),
+            }],
+            0,
+            &owner.address(),
+            0,
+            b"test",
+        )
+        .unwrap_err();
+
+        assert_eq!(err, BuildError::Tx(TxError::TooManyInputs));
+    }
 }
