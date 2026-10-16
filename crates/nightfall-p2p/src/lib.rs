@@ -269,8 +269,13 @@ pub fn read_msg(reader: &mut BufReader<TcpStream>) -> std::io::Result<PeerMsg> {
 /// Local Tor SOCKS by default. Opt out with `--proxy off`.
 pub const DEFAULT_TOR_PROXY: &str = "127.0.0.1:9050";
 
-/// Experimental fail-closed privacy lockdown.
-/// Unknown values enable rather than weaken protection.
+/// The one switch for fail-closed outbound privacy: `NIGHTFALL_PRIVACY_LOCKDOWN`.
+///
+/// Off by default. When set, every outbound P2P connection must go through
+/// SOCKS5 (no direct fallback when Tor is down), the direct HTTPS peer
+/// directory is skipped, and Core's "check against nightfallcoin.org" is
+/// refused. Unknown values enable rather than weaken protection: a typo must
+/// not silently allow clearnet.
 fn privacy_flag_enabled(raw: Option<&std::ffi::OsStr>) -> bool {
     let Some(value) = raw else {
         return false;
@@ -296,30 +301,16 @@ pub fn connect_peer(addr: &str, timeout_ms: u64) -> std::io::Result<TcpStream> {
 
 /// Dial `addr`, optionally through SOCKS5.
 ///
-/// Returns `(stream, used_tor)`. Default policy permits direct fallback;
-/// strict outbound policy refuses it. `.onion` never falls back.
-/// Opt-in fail-closed outbound P2P policy.
-///
-/// The existing fallback remains unchanged unless
-/// NIGHTFALL_P2P_REQUIRE_PROXY is enabled.
+/// Returns `(stream, used_tor)`. By default a clearnet destination falls back
+/// to a direct connect when the proxy is down; under
+/// [`privacy_lockdown_enabled`] it fails instead. `.onion` never falls back —
+/// that would leak the name to DNS.
 pub fn connect_peer_via(
     addr: &str,
     timeout_ms: u64,
     proxy: Option<&SocksProxy>,
 ) -> std::io::Result<(TcpStream, bool)> {
-    // Unknown and non-UTF8 values enable strict mode.
-    // A typo must not silently allow clearnet.
-    let required = privacy_lockdown_enabled()
-        || std::env::var_os("NIGHTFALL_P2P_REQUIRE_PROXY")
-            .map(|v| {
-                !matches!(
-                    v.to_string_lossy().trim().to_ascii_lowercase().as_str(),
-                    "" | "0" | "false" | "off"
-                )
-            })
-            .unwrap_or(false);
-
-    connect_peer_via_policy(addr, timeout_ms, proxy, required)
+    connect_peer_via_policy(addr, timeout_ms, proxy, privacy_lockdown_enabled())
 }
 
 fn connect_peer_via_policy(

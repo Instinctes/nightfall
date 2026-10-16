@@ -23,65 +23,61 @@ use the tools below.
 |---|---|
 | Dandelion-class stem/fluff | **On.** A new transaction is sent to **one** random peer first, then fluffed. |
 | First hop to an old node | That node broadcasts. Stem only helps when the next hop also stems. |
-| Tor / SOCKS5 | **Default** (`127.0.0.1:9050`). If Tor is down, clearnet fallback. `.onion` never falls back. `NIGHTFALL_PROXY=off` disables. |
+| Tor / SOCKS5 | **Default** (`127.0.0.1:9050`). If Tor is down, clearnet fallback — unless `NIGHTFALL_PRIVACY_LOCKDOWN=1` (below). `.onion` never falls back. `NIGHTFALL_PROXY=off` disables. |
 | Dandelion++ fluff via Tor | Combine both. Stem hides the origin from peers; Tor hides the peers from the ISP. |
 
-### Strict outbound P2P: fail closed
+### Privacy lockdown: fail closed when Tor is down
 
-Set `NIGHTFALL_P2P_REQUIRE_PROXY=1` before starting
-the node to require a SOCKS5 proxy for new outbound
-P2P connections.
+By default, a node whose Tor proxy is down connects to peers **directly**,
+which shows your IP address to them. To refuse that instead, set one
+environment variable before starting:
 
-If the proxy is missing, unreachable or refuses
-CONNECT, outbound P2P fails rather than connecting
-directly. The normal fallback is unchanged when
-strict mode is not enabled.
+```bash
+NIGHTFALL_PRIVACY_LOCKDOWN=1
+```
 
-`0`, `false`, `off` and empty disable strict mode.
-Other values enable it.
+With it set:
 
-Use with a working proxy, for example
-`NIGHTFALL_PROXY=127.0.0.1:9050`.
-Setting the proxy to `off` while requiring it
-disables outbound P2P.
+- Every new outgoing P2P connection must go through SOCKS5. If the proxy is
+  missing, unreachable or refuses the connection, the dial fails — there is
+  no direct fallback.
+- The node does not fetch the HTTPS peer directory (that request is direct).
+- Built-in seeds are still reached, through SOCKS5.
+- A manually added peer is refused unless a proxy is configured (resolving
+  its name would otherwise go to your DNS resolver).
+- Core's "check against nightfallcoin.org" is refused (it is a direct HTTPS
+  request).
 
-This setting does not protect inbound P2P,
-HTTP directory requests, browser wallet traffic
-or other applications. Already-open connections
-are not terminated. It is not a complete
-anonymity guarantee.
+`0`, `false`, `off` and an empty value leave it off. Any other value turns it
+on — a typo must not silently allow clearnet. Restart after changing it;
+connections that are already open are not closed.
 
-### Sovereign privacy lockdown (experimental)
+Use it with a working proxy, e.g. `--proxy 127.0.0.1:9050` and Tor running.
+Lockdown with the proxy set to `off` means no outbound P2P at all.
 
-Set `NIGHTFALL_PRIVACY_LOCKDOWN=1` to enable
-fail-closed outbound privacy protection.
+Setting it for Core, which reads it at start:
 
-Properties:
+```bash
+# macOS (start from Terminal; Finder does not pass the variable)
+NIGHTFALL_PRIVACY_LOCKDOWN=1 "/Applications/NIGHTFALLCOIN Core.app/Contents/MacOS/nightfall-core"
 
-- New outgoing Nightfall P2P connections require SOCKS5.
-- No direct P2P fallback when SOCKS5 fails.
-- The direct HTTPS peer-directory bootstrap is disabled.
-- Built-in P2P seeds remain accessible through SOCKS5.
-- Manual peer entry cannot resolve hostnames without
-  a configured proxy.
-- The default networking policy remains unchanged.
+# Linux
+NIGHTFALL_PRIVACY_LOCKDOWN=1 ./nightfall-core-<version>-linux-x64
+```
 
-Use `NIGHTFALL_PROXY=127.0.0.1:9050`
-with a functioning SOCKS5 proxy.
+```bat
+:: Windows (Command Prompt)
+set NIGHTFALL_PRIVACY_LOCKDOWN=1
+nightfall-core-<version>-windows-x64.exe
+```
 
-When the proxy is unavailable, outbound P2P fails closed.
+For `nightfalld` under systemd: `Environment=NIGHTFALL_PRIVACY_LOCKDOWN=1` in
+the unit.
 
-Restart the node when changing the environment.
-Already-open connections are not terminated automatically.
-
-This is not a complete anonymity or traffic-isolation
-guarantee. Inbound connections, other applications,
-browser-wallet requests and operating-system activity
-remain outside its security boundary.
-
-Unlike `NIGHTFALL_P2P_REQUIRE_PROXY=1`, this mode
-also suppresses the node's known direct HTTP
-peer-directory request.
+**Not covered:** inbound connections (peers that dial you see your address —
+do not open a listening port if that matters), the browser wallet, other
+programs and the operating system. This is not a complete anonymity or
+traffic-isolation guarantee.
 
 ### Tor
 
