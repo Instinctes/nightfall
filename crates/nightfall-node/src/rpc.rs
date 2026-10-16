@@ -5,7 +5,7 @@
 //! a single mistyped `--rpc-listen` exposed full wallet control to the
 //! internet. Binding a non-loopback address now requires an explicit opt-in.
 
-use crate::runtime::SharedState;
+use crate::runtime::{SharedState, Shutdown, Workers};
 use nightfall_ledger::Transaction;
 use nightfall_storage::now_unix;
 use nightfall_types::{Amount, MAX_MESSAGE_BYTES, MAX_SUPPLY_NIGHT, TICKER};
@@ -15,7 +15,6 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 
 #[derive(Debug, Deserialize)]
@@ -60,7 +59,12 @@ pub fn is_loopback_addr(addr: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn spawn_rpc(addr: String, state: SharedState) {
+pub(crate) fn spawn_rpc(
+    addr: String,
+    state: SharedState,
+    shutdown: Arc<Shutdown>,
+    workers: Arc<Workers>,
+) {
     if !is_loopback_addr(&addr) && std::env::var("NF_ALLOW_PUBLIC_RPC").is_err() {
         tracing::error!(
             "refusing to bind RPC to non-loopback address {addr}. \
@@ -71,7 +75,8 @@ pub fn spawn_rpc(addr: String, state: SharedState) {
         return;
     }
 
-    thread::spawn(move || {
+    let client_workers = Arc::clone(&workers);
+    workers.spawn(move || {
         let listener = match TcpListener::bind(&addr) {
             Ok(l) => l,
             Err(e) => {
@@ -79,34 +84,86 @@ pub fn spawn_rpc(addr: String, state: SharedState) {
                 return;
             }
         };
+
+        if let Err(e) = listener.set_nonblocking(true) {
+            tracing::error!("rpc listener nonblocking {addr}: {e}");
+            return;
+        }
+
         tracing::info!("rpc listening on {addr}");
-        for conn in listener.incoming() {
-            match conn {
-                Ok(stream) => {
+
+        while !shutdown.is_requested() {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    if shutdown.is_requested() {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        break;
+                    }
+
                     let st = Arc::clone(&state);
-                    thread::spawn(move || {
-                        if let Err(e) = handle_client(stream, st) {
+                    let stop = Arc::clone(&shutdown);
+                    let workers = Arc::clone(&client_workers);
+                    workers.spawn(move || {
+                        if let Err(e) = handle_client(stream, st, stop) {
                             tracing::debug!("rpc client: {e}");
                         }
                     });
                 }
-                Err(e) => tracing::warn!("rpc accept: {e}"),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if shutdown.wait_timeout(Duration::from_millis(100)) {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("rpc accept: {e}");
+                    if shutdown.wait_timeout(Duration::from_millis(100)) {
+                        break;
+                    }
+                }
             }
         }
     });
 }
 
-fn handle_client(stream: TcpStream, state: SharedState) -> anyhow::Result<()> {
+fn handle_client(
+    stream: TcpStream,
+    state: SharedState,
+    shutdown: Arc<Shutdown>,
+) -> anyhow::Result<()> {
+    if shutdown.is_requested() {
+        return Ok(());
+    }
+
+    let _pending_socket = shutdown.track_socket(&stream)?;
+
     stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
 
     loop {
+        if shutdown.is_requested() {
+            break;
+        }
+
         // Bounded read: an unbounded one is a trivial memory exhaustion vector.
         let mut buf = Vec::with_capacity(1024);
-        let n = (&mut reader)
+        let n = match (&mut reader)
             .take(MAX_MESSAGE_BYTES as u64 + 1)
-            .read_until(b'\n', &mut buf)?;
+            .read_until(b'\n', &mut buf)
+        {
+            Ok(n) => n,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                if shutdown.is_requested() {
+                    break;
+                }
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
         if n == 0 {
             break;
         }
@@ -126,7 +183,7 @@ fn handle_client(stream: TcpStream, state: SharedState) -> anyhow::Result<()> {
             }
         };
         if req.method == "scan_subscribe" {
-            handle_scan_subscribe(&req, &state, &mut writer)?;
+            handle_scan_subscribe(&req, &state, &mut writer, &shutdown)?;
             break;
         }
         let res = dispatch(&req, &state);
@@ -547,6 +604,7 @@ fn handle_scan_subscribe(
     req: &RpcReq,
     state: &SharedState,
     writer: &mut TcpStream,
+    shutdown: &Shutdown,
 ) -> anyhow::Result<()> {
     let mut from = req.params.get("from").and_then(|v| v.as_u64()).unwrap_or(0);
     let limit = req
@@ -558,6 +616,10 @@ fn handle_scan_subscribe(
     let id = req.id.clone();
 
     loop {
+        if shutdown.is_requested() {
+            break;
+        }
+
         let snap = scan_feed_snapshot(state, from, limit);
         let scanned_to = snap
             .get("scanned_to")
@@ -582,10 +644,35 @@ fn handle_scan_subscribe(
             break;
         };
         if *guard == seen {
-            let (g, timeout) = cv
-                .wait_timeout(guard, Duration::from_secs(30))
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            if timeout.timed_out() {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let mut g = guard;
+            let mut heartbeat_due = false;
+
+            loop {
+                if shutdown.is_requested() || *g != seen {
+                    break;
+                }
+
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    heartbeat_due = true;
+                    break;
+                }
+
+                let remaining = deadline.saturating_duration_since(now);
+                let slice = remaining.min(Duration::from_millis(250));
+                let waited = cv
+                    .wait_timeout(g, slice)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                g = waited.0;
+            }
+
+            if shutdown.is_requested() {
+                break;
+            }
+
+            if heartbeat_due {
+                drop(g);
                 let heartbeat = ok(
                     json!({
                         "from": from,
@@ -601,7 +688,6 @@ fn handle_scan_subscribe(
                 );
                 writeln!(writer, "{}", serde_json::to_string(&heartbeat)?)?;
                 writer.flush()?;
-                drop(g);
                 continue;
             }
         }

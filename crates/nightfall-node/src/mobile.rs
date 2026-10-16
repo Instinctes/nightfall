@@ -7,13 +7,12 @@
 //! Plain HTTP. TLS belongs on a reverse proxy (Caddy / nginx) in front.
 
 use crate::rpc::{self, RpcReq};
-use crate::runtime::SharedState;
+use crate::runtime::{SharedState, Shutdown, Workers};
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
 const ALLOWED: &[&str] = &[
@@ -37,8 +36,14 @@ struct Rate {
     count: u32,
 }
 
-pub fn spawn_mobile(addr: String, state: SharedState) {
-    thread::spawn(move || {
+pub(crate) fn spawn_mobile(
+    addr: String,
+    state: SharedState,
+    shutdown: Arc<Shutdown>,
+    workers: Arc<Workers>,
+) {
+    let client_workers = Arc::clone(&workers);
+    workers.spawn(move || {
         let listener = match TcpListener::bind(&addr) {
             Ok(l) => l,
             Err(e) => {
@@ -46,20 +51,45 @@ pub fn spawn_mobile(addr: String, state: SharedState) {
                 return;
             }
         };
+
+        if let Err(e) = listener.set_nonblocking(true) {
+            tracing::error!("mobile listener nonblocking {addr}: {e}");
+            return;
+        }
+
         tracing::info!("mobile API listening on {addr} (status/scan_feed/submit_tx only)");
         let rates: Arc<Mutex<HashMap<String, Rate>>> = Arc::new(Mutex::new(HashMap::new()));
-        for conn in listener.incoming() {
-            match conn {
-                Ok(stream) => {
+
+        while !shutdown.is_requested() {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    if shutdown.is_requested() {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        break;
+                    }
+
                     let st = Arc::clone(&state);
                     let rates = Arc::clone(&rates);
-                    thread::spawn(move || {
-                        if let Err(e) = handle(stream, st, rates) {
+                    let stop = Arc::clone(&shutdown);
+                    let workers = Arc::clone(&client_workers);
+
+                    workers.spawn(move || {
+                        if let Err(e) = handle(stream, st, rates, stop) {
                             tracing::debug!("mobile client: {e}");
                         }
                     });
                 }
-                Err(e) => tracing::warn!("mobile accept: {e}"),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if shutdown.wait_timeout(Duration::from_millis(100)) {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("mobile accept: {e}");
+                    if shutdown.wait_timeout(Duration::from_millis(100)) {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -69,8 +99,15 @@ fn handle(
     mut stream: TcpStream,
     state: SharedState,
     rates: Arc<Mutex<HashMap<String, Rate>>>,
+    shutdown: Arc<Shutdown>,
 ) -> anyhow::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(20)))?;
+    if shutdown.is_requested() {
+        return Ok(());
+    }
+
+    let _pending_socket = shutdown.track_socket(&stream)?;
+
+    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
     stream.set_write_timeout(Some(Duration::from_secs(20)))?;
     let peer = stream
         .peer_addr()

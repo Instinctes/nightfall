@@ -166,35 +166,48 @@ impl Default for SessionPool {
 /// Fan a block out to every live socket. One thread per session so a stuck
 /// write cannot delay the rest — the same lesson as the old dial-per-peer
 /// announce, minus the dial.
-pub fn fanout_block(sessions: &[SessionHandle], block: &Block) {
+pub fn fanout_block<F>(sessions: &[SessionHandle], block: &Block, mut spawn: F)
+where
+    F: FnMut(Box<dyn FnOnce() + Send>),
+{
     for s in sessions {
         let s = s.clone();
         let block = block.clone();
-        std::thread::spawn(move || {
+        spawn(Box::new(move || {
             if let Err(e) = s.send_block(&block) {
                 tracing::debug!("session {} block send: {e}", s.key);
             }
-        });
+        }));
     }
 }
 
-pub fn fanout_tx(sessions: &[SessionHandle], tx: &Transaction) {
-    fluff_tx(sessions, tx, None);
+pub fn fanout_tx<F>(sessions: &[SessionHandle], tx: &Transaction, spawn: F)
+where
+    F: FnMut(Box<dyn FnOnce() + Send>),
+{
+    fluff_tx(sessions, tx, None, spawn);
 }
 
 /// Broadcast a transaction to every live socket except `exclude`.
-pub fn fluff_tx(sessions: &[SessionHandle], tx: &Transaction, exclude: Option<&str>) {
+pub fn fluff_tx<F>(
+    sessions: &[SessionHandle],
+    tx: &Transaction,
+    exclude: Option<&str>,
+    mut spawn: F,
+) where
+    F: FnMut(Box<dyn FnOnce() + Send>),
+{
     for s in sessions {
         if exclude == Some(s.key.as_str()) {
             continue;
         }
         let s = s.clone();
         let tx = tx.clone();
-        std::thread::spawn(move || {
+        spawn(Box::new(move || {
             if let Err(e) = s.send_tx(&tx) {
                 tracing::debug!("session {} tx send: {e}", s.key);
             }
-        });
+        }));
     }
 }
 
@@ -223,17 +236,25 @@ pub fn pick_stem_peer<'a>(
 }
 
 /// Forward a transaction to exactly one peer. Returns false if nobody is left.
-pub fn stem_tx(sessions: &[SessionHandle], tx: &Transaction, exclude: Option<&str>) -> bool {
+pub fn stem_tx<F>(
+    sessions: &[SessionHandle],
+    tx: &Transaction,
+    exclude: Option<&str>,
+    mut spawn: F,
+) -> bool
+where
+    F: FnMut(Box<dyn FnOnce() + Send>),
+{
     let Some(chosen) = pick_stem_peer(sessions, exclude) else {
         return false;
     };
     let s = chosen.clone();
     let tx = tx.clone();
-    std::thread::spawn(move || {
+    spawn(Box::new(move || {
         if let Err(e) = s.send_tx(&tx) {
             tracing::debug!("session {} stem send: {e}", s.key);
         }
-    });
+    }));
     true
 }
 
