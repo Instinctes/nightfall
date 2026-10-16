@@ -279,6 +279,15 @@ fn main() -> anyhow::Result<()> {
             if answer.trim_end_matches(['\r', '\n']) != format!("APPROVE {}", checked.nonce) {
                 anyhow::bail!("owner declined agent payment");
             }
+            // Re-check the clock at the point of use: owner confirmation can
+            // take longer than the intent's short allowed lifetime.
+            let signing_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| anyhow::anyhow!("system clock before Unix epoch"))?
+                .as_secs();
+            if signing_time >= checked.expires_at || signing_time >= policy.expires_at {
+                anyhow::bail!("agent intent expired before owner approval completed");
+            }
             // Same validated construction, broadcast and pending accounting as
             // the normal CLI send path: no alternative signer or consensus path.
             let tx = wallet.create_payment(
