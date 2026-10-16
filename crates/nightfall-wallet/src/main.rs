@@ -276,9 +276,7 @@ fn main() -> anyhow::Result<()> {
             std::io::stdout().flush()?;
             let mut answer = String::new();
             std::io::stdin().read_line(&mut answer)?;
-            if answer.trim_end_matches(['\r', '\n'])
-                != format!("APPROVE {}", checked.nonce)
-            {
+            if answer.trim_end_matches(['\r', '\n']) != format!("APPROVE {}", checked.nonce) {
                 anyhow::bail!("owner declined agent payment");
             }
             // Same validated construction, broadcast and pending accounting as
