@@ -394,10 +394,14 @@ impl Chain {
             let end = (height as usize).saturating_add(1).min(self.blocks.len());
             return Some(self.blocks[..end].to_vec());
         }
-        if height + 1 < self.first_height {
+        // Avoid `height + 1`: callers may supply `u64::MAX`.
+        // `first_height > 0` here, so comparing against its predecessor
+        // expresses the same prune boundary without overflow.
+        let before_first = self.first_height - 1;
+        if height < before_first {
             return None;
         }
-        if height + 1 == self.first_height {
+        if height == before_first {
             return Some(Vec::new());
         }
         let last = height.checked_sub(self.first_height)? as usize;

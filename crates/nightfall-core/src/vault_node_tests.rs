@@ -475,3 +475,177 @@ fn isolated_vault_node_lifecycle() {
         .starts_with("nightfall-vault-node-e2e-"));
     fs::remove_dir_all(root).unwrap();
 }
+
+const DEAD_ENV_ROOT: &str = "NF_DEAD_BRANCH_TEST_ROOT";
+
+/// The 1.0.6 community case, end to end on a real in-process node.
+///
+/// Alice mines on a branch, spends from it, and then the node is resynced
+/// onto a different, *shorter* chain — what "Resync chain, keep wallet" does
+/// for a node stuck on a dead branch. Before 1.0.6 the wallet then waited for
+/// ever (its scan stood above the new tip) and the payment of coins that no
+/// longer exist stayed pending, locking the wallet out of a rescan. Now the
+/// background worker rebases the wallet onto the network's chain and the
+/// impossible payment is released.
+#[test]
+#[ignore = "subprocess helper; invoked only by isolated_dead_branch_recovery"]
+fn dead_branch_child() {
+    let root =
+        PathBuf::from(std::env::var_os(DEAD_ENV_ROOT).expect("test parent supplies private root"));
+    assert!(root.is_absolute() && root.is_dir());
+    assert!(root
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("nightfall-dead-branch-e2e-"));
+    let alice_keys = WalletKeys::from_seed([0; 32]);
+    let bob_keys = WalletKeys::from_seed([1; 32]);
+    let node = NodeHandle::start(NodeConfig {
+        network: NetworkId::Devnet,
+        datadir: root.join("node"),
+        p2p_listen: "127.0.0.1:0".into(),
+        rpc_listen: "127.0.0.1:0".into(),
+        connect: vec![],
+        mine: false,
+        miner: None,
+        proxy: Some("off".into()),
+        mobile_listen: None,
+        peers_url: Some("off".into()),
+        introducer: false,
+        prune: false,
+    })
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while node.status_snapshot().unwrap().loading {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut alice = open_wallet(&root, "alice", 0);
+
+    // The branch the node will later abandon: Alice's coins and a payment
+    // spending them, never mined.
+    mine(&node, &alice_keys.address(), 14);
+    alice.sync_from_node(&node).unwrap();
+    assert_eq!(alice.scanned_to(), 13);
+    let txid = alice
+        .send(
+            &node,
+            &bob_keys.address().encode(),
+            100_000_000,
+            100,
+            "dead-branch payment",
+        )
+        .unwrap();
+    assert!(
+        alice.check_rescan_allowed().is_err(),
+        "the 1.0.5 trap: pending blocks a rescan"
+    );
+
+    // Resync onto the network's chain, which is shorter and not Alice's.
+    node.resync_chain().unwrap();
+    mine(&node, &bob_keys.address(), 5);
+    assert_eq!(node.status_snapshot().unwrap().tip_height, 4);
+    assert!(alice.scanned_past_tip(&node));
+    assert!(crate::wallet_state::chain_settled(&node));
+    let error = alice.sync_from_node(&node).unwrap_err().to_string();
+    assert!(error.contains("already scanned height 13"), "{error}");
+
+    // The production worker takes the way out by itself.
+    let shared_wallet = Arc::new(std::sync::Mutex::new(alice));
+    let signal = Arc::new(std::sync::Mutex::new(None));
+    let syncing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let access = Arc::new(std::sync::Mutex::new(()));
+    let repaired = std::sync::atomic::AtomicU64::new(0);
+    crate::app::run_wallet_scan(
+        &shared_wallet,
+        &node,
+        &signal,
+        &syncing,
+        &paused,
+        &access,
+        &repaired,
+    );
+    assert!(signal.lock().unwrap().take().unwrap().is_ok());
+    assert_eq!(repaired.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let mut alice = Arc::try_unwrap(shared_wallet)
+        .ok()
+        .unwrap()
+        .into_inner()
+        .unwrap();
+    assert_eq!(
+        alice.scanned_to(),
+        4,
+        "the wallet now stands on the network's chain"
+    );
+    assert!(!alice.scanned_past_tip(&node));
+    assert_eq!(
+        alice.balances(4, 10).available,
+        0,
+        "coins mined on the dead branch are gone"
+    );
+    // Still pending: under ten minutes old, so not yet judged.
+    assert!(alice
+        .history()
+        .iter()
+        .any(|e| e.txid == txid && e.is_pending()));
+
+    // An hour later the payment is judged impossible and released.
+    let later = nightfall_storage::now_unix() + 3_600;
+    assert_eq!(alice.release_impossible_sends_at(&node, later).unwrap(), 1);
+    assert!(!alice.history().iter().any(|e| e.txid == txid));
+    alice.check_rescan_allowed().unwrap();
+    // And the wallet is an ordinary one again.
+    mine(&node, &alice_keys.address(), 1);
+    alice.sync_from_node(&node).unwrap();
+    assert_eq!(alice.scanned_to(), 5);
+    assert!(node.shared().lock().unwrap().bootstrap.is_empty());
+    alice.lock_vault();
+}
+
+#[test]
+fn isolated_dead_branch_recovery() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "nightfall-dead-branch-e2e-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&root).unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "vault_node_tests::dead_branch_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(DEAD_ENV_ROOT, &root)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "dead-branch test timed out; fixtures retained at {}",
+                root.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(
+        status.success(),
+        "dead-branch test failed; fixtures retained at {}",
+        root.display()
+    );
+    fs::remove_dir_all(root).unwrap();
+}

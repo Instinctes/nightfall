@@ -8,7 +8,7 @@ use nightfall_consensus::Block;
 use nightfall_crypto::{
     scan_candidate, scan_output, Address, Commitment, ScanCandidate, WalletKeys,
 };
-use nightfall_ledger::{build_transfer, Payment, Spendable, Transaction};
+use nightfall_ledger::{build_transfer, Payment, Spendable, Transaction, MAX_INPUTS};
 use nightfall_storage::write_secret_file;
 use nightfall_types::{Amount, NetworkId};
 use serde::{Deserialize, Serialize};
@@ -980,11 +980,103 @@ impl Wallet {
     /// Returns how many new outputs were discovered.
     pub fn scan_blocks(&mut self, blocks: &[Block]) -> anyhow::Result<u32> {
         self.check_chain_continuity(blocks)?;
+        self.scan_blocks_inner(blocks, false)
+    }
+
+    /// Adopt a node chain that now ends *below* this wallet's scan position.
+    ///
+    /// This is what a chain resync off a dead branch looks like from here: the
+    /// node threw away a branch the wallet had already scanned past, and the
+    /// network's chain is shorter than the abandoned one. The ordinary checks
+    /// are right to refuse that as an incremental page — the wallet would be
+    /// asked to scan a height it has "already" seen — and before 1.0.6 the
+    /// result was a wallet that waited for ever for the node to catch up with
+    /// a branch nobody else was on.
+    ///
+    /// `blocks` must be the node's whole chain from the birth height (or from
+    /// genesis). That is the one range in which absence means absence, so the
+    /// usual reconcile runs over it: outputs the chain no longer contains go,
+    /// spent flags are recomputed, and sends confirmed only on the abandoned
+    /// branch return to pending and are withheld from automatic re-sending.
+    /// Nothing is broadcast.
+    pub fn rebase_on_shorter_chain(&mut self, blocks: &[Block]) -> anyhow::Result<u32> {
+        let first = blocks
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("The node supplied no blocks to rebase on."))?;
+        let start = first.header.height.0;
+        anyhow::ensure!(
+            start == 0 || start == self.db.birth_height,
+            "A rebase needs the chain from the wallet's birth height ({}), not from {start}.",
+            self.db.birth_height
+        );
+        for (i, b) in blocks.iter().enumerate() {
+            anyhow::ensure!(
+                b.header.height.0 == start + i as u64,
+                "The node's chain has a gap at height {}. Nothing was changed.",
+                start + i as u64
+            );
+        }
+        let last = blocks.last().map(|b| b.header.height.0).unwrap_or(start);
+        anyhow::ensure!(
+            last < self.db.scanned_to,
+            "The node's chain reaches {last}, which is not below the wallet's scan at {}. Use an ordinary scan.",
+            self.db.scanned_to
+        );
+        self.scan_blocks_inner(blocks, true)
+    }
+
+    /// Forget sends that provably cannot confirm on the node's current chain,
+    /// and make the coins they were holding spendable again.
+    ///
+    /// The caller decides which ones — it is the side that can see the node's
+    /// UTXO set — and passes the inputs that still exist there in `unspend`.
+    /// An input still claimed by another pending send stays reserved.
+    /// Returns how many history entries were removed.
+    pub fn release_sends(
+        &mut self,
+        txids: &[String],
+        unspend: &BTreeSet<[u8; 32]>,
+    ) -> anyhow::Result<usize> {
+        let before_history = self.db.history.clone();
+        let before_outputs = self.db.outputs.clone();
+        let before = self.db.history.len();
+        self.db.history.retain(|e| {
+            !(e.direction == Direction::Sent && e.is_pending() && txids.contains(&e.txid))
+        });
+        let removed = before - self.db.history.len();
+        if removed == 0 {
+            return Ok(0);
+        }
+        let still_claimed = self.pending_input_commits();
+        for o in self.db.outputs.iter_mut() {
+            if unspend.contains(&o.commit.0) && !still_claimed.contains(&o.commit.0) {
+                o.spent = false;
+            }
+        }
+        if let Err(error) = self.save() {
+            self.db.history = before_history;
+            self.db.outputs = before_outputs;
+            return Err(error);
+        }
+        Ok(removed)
+    }
+
+    fn scan_blocks_inner(
+        &mut self,
+        blocks: &[Block],
+        force_canonical: bool,
+    ) -> anyhow::Result<u32> {
         let view = self.keys.view_key();
         let known: BTreeSet<[u8; 32]> = self.db.outputs.iter().map(|o| o.commit.0).collect();
         let mut found = 0u32;
         let mut spent_commits: BTreeSet<[u8; 32]> = BTreeSet::new();
-        let mut highest = self.scan_from();
+        // A forced canonical pass replaces the scan position outright: the old
+        // one belongs to a branch the node has abandoned.
+        let mut highest = if force_canonical {
+            blocks.first().map(|b| b.header.height.0).unwrap_or(0)
+        } else {
+            self.scan_from()
+        };
         let mut new_history: Vec<HistoryEntry> = Vec::new();
         let mut confirmed: Vec<(String, u64, u64)> = Vec::new();
 
@@ -1092,12 +1184,14 @@ impl Wallet {
         // height 0 is not that — treating it as one dropped every later
         // output, and a sync that stopped after the first page lost them
         // for good.
-        if covers_canonical_history(
-            blocks,
-            self.db.birth_height,
-            self.db.scanned_to,
-            &self.db.outputs,
-        ) {
+        if force_canonical
+            || covers_canonical_history(
+                blocks,
+                self.db.birth_height,
+                self.db.scanned_to,
+                &self.db.outputs,
+            )
+        {
             self.reconcile_with(blocks, &spent_commits);
         }
 
@@ -1517,19 +1611,30 @@ impl Wallet {
         // Largest first, so a payment consumes as few outputs as it can.
         available.sort_by_key(|o| std::cmp::Reverse(o.value));
 
+        let available_total = available
+            .iter()
+            .fold(0u64, |sum, o| sum.saturating_add(o.value));
+
         let mut chosen = Vec::new();
         let mut total = 0u64;
-        for o in available {
+        for o in available.into_iter().take(MAX_INPUTS) {
             if total >= target {
                 break;
             }
             total = total.saturating_add(o.value);
             chosen.push(o.to_spendable(&self.keys)?);
         }
+
         if total < target {
+            if available_total >= target {
+                bail!(
+                    "This payment would need more than {} coins (inputs), the most one transaction may spend. Your balance is spread over many small outputs, such as mining rewards. Send a smaller amount first, or send several payments in parts.",
+                    MAX_INPUTS
+                );
+            }
             bail!(
                 "insufficient funds: have {}, need {}",
-                Amount(total),
+                Amount(available_total),
                 Amount(target)
             );
         }
@@ -3024,6 +3129,46 @@ mod tests {
     }
 
     #[test]
+    fn coin_selection_refuses_fragmented_balance_over_consensus_input_limit() {
+        let keys = WalletKeys::from_seed([7u8; 32]);
+        let mut wallet = Wallet::in_memory(NetworkId::Devnet, keys, 0);
+
+        for i in 0..=MAX_INPUTS {
+            let blind = Scalar::from((i as u64) + 1);
+            wallet.test_insert_output(OwnedOutput {
+                commit: Commitment::new(1, &blind),
+                value: 1,
+                blind_hex: hex::encode(blind.to_bytes()),
+                key_offset_hex: hex::encode(Scalar::ZERO.to_bytes()),
+                memo: String::new(),
+                height: 0,
+                spent: false,
+                is_coinbase: false,
+            });
+        }
+
+        let at_limit = wallet
+            .select_coins(MAX_INPUTS as u64)
+            .expect("exactly MAX_INPUTS inputs must remain selectable");
+        assert_eq!(at_limit.len(), MAX_INPUTS);
+
+        let err = wallet
+            .select_coins(MAX_INPUTS as u64 + 1)
+            .expect_err("MAX_INPUTS + 1 fragmented inputs must be rejected");
+        let message = err.to_string();
+        let limit_message = format!("more than {} coins", MAX_INPUTS);
+
+        assert!(
+            message.contains(&limit_message),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("spread over many small outputs"),
+            "fragmentation must be explicit: {message}"
+        );
+    }
+
+    #[test]
     fn a_reserved_coin_can_still_fund_the_swap_lock() {
         let d = tmpdir("reserved-lock");
         let mut w = Wallet::open(&d, NetworkId::Devnet, "w.seed").unwrap();
@@ -3112,5 +3257,133 @@ mod tests {
         assert!(!wallet.has_reservations());
         drop(wallet);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn branch_block(owner: &Address, height: u64, nonce: u64) -> Block {
+        let ctx = NetworkId::Devnet.proof_context();
+        let reward = 20 * DARKS_PER_NIGHT;
+        let cb = build_coinbase(owner, reward, height, ctx).unwrap();
+        let body = BlockBody::aggregate(&[cb]);
+        let mut ledger = LedgerState::genesis();
+        ledger
+            .apply_block(&body, Height(height), reward, ctx)
+            .unwrap();
+        Block {
+            header: nightfall_consensus::BlockHeader {
+                version: nightfall_types::PROTOCOL_VERSION,
+                height: Height(height),
+                prev_hash: nightfall_types::Hash256::ZERO,
+                body_root: body.hash(),
+                utxo_root: ledger.utxo_root(),
+                kernel_sum: ledger.kernel_sum(),
+                timestamp_unix: 1_800_000_000 + height,
+                difficulty: 1,
+                nonce,
+                reward_darks: reward,
+            },
+            body,
+        }
+    }
+
+    /// The community report behind 1.0.6: a node resynced off a dead branch
+    /// whose tip was *taller* than the network's chain. Every scan asked for
+    /// a height the wallet had "already" seen, and the wallet waited for ever.
+    /// Rebasing on the whole shorter chain must drop the branch's coins, move
+    /// the scan position down, and anchor it on the network's chain.
+    #[test]
+    fn a_wallet_rebases_onto_a_shorter_chain_after_a_dead_branch() {
+        let d = tmpdir("rebase-shorter");
+        let mut w = Wallet::open(&d, NetworkId::Devnet, "w.seed").unwrap();
+        let me = w.address();
+        let stranger = WalletKeys::generate().address();
+        let reward = 20 * DARKS_PER_NIGHT;
+
+        let dead: Vec<Block> = (0..=5).map(|h| branch_block(&me, h, h)).collect();
+        w.scan_blocks(&dead).unwrap();
+        assert_eq!(w.outputs().len(), 6);
+        assert_eq!(w.scanned_to(), 5);
+
+        // The network's chain shares block 0 and is three blocks shorter.
+        let mut net = vec![dead[0].clone()];
+        net.extend((1..=3).map(|h| branch_block(&stranger, h, 100 + h)));
+        // An ordinary page from the overlap is refused or meaningless here;
+        // the rebase is the path.
+        w.rebase_on_shorter_chain(&net).unwrap();
+        assert_eq!(
+            w.outputs().len(),
+            1,
+            "coins mined on the dead branch must go"
+        );
+        assert_eq!(w.balance().darks(), reward);
+        assert_eq!(w.scanned_to(), 3);
+        assert_eq!(w.scan_anchor(), net[3].hash().to_hex());
+
+        // Ordinary paging continues from the new anchor.
+        let next = vec![net[3].clone(), branch_block(&me, 4, 104)];
+        w.scan_blocks(&next).unwrap();
+        assert_eq!(w.scanned_to(), 4);
+        assert_eq!(w.balance().darks(), 2 * reward);
+
+        // A chain that is not shorter is not a rebase.
+        let mut taller = net.clone();
+        taller.push(next[1].clone());
+        taller.push(branch_block(&stranger, 5, 105));
+        assert!(w.rebase_on_shorter_chain(&taller).is_err());
+        // Nor is a range that does not start at the birth height.
+        assert!(w.rebase_on_shorter_chain(&net[1..]).is_err());
+        fs::remove_dir_all(&d).ok();
+    }
+
+    /// Releasing a send that can never confirm returns its surviving inputs,
+    /// except one still claimed by another pending send.
+    #[test]
+    fn releasing_an_impossible_send_returns_only_unclaimed_inputs() {
+        let d = tmpdir("release-sends");
+        let mut w = Wallet::open(&d, NetworkId::Devnet, "w.seed").unwrap();
+        let me = w.address();
+        let blocks: Vec<Block> = (0..=2).map(|h| branch_block(&me, h, h)).collect();
+        w.scan_blocks(&blocks).unwrap();
+        let c: Vec<[u8; 32]> = w.outputs().iter().map(|o| o.commit.0).collect();
+        let pending = |txid: &str, inputs: Vec<[u8; 32]>| HistoryEntry {
+            direction: Direction::Sent,
+            amount: 1,
+            fee: 1,
+            memo: String::new(),
+            height: None,
+            txid: txid.into(),
+            timestamp: 0,
+            spent_commits: inputs,
+            raw: None,
+            quarantined: false,
+        };
+        w.db.history.push(pending("dead", vec![c[0], c[1]]));
+        w.db.history.push(pending("other", vec![c[1]]));
+        for o in w.db.outputs.iter_mut() {
+            if o.commit.0 == c[0] || o.commit.0 == c[1] {
+                o.spent = true;
+            }
+        }
+        let unspend: BTreeSet<[u8; 32]> = [c[0], c[1]].into_iter().collect();
+        assert_eq!(w.release_sends(&["dead".to_string()], &unspend).unwrap(), 1);
+        assert!(!w.history().iter().any(|e| e.txid == "dead"));
+        assert!(w.history().iter().any(|e| e.txid == "other"));
+        let spent = |commit: [u8; 32]| {
+            w.outputs()
+                .iter()
+                .find(|o| o.commit.0 == commit)
+                .unwrap()
+                .spent
+        };
+        assert!(
+            !spent(c[0]),
+            "an input only the released send held must return"
+        );
+        assert!(
+            spent(c[1]),
+            "an input another pending send still claims stays reserved"
+        );
+        // Releasing an unknown or already-released send changes nothing.
+        assert_eq!(w.release_sends(&["dead".to_string()], &unspend).unwrap(), 0);
+        fs::remove_dir_all(&d).ok();
     }
 }

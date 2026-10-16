@@ -10,7 +10,7 @@
 > |---|---|
 > | *Anonymity-set goal: **Protocol-scale / full-set class*** | **Partly delivered.** Blocks now aggregate every transaction into one sorted set, so the anonymity set is every transaction in the block rather than one. Cut-through is still absent and is incompatible with one-sided payments, so spent outputs remain visible and the graph is obscured rather than erased. |
 > | *Network-layer privacy: **Dandelion-class or better*** | **Stem/fluff implemented** over the existing `Tx` message. Optional SOCKS5/Tor for outbound dials. A hop onto a node that still fluffs immediately remains a leak. |
-> | *Bootstrap: **memory-hard / CPU-fair (not SHA-256 ASIC day-one)*** | ✅ **Delivered.** Nighthash-v2 is Argon2id at 32 MiB per hash on mainnet. |
+> | *Bootstrap: **memory-hard / CPU-fair (not SHA-256 ASIC day-one)*** | **Memory-hard: delivered. CPU-fair: no.** Nighthash-v2 is Argon2id at 32 MiB per hash on mainnet, which rules out a SHA-256-style ASIC on day one. GPUs are not shut out: third-party CUDA miners report roughly 10× a desktop CPU (Oct 2026). |
 > | *Max supply **90,000,000*** | Ceiling. v8 curve terminates at **89,999,999.25** (0.75 NIGHT short). |
 >
 > Delivered in v5: mandatory confidential amounts, no on-chain recipient,
