@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIGHTFALL Node Kit: local, redacted, falsifiable operator evidence.
+"""NIGHTFALL Node Evidence: local, redacted, falsifiable operator evidence.
 
 Read-only RPC status and verify_supply; intentionally not a consensus verifier.
 """
@@ -258,7 +258,7 @@ def main():
         return 0
     except (EvidenceError, OSError, ValueError) as ex:
         # Never print a potentially sensitive RPC payload or filesystem contents.
-        print("node kit: " + str(ex), file=sys.stderr)
+        print("node evidence: " + str(ex), file=sys.stderr)
         return 2
 
 

@@ -8,7 +8,7 @@ import tempfile
 import threading
 import unittest
 
-P = pathlib.Path(__file__).with_name("node-kit-evidence.py")
+P = pathlib.Path(__file__).with_name("node-evidence.py")
 S = importlib.util.spec_from_file_location("node_evidence", P)
 kit = importlib.util.module_from_spec(S)
 S.loader.exec_module(kit)

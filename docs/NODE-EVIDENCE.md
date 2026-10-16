@@ -1,7 +1,8 @@
-# Independent Node Kit — redacted operator evidence (experimental)
+# Independent Node Evidence — redacted operator evidence (experimental)
 
 This tool supports the [September 2027 roadmap](https://nightfallcoin.org/roadmap/)
-Node Kit/independence checkpoint. It collects **local, read-only RPC claims**
+independence checkpoint. This evidence probe is separate from the
+`nightfall-nodekit` operator crate and `docs/NODE-KIT.md`. It collects **local, read-only RPC claims**
 into a tightly allowlisted, hash-sealed JSON file. It neither reads wallet
 files nor modifies nodes, peers, mining, chain state or keys.
 
@@ -10,9 +11,13 @@ files nor modifies nodes, peers, mining, chain state or keys.
 Run on the machine operating `nightfalld` (mainnet, protocol 8, wire 6):
 
 ```sh
-python3 scripts/test-node-kit-evidence.py
-python3 scripts/node-kit-evidence.py capture --output local-node.json
+python3 scripts/test-node-evidence.py
+python3 scripts/node-evidence.py capture --output local-node.json
 ```
+
+**Version compatibility:** This probe accepts protocol 8 / wire 6 exactly.
+When either protocol version changes, update the version checks, test
+fixtures and this documentation before using the probe again.
 
 If the local daemon is not running, the probe fails clearly. Exit status is
 0 for ordinary observations, 1 for detected cautions and 2 for failure.
@@ -20,7 +25,7 @@ Repeat on another **independently managed machine**; exchange only the
 redacted receipts, then compare offline:
 
 ```sh
-python3 scripts/node-kit-evidence.py compare local-node.json other-node.json
+python3 scripts/node-evidence.py compare local-node.json other-node.json
 ```
 
 Same height with different reported tip hashes is a meaningful discrepancy;
