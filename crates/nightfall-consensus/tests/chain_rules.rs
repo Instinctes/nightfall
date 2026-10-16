@@ -26,6 +26,7 @@ fn mines_and_accumulates_work() {
     assert!(chain.total_work > w0, "work must accumulate");
     assert_eq!(chain.block_count(), 2);
     chain.verify_supply().unwrap();
+    chain.verify_authenticated_shadow().unwrap();
 }
 
 #[test]
@@ -45,6 +46,14 @@ fn own_disk_replay_matches_full_apply() {
     assert_eq!(fast.total_work, full.total_work);
     assert_eq!(fast.ledger.utxo_root(), full.ledger.utxo_root());
     assert_eq!(fast.ledger.kernel_sum(), full.ledger.kernel_sum());
+
+    assert_eq!(
+        fast.authenticated_utxo_root(),
+        full.authenticated_utxo_root()
+    );
+
+    full.verify_authenticated_shadow().unwrap();
+    fast.verify_authenticated_shadow().unwrap();
     fast.verify_supply().unwrap();
 }
 
@@ -114,6 +123,13 @@ fn heavier_chain_is_adopted() {
         .unwrap());
     assert_eq!(short.tip_hash(), long.tip_hash());
     assert_eq!(short.total_work, long.total_work);
+
+    assert_eq!(
+        short.authenticated_utxo_root(),
+        long.authenticated_utxo_root()
+    );
+
+    short.verify_authenticated_shadow().unwrap();
     short.verify_supply().unwrap();
 }
 
@@ -335,6 +351,14 @@ fn trusted_prefix_rebuild_matches_full_rebuild() {
     assert_eq!(fast.total_work, full.total_work);
     assert_eq!(fast.ledger.utxo_root(), full.ledger.utxo_root());
     assert_eq!(fast.ledger.kernel_sum(), full.ledger.kernel_sum());
+
+    assert_eq!(
+        fast.authenticated_utxo_root(),
+        full.authenticated_utxo_root()
+    );
+
+    fast.verify_authenticated_shadow().unwrap();
+    full.verify_authenticated_shadow().unwrap();
     fast.verify_supply().unwrap();
 }
 
@@ -1023,6 +1047,10 @@ fn prune_keeps_count_and_utxo_drops_old_bodies() {
     let count = chain.block_count();
     let tip = chain.tip_hash();
     let root = chain.ledger.utxo_root();
+    let authenticated_root = chain.authenticated_utxo_root();
+
+    chain.verify_authenticated_shadow().unwrap();
+
     let dropped = chain.prune_keep(4).unwrap();
     assert_eq!(dropped, 8);
     assert!(chain.is_pruned());
@@ -1031,6 +1059,11 @@ fn prune_keeps_count_and_utxo_drops_old_bodies() {
     assert_eq!(chain.block_count(), count);
     assert_eq!(chain.tip_hash(), tip);
     assert_eq!(chain.ledger.utxo_root(), root);
+
+    // Pruning removes historical bodies, not live state.
+    assert_eq!(chain.authenticated_utxo_root(), authenticated_root);
+    chain.verify_authenticated_shadow().unwrap();
+
     assert!(chain.block_by_height(0).is_none());
     assert!(chain.block_by_height(8).is_some());
     assert!(chain.blocks_from(0, 4).is_empty());
@@ -1041,6 +1074,9 @@ fn prune_keeps_count_and_utxo_drops_old_bodies() {
         .unwrap();
     assert_eq!(chain.block_count(), count + 1);
     assert_eq!(chain.blocks.len(), 5);
+
+    // The live shadow must continue advancing correctly after pruning.
+    chain.verify_authenticated_shadow().unwrap();
 }
 
 #[test]
@@ -1074,6 +1110,156 @@ fn prune_reorg_inside_the_window_still_works() {
     assert!(adopted, "heavier suffix inside the window must win");
     assert_eq!(ours.block_count(), 12);
     assert!(ours.is_pruned());
+
+    assert_eq!(ours.tip_hash(), theirs.tip_hash());
+    assert_eq!(ours.ledger.utxo_root(), theirs.ledger.utxo_root());
+    assert_eq!(ours.ledger.kernel_sum(), theirs.ledger.kernel_sum());
+    assert_eq!(
+        ours.authenticated_utxo_root(),
+        theirs.authenticated_utxo_root()
+    );
+
+    ours.verify_authenticated_shadow().unwrap();
+    theirs.verify_authenticated_shadow().unwrap();
+    ours.verify_supply().unwrap();
+}
+
+#[test]
+fn failed_pruned_candidate_rebuild_cannot_touch_live_chain() {
+    let a = WalletKeys::from_seed([31u8; 32]).address();
+    let b = WalletKeys::from_seed([32u8; 32]).address();
+
+    // Four blocks are common history.
+    let mut stem = devnet();
+    for i in 0..4u64 {
+        stem.mine_block(&a, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+
+    // Our branch reaches height 9 and is then pruned so the
+    // retained body window starts exactly at the fork point.
+    let mut ours = stem.clone();
+
+    for i in 4..10u64 {
+        ours.mine_block(&a, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+
+    ours.prune_keep(6).unwrap();
+
+    assert_eq!(ours.first_height, 4);
+    assert!(ours.is_pruned());
+    ours.verify_authenticated_shadow().unwrap();
+
+    // Competing branch is genuinely heavier.
+    let mut theirs = stem;
+
+    for i in 4..12u64 {
+        theirs
+            .mine_block(&b, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+
+    assert!(
+        theirs.total_work > ours.total_work,
+        "fixture must offer a genuinely heavier candidate"
+    );
+
+    // A pruned peer sends only the suffix beginning at our
+    // retained horizon.
+    let mut suffix = theirs.blocks[ours.first_height as usize..].to_vec();
+
+    assert_eq!(suffix.first().unwrap().header.height.0, ours.first_height);
+
+    // Destroy PoW on the LAST block only. All preceding candidate
+    // blocks therefore exercise the pruned rebuild path before the
+    // failure occurs.
+    let params = NetworkId::Devnet.pow_params();
+    let last = suffix.last_mut().unwrap();
+
+    last.header.nonce = last.header.nonce.wrapping_add(1);
+
+    while last.pow_is_valid(params) {
+        last.header.nonce = last.header.nonce.wrapping_add(1);
+    }
+
+    assert!(
+        !last.pow_is_valid(params),
+        "fixture must contain invalid proof of work"
+    );
+
+    // Snapshot every externally relevant part of the active chain.
+    let before_tip = ours.tip_hash();
+    let before_work = ours.total_work;
+    let before_count = ours.block_count();
+    let before_first_height = ours.first_height;
+
+    let before_blocks: Vec<Hash256> = ours.blocks.iter().map(|b| b.hash()).collect();
+
+    let before_headers: Vec<Hash256> = ours.headers.iter().map(|h| h.hash).collect();
+
+    let before_utxo_root = ours.ledger.utxo_root();
+    let before_kernel_sum = ours.ledger.kernel_sum();
+    let before_height = ours.ledger.height;
+    let before_tx_count = ours.ledger.tx_count;
+
+    let before_minted = ours.ledger.supply.total_minted_darks;
+
+    let before_burned = ours.ledger.supply.total_burned_darks;
+
+    let before_shadow_root = ours.authenticated_utxo_root();
+
+    let before_horizon_work = ours.horizon_work;
+
+    let before_horizon_root = ours.horizon.as_ref().map(|h| h.utxo_root());
+
+    // The expensive candidate rebuild must fail outside the active
+    // chain. `maybe_reorg_to` must not partially adopt anything.
+    let result = ours.maybe_reorg_to(suffix, NOW + 20_000);
+
+    assert!(
+        matches!(result, Err(ConsensusError::BadPow)),
+        "invalid pruned suffix must fail on PoW, got {result:?}"
+    );
+
+    // Active chain identity unchanged.
+    assert_eq!(ours.tip_hash(), before_tip);
+    assert_eq!(ours.total_work, before_work);
+    assert_eq!(ours.block_count(), before_count);
+    assert_eq!(ours.first_height, before_first_height);
+
+    assert_eq!(
+        ours.blocks.iter().map(|b| b.hash()).collect::<Vec<_>>(),
+        before_blocks
+    );
+
+    assert_eq!(
+        ours.headers.iter().map(|h| h.hash).collect::<Vec<_>>(),
+        before_headers
+    );
+
+    // Canonical ledger unchanged.
+    assert_eq!(ours.ledger.utxo_root(), before_utxo_root);
+    assert_eq!(ours.ledger.kernel_sum(), before_kernel_sum);
+    assert_eq!(ours.ledger.height, before_height);
+    assert_eq!(ours.ledger.tx_count, before_tx_count);
+
+    assert_eq!(ours.ledger.supply.total_minted_darks, before_minted);
+
+    assert_eq!(ours.ledger.supply.total_burned_darks, before_burned);
+
+    // Pruning horizon unchanged.
+    assert_eq!(ours.horizon_work, before_horizon_work);
+
+    assert_eq!(
+        ours.horizon.as_ref().map(|h| h.utxo_root()),
+        before_horizon_root
+    );
+
+    // Experimental authenticated state unchanged and still valid.
+    assert_eq!(ours.authenticated_utxo_root(), before_shadow_root);
+
+    ours.verify_authenticated_shadow().unwrap();
     ours.verify_supply().unwrap();
 }
 

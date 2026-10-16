@@ -7,7 +7,9 @@ use nightfall_crypto::{
     block_work, default_threads, domain, genesis_commitment, hash_multi, meets_difficulty,
     mine_parallel, nighthash, Address, Commitment,
 };
-use nightfall_ledger::{build_coinbase, BlockBody, LedgerState, Transaction};
+use nightfall_ledger::{
+    authenticated_state::AuthenticatedUtxoTree, build_coinbase, BlockBody, LedgerState, Transaction,
+};
 use nightfall_types::{
     Amount, GenesisConfig, Hash256, Height, NetworkId, PowParams, DARKS_PER_NIGHT,
     HALVING_INTERVAL_BLOCKS, INITIAL_BLOCK_REWARD_NIGHT, MAX_FUTURE_DRIFT_SECS, MAX_SUPPLY_DARKS,
@@ -248,6 +250,17 @@ pub struct Chain {
     pub genesis_hash: Hash256,
     pub emission: EmissionSchedule,
     pub ledger: LedgerState,
+
+    /// Experimental authenticated representation of the canonical live UTXO set.
+    ///
+    /// This is deliberately NOT consensus-active. Protocol v8's
+    /// `BlockHeader::utxo_root` remains authoritative.
+    ///
+    /// The shadow advances only after the canonical ledger transition has
+    /// succeeded on a scratch state. Before commit it must exactly match the
+    /// canonical UTXO map and its incremental root must equal a clean rebuild.
+    authenticated_utxo_shadow: AuthenticatedUtxoTree,
+
     /// Full bodies from [`Self::first_height`] onward. Archive: the whole
     /// chain. Pruned: the reorg window.
     pub blocks: Vec<Block>,
@@ -272,12 +285,17 @@ impl Chain {
             .map_err(|e| ConsensusError::UnfairGenesis(e.to_string()))?;
         let bytes =
             serde_json::to_vec(&genesis).map_err(|e| ConsensusError::Codec(e.to_string()))?;
+
+        let ledger = LedgerState::for_network(network);
+        let authenticated_utxo_shadow = AuthenticatedUtxoTree::from_utxo_set(&ledger.utxos);
+
         Ok(Self {
             network,
             genesis,
             genesis_hash: genesis_commitment(&bytes),
             emission: EmissionSchedule::locked_mainnet(),
-            ledger: LedgerState::for_network(network),
+            ledger,
+            authenticated_utxo_shadow,
             blocks: Vec::new(),
             headers: Vec::new(),
             first_height: 0,
@@ -647,9 +665,17 @@ impl Chain {
             .emission
             .reward_at(block.header.height, self.ledger.supply.total_minted_darks)
             .darks();
-        self.ledger
+        let mut trial = self.ledger.clone();
+        trial
             .apply_block_state_only(&block.body, block.header.height, subsidy)
             .map_err(|e| ConsensusError::Ledger(e.to_string()))?;
+
+        self.authenticated_utxo_shadow
+            .apply_committed_block_shadow(&block.body, block.header.height, &trial.utxos)
+            .map_err(|e| ConsensusError::AuthenticatedState(e.to_string()))?;
+
+        // Canonical and authenticated state advance together.
+        self.ledger = trial;
         self.total_work = self.total_work.saturating_add(block.work());
         self.push_block(block);
         Ok(())
@@ -754,6 +780,16 @@ impl Chain {
         if trial.kernel_sum() != block.header.kernel_sum {
             return Err(ConsensusError::BadKernelSum);
         }
+
+        // --- authenticated shadow transition ---
+        //
+        // The shadow does not validate consensus. It mirrors a block already
+        // accepted by the canonical scratch ledger and cross-checks the
+        // resulting state before the canonical trial becomes live. On failure,
+        // the shadow transition restores itself through its undo journal.
+        self.authenticated_utxo_shadow
+            .apply_committed_block_shadow(&block.body, block.header.height, &trial.utxos)
+            .map_err(|e| ConsensusError::AuthenticatedState(e.to_string()))?;
 
         // --- commit ---
         self.total_work = self.total_work.saturating_add(block.work());
@@ -889,6 +925,8 @@ impl Chain {
         if self.ledger.kernel_sum() != tip.header.kernel_sum {
             return Err(ConsensusError::BadKernelSum);
         }
+
+        self.verify_authenticated_shadow()?;
         Ok(())
     }
 
@@ -1055,6 +1093,11 @@ impl Chain {
     ) -> Result<Self, ConsensusError> {
         let mut chain = Self::new_fair(network)?;
         chain.ledger = base.horizon.clone();
+
+        // A pruned rebuild starts from a materialised canonical horizon.
+        // Reconstruct the shadow from that exact state before suffix replay.
+        chain.authenticated_utxo_shadow = AuthenticatedUtxoTree::from_utxo_set(&chain.ledger.utxos);
+
         chain.horizon = Some(base.horizon);
         chain.horizon_work = base.horizon_work;
         chain.first_height = base.first_height;
@@ -1101,11 +1144,196 @@ impl Chain {
             .map_err(|e| ConsensusError::Ledger(e.to_string()))
     }
 
+    /// Root of the experimental authenticated UTXO shadow.
+    ///
+    /// Diagnostic only. It is not protocol-v8 consensus data.
+    pub fn authenticated_utxo_root(&self) -> Hash256 {
+        self.authenticated_utxo_shadow.root()
+    }
+
+    /// Rebuild the experimental authenticated shadow from the current
+    /// canonical ledger.
+    ///
+    /// This is intentionally explicit rather than part of normal block
+    /// processing. It exists for trusted state-restoration boundaries such
+    /// as loading a validated pruning horizon from disk.
+    ///
+    /// Normal block acceptance must never use this method to hide a shadow
+    /// mismatch: block transitions remain fail-closed and transactional.
+    pub fn rebuild_authenticated_shadow_from_canonical(&mut self) {
+        self.authenticated_utxo_shadow = AuthenticatedUtxoTree::from_utxo_set(&self.ledger.utxos);
+    }
+
+    /// Deep consistency check for the experimental authenticated state.
+    ///
+    /// The clean rebuild is intentionally expensive and currently acts as a
+    /// correctness oracle. Later it can move out of the per-block path.
+    pub fn verify_authenticated_shadow(&self) -> Result<(), ConsensusError> {
+        if !self
+            .authenticated_utxo_shadow
+            .matches_utxo_set(&self.ledger.utxos)
+        {
+            return Err(ConsensusError::AuthenticatedState(
+                "shadow UTXO map differs from canonical ledger".to_string(),
+            ));
+        }
+
+        let rebuilt = AuthenticatedUtxoTree::from_utxo_set(&self.ledger.utxos);
+        let incremental = self.authenticated_utxo_shadow.root();
+        let rebuilt_root = rebuilt.root();
+
+        if incremental != rebuilt_root {
+            return Err(ConsensusError::AuthenticatedState(format!(
+                "incremental root {:?} differs from clean rebuild {:?}",
+                incremental, rebuilt_root
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Re-verify the global supply invariant.
     pub fn verify_supply(&self) -> Result<(), ConsensusError> {
         self.ledger
             .verify_supply()
             .map_err(|e| ConsensusError::Ledger(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod authenticated_shadow_chain_tests {
+    use super::*;
+    use nightfall_crypto::WalletKeys;
+    use nightfall_types::TARGET_BLOCK_TIME_SECS;
+
+    const TEST_NOW: u64 = 1_900_000_000;
+
+    #[test]
+    fn shadow_failure_cannot_partially_commit_a_valid_peer_block() {
+        let miner = WalletKeys::generate().address();
+
+        // Establish one canonical block.
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+        chain.mine_block(&miner, vec![], TEST_NOW).unwrap();
+
+        // Produce a genuinely valid next block from an exact healthy clone.
+        let mut healthy = chain.clone();
+        let candidate = healthy
+            .mine_block(&miner, vec![], TEST_NOW + TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+
+        // Deliberately destroy the experimental shadow only.
+        // Canonical ledger state remains valid.
+        chain.authenticated_utxo_shadow = AuthenticatedUtxoTree::new();
+
+        let before_tip = chain.tip_hash();
+        let before_work = chain.total_work;
+        let before_block_count = chain.block_count();
+        let before_blocks_len = chain.blocks.len();
+        let before_headers_len = chain.headers.len();
+
+        let before_utxo_root = chain.ledger.utxo_root();
+        let before_kernel_sum = chain.ledger.kernel_sum();
+        let before_height = chain.ledger.height;
+        let before_tx_count = chain.ledger.tx_count;
+        let before_minted = chain.ledger.supply.total_minted_darks;
+        let before_burned = chain.ledger.supply.total_burned_darks;
+
+        let before_shadow_root = chain.authenticated_utxo_root();
+
+        // The block itself is valid. The only reason acceptance must fail
+        // is that the authenticated shadow disagrees with canonical state.
+        let error = chain.apply_block(candidate, TEST_NOW + 10_000).unwrap_err();
+
+        assert!(
+            matches!(error, ConsensusError::AuthenticatedState(_)),
+            "unexpected failure: {error:?}"
+        );
+
+        // Canonical chain must be byte-logically unchanged.
+        assert_eq!(chain.tip_hash(), before_tip);
+        assert_eq!(chain.total_work, before_work);
+        assert_eq!(chain.block_count(), before_block_count);
+        assert_eq!(chain.blocks.len(), before_blocks_len);
+        assert_eq!(chain.headers.len(), before_headers_len);
+
+        assert_eq!(chain.ledger.utxo_root(), before_utxo_root);
+        assert_eq!(chain.ledger.kernel_sum(), before_kernel_sum);
+        assert_eq!(chain.ledger.height, before_height);
+        assert_eq!(chain.ledger.tx_count, before_tx_count);
+        assert_eq!(chain.ledger.supply.total_minted_darks, before_minted);
+        assert_eq!(chain.ledger.supply.total_burned_darks, before_burned);
+
+        // Failed transition must also restore the already-corrupt
+        // shadow exactly to its pre-call state.
+        assert_eq!(chain.authenticated_utxo_root(), before_shadow_root);
+
+        // It must remain visibly inconsistent rather than silently
+        // "healing" itself and hiding the corruption.
+        assert!(chain.verify_authenticated_shadow().is_err());
+    }
+
+    #[test]
+    fn shadow_failure_cannot_partially_commit_own_disk_replay() {
+        let miner = WalletKeys::generate().address();
+
+        let mut source = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+        source.mine_block(&miner, vec![], TEST_NOW).unwrap();
+        source
+            .mine_block(&miner, vec![], TEST_NOW + TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+
+        let first = source.blocks[0].clone();
+        let second = source.blocks[1].clone();
+
+        let mut replay = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+        replay.apply_block_from_own_disk(first).unwrap();
+        replay.verify_authenticated_shadow().unwrap();
+
+        // Simulate corrupted/lost authenticated auxiliary state
+        // between two replayed blocks.
+        replay.authenticated_utxo_shadow = AuthenticatedUtxoTree::new();
+
+        let before_tip = replay.tip_hash();
+        let before_work = replay.total_work;
+        let before_block_count = replay.block_count();
+        let before_blocks_len = replay.blocks.len();
+        let before_headers_len = replay.headers.len();
+
+        let before_utxo_root = replay.ledger.utxo_root();
+        let before_kernel_sum = replay.ledger.kernel_sum();
+        let before_height = replay.ledger.height;
+        let before_tx_count = replay.ledger.tx_count;
+        let before_minted = replay.ledger.supply.total_minted_darks;
+        let before_burned = replay.ledger.supply.total_burned_darks;
+
+        let before_shadow_root = replay.authenticated_utxo_root();
+
+        let error = replay.apply_block_from_own_disk(second).unwrap_err();
+
+        assert!(
+            matches!(error, ConsensusError::AuthenticatedState(_)),
+            "unexpected failure: {error:?}"
+        );
+
+        assert_eq!(replay.tip_hash(), before_tip);
+        assert_eq!(replay.total_work, before_work);
+        assert_eq!(replay.block_count(), before_block_count);
+        assert_eq!(replay.blocks.len(), before_blocks_len);
+        assert_eq!(replay.headers.len(), before_headers_len);
+
+        assert_eq!(replay.ledger.utxo_root(), before_utxo_root);
+        assert_eq!(replay.ledger.kernel_sum(), before_kernel_sum);
+        assert_eq!(replay.ledger.height, before_height);
+        assert_eq!(replay.ledger.tx_count, before_tx_count);
+        assert_eq!(replay.ledger.supply.total_minted_darks, before_minted);
+        assert_eq!(replay.ledger.supply.total_burned_darks, before_burned);
+
+        assert_eq!(replay.authenticated_utxo_root(), before_shadow_root);
+
+        assert!(replay.verify_authenticated_shadow().is_err());
     }
 }
 
@@ -1288,6 +1516,8 @@ pub enum ConsensusError {
     Tx(String),
     #[error("ledger: {0}")]
     Ledger(String),
+    #[error("authenticated UTXO shadow: {0}")]
+    AuthenticatedState(String),
     #[error("protocol version {got}, expected {expected}")]
     BadVersion { got: u32, expected: u32 },
     #[error("invalid transaction count")]
