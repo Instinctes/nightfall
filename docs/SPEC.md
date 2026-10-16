@@ -238,6 +238,34 @@ cargo run --release -p nightfall-node --example checkpoint -- <height>
 
 Never add a pin from a single machine. Current pin: height **25,000**.
 
+#### 2.5.1 Checkpoint-state bootstrap
+
+A fresh mainnet datadir may be initialized from portable checkpoint state at
+the newest checkpoint compiled into the binary. This is a startup and
+distribution optimization, not a new consensus authority.
+
+The importer:
+
+- is mainnet-only and requires fresh chain state
+- refuses to run when `NIGHTFALL_NO_ASSUME_VALID` is present
+- requires the snapshot height to equal the newest compiled checkpoint
+- verifies header linkage and the exact compiled checkpoint hash
+- verifies the checkpoint UTXO root, kernel sum and supply invariant
+- reconstructs minted supply from the protocol emission schedule
+- authenticates still-maturity-sensitive coinbase metadata through the
+  corresponding checkpoint-anchored block body roots
+- recomputes cumulative work with checked arithmetic
+- persists the resulting bodyless pruned state with authenticated local
+  semantic seals
+
+The snapshot provider therefore does not add a trust assumption beyond the
+compiled checkpoint policy described above. Blocks after the checkpoint are
+downloaded and fully validated normally.
+
+With the current pin at height 25,000, this optimization removes historical
+body replay only through height 25,000. Moving the pin is a separate review
+and release decision.
+
 ### 2.6 Pruned nodes
 
 A node may drop block **bodies** older than [`MAX_REORG_DEPTH`] (500),
@@ -253,14 +281,19 @@ This is a **local storage policy**, not a consensus rule. A pruned node:
 - cannot serve `GetBlocks` below the prune height — IBD needs an archive
 - cannot rescan stealth outputs from genesis; use an archive node or the
   light API (`scan_feed` on a seed)
-- cannot export a full snapshot
+- cannot export a full archival snapshot; checkpoint-state export also
+  requires an archive chain because it reconstructs state at the compiled pin
 
 `--prune` / Core → Settings → **Prune old blocks**. Seeds that serve IBD
 or `--mobile-listen` stay archives. A pruned datadir that fails its
 validation record cannot re-hash the dropped bodies; resync from a seed.
 
-The same class of assumption as Bitcoin's prune: you trust this node's
-own disk, not a stranger's UTXO snapshot.
+Ordinary pruning trusts this node's own authenticated local state.
+
+Checkpoint-state import is different from blindly trusting a stranger's UTXO
+database: imported state must bind to the compiled mainnet checkpoint and pass
+the header, UTXO-root, kernel-sum, supply, maturity-metadata and cumulative-work
+checks described in §2.5.1.
 
 ### 2.7 On-disk chain format
 
@@ -394,8 +427,10 @@ Deliberately listed in the spec so they are not forgotten.
 
 - **UTXO root is O(n log n) per block.** A Merkle Mountain Range would make it
   incremental.
-- **Startup replays the whole chain.** No headers-first sync, no snapshots, no
-  pruning.
+- **No headers-first P2P sync.** Ordinary archive replay and network catch-up
+  still process historical blocks. Checkpoint-state bootstrap can initialize
+  fresh mainnet state at the compiled pin under the explicit `assumevalid`
+  policy, and pruning exists as the local storage policy described in §2.6.
 - **No multi-asset support.** `asset_id` was removed rather than left as a field
   the value commitment ignored — the v4 arrangement would have permitted
   cross-asset inflation the moment a second asset existed.

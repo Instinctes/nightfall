@@ -46,8 +46,11 @@ These are documented, deliberate, and already on the roadmap:
   payments safe. See [`docs/SPEC.md`](docs/SPEC.md) §7.
 - **No network-layer privacy.** No Dandelion++. The first relaying node is
   probably the origin.
-- **Initial sync is slow.** Memory-hard PoW makes verification expensive by
-  design; there are no UTXO snapshots yet.
+- **Initial sync above the newest compiled checkpoint is still expensive.**
+  Memory-hard PoW makes full validation costly. Checkpoint-state bootstrap can
+  initialize a fresh mainnet datadir at the compiled checkpoint without replaying
+  its historical block bodies. It uses the existing `assumevalid` trust policy
+  and is disabled when `NIGHTFALL_NO_ASSUME_VALID` is present.
 - **Small network.** A young chain with little hashrate can be out-mined. This
   is a property of every new proof-of-work network, not a bug.
 
