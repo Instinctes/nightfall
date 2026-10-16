@@ -8,6 +8,7 @@
 
 mod aggregate;
 mod builder;
+pub mod confidential_state_sum;
 mod tx;
 mod utxo;
 
