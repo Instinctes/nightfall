@@ -57,6 +57,92 @@ fn require_finished_replay(loading: bool) -> anyhow::Result<()> {
 
 /// Call with the node mutex held. A height alone does not establish that the
 /// wallet and node agree on the chain that owns the selected coins.
+/// Has the node finished catching up with the network, so that its chain can
+/// stand for "the" chain?
+///
+/// Decisions that read *absence* from the node's chain — a coin that is not
+/// there, a height it does not reach — are only sound once it has. During a
+/// download, and right after a resync before any peer has reported its
+/// height, the node's chain is merely incomplete. A solo Devnet node with no
+/// peers is its own network.
+pub fn chain_settled(node: &NodeHandle) -> bool {
+    let Ok(status) = node.status_snapshot() else {
+        return false;
+    };
+    let devnet = node
+        .shared()
+        .lock()
+        .map(|g| g.network == NetworkId::Devnet)
+        .unwrap_or(false);
+    settled(&status, devnet)
+}
+
+pub(crate) fn settled(status: &nightfall_node::StatusSnap, devnet: bool) -> bool {
+    if status.loading
+        || status.reorg_in_flight
+        || status.stalled_on_fork
+        || status.blocks_behind > 0
+    {
+        return false;
+    }
+    if status.live_peers > 0 {
+        status.best_peer_height > 0 && status.tip_height >= status.best_peer_height
+    } else {
+        devnet && status.best_peer_height == 0
+    }
+}
+
+/// Is a mempool refusal one that no later block can change?
+///
+/// Spending an immature coinbase or a time-locked kernel becomes valid as the
+/// chain grows, so those wait. Everything else the precheck can say about a
+/// transaction whose inputs all exist — too many inputs, a bad proof or
+/// signature, an output that already exists — is a property of the
+/// transaction and the current chain, and stays true.
+pub(crate) fn permanent_rejection(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    !(error.contains("immature") || error.contains("locked until"))
+}
+
+/// Minimum age before a pending send may be judged impossible.
+const RELEASE_MIN_AGE_SECS: u64 = 600;
+
+/// Which pending sends can never confirm, and which of their inputs still
+/// exist (and should be spendable again). Pure, so the rule is testable
+/// without a node: `in_utxo_set` answers for the node's current chain.
+pub(crate) fn impossible_sends(
+    history: &[HistoryEntry],
+    now: u64,
+    in_utxo_set: impl Fn(&[u8; 32]) -> bool,
+    permanently_rejected: impl Fn(&HistoryEntry) -> bool,
+) -> (Vec<String>, std::collections::BTreeSet<[u8; 32]>) {
+    let mut txids = Vec::new();
+    let mut unspend = std::collections::BTreeSet::new();
+    for entry in history.iter().filter(|e| {
+        e.direction == nightfall_wallet::Direction::Sent
+            && e.is_pending()
+            && !e.spent_commits.is_empty()
+            && now.saturating_sub(e.timestamp) >= RELEASE_MIN_AGE_SECS
+            && e.memo != "swap-lock"
+    }) {
+        let present: Vec<bool> = entry.spent_commits.iter().map(&in_utxo_set).collect();
+        // Every input still exists. The payment can only be impossible if
+        // the chain refuses the transaction itself — for example one that
+        // spends more than 512 inputs (issue #24), which 1.0.5 could build
+        // and which no block may ever contain.
+        if present.iter().all(|p| *p) && !permanently_rejected(entry) {
+            continue;
+        }
+        txids.push(entry.txid.clone());
+        for (commit, here) in entry.spent_commits.iter().zip(present) {
+            if here {
+                unspend.insert(*commit);
+            }
+        }
+    }
+    (txids, unspend)
+}
+
 fn require_canonical_scan(wallet: &Wallet, node: &NodeInner) -> anyhow::Result<()> {
     require_finished_replay(node.is_loading())?;
     let tip = node.chain.tip_height().map(|h| h.0).unwrap_or(0);
@@ -508,6 +594,7 @@ impl WalletState {
     /// nothing new.
     pub fn sync_from_node(&mut self, node: &NodeHandle) -> anyhow::Result<u32> {
         let (found, _) = self.scan_without_relay(node, usize::MAX)?;
+        self.release_impossible_sends(node)?;
         Self::resend_pending(self.require_wallet()?, node)?;
         Ok(found)
     }
@@ -897,7 +984,125 @@ impl WalletState {
     /// Core runs this automatically on its detached scan candidate. Pending
     /// reservations and local metadata survive; no transaction is broadcast.
     /// A confirmed payment revived by the changed chain is quarantined.
+    /// Has the node's chain ended *below* the height this wallet already scanned?
+    ///
+    /// While the node is downloading that is ordinary — the caller must also
+    /// know the node has caught up with its peers before treating it as a
+    /// changed chain. After a resync off a dead branch it is the normal state:
+    /// the abandoned branch can be taller than the network's chain.
+    pub fn scanned_past_tip(&self, node: &NodeHandle) -> bool {
+        let Ok(wallet) = self.require_wallet() else {
+            return false;
+        };
+        if wallet.needs_canonical_pass() || !wallet.has_scanned_history() {
+            return false;
+        }
+        let shared = node.shared();
+        let Ok(guard) = shared.lock() else {
+            return false;
+        };
+        if guard.is_loading() {
+            return false;
+        }
+        let tip = guard.chain.tip_height().map(|h| h.0).unwrap_or(0);
+        guard.chain.block_count() > 0 && wallet.scanned_to() > tip
+    }
+
+    /// Find pending sends that the node's current chain can never accept and
+    /// give their coins back.
+    ///
+    /// A send is impossible when at least one of its inputs is not in the
+    /// node's UTXO set while the wallet is fully scanned to that node's tip:
+    /// had a block taken the payment, the scan would have confirmed it, so the
+    /// input was spent by something else — or never existed on this chain at
+    /// all, which is what coins mined on an abandoned branch look like after
+    /// a resync. No block on this chain can ever include such a payment.
+    ///
+    /// Before 1.0.6 these stayed "pending" for ever and kept every input that
+    /// did still exist locked, which users saw as coins frozen for days.
+    /// Fresh payments (under ten minutes old) are left alone so a just-mined
+    /// block the wallet has not scanned yet can never be misread.
+    pub fn release_impossible_sends(&mut self, node: &NodeHandle) -> anyhow::Result<usize> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.release_impossible_sends_at(node, now)
+    }
+
+    /// [`Self::release_impossible_sends`] with the reader's clock passed in.
+    pub(crate) fn release_impossible_sends_at(
+        &mut self,
+        node: &NodeHandle,
+        now: u64,
+    ) -> anyhow::Result<usize> {
+        if !chain_settled(node) {
+            return Ok(0);
+        }
+        let (txids, unspend) = {
+            let wallet = self.require_wallet()?;
+            let shared = node.shared();
+            let guard = shared
+                .lock()
+                .map_err(|_| anyhow::anyhow!("node state lock poisoned"))?;
+            if require_canonical_scan(wallet, &guard).is_err() {
+                return Ok(0);
+            }
+            impossible_sends(
+                wallet.history(),
+                now,
+                |commit| {
+                    guard
+                        .chain
+                        .ledger
+                        .utxos
+                        .contains(&nightfall_crypto::Commitment(*commit))
+                },
+                |entry| {
+                    let Some(tx) = entry
+                        .raw
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<Transaction>(raw).ok())
+                    else {
+                        return false;
+                    };
+                    match guard.chain.precheck_tx(&tx) {
+                        Ok(()) => false,
+                        Err(error) => permanent_rejection(&error.to_string()),
+                    }
+                },
+            )
+        };
+        if txids.is_empty() {
+            return Ok(0);
+        }
+        let released = self.update(|wallet| wallet.release_sends(&txids, &unspend))?;
+        if released > 0 {
+            tracing::warn!(
+                "released {released} pending payment(s) that the current chain can never confirm"
+            );
+        }
+        Ok(released)
+    }
+
     pub fn reconcile_with_chain(&mut self, node: &NodeHandle) -> anyhow::Result<u32> {
+        if !self.chain_moved_under_scan(node) && self.scanned_past_tip(node) {
+            let from = self.require_wallet()?.birth_height();
+            let page = {
+                let shared = node.shared();
+                let guard = shared
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("node state lock poisoned"))?;
+                require_finished_replay(guard.is_loading())?;
+                anyhow::ensure!(
+                    !(guard.chain.is_pruned() && from < guard.chain.first_height),
+                    "This node is pruned; bodies start at height {}. Reconciling needs the history from {from}. Use an archive node.",
+                    guard.chain.first_height
+                );
+                guard.chain.blocks_from(from, usize::MAX)
+            };
+            return self.update(|wallet| wallet.rebase_on_shorter_chain(&page));
+        }
         anyhow::ensure!(
             self.chain_moved_under_scan(node),
             "This wallet's scan still matches the chain. There is nothing to reconcile."
@@ -963,5 +1168,91 @@ mod scan_readiness_tests {
         );
         // ...including on a fresh wallet, which has no history to prove.
         assert_eq!(canonical_scan_request(false, 0, 0), (0, SCAN_PAGE));
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::impossible_sends;
+    use nightfall_wallet::{Direction, HistoryEntry};
+
+    fn send(txid: &str, inputs: &[u8], timestamp: u64, height: Option<u64>) -> HistoryEntry {
+        HistoryEntry {
+            direction: Direction::Sent,
+            amount: 5,
+            fee: 1,
+            memo: String::new(),
+            height,
+            txid: txid.into(),
+            timestamp,
+            spent_commits: inputs.iter().map(|b| [*b; 32]).collect(),
+            raw: None,
+            quarantined: false,
+        }
+    }
+
+    /// The community report: a payment of coins that exist only on an
+    /// abandoned branch stayed "pending" for days and kept its other inputs
+    /// locked. Inputs absent from the chain's UTXO set mean it can never
+    /// confirm; the inputs that do exist come back.
+    #[test]
+    fn a_send_with_an_input_the_chain_lacks_is_released_and_its_other_inputs_return() {
+        let utxo = |c: &[u8; 32]| c[0] != 2; // input 2 is gone
+        let history = vec![send("dead", &[1, 2], 0, None)];
+        let (txids, unspend) = impossible_sends(&history, 10_000, utxo, |_| false);
+        assert_eq!(txids, vec!["dead".to_string()]);
+        assert!(unspend.contains(&[1; 32]));
+        assert!(!unspend.contains(&[2; 32]));
+    }
+
+    /// Issue #24: a transaction with more inputs than any block may hold.
+    /// Its inputs all exist, so only the chain's own refusal can tell.
+    #[test]
+    fn a_send_the_chain_refuses_outright_is_released_with_all_its_inputs() {
+        let history = vec![send("too-big", &[1, 3], 0, None)];
+        let (txids, unspend) = impossible_sends(&history, 10_000, |_| true, |_| true);
+        assert_eq!(txids, vec!["too-big".to_string()]);
+        assert!(unspend.contains(&[1; 32]) && unspend.contains(&[3; 32]));
+    }
+
+    #[test]
+    fn waiting_for_maturity_or_a_lock_is_not_a_permanent_refusal() {
+        use super::permanent_rejection;
+        assert!(!permanent_rejection(
+            "immature coinbase: created at 5, spend attempted at 9"
+        ));
+        assert!(!permanent_rejection("kernel locked until height 99"));
+        assert!(permanent_rejection(
+            "ledger: transaction 0: too many inputs"
+        ));
+        assert!(permanent_rejection("invalid range proof"));
+    }
+
+    #[test]
+    fn a_send_whose_inputs_all_exist_is_left_pending() {
+        let history = vec![send("live", &[1, 3], 0, None)];
+        let (txids, _) = impossible_sends(&history, 10_000, |_| true, |_| false);
+        assert!(
+            txids.is_empty(),
+            "a valid, unmined payment may still confirm"
+        );
+    }
+
+    #[test]
+    fn fresh_confirmed_and_incoming_entries_are_never_touched() {
+        let mut incoming = send("in", &[4], 0, None);
+        incoming.direction = Direction::Received;
+        let mut swap = send("swap", &[6], 0, None);
+        swap.memo = "swap-lock".into();
+        let history = vec![
+            send("fresh", &[5], 9_900, None), // under ten minutes old
+            send("mined", &[5], 0, Some(42)), // already confirmed
+            incoming,
+            swap,
+            send("empty", &[], 0, None), // pre-0.8.2: no inputs recorded
+        ];
+        let (txids, unspend) = impossible_sends(&history, 10_000, |_| false, |_| true);
+        assert!(txids.is_empty(), "released {txids:?}");
+        assert!(unspend.is_empty());
     }
 }
