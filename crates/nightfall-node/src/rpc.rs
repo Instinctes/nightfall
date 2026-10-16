@@ -90,7 +90,14 @@ pub fn is_loopback_addr(addr: &str) -> bool {
  // before each timeout. This function enforces a deadline across the ENTIRE
  // line while preserving already-buffered pipelined frames.
  fn read_rpc_frame(reader: &mut BufReader<TcpStream>) -> io::Result<Option<Vec<u8>>> {
-     let deadline = Instant::now() + RPC_FRAME_BUDGET;
+     read_rpc_frame_with_budget(reader, RPC_FRAME_BUDGET)
+ }
+
+ fn read_rpc_frame_with_budget(
+     reader: &mut BufReader<TcpStream>,
+     budget: Duration,
+ ) -> io::Result<Option<Vec<u8>>> {
+     let deadline = Instant::now() + budget;
      let mut frame = Vec::with_capacity(1024);
      loop {
          let remaining = deadline.saturating_duration_since(Instant::now());
@@ -779,6 +786,32 @@ mod tests {
         let (stream, _) = listener.accept().unwrap();
         let mut reader = BufReader::new(stream);
         assert_eq!(read_rpc_frame(&mut reader).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn drip_fed_partial_frames_exhaust_absolute_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap();
+        let sender = thread::spawn(move || {
+            let mut stream = TcpStream::connect(port).unwrap();
+            for _ in 0..9 {
+                if stream.write_all(b"x").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(60));
+            }
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        let start = Instant::now();
+        assert_eq!(
+            read_rpc_frame_with_budget(&mut reader, Duration::from_millis(260))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(start.elapsed() < Duration::from_secs(3));
         sender.join().unwrap();
     }
 
