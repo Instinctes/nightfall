@@ -46,6 +46,7 @@ pub struct CheckedIntent {
     pub fee_darks: u64,
     pub memo: String,
     pub nonce: String,
+    pub expires_at: u64,
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path, owner_policy: bool) -> Result<T> {
@@ -161,6 +162,7 @@ pub fn authorize(
         fee_darks: intent.fee_darks,
         memo: intent.memo,
         nonce: intent.nonce,
+        expires_at: intent.expires_at,
     })
 }
 
