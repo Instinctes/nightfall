@@ -17,6 +17,13 @@ or `SHA256SUMS-1.0.6-linux.txt` before running a download. macOS bundles are
 ad-hoc signed for integrity checks, not Developer-ID signed or notarized.
 Windows binaries do not have a publisher signing certificate.
 
+From the release after 1.0.6 on, every file — both DMGs included — is built by
+GitHub Actions and carries a signed build provenance, so you can check which
+workflow built it from which tag:
+`gh attestation verify <file> --repo Instinctes/nightfall`. See
+[docs/RELEASE-PROVENANCE.md](../docs/RELEASE-PROVENANCE.md). That proves where a
+file came from; it does not remove the first-launch warning.
+
 Core starts on mainnet by default and includes a full node, miner and wallet.
 The macOS app bundles include the `nightfalld` and `nightfall-wallet` CLI tools;
 Windows/Linux CLI tools are separate release assets. Close Core completely
