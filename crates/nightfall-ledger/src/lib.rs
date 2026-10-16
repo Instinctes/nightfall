@@ -7,6 +7,7 @@
 //! corrupted the node (audit finding N-01).
 
 mod aggregate;
+pub mod authenticated_state;
 mod builder;
 mod tx;
 mod utxo;
