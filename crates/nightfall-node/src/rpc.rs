@@ -60,13 +60,13 @@ pub fn is_loopback_addr(addr: &str) -> bool {
         .unwrap_or(false)
 }
 
-// PARADIGM CREATOR / RESOURCE SOVEREIGNTY
+// Bound RPC worker resources without changing consensus or authentication.
 // Memory, thread and wall-clock bounds belong at the accept/read boundary.
 // This is process protection, not consensus validation or RPC authentication.
 const MAX_RPC_CONNECTIONS: usize = 32;
 const MAX_RPC_STREAMS: usize = 8;
 const RPC_FRAME_BUDGET: Duration = Duration::from_secs(10);
-const RPC_STREAM_LIFETIME: Duration = Duration::from_secs(600);
+const RPC_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const RPC_CONNECTION_LIFETIME: Duration = Duration::from_secs(600);
 
 struct RpcSlot(Arc<AtomicUsize>);
@@ -109,18 +109,41 @@ fn read_rpc_frame_with_budget(
     reader: &mut BufReader<TcpStream>,
     budget: Duration,
 ) -> io::Result<Option<Vec<u8>>> {
-    let deadline = Instant::now() + budget;
+    read_rpc_frame_with_limits(reader, budget, RPC_IDLE_TIMEOUT)
+}
+
+// Wait for a first byte under a separate idle budget. Once a frame begins,
+// its absolute deadline cannot be extended by slowly trickling more bytes.
+// BufReader may already contain the next pipelined request.
+fn read_rpc_frame_with_limits(
+    reader: &mut BufReader<TcpStream>,
+    budget: Duration,
+    idle_timeout: Duration,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut deadline: Option<Instant> = None;
     let mut frame = Vec::with_capacity(1024);
+
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "RPC frame deadline",
-            ));
-        }
-        reader.get_mut().set_read_timeout(Some(remaining))?;
-        let (used, end) = {
+        let timeout = match deadline {
+            Some(end) => {
+                let remaining = end.saturating_duration_since(Instant::now());
+
+                if remaining.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "RPC frame deadline",
+                    ));
+                }
+                remaining
+            }
+            None => idle_timeout,
+        };
+
+        reader
+            .get_mut()
+            .set_read_timeout(Some(timeout.max(Duration::from_millis(1))))?;
+
+        let (used, complete) = {
             let available = match reader.fill_buf() {
                 Ok(data) => data,
                 Err(e)
@@ -131,7 +154,11 @@ fn read_rpc_frame_with_budget(
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        "RPC frame deadline",
+                        if deadline.is_some() {
+                            "RPC frame deadline"
+                        } else {
+                            "RPC idle timeout"
+                        },
                     ));
                 }
                 Err(e) => return Err(e),
@@ -147,21 +174,37 @@ fn read_rpc_frame_with_budget(
                     ))
                 };
             }
+
+            if let Some(end) = deadline {
+                if Instant::now() >= end {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "RPC frame deadline",
+                    ));
+                }
+            } else {
+                deadline = Some(Instant::now() + budget);
+            }
+
             let used = available
                 .iter()
                 .position(|byte| *byte == b'\n')
                 .map_or(available.len(), |i| i + 1);
+
             if frame.len().saturating_add(used) > MAX_MESSAGE_BYTES {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "request too large",
                 ));
             }
+
             frame.extend_from_slice(&available[..used]);
             (used, frame.last() == Some(&b'\n'))
         };
+
         reader.consume(used);
-        if end {
+
+        if complete {
             return Ok(Some(frame));
         }
     }
@@ -687,14 +730,9 @@ fn handle_scan_subscribe(
         .unwrap_or(256)
         .clamp(1, 1_024) as usize;
     let id = req.id.clone();
-    // Bound live subscriptions too; clients reconnect after this limit.
-    // A stale or malicious subscriber must not reserve a slot indefinitely.
-    let deadline = Instant::now() + RPC_STREAM_LIFETIME;
-
+    // Subscription slots and write timeouts bound resource use. Keep the
+    // stream open because nightfall-wallet follow does not reconnect.
     loop {
-        if Instant::now() >= deadline {
-            break;
-        }
         let snap = scan_feed_snapshot(state, from, limit);
         let scanned_to = snap
             .get("scanned_to")
@@ -720,10 +758,7 @@ fn handle_scan_subscribe(
         };
         if *guard == seen {
             let (g, timeout) = cv
-                .wait_timeout(
-                    guard,
-                    Duration::from_secs(30).min(deadline.saturating_duration_since(Instant::now())),
-                )
+                .wait_timeout(guard, Duration::from_secs(30))
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             if timeout.timed_out() {
                 let heartbeat = ok(
@@ -859,6 +894,63 @@ mod tests {
             io::ErrorKind::TimedOut
         );
         assert!(start.elapsed() < Duration::from_secs(3));
+        sender.join().unwrap();
+    }
+    #[test]
+    fn idle_wait_does_not_consume_the_frame_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (start, ready) = std::sync::mpsc::channel();
+
+        let sender = thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            ready.recv().unwrap();
+            thread::sleep(Duration::from_millis(240));
+            s.write_all(b"{\"id\":4}\n").unwrap();
+        });
+
+        let (stream, _) = listener.accept().unwrap();
+        start.send(()).unwrap();
+        let mut reader = BufReader::new(stream);
+
+        assert_eq!(
+            read_rpc_frame_with_limits(
+                &mut reader,
+                Duration::from_millis(80),
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+            Some(b"{\"id\":4}\n".to_vec()),
+        );
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn completely_idle_connections_expire() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (start, ready) = std::sync::mpsc::channel();
+
+        let sender = thread::spawn(move || {
+            let _s = TcpStream::connect(addr).unwrap();
+            ready.recv().unwrap();
+            thread::sleep(Duration::from_millis(400));
+        });
+
+        let (stream, _) = listener.accept().unwrap();
+        start.send(()).unwrap();
+        let mut reader = BufReader::new(stream);
+
+        assert_eq!(
+            read_rpc_frame_with_limits(
+                &mut reader,
+                Duration::from_millis(40),
+                Duration::from_millis(120),
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::TimedOut,
+        );
         sender.join().unwrap();
     }
 }

@@ -1,4 +1,4 @@
-# Paradigm Creator: resource-sovereign local RPC (experimental)
+# Bounded RPC resource admission (experimental)
 
 ## Threat and boundary
 
@@ -15,9 +15,10 @@ The new admission protocol is intentionally **not consensus-active**:
 | --- | --- | --- |
 | Active RPC sessions | 32 | Reject excess sockets before spawning a worker |
 | Long-lived scan subscriptions | 8 | Reserve at least 24 other session positions |
-| Complete inbound JSON frame | 10 seconds, 4 MiB | Absolute deadline, not reset by trickling bytes |
-| Any RPC session lifetime | 10 minutes | Valid pipelining cannot monopolize a slot forever |
-| Streaming session lifetime | 10 minutes | Subscribers must reconnect on normal expiration |
+| Complete inbound JSON frame | 10 seconds from first byte, 4 MiB | Slow-drip frames cannot extend the deadline |
+| Idle waiting for the next request | 60 seconds | Waiting does not consume the frame deadline |
+| Non-streaming RPC session lifetime | 10 minutes | Valid pipelining cannot monopolize a slot forever |
+| Streaming subscriptions | No fixed lifetime; at most 8 | Existing wallet follow clients remain connected |
 | Write operation | 10 seconds | Stalled receivers do not hold a worker forever |
 
 The existing JSON wire format, RPC names, genesis, validation, mining,
@@ -33,10 +34,10 @@ atomic compare-and-swap and RAII release even on error/unwind.
   a separate correctly configured authentication boundary.
 - A rejected connection is closed without a JSON error to avoid blocking the
   accept loop. Consumers must retry with bounded exponential backoff.
-- A `scan_subscribe` caller must reconnect and resume from its last received
-  height after ten minutes. Some older clients may require a reconnect fix.
-- Tests cover slot exhaustion/reclaim, two pipelined JSON frames, truncated
-  frames and size overflow. A real multi-client soak test is still required
+- `scan_subscribe` stays open for existing `nightfall-wallet follow` clients.
+  Its separate eight-slot limit and write timeout still bound server resources.
+- Tests cover slot exhaustion/reclaim, delayed first bytes, idle timeouts,
+  pipelined JSON frames, truncated frames and size overflow. A real multi-client and 10-minute follow soak test is still required
   before deployment. This module does not prove resistance to network-level
   DDoS or malicious chain data.
 
@@ -51,5 +52,5 @@ cargo clippy --locked -p nightfall-node --all-targets -- -D warnings
 git diff --check
 ```
 
-Security review and a real-device reconnect test are required before merging.
+Security review and a real-client 10-minute follow test are required before merging.
 Do not run fault-injection against live mainnet RPC.
