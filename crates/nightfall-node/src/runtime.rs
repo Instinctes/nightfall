@@ -2109,6 +2109,12 @@ fn peer_io_loop(
                             .blocks_from(from_height, limit.min(MAX_BLOCKS_PER_REQUEST))
                     }
                 };
+                // Count limits alone are insufficient: 128 legitimate
+                // blocks may serialize beyond the receiver's wire-frame cap.
+                // Send the largest prefix that is guaranteed to fit. Clients
+                // paginate short byte-limited pages until the requested count
+                // or actual chain end is reached.
+                let blocks = nightfall_p2p::fit_blocks_response(blocks)?;
                 sess.send(&PeerMsg::Blocks { blocks })?;
             }
 
