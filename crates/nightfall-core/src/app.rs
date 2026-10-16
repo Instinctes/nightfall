@@ -2213,6 +2213,13 @@ fn save_mining_threads(datadir: &std::path::Path, n: usize) {
 }
 
 fn fetch_public_tip() -> Result<(String, u64, String), String> {
+    // A direct HTTPS request would show this machine's address to the site,
+    // which is exactly what the lockdown promises not to do.
+    if nightfall_p2p::privacy_lockdown_enabled() {
+        return Err(
+            "privacy lockdown is on: Core does not contact nightfallcoin.org directly".into(),
+        );
+    }
     let body: serde_json::Value = ureq::get("https://nightfallcoin.org/network.json")
         .timeout(Duration::from_secs(8))
         .call()
