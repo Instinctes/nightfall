@@ -68,6 +68,7 @@ pub fn is_loopback_addr(addr: &str) -> bool {
  const MAX_RPC_STREAMS: usize = 8;
  const RPC_FRAME_BUDGET: Duration = Duration::from_secs(10);
  const RPC_STREAM_LIFETIME: Duration = Duration::from_secs(600);
+ const RPC_CONNECTION_LIFETIME: Duration = Duration::from_secs(600);
 
  struct RpcSlot(Arc<AtomicUsize>);
  impl Drop for RpcSlot {
@@ -178,8 +179,13 @@ fn handle_client(
     stream.set_write_timeout(Some(RPC_FRAME_BUDGET))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
+    // Even a fully valid pipelined client cannot monopolize a slot forever.
+    let deadline = Instant::now() + RPC_CONNECTION_LIFETIME;
 
     loop {
+        if Instant::now() >= deadline {
+            break;
+        }
         let buf = match read_rpc_frame(&mut reader) {
             Ok(Some(frame)) => frame,
             Ok(None) => break,
@@ -764,7 +770,9 @@ mod tests {
             let mut remaining = MAX_MESSAGE_BYTES + 1;
             while remaining > 0 {
                 let n = remaining.min(chunk.len());
-                stream.write_all(&chunk[..n]).unwrap();
+                if stream.write_all(&chunk[..n]).is_err() {
+                    break; // the server correctly closed the overlong connection
+                }
                 remaining -= n;
             }
         });
