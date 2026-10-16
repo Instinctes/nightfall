@@ -21,6 +21,7 @@ mod receipt;
 pub use receipt::{verify_receipt, PaymentReceipt, ReceiptKind, ReceiptProof, RECEIPT_VERSION};
 /// The payment request: what a payee asks for, as one checkable line.
 pub mod air;
+pub mod agent_policy;
 pub mod amount_input;
 pub mod counter;
 pub mod payment_request;
