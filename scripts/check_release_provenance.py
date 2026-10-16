@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Fail-closed validation of Nightfall CI release bytes and signed provenance.
 
-Scope: Linux/Windows CI artifacts only. No claim of audit or reproducibility.
+Scope: CI-built Linux, Windows and macOS release artifacts. Build provenance
+only: no claim of audit, reproducibility, or Apple/Microsoft code signing.
 """
 import argparse
 import hashlib
@@ -15,14 +16,21 @@ WORKFLOW = REPO + "/.github/workflows/release.yml"
 VERSION = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?\Z")
 SUM_LINE = re.compile(r"([0-9a-f]{64})  ([A-Za-z0-9._-]+)\Z")
 PRODUCTS = ("nightfall-core", "nightfalld", "nightfall-wallet")
+PLATFORMS = ("linux", "windows", "macos")
 
 
 def expected_assets(tag, platform):
     if VERSION.fullmatch(tag) is None:
         raise ValueError("unsupported release tag")
-    if platform not in ("linux", "windows"):
-        raise ValueError("platform must be linux or windows")
+    if platform not in PLATFORMS:
+        raise ValueError("platform must be linux, windows or macos")
     version = tag[1:]
+    if platform == "macos":
+        # One DMG per architecture; the list keeps its historical name
+        # SHA256SUMS-<version>.txt, without a platform suffix.
+        binaries = tuple(f"NIGHTFALLCOIN-Core-{version}-macOS-{arch}.dmg"
+                         for arch in ("arm64", "intel"))
+        return binaries, f"SHA256SUMS-{version}.txt"
     ending = "linux-x64" if platform == "linux" else "windows-x64.exe"
     binaries = tuple(f"{name}-{version}-{ending}" for name in PRODUCTS)
     sums = f"SHA256SUMS-{version}-{platform}.txt"
@@ -92,7 +100,7 @@ def verify(folder, tag, platform, run=subprocess.run):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--tag", required=True)
-    p.add_argument("--platform", choices=("linux", "windows"), required=True)
+    p.add_argument("--platform", choices=PLATFORMS, required=True)
     p.add_argument("--directory", required=True)
     args = p.parse_args()
     try:

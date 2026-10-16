@@ -60,6 +60,31 @@ class ReleaseProvenanceTests(unittest.TestCase):
         self.assertEqual(sums, "SHA256SUMS-1.2.3-windows.txt")
         self.assertTrue(all(f.endswith("-windows-x64.exe") for f in files))
 
+    def test_macos_expected_names(self):
+        files, sums = expected_assets("v1.2.3", "macos")
+        self.assertEqual(sums, "SHA256SUMS-1.2.3.txt")
+        self.assertEqual(files, ("NIGHTFALLCOIN-Core-1.2.3-macOS-arm64.dmg",
+                                 "NIGHTFALLCOIN-Core-1.2.3-macOS-intel.dmg"))
+
+    def test_macos_tampered_dmg_rejects(self):
+        dmgs, sums = expected_assets(self.tag, "macos")
+        folder = self.folder / "mac"
+        folder.mkdir()
+        for name in dmgs:
+            (folder / name).write_bytes(b"dmg fixture: " + name.encode())
+        lines = [f"{hashlib.sha256((folder / n).read_bytes()).hexdigest()}  {n}" for n in dmgs]
+        (folder / sums).write_bytes(("\n".join(lines) + "\n").encode())
+        f = Mock(return_value=Mock(returncode=0, stderr=""))
+        verify(folder, self.tag, "macos", run=f)
+        self.assertEqual(f.call_count, 3)
+        (folder / dmgs[0]).write_bytes(b"replaced dmg")
+        with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+            verify(folder, self.tag, "macos", run=f)
+
+    def test_unknown_platform_rejects(self):
+        with self.assertRaises(ValueError):
+            expected_assets("v1.2.3", "android")
+
     def test_tag_injection_rejects(self):
         for bad in ("main", "v1.2", "v1.2.3;echo", "v1.2.3/evil", "v1.2.3\n"):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
