@@ -8,11 +8,17 @@
 
 mod aggregate;
 mod builder;
+mod cutthrough_retention_v1;
+mod cutthrough_v1;
+mod spend_auth;
 mod tx;
 mod utxo;
 
 pub use aggregate::*;
 pub use builder::*;
+pub use cutthrough_retention_v1::*;
+pub use cutthrough_v1::*;
+pub use spend_auth::*;
 pub use tx::*;
 pub use utxo::*;
 
