@@ -12,6 +12,7 @@ members = [
     "crates/nightfall-core",
     "crates/nightfall-mobile",
     "crates/nightfall-web",
+    "crates/nightfall-light-verify",
 ]
 
 [workspace.package]
