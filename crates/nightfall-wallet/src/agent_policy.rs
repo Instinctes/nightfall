@@ -261,8 +261,12 @@ mod tests {
 
     #[test]
     fn rejects_review_spoofing_and_bad_nonces() {
-        for memo in ["\nAPPROVE".to_string(), "\u{1b}[2J".into(),
-                     "a\u{202e}b".into(), "x".repeat(65)] {
+        for memo in [
+            "\nAPPROVE".to_string(),
+            "\u{1b}[2J".into(),
+            "a\u{202e}b".into(),
+            "x".repeat(65),
+        ] {
             let (p, mut i) = good();
             i.memo = memo;
             assert!(!allowed(&p, i, 1050));
@@ -277,9 +281,8 @@ mod tests {
     #[test]
     fn rejects_unknown_fields_and_duplicate_keys() {
         let (p, _) = good();
-        let duplicate = format!(
-            r#"{{"format":"{FORMAT}","format":"{FORMAT}","network":"devnet"}}"#
-        );
+        let duplicate =
+            format!(r#"{{"format":"{FORMAT}","format":"{FORMAT}","network":"devnet"}}"#);
         assert!(serde_json::from_str::<AgentIntent>(&duplicate).is_err());
         let extra = format!(
             r#"{{"format":"{FORMAT}","network":"devnet","wallet":"{}","agent_id":"{}","recipient":"{}","amount_darks":1,"fee_darks":1,"memo":"","nonce":"1234567890abcdef1234567890abcdef","created_at":1000,"expires_at":1100,"execute_shell":"bad"}}"#,
