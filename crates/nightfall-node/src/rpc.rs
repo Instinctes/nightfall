@@ -11,12 +11,12 @@ use nightfall_storage::now_unix;
 use nightfall_types::{Amount, MAX_MESSAGE_BYTES, MAX_SUPPLY_NIGHT, TICKER};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct RpcReq {
@@ -60,6 +60,69 @@ pub fn is_loopback_addr(addr: &str) -> bool {
         .unwrap_or(false)
 }
 
+
+ // PARADIGM CREATOR / RESOURCE SOVEREIGNTY
+ // Memory, thread and wall-clock bounds belong at the accept/read boundary.
+ // This is process protection, not consensus validation or RPC authentication.
+ const MAX_RPC_CONNECTIONS: usize = 32;
+ const MAX_RPC_STREAMS: usize = 8;
+ const RPC_FRAME_BUDGET: Duration = Duration::from_secs(10);
+ const RPC_STREAM_LIFETIME: Duration = Duration::from_secs(600);
+
+ struct RpcSlot(Arc<AtomicUsize>);
+ impl Drop for RpcSlot {
+     fn drop(&mut self) {
+         self.0.fetch_sub(1, Ordering::AcqRel);
+     }
+ }
+
+ fn reserve(counter: &Arc<AtomicUsize>, limit: usize) -> Option<RpcSlot> {
+     counter
+         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+             (n < limit).then_some(n + 1)
+         })
+         .ok()?;
+     Some(RpcSlot(Arc::clone(counter)))
+ }
+
+ // A read_timeout alone is insufficient: an attacker could drip one byte
+ // before each timeout. This function enforces a deadline across the ENTIRE
+ // line while preserving already-buffered pipelined frames.
+ fn read_rpc_frame(reader: &mut BufReader<TcpStream>) -> io::Result<Option<Vec<u8>>> {
+     let deadline = Instant::now() + RPC_FRAME_BUDGET;
+     let mut frame = Vec::with_capacity(1024);
+     loop {
+         let remaining = deadline.saturating_duration_since(Instant::now());
+         if remaining.is_zero() {
+             return Err(io::Error::new(io::ErrorKind::TimedOut, "RPC frame deadline"));
+         }
+         reader.get_mut().set_read_timeout(Some(remaining))?;
+         let (used, end) = {
+             let available = reader.fill_buf()?;
+             if available.is_empty() {
+                 return if frame.is_empty() {
+                     Ok(None)
+                 } else {
+                     Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated RPC frame"))
+                 };
+             }
+             let used = available
+                 .iter()
+                 .position(|byte| *byte == b'\n')
+                 .map_or(available.len(), |i| i + 1);
+             if frame.len().saturating_add(used) > MAX_MESSAGE_BYTES {
+                 return Err(io::Error::new(io::ErrorKind::InvalidData, "request too large"));
+             }
+             frame.extend_from_slice(&available[..used]);
+             (used, frame.last() == Some(&b'\n'))
+         };
+         reader.consume(used);
+         if end {
+             return Ok(Some(frame));
+         }
+     }
+ }
+
 pub fn spawn_rpc(addr: String, state: SharedState) {
     if !is_loopback_addr(&addr) && std::env::var("NF_ALLOW_PUBLIC_RPC").is_err() {
         tracing::error!(
@@ -71,6 +134,8 @@ pub fn spawn_rpc(addr: String, state: SharedState) {
         return;
     }
 
+    let active = Arc::new(AtomicUsize::new(0));
+    let subscriptions = Arc::new(AtomicUsize::new(0));
     thread::spawn(move || {
         let listener = match TcpListener::bind(&addr) {
             Ok(l) => l,
@@ -83,9 +148,17 @@ pub fn spawn_rpc(addr: String, state: SharedState) {
         for conn in listener.incoming() {
             match conn {
                 Ok(stream) => {
+                    // Reject BEFORE spawning: slow clients cannot create
+                    // unbounded blocked threads on a small node.
+                    let Some(slot) = reserve(&active, MAX_RPC_CONNECTIONS) else {
+                        drop(stream);
+                        continue;
+                    };
                     let st = Arc::clone(&state);
+                    let stream_budget = Arc::clone(&subscriptions);
                     thread::spawn(move || {
-                        if let Err(e) = handle_client(stream, st) {
+                        let _slot = slot;
+                        if let Err(e) = handle_client(stream, st, stream_budget) {
                             tracing::debug!("rpc client: {e}");
                         }
                     });
@@ -96,25 +169,27 @@ pub fn spawn_rpc(addr: String, state: SharedState) {
     });
 }
 
-fn handle_client(stream: TcpStream, state: SharedState) -> anyhow::Result<()> {
+fn handle_client(
+    stream: TcpStream,
+    state: SharedState,
+    subscriptions: Arc<AtomicUsize>,
+) -> anyhow::Result<()> {
     stream.set_nodelay(true)?;
+    stream.set_write_timeout(Some(RPC_FRAME_BUDGET))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
 
     loop {
-        // Bounded read: an unbounded one is a trivial memory exhaustion vector.
-        let mut buf = Vec::with_capacity(1024);
-        let n = (&mut reader)
-            .take(MAX_MESSAGE_BYTES as u64 + 1)
-            .read_until(b'\n', &mut buf)?;
-        if n == 0 {
-            break;
-        }
-        if n > MAX_MESSAGE_BYTES {
-            let res = err("request too large", json!(null));
-            writeln!(writer, "{}", serde_json::to_string(&res)?)?;
-            break;
-        }
+        let buf = match read_rpc_frame(&mut reader) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                let res = err("request too large", json!(null));
+                writeln!(writer, "{}", serde_json::to_string(&res)?)?;
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         let text = String::from_utf8_lossy(&buf);
         let req: RpcReq = match serde_json::from_str(text.trim()) {
@@ -126,6 +201,13 @@ fn handle_client(stream: TcpStream, state: SharedState) -> anyhow::Result<()> {
             }
         };
         if req.method == "scan_subscribe" {
+            // Streams may be long-lived, so they consume a SEPARATE,
+            // smaller budget rather than starving ordinary wallet requests.
+            let Some(_stream_slot) = reserve(&subscriptions, MAX_RPC_STREAMS) else {
+                let res = err("too many RPC subscriptions", req.id.clone());
+                writeln!(writer, "{}", serde_json::to_string(&res)?)?;
+                break;
+            };
             handle_scan_subscribe(&req, &state, &mut writer)?;
             break;
         }
@@ -556,8 +638,14 @@ fn handle_scan_subscribe(
         .unwrap_or(256)
         .clamp(1, 1_024) as usize;
     let id = req.id.clone();
+    // Bound live subscriptions too; clients reconnect after this limit.
+    // A stale or malicious subscriber must not reserve a slot indefinitely.
+    let deadline = Instant::now() + RPC_STREAM_LIFETIME;
 
     loop {
+        if Instant::now() >= deadline {
+            break;
+        }
         let snap = scan_feed_snapshot(state, from, limit);
         let scanned_to = snap
             .get("scanned_to")
@@ -583,7 +671,11 @@ fn handle_scan_subscribe(
         };
         if *guard == seen {
             let (g, timeout) = cv
-                .wait_timeout(guard, Duration::from_secs(30))
+                .wait_timeout(
+                    guard,
+                    Duration::from_secs(30)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                )
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             if timeout.timed_out() {
                 let heartbeat = ok(
@@ -621,4 +713,65 @@ mod tests {
         assert!(!is_loopback_addr("192.168.1.5:17881"));
         assert!(!is_loopback_addr("nonsense"));
     }
+    #[test]
+    fn resource_slots_are_atomic_and_reclaimed() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let a = reserve(&active, 2).expect("slot a");
+        let b = reserve(&active, 2).expect("slot b");
+        assert!(reserve(&active, 2).is_none());
+        assert_eq!(active.load(Ordering::Acquire), 2);
+        drop(a);
+        let c = reserve(&active, 2).expect("reclaimed slot");
+        drop(b);
+        drop(c);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn framed_rpc_preserves_pipelining_and_rejects_truncated_frames() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap();
+        let sender = thread::spawn(move || {
+            let mut stream = TcpStream::connect(port).unwrap();
+            stream.write_all(b"{\"id\":1}\n{\"id\":2}\n").unwrap();
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        assert_eq!(read_rpc_frame(&mut reader).unwrap(), Some(b"{\"id\":1}\n".to_vec()));
+        assert_eq!(read_rpc_frame(&mut reader).unwrap(), Some(b"{\"id\":2}\n".to_vec()));
+        assert_eq!(read_rpc_frame(&mut reader).unwrap(), None);
+        sender.join().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap();
+        let sender = thread::spawn(move || {
+            let mut stream = TcpStream::connect(port).unwrap();
+            stream.write_all(b"{\"id\":3}").unwrap();
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        assert_eq!(read_rpc_frame(&mut reader).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn overlong_frames_fail_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap();
+        let sender = thread::spawn(move || {
+            let mut stream = TcpStream::connect(port).unwrap();
+            let chunk = vec![b'x'; 8_192];
+            let mut remaining = MAX_MESSAGE_BYTES + 1;
+            while remaining > 0 {
+                let n = remaining.min(chunk.len());
+                stream.write_all(&chunk[..n]).unwrap();
+                remaining -= n;
+            }
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        assert_eq!(read_rpc_frame(&mut reader).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        sender.join().unwrap();
+    }
+
 }
