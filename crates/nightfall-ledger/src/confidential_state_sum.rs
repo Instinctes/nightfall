@@ -5,8 +5,8 @@
 //! consensus-anchored root and independently verified state transition exist.
 //! This module does not change UTXO validation, consensus, state or wallets.
 
-use curve25519_dalek::traits::Identity;
 use curve25519_dalek::ristretto::RistrettoPoint;
+use curve25519_dalek::traits::Identity;
 use nightfall_crypto::{commit_public_value, hash_multi, Commitment};
 use nightfall_types::{Hash256, MAX_SUPPLY_DARKS};
 
@@ -133,7 +133,10 @@ impl ResearchTree {
     }
 
     pub fn prove(&self, commitment: Commitment) -> Option<(StateLeaf, MembershipProof)> {
-        let index = self.leaves.binary_search_by_key(&commitment.0, |x| x.commitment.0).ok()?;
+        let index = self
+            .leaves
+            .binary_search_by_key(&commitment.0, |x| x.commitment.0)
+            .ok()?;
         let mut offset = index;
         let mut siblings = Vec::with_capacity(self.levels.len().saturating_sub(1));
         for level in self.levels.iter().take(self.levels.len() - 1) {
@@ -155,11 +158,7 @@ impl ResearchTree {
 /// Check a member of an explicitly supplied expected root.
 /// If expected_root came from an untrusted server, the result is only
 /// self-consistency, NOT independently validated blockchain membership.
-pub fn verify_member(
-    leaf: &StateLeaf,
-    proof: &MembershipProof,
-    expected_root: &SumRoot,
-) -> bool {
+pub fn verify_member(leaf: &StateLeaf, proof: &MembershipProof, expected_root: &SumRoot) -> bool {
     if proof.leaf_count == 0
         || proof.leaf_count != expected_root.leaf_count
         || proof.leaf_count > MAX_RESEARCH_LEAVES as u64
@@ -214,8 +213,12 @@ pub fn check_reported_conservation(
     if minted_darks > MAX_SUPPLY_DARKS || burned_darks > minted_darks {
         return false;
     }
-    let Some(utxo_sum) = root.sum.point() else { return false };
-    let Some(kernel_sum) = kernel_excess_sum.point() else { return false };
+    let Some(utxo_sum) = root.sum.point() else {
+        return false;
+    };
+    let Some(kernel_sum) = kernel_excess_sum.point() else {
+        return false;
+    };
     utxo_sum - kernel_sum == commit_public_value(minted_darks - burned_darks)
 }
 
@@ -250,7 +253,12 @@ mod tests {
         let tree = ResearchTree::build(vec![]).unwrap();
         assert_eq!(tree.root().leaf_count, 0);
         assert!(tree.prove(leaf(1).commitment).is_none());
-        assert!(check_reported_conservation(&tree.root(), Commitment::identity(), 0, 0));
+        assert!(check_reported_conservation(
+            &tree.root(),
+            Commitment::identity(),
+            0,
+            0
+        ));
     }
 
     #[test]
@@ -302,7 +310,9 @@ mod tests {
     #[test]
     fn roots_bind_leaf_count_sum_and_metadata() {
         let a = ResearchTree::build(vec![leaf(1), leaf(2)]).unwrap().root();
-        let b = ResearchTree::build(vec![leaf(1), leaf(2), leaf(3)]).unwrap().root();
+        let b = ResearchTree::build(vec![leaf(1), leaf(2), leaf(3)])
+            .unwrap()
+            .root();
         assert_ne!(a.hash, b.hash);
         let mut corrupt = a;
         corrupt.sum = Commitment::identity();
@@ -315,16 +325,26 @@ mod tests {
     fn supply_equation_catches_wrong_amounts_and_kernel() {
         let item = StateLeaf {
             commitment: Commitment::new(100, &Scalar::from(17u64)),
-            output_pk: [42; 32], created_height: 1, coinbase: false,
+            output_pk: [42; 32],
+            created_height: 1,
+            coinbase: false,
         };
         let root = ResearchTree::build(vec![item]).unwrap().root();
-        let kernel = Commitment::from_point(
-            nightfall_crypto::generator_h() * Scalar::from(17u64),
-        );
+        let kernel = Commitment::from_point(nightfall_crypto::generator_h() * Scalar::from(17u64));
         assert!(check_reported_conservation(&root, kernel, 120, 20));
         assert!(!check_reported_conservation(&root, kernel, 121, 20));
-        assert!(!check_reported_conservation(&root, Commitment::identity(), 120, 20));
+        assert!(!check_reported_conservation(
+            &root,
+            Commitment::identity(),
+            120,
+            20
+        ));
         assert!(!check_reported_conservation(&root, kernel, 20, 21));
-        assert!(!check_reported_conservation(&root, kernel, MAX_SUPPLY_DARKS + 1, 0));
+        assert!(!check_reported_conservation(
+            &root,
+            kernel,
+            MAX_SUPPLY_DARKS + 1,
+            0
+        ));
     }
 }
