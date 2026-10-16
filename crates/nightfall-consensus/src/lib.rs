@@ -608,11 +608,12 @@ impl Chain {
         self.apply_block_inner(block, now_unix, false)
     }
 
-    /// Replay a block from this node's own `blocks.jsonl`.
+    /// Replay a block from this node's own persisted chain.
     ///
-    /// Linkage only (height, parent). Proofs, signatures and the supply
-    /// equation already ran when we accepted the block. Used on restart so
-    /// a miner is not stuck for minutes on their own file.
+    /// Proofs, signatures and proof of work already ran when the block was
+    /// accepted. Replay still checks height/parent/checkpoint linkage and
+    /// binds the stored body to the validated header's body root before
+    /// applying its state transition.
     pub fn apply_block_from_own_disk(&mut self, block: Block) -> Result<(), ConsensusError> {
         if block.header.version != PROTOCOL_VERSION {
             return Err(ConsensusError::BadVersion {
@@ -643,6 +644,14 @@ impl Chain {
                 });
             }
         }
+
+        // Block identity is header-only. Even for locally trusted replay,
+        // bind the stored body back to the body root that was validated when
+        // the block was originally accepted.
+        if block.body.hash() != block.header.body_root {
+            return Err(ConsensusError::BadTxRoot);
+        }
+
         let subsidy = self
             .emission
             .reward_at(block.header.height, self.ledger.supply.total_minted_darks)

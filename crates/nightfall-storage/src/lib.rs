@@ -8,7 +8,7 @@
 //! rewrite; the cost grows linearly with height forever (audit finding N-05).
 
 use nightfall_consensus::{Chain, CompactHeader};
-use nightfall_crypto::Commitment;
+use nightfall_crypto::{hash_domain, Commitment};
 use nightfall_ledger::{LedgerState, UtxoEntry, UtxoSet};
 use nightfall_types::{Hash256, Height, NetworkId};
 use serde::{Deserialize, Serialize};
@@ -59,6 +59,12 @@ struct ChainMeta {
     validated_horizon_bytes: u64,
     #[serde(default)]
     validated_headers_bytes: u64,
+    /// Content hash of the pruned UTXO horizon.
+    #[serde(default)]
+    validated_horizon_hash: String,
+    /// Content hash of the compact-header prefix.
+    #[serde(default)]
+    validated_headers_hash: String,
 }
 
 /// Sidecar written next to an exported `blocks.jsonl`.
@@ -77,6 +83,40 @@ pub struct SnapshotManifest {
 
 fn json_format_name() -> String {
     "json".to_string()
+}
+
+const HORIZON_FILE_HASH_DOMAIN: &[u8] = b"nightfall:storage:horizon-file:v1";
+const HEADERS_FILE_HASH_DOMAIN: &[u8] = b"nightfall:storage:headers-file:v1";
+
+fn file_content_hash(path: &Path, domain: &[u8]) -> anyhow::Result<String> {
+    let bytes = fs::read(path)?;
+    Ok(hash_domain(domain, &bytes).to_hex())
+}
+
+/// Sync the parent directory after a rename on Unix so the directory entry
+/// participates in the persistence ordering. File contents are synced separately.
+fn sync_parent_dir(path: &std::path::Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+        File::open(parent)?.sync_all()?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+
+    Ok(())
+}
+
+/// Finish a buffered file before it becomes authoritative on disk.
+fn flush_and_sync(file: &mut BufWriter<File>) -> anyhow::Result<()> {
+    file.flush()?;
+    file.get_ref().sync_all()?;
+    Ok(())
 }
 
 pub struct ChainStore {
@@ -170,6 +210,16 @@ impl ChainStore {
         let validated_headers_bytes = fs::metadata(self.headers_path())
             .map(|m| m.len())
             .unwrap_or(0);
+
+        let (validated_horizon_hash, validated_headers_hash) = if chain.is_pruned() {
+            (
+                file_content_hash(&self.horizon_path(), HORIZON_FILE_HASH_DOMAIN)?,
+                file_content_hash(&self.headers_path(), HEADERS_FILE_HASH_DOMAIN)?,
+            )
+        } else {
+            (String::new(), String::new())
+        };
+
         let meta = ChainMeta {
             network: chain.network,
             genesis_hash: chain.genesis_hash.to_hex(),
@@ -183,10 +233,18 @@ impl ChainStore {
             horizon_work: chain.horizon_work.to_string(),
             validated_horizon_bytes,
             validated_headers_bytes,
+            validated_horizon_hash,
+            validated_headers_hash,
         };
         let tmp = self.dir.join("chain-meta.json.tmp");
-        fs::write(&tmp, serde_json::to_vec_pretty(&meta)?)?;
-        fs::rename(tmp, self.meta_path())?;
+        {
+            let mut file = File::create(&tmp)?;
+            file.write_all(&serde_json::to_vec_pretty(&meta)?)?;
+            file.sync_all()?;
+        }
+        let dst = self.meta_path();
+        fs::rename(&tmp, &dst)?;
+        sync_parent_dir(&dst)?;
         Ok(())
     }
 
@@ -201,37 +259,62 @@ impl ChainStore {
         Some((m.block_count, m.validated_tip, m.genesis_hash))
     }
 
-    /// True when on-disk files are byte-for-byte what this node last validated.
+    /// True when on-disk chain content still matches this node's validation
+    /// record closely enough to use the trusted replay path.
     pub fn is_own_file_trusted(&self) -> bool {
         let Some(m) = self.read_meta() else {
             return false;
         };
         if m.validated_tip.is_empty() {
             return false;
-        }
+        };
+
         // A record from another installation is somebody else's word, not
-        // our own past work. This is the line that makes a downloadable
-        // chain archive safe: ship the blocks, and the receiving node still
-        // checks every one of them.
+        // evidence that this installation validated these files.
         if m.validated_by.is_empty() || m.validated_by != self.install_id() {
             return false;
         }
+
         let bytes = fs::metadata(self.blocks_path())
             .map(|x| x.len())
             .unwrap_or(0);
         if m.validated_bytes != bytes || bytes == 0 {
             return false;
         }
+
         if !m.pruned && m.first_height == 0 {
             return true;
         }
+
         let hz = fs::metadata(self.horizon_path())
             .map(|x| x.len())
             .unwrap_or(0);
         let hd = fs::metadata(self.headers_path())
             .map(|x| x.len())
             .unwrap_or(0);
-        m.validated_horizon_bytes == hz && hz > 0 && m.validated_headers_bytes == hd && hd > 0
+
+        if m.validated_horizon_bytes != hz || hz == 0 || m.validated_headers_bytes != hd || hd == 0
+        {
+            return false;
+        }
+
+        // A pruned chain cannot reconstruct dropped bodies. Old validation
+        // records therefore cannot safely prove that same-size sidecar
+        // modifications did not occur. Fail closed and require a one-time
+        // resync instead of silently creating a new trust anchor.
+        if m.validated_horizon_hash.is_empty() || m.validated_headers_hash.is_empty() {
+            return false;
+        }
+
+        let horizon_ok = file_content_hash(&self.horizon_path(), HORIZON_FILE_HASH_DOMAIN)
+            .map(|got| got == m.validated_horizon_hash)
+            .unwrap_or(false);
+
+        let headers_ok = file_content_hash(&self.headers_path(), HEADERS_FILE_HASH_DOMAIN)
+            .map(|got| got == m.validated_headers_hash)
+            .unwrap_or(false);
+
+        horizon_ok && headers_ok
     }
 
     fn read_meta(&self) -> Option<ChainMeta> {
@@ -422,6 +505,8 @@ impl ChainStore {
             horizon_work: String::new(),
             validated_horizon_bytes: 0,
             validated_headers_bytes: 0,
+            validated_horizon_hash: String::new(),
+            validated_headers_hash: String::new(),
         };
         fs::write(self.meta_path(), serde_json::to_vec_pretty(&meta)?)?;
         let chain = self.load_or_new(network)?;
@@ -504,7 +589,7 @@ impl ChainStore {
         for block in &chain.blocks[on_disk as usize..] {
             codec::write_block(&mut file, block, fmt)?;
         }
-        file.flush()?;
+        flush_and_sync(&mut file)?;
         self.write_meta(chain)?;
         Ok(())
     }
@@ -545,7 +630,7 @@ impl ChainStore {
             for block in chain.blocks.iter().skip(already) {
                 codec::write_block(&mut file, block, fmt)?;
             }
-            file.flush()?;
+            flush_and_sync(&mut file)?;
         }
 
         self.write_meta(chain)?;
@@ -560,9 +645,11 @@ impl ChainStore {
                 serde_json::to_writer(&mut file, h)?;
                 file.write_all(b"\n")?;
             }
-            file.flush()?;
+            flush_and_sync(&mut file)?;
         }
-        fs::rename(tmp, self.headers_path())?;
+        let dst = self.headers_path();
+        fs::rename(&tmp, &dst)?;
+        sync_parent_dir(&dst)?;
         Ok(())
     }
 
@@ -571,8 +658,14 @@ impl ChainStore {
             anyhow::bail!("pruned chain is missing its UTXO horizon");
         };
         let tmp = self.dir.join("utxo-horizon.json.tmp");
-        fs::write(&tmp, serde_json::to_vec(&horizon_to_file(horizon))?)?;
-        fs::rename(tmp, self.horizon_path())?;
+        {
+            let mut file = File::create(&tmp)?;
+            file.write_all(&serde_json::to_vec(&horizon_to_file(horizon))?)?;
+            file.sync_all()?;
+        }
+        let dst = self.horizon_path();
+        fs::rename(&tmp, &dst)?;
+        sync_parent_dir(&dst)?;
         Ok(())
     }
 
@@ -584,9 +677,11 @@ impl ChainStore {
             for block in &chain.blocks {
                 codec::write_block(&mut file, block, fmt)?;
             }
-            file.flush()?;
+            flush_and_sync(&mut file)?;
         }
-        fs::rename(tmp, self.blocks_path())?;
+        let dst = self.blocks_path();
+        fs::rename(&tmp, &dst)?;
+        sync_parent_dir(&dst)?;
         Ok(())
     }
 
@@ -605,9 +700,11 @@ impl ChainStore {
             for block in &chain.blocks {
                 codec::write_block(&mut file, block, fmt)?;
             }
-            file.flush()?;
+            flush_and_sync(&mut file)?;
         }
-        fs::rename(tmp, self.blocks_path())?;
+        let dst = self.blocks_path();
+        fs::rename(&tmp, &dst)?;
+        sync_parent_dir(&dst)?;
         self.write_meta(chain)?;
         Ok(())
     }
@@ -688,9 +785,9 @@ impl ChainStore {
             }
         }
 
-        // Trust our own past validation only if the blocks file is byte-for-byte
-        // what it was when we recorded it. Any edit, truncation or corruption
-        // changes the length and forces a full re-verification.
+        // A matching local validation record permits the fast replay path.
+        // Trusted replay still binds each stored body to its validated header
+        // and checks chain linkage. Pruned sidecars are content-hashed separately.
         let current_bytes = fs::metadata(self.blocks_path())
             .map(|m| m.len())
             .unwrap_or(0);
@@ -1061,6 +1158,242 @@ mod tests {
         loaded.verify_supply().unwrap();
         assert!(loaded.block_by_height(0).is_none());
         assert!(loaded.block_by_height(8).is_some());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn same_size_block_mutation_makes_load_fail_closed() {
+        use nightfall_crypto::WalletKeys;
+
+        let dir = std::env::temp_dir().join(format!("nf-trust-block-load-{}", now_unix()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+        for i in 0..4u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+
+        store.save(&chain).unwrap();
+        assert!(
+            store.is_own_file_trusted(),
+            "setup: freshly written chain should be eligible for trusted replay"
+        );
+
+        let path = store.blocks_path();
+        let format = store.format();
+        assert_eq!(
+            format,
+            Format::Binary,
+            "fresh test datadir should use binary storage"
+        );
+
+        let len_before = fs::metadata(&path).unwrap().len();
+        let mut blocks = codec::read_blocks(File::open(&path).unwrap(), format).unwrap();
+
+        let proof = &mut blocks[0].body.outputs[0].range_proof.0;
+        assert!(!proof.is_empty(), "test output must carry a range proof");
+        proof[0] ^= 0x01;
+
+        {
+            let mut writer = BufWriter::new(File::create(&path).unwrap());
+            for block in &blocks {
+                codec::write_block(&mut writer, block, format).unwrap();
+            }
+            writer.flush().unwrap();
+        }
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            len_before,
+            "test mutation must preserve file length"
+        );
+
+        // Length and the local validation record still allow the fast path.
+        // The replay itself must detect that the body no longer matches the
+        // body root committed by the already-validated header.
+        assert!(
+            store.is_own_file_trusted(),
+            "same-size mutation should reach the trusted replay guard"
+        );
+
+        let result = store.load_or_new(NetworkId::Devnet);
+        assert!(
+            result.is_err(),
+            "trusted replay must reject a body that no longer matches its header"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn same_size_pruned_horizon_mutation_invalidates_own_file_trust() {
+        use nightfall_crypto::WalletKeys;
+
+        let dir = std::env::temp_dir().join(format!("nf-trust-horizon-mutation-{}", now_unix()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+        for i in 0..12u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+
+        chain.prune_keep(4).unwrap();
+        store.save(&chain).unwrap();
+
+        assert!(
+            store.is_own_file_trusted(),
+            "freshly written pruned chain should be trusted"
+        );
+
+        let path = store.horizon_path();
+        let mut raw = fs::read(&path).unwrap();
+        assert!(!raw.is_empty());
+
+        let len_before = raw.len();
+        let index = raw.len() / 2;
+        raw[index] ^= 0x01;
+        fs::write(&path, &raw).unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().len() as usize,
+            len_before,
+            "test mutation must preserve file length"
+        );
+
+        assert!(
+            !store.is_own_file_trusted(),
+            "same-size horizon mutation must invalidate the validation record"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn same_size_pruned_horizon_mutation_makes_load_fail_closed() {
+        use nightfall_crypto::WalletKeys;
+
+        let dir = std::env::temp_dir().join(format!("nf-trust-horizon-load-{}", now_unix()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+        for i in 0..12u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+
+        chain.prune_keep(4).unwrap();
+        store.save(&chain).unwrap();
+
+        assert!(
+            store.is_own_file_trusted(),
+            "setup: freshly written pruned chain should be trusted"
+        );
+
+        let path = store.horizon_path();
+        let mut raw = fs::read(&path).unwrap();
+        let len_before = raw.len();
+
+        let needle = b"\"tx_count\":";
+        let start = raw
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("tx_count field must exist in horizon JSON")
+            + needle.len();
+
+        assert!(
+            raw[start].is_ascii_digit(),
+            "tx_count must begin with an ASCII digit"
+        );
+
+        raw[start] = match raw[start] {
+            b'9' => b'8',
+            digit => digit + 1,
+        };
+
+        let _: HorizonFile =
+            serde_json::from_slice(&raw).expect("mutated horizon must remain valid horizon JSON");
+
+        fs::write(&path, &raw).unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().len() as usize,
+            len_before,
+            "test mutation must preserve file length"
+        );
+
+        assert!(
+            !store.is_own_file_trusted(),
+            "same-size valid-JSON horizon mutation must invalidate trust"
+        );
+
+        let result = store.load_or_new(NetworkId::Devnet);
+        assert!(
+            result.is_err(),
+            "an untrusted pruned datadir must fail closed instead of loading"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn same_size_pruned_headers_mutation_invalidates_own_file_trust() {
+        use nightfall_crypto::WalletKeys;
+
+        let dir = std::env::temp_dir().join(format!("nf-trust-headers-mutation-{}", now_unix()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+        for i in 0..12u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+
+        chain.prune_keep(4).unwrap();
+        store.save(&chain).unwrap();
+
+        assert!(
+            store.is_own_file_trusted(),
+            "freshly written pruned chain should be trusted"
+        );
+
+        let path = store.headers_path();
+        let mut raw = fs::read(&path).unwrap();
+        assert!(!raw.is_empty());
+
+        let len_before = raw.len();
+        let index = raw.len() / 2;
+        raw[index] ^= 0x01;
+        fs::write(&path, &raw).unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().len() as usize,
+            len_before,
+            "test mutation must preserve file length"
+        );
+
+        assert!(
+            !store.is_own_file_trusted(),
+            "same-size headers mutation must invalidate the validation record"
+        );
+
         fs::remove_dir_all(&dir).ok();
     }
 
