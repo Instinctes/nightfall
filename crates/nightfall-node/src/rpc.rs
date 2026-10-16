@@ -60,76 +60,112 @@ pub fn is_loopback_addr(addr: &str) -> bool {
         .unwrap_or(false)
 }
 
+// PARADIGM CREATOR / RESOURCE SOVEREIGNTY
+// Memory, thread and wall-clock bounds belong at the accept/read boundary.
+// This is process protection, not consensus validation or RPC authentication.
+const MAX_RPC_CONNECTIONS: usize = 32;
+const MAX_RPC_STREAMS: usize = 8;
+const RPC_FRAME_BUDGET: Duration = Duration::from_secs(10);
+const RPC_STREAM_LIFETIME: Duration = Duration::from_secs(600);
+const RPC_CONNECTION_LIFETIME: Duration = Duration::from_secs(600);
 
- // PARADIGM CREATOR / RESOURCE SOVEREIGNTY
- // Memory, thread and wall-clock bounds belong at the accept/read boundary.
- // This is process protection, not consensus validation or RPC authentication.
- const MAX_RPC_CONNECTIONS: usize = 32;
- const MAX_RPC_STREAMS: usize = 8;
- const RPC_FRAME_BUDGET: Duration = Duration::from_secs(10);
- const RPC_STREAM_LIFETIME: Duration = Duration::from_secs(600);
- const RPC_CONNECTION_LIFETIME: Duration = Duration::from_secs(600);
+struct RpcSlot(Arc<AtomicUsize>);
+impl Drop for RpcSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
- struct RpcSlot(Arc<AtomicUsize>);
- impl Drop for RpcSlot {
-     fn drop(&mut self) {
-         self.0.fetch_sub(1, Ordering::AcqRel);
-     }
- }
+fn reserve(counter: &Arc<AtomicUsize>, limit: usize) -> Option<RpcSlot> {
+    let mut current = counter.load(Ordering::Acquire);
 
- fn reserve(counter: &Arc<AtomicUsize>, limit: usize) -> Option<RpcSlot> {
-     counter
-         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-             (n < limit).then_some(n + 1)
-         })
-         .ok()?;
-     Some(RpcSlot(Arc::clone(counter)))
- }
+    loop {
+        if current >= limit {
+            return None;
+        }
 
- // A read_timeout alone is insufficient: an attacker could drip one byte
- // before each timeout. This function enforces a deadline across the ENTIRE
- // line while preserving already-buffered pipelined frames.
- fn read_rpc_frame(reader: &mut BufReader<TcpStream>) -> io::Result<Option<Vec<u8>>> {
-     read_rpc_frame_with_budget(reader, RPC_FRAME_BUDGET)
- }
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                return Some(RpcSlot(Arc::clone(counter)));
+            }
+            Err(actual) => current = actual,
+        }
+    }
+}
 
- fn read_rpc_frame_with_budget(
-     reader: &mut BufReader<TcpStream>,
-     budget: Duration,
- ) -> io::Result<Option<Vec<u8>>> {
-     let deadline = Instant::now() + budget;
-     let mut frame = Vec::with_capacity(1024);
-     loop {
-         let remaining = deadline.saturating_duration_since(Instant::now());
-         if remaining.is_zero() {
-             return Err(io::Error::new(io::ErrorKind::TimedOut, "RPC frame deadline"));
-         }
-         reader.get_mut().set_read_timeout(Some(remaining))?;
-         let (used, end) = {
-             let available = reader.fill_buf()?;
-             if available.is_empty() {
-                 return if frame.is_empty() {
-                     Ok(None)
-                 } else {
-                     Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated RPC frame"))
-                 };
-             }
-             let used = available
-                 .iter()
-                 .position(|byte| *byte == b'\n')
-                 .map_or(available.len(), |i| i + 1);
-             if frame.len().saturating_add(used) > MAX_MESSAGE_BYTES {
-                 return Err(io::Error::new(io::ErrorKind::InvalidData, "request too large"));
-             }
-             frame.extend_from_slice(&available[..used]);
-             (used, frame.last() == Some(&b'\n'))
-         };
-         reader.consume(used);
-         if end {
-             return Ok(Some(frame));
-         }
-     }
- }
+// A read_timeout alone is insufficient: an attacker could drip one byte
+// before each timeout. This function enforces a deadline across the ENTIRE
+// line while preserving already-buffered pipelined frames.
+fn read_rpc_frame(reader: &mut BufReader<TcpStream>) -> io::Result<Option<Vec<u8>>> {
+    read_rpc_frame_with_budget(reader, RPC_FRAME_BUDGET)
+}
+
+fn read_rpc_frame_with_budget(
+    reader: &mut BufReader<TcpStream>,
+    budget: Duration,
+) -> io::Result<Option<Vec<u8>>> {
+    let deadline = Instant::now() + budget;
+    let mut frame = Vec::with_capacity(1024);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "RPC frame deadline",
+            ));
+        }
+        reader.get_mut().set_read_timeout(Some(remaining))?;
+        let (used, end) = {
+            let available = match reader.fill_buf() {
+                Ok(data) => data,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "RPC frame deadline",
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
+
+            if available.is_empty() {
+                return if frame.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated RPC frame",
+                    ))
+                };
+            }
+            let used = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |i| i + 1);
+            if frame.len().saturating_add(used) > MAX_MESSAGE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "request too large",
+                ));
+            }
+            frame.extend_from_slice(&available[..used]);
+            (used, frame.last() == Some(&b'\n'))
+        };
+        reader.consume(used);
+        if end {
+            return Ok(Some(frame));
+        }
+    }
+}
 
 pub fn spawn_rpc(addr: String, state: SharedState) {
     if !is_loopback_addr(&addr) && std::env::var("NF_ALLOW_PUBLIC_RPC").is_err() {
@@ -686,8 +722,7 @@ fn handle_scan_subscribe(
             let (g, timeout) = cv
                 .wait_timeout(
                     guard,
-                    Duration::from_secs(30)
-                        .min(deadline.saturating_duration_since(Instant::now())),
+                    Duration::from_secs(30).min(deadline.saturating_duration_since(Instant::now())),
                 )
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             if timeout.timed_out() {
@@ -750,8 +785,14 @@ mod tests {
         });
         let (stream, _) = listener.accept().unwrap();
         let mut reader = BufReader::new(stream);
-        assert_eq!(read_rpc_frame(&mut reader).unwrap(), Some(b"{\"id\":1}\n".to_vec()));
-        assert_eq!(read_rpc_frame(&mut reader).unwrap(), Some(b"{\"id\":2}\n".to_vec()));
+        assert_eq!(
+            read_rpc_frame(&mut reader).unwrap(),
+            Some(b"{\"id\":1}\n".to_vec())
+        );
+        assert_eq!(
+            read_rpc_frame(&mut reader).unwrap(),
+            Some(b"{\"id\":2}\n".to_vec())
+        );
         assert_eq!(read_rpc_frame(&mut reader).unwrap(), None);
         sender.join().unwrap();
 
@@ -763,7 +804,10 @@ mod tests {
         });
         let (stream, _) = listener.accept().unwrap();
         let mut reader = BufReader::new(stream);
-        assert_eq!(read_rpc_frame(&mut reader).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            read_rpc_frame(&mut reader).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
         sender.join().unwrap();
     }
 
@@ -785,7 +829,10 @@ mod tests {
         });
         let (stream, _) = listener.accept().unwrap();
         let mut reader = BufReader::new(stream);
-        assert_eq!(read_rpc_frame(&mut reader).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            read_rpc_frame(&mut reader).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
         sender.join().unwrap();
     }
 
@@ -814,5 +861,4 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(3));
         sender.join().unwrap();
     }
-
 }
