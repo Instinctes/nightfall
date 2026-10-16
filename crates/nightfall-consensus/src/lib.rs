@@ -676,6 +676,11 @@ impl Chain {
         if block.body.outputs.is_empty() || block.body.kernels.is_empty() {
             return Err(ConsensusError::BadTxCount);
         }
+        if block.body.exceeds_size_limits() {
+            return Err(ConsensusError::Ledger(
+                nightfall_ledger::LedgerError::BlockTooLarge.to_string(),
+            ));
+        }
         if block.header.height != self.next_height() {
             return Err(ConsensusError::BadHeight);
         }

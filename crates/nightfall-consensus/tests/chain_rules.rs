@@ -1194,3 +1194,30 @@ fn bodies_through_handles_max_height_after_pruning() {
     assert_eq!(chain.bodies_through(1), Some(Vec::new()));
     assert!(chain.bodies_through(0).is_none());
 }
+
+#[test]
+fn oversized_block_is_rejected_before_pow() {
+    let mut chain = devnet();
+    let miner = WalletKeys::generate().address();
+
+    // Start from a structurally normal template, but deliberately do not mine it.
+    let mut block = chain.build_template(&miner, vec![], NOW).unwrap().seal(0);
+
+    // Exceed an existing consensus aggregate limit. The duplicated outputs do
+    // not need to be otherwise valid: size must win before PoW or ledger crypto.
+    let output = block.body.outputs[0].clone();
+    block
+        .body
+        .outputs
+        .resize(nightfall_ledger::MAX_BLOCK_OUTPUTS + 1, output);
+
+    let res = chain.apply_block(block, NOW);
+    assert!(
+        matches!(
+            res,
+            Err(ConsensusError::Ledger(ref msg))
+                if msg == &nightfall_ledger::LedgerError::BlockTooLarge.to_string()
+        ),
+        "oversized body must be rejected before proof of work, got {res:?}"
+    );
+}

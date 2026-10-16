@@ -100,10 +100,7 @@ impl LedgerState {
         if !body.is_canonical() {
             return Err(LedgerError::NonCanonicalOrder);
         }
-        if body.inputs.len() > MAX_BLOCK_INPUTS
-            || body.outputs.len() > MAX_BLOCK_OUTPUTS
-            || body.kernels.len() > MAX_BLOCK_KERNELS
-        {
+        if body.exceeds_size_limits() {
             return Err(LedgerError::BlockTooLarge);
         }
 

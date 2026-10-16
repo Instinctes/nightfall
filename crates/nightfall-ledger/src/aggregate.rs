@@ -40,6 +40,7 @@
 //! closing it. Closing it needs a proof system that can authorise a spend
 //! without publishing a per-input signature.
 
+use crate::{MAX_BLOCK_INPUTS, MAX_BLOCK_KERNELS, MAX_BLOCK_OUTPUTS};
 use nightfall_crypto::{domain, hash_multi, Commitment, KernelFeature, Output, TxKernel};
 use nightfall_types::Hash256;
 use serde::{Deserialize, Serialize};
@@ -55,6 +56,13 @@ pub struct BlockBody {
 }
 
 impl BlockBody {
+    /// Cheap structural bound used before expensive cryptographic validation.
+    pub fn exceeds_size_limits(&self) -> bool {
+        self.inputs.len() > MAX_BLOCK_INPUTS
+            || self.outputs.len() > MAX_BLOCK_OUTPUTS
+            || self.kernels.len() > MAX_BLOCK_KERNELS
+    }
+
     /// Merge transactions into one aggregate and sort it canonically.
     ///
     /// The coinbase transaction is folded in exactly like any other; it is
