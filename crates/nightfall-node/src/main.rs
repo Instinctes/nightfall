@@ -99,6 +99,17 @@ enum Commands {
         #[arg(long)]
         from: PathBuf,
     },
+    /// Controlled offline escape hatch for a node stuck on a dead fork.
+    ///
+    /// This does not rewrite consensus history and does not touch wallet keys.
+    /// It moves local chain files into a timestamped backup directory, creates
+    /// a fresh genesis chain in the same storage format, and lets the operator
+    /// resync from peers on the next run.
+    RecoverStalledFork {
+        /// Required because this moves local chain files aside.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -241,6 +252,12 @@ fn main() -> anyhow::Result<()> {
             let chain = store.import_snapshot(&from, network)?;
             print_status(&chain, &datadir, network, 0, 0);
         }
+        Commands::RecoverStalledFork { force } => {
+            let backup = recover_stalled_fork(&datadir, network, force)?;
+            println!("recovery....... staged");
+            println!("backup......... {}", backup.display());
+            println!("next........... start `nightfalld run` and resync from peers");
+        }
         Commands::Run {
             listen,
             rpc_listen,
@@ -325,6 +342,53 @@ fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn recover_stalled_fork(
+    datadir: &std::path::Path,
+    network: NetworkId,
+    force: bool,
+) -> anyhow::Result<PathBuf> {
+    if !force {
+        anyhow::bail!(
+            "refusing to move chain files without --force. This command is an offline recovery escape hatch for a stalled fork."
+        );
+    }
+
+    let store = ChainStore::new(datadir);
+    store.ensure_dir()?;
+
+    let blocks = store.blocks_path();
+    if !blocks.exists() {
+        anyhow::bail!(
+            "no chain file found at {} — nothing to recover",
+            blocks.display()
+        );
+    }
+
+    let stamp = now_unix();
+    let backup = store
+        .dir
+        .join(format!("stalled-fork-recovery-backup-{stamp}"));
+    fs::create_dir_all(&backup)?;
+
+    let format = store.format();
+    let chain_file_name = format.file_name();
+
+    fs::rename(&blocks, backup.join(chain_file_name))?;
+    fs::write(&blocks, b"")?;
+
+    for name in ["chain-meta.json", "headers.jsonl", "utxo-horizon.json"] {
+        let src = store.dir.join(name);
+        if src.exists() {
+            fs::rename(&src, backup.join(name))?;
+        }
+    }
+
+    let fresh = nightfall_consensus::Chain::new_fair(network)?;
+    store.save(&fresh)?;
+
+    Ok(backup)
 }
 
 fn resolve(datadir: &std::path::Path, p: &PathBuf) -> PathBuf {
@@ -418,5 +482,66 @@ fn load_or_create_miner(path: &PathBuf) -> anyhow::Result<WalletKeys> {
         nightfall_storage::write_secret_file(path, &hex::encode(keys.seed))?;
         println!("wrote new miner seed {} (mode 0600)", path.display());
         Ok(keys)
+    }
+}
+
+#[cfg(test)]
+mod recover_stalled_fork_cli_tests {
+    use super::*;
+    use std::path::Path;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let p =
+                std::env::temp_dir().join(format!("{tag}-{}-{}", std::process::id(), now_unix()));
+            std::fs::create_dir_all(&p).expect("create tempdir");
+            Self(p)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn stalled_fork_recovery_requires_force() {
+        let dir = TempDir::new("nf-recovery-requires-force");
+        let store = ChainStore::new(dir.path());
+        let chain = nightfall_consensus::Chain::new_fair(NetworkId::Devnet).unwrap();
+        store.save(&chain).unwrap();
+
+        let err = recover_stalled_fork(dir.path(), NetworkId::Devnet, false)
+            .expect_err("recovery without --force must fail")
+            .to_string();
+
+        assert!(err.contains("--force"), "error should mention force: {err}");
+    }
+
+    #[test]
+    fn stalled_fork_recovery_backs_up_chain_and_creates_fresh_chain() {
+        let dir = TempDir::new("nf-recovery-backup");
+        let store = ChainStore::new(dir.path());
+        let chain = nightfall_consensus::Chain::new_fair(NetworkId::Devnet).unwrap();
+        store.save(&chain).unwrap();
+
+        assert!(store.blocks_path().exists());
+
+        let backup = recover_stalled_fork(dir.path(), NetworkId::Devnet, true)
+            .expect("forced recovery succeeds");
+
+        assert!(backup.is_dir());
+        assert!(backup.join(store.format().file_name()).exists());
+        assert!(store.blocks_path().exists());
+
+        let recovered = store.load_or_new(NetworkId::Devnet).unwrap();
+        assert!(recovered.verify_supply().is_ok());
     }
 }
