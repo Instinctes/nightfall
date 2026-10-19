@@ -11,6 +11,8 @@ use nightfall_types::{
 };
 use std::fs;
 use std::path::PathBuf;
+mod recovery;
+
 use std::thread;
 use std::time::Duration;
 
@@ -24,8 +26,8 @@ struct Cli {
     #[arg(long, global = true)]
     datadir: Option<PathBuf>,
 
-    #[arg(long, value_enum, global = true, default_value_t = Net::Devnet)]
-    network: Net,
+    #[arg(long, value_enum, global = true)]
+    network: Option<Net>,
 
     #[command(subcommand)]
     command: Commands,
@@ -99,6 +101,11 @@ enum Commands {
         #[arg(long)]
         from: PathBuf,
     },
+    /// Offline-only rescue. Requires explicit network, datadir and --force.
+    RecoverStalledFork {
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -125,7 +132,26 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let network: NetworkId = cli.network.into();
+    if matches!(&cli.command, Commands::RecoverStalledFork { .. })
+        && (cli.datadir.is_none() || cli.network.is_none())
+    {
+        anyhow::bail!("recovery requires explicit --network and --datadir");
+    }
+    if matches!(&cli.command, Commands::RecoverStalledFork { .. }) {
+        let metadata = fs::symlink_metadata(cli.datadir.as_ref().unwrap())?;
+        if !metadata.file_type().is_dir() {
+            anyhow::bail!("recovery datadir must be an existing non-linked directory");
+        }
+        let lock_path = cli.datadir.as_ref().unwrap().join(".nightfall-lock");
+        match fs::symlink_metadata(&lock_path) {
+            Ok(m) if !m.file_type().is_file() => {
+                anyhow::bail!("recovery refuses linked/non-regular lockfile")
+            }
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+    }
+    let network: NetworkId = cli.network.unwrap_or(Net::Devnet).into();
     let datadir = cli.datadir.unwrap_or_else(|| default_data_dir(network));
 
     // One writer per data directory. The wallet takes the same lock, so a
@@ -234,6 +260,15 @@ fn main() -> anyhow::Result<()> {
             );
             println!("verified....... every block hash matched before the swap");
             println!("kept........... blocks.jsonl.pre-binary — delete when happy");
+        }
+        Commands::RecoverStalledFork { force } => {
+            if !force {
+                anyhow::bail!("recovery requires --force");
+            }
+            let backup = recovery::recover(&datadir, network)?;
+            println!("backup......... {}", backup.display());
+            println!("success........ offline recovery completed");
+            println!("next........... start nightfalld run with --network and --datadir WITHOUT --mine; wait for full sync");
         }
         Commands::ImportSnapshot { from } => {
             println!("importing...... {}", from.display());
