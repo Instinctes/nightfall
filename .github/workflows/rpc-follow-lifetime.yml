@@ -5,6 +5,16 @@ on:
     paths:
       - 'scripts/test_rpc_follow_lifetime.py'
       - '.github/workflows/rpc-follow-lifetime.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/nightfall-node/**'
+      - 'crates/nightfall-wallet/**'
+      - 'crates/nightfall-types/**'
+      - 'crates/nightfall-crypto/**'
+      - 'crates/nightfall-ledger/**'
+      - 'crates/nightfall-consensus/**'
+      - 'crates/nightfall-storage/**'
+      - 'crates/nightfall-p2p/**'
   workflow_dispatch:
 
 jobs:
