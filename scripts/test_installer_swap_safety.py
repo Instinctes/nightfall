@@ -31,37 +31,37 @@ class SwapLifecycleTests(unittest.TestCase):
             events = root / "events"
             # A file with the old fixed name must not be deleted or rewritten.
             old_file = root / "nightfall-build.swap"
-            old_file.write_bytes(b"pre-existing operator data\\n")
+            old_file.write_bytes(b"pre-existing operator data\n")
             for name in ("fallocate", "dd", "mkswap", "swapon", "swapoff"):
                 executable = bin_dir / name
                 executable.write_text(
-                    '#!/bin/sh\\n'
-                    'printf "%s %s\\\\n" "$(basename "$0")" "$*" >> "$EVENTS"\\n'
-                    'case "$(basename "$0")" in\\n'
-                    '  fallocate) exit "$ALLOC_RC";;\\n'
-                    '  dd) exit 1;;\\n'
-                    '  mkswap) exit "$MKSWAP_RC";;\\n'
-                    '  swapon) exit "$SWAPON_RC";;\\n'
-                    'esac\\nexit 0\\n', encoding="utf-8"
+                    '#!/bin/sh\n'
+                    'printf "%s %s\\n" "$(basename "$0")" "$*" >> "$EVENTS"\n'
+                    'case "$(basename "$0")" in\n'
+                    '  fallocate) exit "$ALLOC_RC";;\n'
+                    '  dd) exit 1;;\n'
+                    '  mkswap) exit "$MKSWAP_RC";;\n'
+                    '  swapon) exit "$SWAPON_RC";;\n'
+                    'esac\nexit 0\n', encoding="utf-8"
                 )
                 executable.chmod(0o700)
             fragment = swap_fragment(installer)
             self.assertNotIn("SWAP_PATH=/var/tmp/nightfall-build.swap", fragment)
             fragment = fragment.replace("/var/tmp/nightfall-build.", str(root) + "/nightfall-build.")
             command = (
-                'set -euo pipefail\\n'
-                'TOTAL_MB=1024\\n'
-                'info() { :; }\\n'
-                'warn() { :; }\\n'
-                'die() { echo "$*" >&2; exit 1; }\\n'
-                + fragment + f'\\nexit {end_rc}\\n'
+                'set -euo pipefail\n'
+                'TOTAL_MB=1024\n'
+                'info() { :; }\n'
+                'warn() { :; }\n'
+                'die() { echo "$*" >&2; exit 1; }\n'
+                + fragment + f'\nexit {end_rc}\n'
             )
             env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ["PATH"],
                        TMPDIR=str(root), EVENTS=str(events), ALLOC_RC=alloc_rc,
                        MKSWAP_RC=mkswap_rc, SWAPON_RC=swapon_rc)
             run = subprocess.run(["bash", "-c", command], env=env, capture_output=True, text=True)
             self.assertEqual(run.returncode, int(end_rc), run.stderr)
-            self.assertEqual(old_file.read_bytes(), b"pre-existing operator data\\n")
+            self.assertEqual(old_file.read_bytes(), b"pre-existing operator data\n")
             leftovers = list(root.glob("nightfall-build.*.swap"))
             self.assertEqual(leftovers, [], f"temporary swap left behind: {leftovers}")
             log = events.read_text() if events.exists() else ""
