@@ -70,7 +70,7 @@ class BackupRehearsal(unittest.TestCase):
         target = self.restored_dir()
         self.assertEqual(self.cli(target, "address").stdout.strip(), self.address)
         balance = self.cli(target, "balance").stdout.splitlines()
-        self.assertTrue(balance and balance[0].strip() == "0.00000000",
+        self.assertTrue(balance and balance[0].split()[0] == "0.00000000",
                         "restored disposable wallet has unexpected balance")
         if os.name == "posix":
             self.assertEqual(stat.S_IMODE((target / SEED).stat().st_mode), 0o600)
