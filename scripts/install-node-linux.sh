@@ -115,10 +115,17 @@ BUILD="$(mktemp -d)"
 info "fetching source"
 git clone --depth 1 "$REPO" "$BUILD/nightfall" >/dev/null 2>&1 \
     || die "clone failed — check network access to github.com"
+SOURCE_REV="$(git -C "$BUILD/nightfall" rev-parse --verify HEAD)" \
+    || die "could not identify source revision"
+LOCK_SHA="$(sha256sum "$BUILD/nightfall/Cargo.lock" | awk '{print $1}')" \
+    || die "could not hash Cargo.lock"
+info "source commit: $SOURCE_REV"
+info "Cargo.lock SHA256: $LOCK_SHA"
+
 JOBS=1
 [ "$TOTAL_MB" -ge 4096 ] && JOBS=$(nproc)
 info "building with $JOBS job(s)"
-( cd "$BUILD/nightfall" && cargo build --release -j "$JOBS" -p nightfall-node ) \
+( cd "$BUILD/nightfall" && cargo build --locked --release -j "$JOBS" -p nightfall-node ) \
     || die "build failed — if it was killed without an error, it ran out of memory"
 install -m 0755 "$BUILD/nightfall/target/release/nightfalld" "$BINDIR/nightfalld"
 info "installed $BINDIR/nightfalld"
