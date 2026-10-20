@@ -8,8 +8,8 @@
 //! rewrite; the cost grows linearly with height forever (audit finding N-05).
 
 use nightfall_consensus::{Chain, CompactHeader};
-use nightfall_crypto::Commitment;
-use nightfall_ledger::{LedgerState, UtxoEntry, UtxoSet};
+use nightfall_crypto::{hash_multi, Commitment};
+use nightfall_ledger::{state_fingerprint, LedgerState, UtxoEntry, UtxoSet};
 use nightfall_types::{Hash256, Height, NetworkId};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -59,6 +59,18 @@ struct ChainMeta {
     validated_horizon_bytes: u64,
     #[serde(default)]
     validated_headers_bytes: u64,
+
+    /// Non-consensus seal of the materialised prune-horizon state.
+    ///
+    /// This deliberately includes local UTXO metadata such as
+    /// `is_coinbase` that historical V8 `utxo_root` does not commit.
+    #[serde(default)]
+    validated_horizon_fingerprint: String,
+
+    /// Non-consensus seal of the compact-header history used for
+    /// difficulty, MTP, chain-work and hash walks after pruning.
+    #[serde(default)]
+    validated_headers_fingerprint: String,
 }
 
 /// Sidecar written next to an exported `blocks.jsonl`.
@@ -77,6 +89,33 @@ pub struct SnapshotManifest {
 
 fn json_format_name() -> String {
     "json".to_string()
+}
+
+/// Non-consensus fingerprint of the compact-header history retained after
+/// pruning.  This authenticates the semantic fields, not JSON formatting.
+fn compact_headers_fingerprint(headers: &[CompactHeader]) -> Hash256 {
+    let leaves: Vec<Hash256> = headers
+        .iter()
+        .map(|h| {
+            hash_multi(
+                b"nightfall:local-compact-header:v1",
+                &[
+                    &h.height.to_le_bytes(),
+                    &h.hash.0,
+                    &h.prev_hash.0,
+                    &h.timestamp_unix.to_le_bytes(),
+                    &h.difficulty.to_le_bytes(),
+                ],
+            )
+        })
+        .collect();
+
+    let count = (leaves.len() as u64).to_le_bytes();
+    let mut refs: Vec<&[u8]> = Vec::with_capacity(leaves.len() + 1);
+    refs.push(&count);
+    refs.extend(leaves.iter().map(|h| h.0.as_slice()));
+
+    hash_multi(b"nightfall:local-compact-headers:v1", &refs)
 }
 
 pub struct ChainStore {
@@ -170,6 +209,21 @@ impl ChainStore {
         let validated_headers_bytes = fs::metadata(self.headers_path())
             .map(|m| m.len())
             .unwrap_or(0);
+
+        let (validated_horizon_fingerprint, validated_headers_fingerprint) = if chain.is_pruned() {
+            let horizon = chain
+                .horizon
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("pruned chain is missing its UTXO horizon"))?;
+
+            (
+                state_fingerprint(horizon).to_hex(),
+                compact_headers_fingerprint(&chain.headers).to_hex(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+
         let meta = ChainMeta {
             network: chain.network,
             genesis_hash: chain.genesis_hash.to_hex(),
@@ -183,6 +237,8 @@ impl ChainStore {
             horizon_work: chain.horizon_work.to_string(),
             validated_horizon_bytes,
             validated_headers_bytes,
+            validated_horizon_fingerprint,
+            validated_headers_fingerprint,
         };
         let tmp = self.dir.join("chain-meta.json.tmp");
         fs::write(&tmp, serde_json::to_vec_pretty(&meta)?)?;
@@ -201,7 +257,11 @@ impl ChainStore {
         Some((m.block_count, m.validated_tip, m.genesis_hash))
     }
 
-    /// True when on-disk files are byte-for-byte what this node last validated.
+    /// True when this datadir still matches its local validation record.
+    ///
+    /// File sizes are cheap first-line checks. Pruned datadirs additionally
+    /// authenticate the materialised horizon state and compact-header history
+    /// with non-consensus semantic fingerprints.
     pub fn is_own_file_trusted(&self) -> bool {
         let Some(m) = self.read_meta() else {
             return false;
@@ -231,7 +291,35 @@ impl ChainStore {
         let hd = fs::metadata(self.headers_path())
             .map(|x| x.len())
             .unwrap_or(0);
-        m.validated_horizon_bytes == hz && hz > 0 && m.validated_headers_bytes == hd && hd > 0
+
+        if m.validated_horizon_bytes != hz || hz == 0 || m.validated_headers_bytes != hd || hd == 0
+        {
+            return false;
+        }
+
+        // A pruned datadir cannot safely bootstrap these seals from itself:
+        // the discarded bodies no longer exist to reconstruct and verify the
+        // horizon/header prefix independently. Missing or partial seals therefore
+        // fail closed and require a resync.
+        if m.validated_horizon_fingerprint.is_empty() || m.validated_headers_fingerprint.is_empty()
+        {
+            return false;
+        }
+
+        let horizon = match load_horizon_file(&self.horizon_path()) {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+        if state_fingerprint(&horizon).to_hex() != m.validated_horizon_fingerprint {
+            return false;
+        }
+
+        let headers = match load_jsonl_headers(&self.headers_path()) {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+
+        compact_headers_fingerprint(&headers).to_hex() == m.validated_headers_fingerprint
     }
 
     fn read_meta(&self) -> Option<ChainMeta> {
@@ -422,6 +510,8 @@ impl ChainStore {
             horizon_work: String::new(),
             validated_horizon_bytes: 0,
             validated_headers_bytes: 0,
+            validated_horizon_fingerprint: String::new(),
+            validated_headers_fingerprint: String::new(),
         };
         fs::write(self.meta_path(), serde_json::to_vec_pretty(&meta)?)?;
         let chain = self.load_or_new(network)?;
@@ -688,9 +778,9 @@ impl ChainStore {
             }
         }
 
-        // Trust our own past validation only if the blocks file is byte-for-byte
-        // what it was when we recorded it. Any edit, truncation or corruption
-        // changes the length and forces a full re-verification.
+        // Reuse our own past validation only when the local validation record
+        // still matches. File lengths catch truncation/replacement cheaply; pruned
+        // state also carries semantic fingerprints for the horizon and headers.
         let current_bytes = fs::metadata(self.blocks_path())
             .map(|m| m.len())
             .unwrap_or(0);
@@ -720,23 +810,49 @@ impl ChainStore {
 
         if pruned {
             let m = meta.as_ref().expect("pruned load has meta");
-            chain.first_height = m.first_height;
-            chain.horizon_work = m.horizon_work.parse().unwrap_or(0);
+
+            let expected_horizon_height = m
+                .first_height
+                .checked_sub(1)
+                .ok_or_else(|| anyhow::anyhow!("pruned datadir has first_height 0"))?;
+
             let horizon = load_horizon_file(&self.horizon_path())?;
-            chain.ledger = horizon.clone();
-            chain.horizon = Some(horizon);
-            chain.total_work = chain.horizon_work;
-            chain.headers = load_jsonl_headers(&self.headers_path())?
-                .into_iter()
-                .filter(|h| h.height < m.first_height)
-                .collect();
-            if chain.headers.len() as u64 != m.first_height {
+            if horizon.height.0 != expected_horizon_height {
                 anyhow::bail!(
-                    "headers.jsonl prefix is {} long, prune horizon is {}",
-                    chain.headers.len(),
+                    "UTXO horizon is at height {}, expected {} for first stored body {}",
+                    horizon.height.0,
+                    expected_horizon_height,
                     m.first_height
                 );
             }
+
+            let headers: Vec<CompactHeader> = load_jsonl_headers(&self.headers_path())?
+                .into_iter()
+                .filter(|h| h.height < m.first_height)
+                .collect();
+
+            if headers.len() as u64 != m.first_height {
+                anyhow::bail!(
+                    "headers.jsonl prefix is {} long, prune horizon is {}",
+                    headers.len(),
+                    m.first_height
+                );
+            }
+
+            // Never trust cached chain work from chain-meta.json. The compact
+            // headers are already authenticated by the local semantic seal, so
+            // derive the prefix work from them instead.
+            let horizon_work = headers.iter().try_fold(0u128, |sum, header| {
+                sum.checked_add(header.work())
+                    .ok_or_else(|| anyhow::anyhow!("horizon work overflow"))
+            })?;
+
+            chain.first_height = m.first_height;
+            chain.horizon_work = horizon_work;
+            chain.total_work = horizon_work;
+            chain.ledger = horizon.clone();
+            chain.horizon = Some(horizon);
+            chain.headers = headers;
         }
 
         let stored_blocks = codec::read_blocks(File::open(self.blocks_path())?, self.format())?;
@@ -1028,6 +1144,60 @@ mod tests {
     }
 
     #[test]
+    fn pruned_load_recomputes_horizon_work_from_authenticated_headers() {
+        use nightfall_crypto::WalletKeys;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("nf-prune-work-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+        for i in 0..12u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+
+        chain.prune_keep(4).unwrap();
+
+        let expected_horizon_work = chain.horizon_work;
+        let expected_total_work = chain.total_work;
+
+        assert!(expected_horizon_work > 1);
+
+        store.save(&chain).unwrap();
+        assert!(store.is_own_file_trusted());
+
+        // Corrupt only the cached metadata. Horizon and header seals remain
+        // untouched, so the loader must not use this value for fork choice.
+        let meta_path = store.meta_path();
+        let mut meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+
+        meta["horizon_work"] = serde_json::Value::String("1".to_string());
+        fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+
+        assert!(
+            store.is_own_file_trusted(),
+            "horizon_work is not itself part of the semantic file seals"
+        );
+
+        let loaded = store.load_or_new(NetworkId::Devnet).unwrap();
+
+        assert_eq!(loaded.horizon_work, expected_horizon_work);
+        assert_eq!(loaded.total_work, expected_total_work);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn pruned_roundtrip_keeps_utxo_and_drops_bodies() {
         use nightfall_crypto::WalletKeys;
         let dir = std::env::temp_dir().join(format!("nf-prune-{}", now_unix()));
@@ -1064,10 +1234,206 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn legacy_pruned_validation_record_fails_closed_without_seals() {
+        use nightfall_crypto::WalletKeys;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nf-prune-seal-legacy-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+        for i in 0..12u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+
+        chain.prune_keep(4).unwrap();
+        store.save(&chain).unwrap();
+        assert!(store.is_own_file_trusted());
+
+        let meta_path = store.meta_path();
+        let mut meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+
+        let object = meta.as_object_mut().unwrap();
+        object.remove("validated_horizon_fingerprint");
+        object.remove("validated_headers_fingerprint");
+
+        fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+
+        assert!(
+            !store.is_own_file_trusted(),
+            "pruned metadata without semantic seals must fail closed"
+        );
+
+        let err = store
+            .load_or_new(NetworkId::Devnet)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("pruned datadir failed the validation record"),
+            "got: {err}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
     /// The whole point of the conversion: a node that ran on JSON and a node
     /// that converted must hold the same chain. Tip, height, and UTXO root —
     /// if any of the three moved, the format changed meaning, and the format
     /// is not allowed to mean anything.
+    #[test]
+    fn pruned_validation_seal_rejects_horizon_content_change() {
+        use nightfall_crypto::WalletKeys;
+
+        let dir = std::env::temp_dir().join(format!("nf-prune-seal-hz-{}", now_unix()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+        for i in 0..12u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+
+        chain.prune_keep(4).unwrap();
+
+        let minted = chain.horizon.as_ref().unwrap().supply.total_minted_darks;
+        assert!(minted >= 10, "setup needs a multi-digit minted value");
+
+        store.save(&chain).unwrap();
+        assert!(store.is_own_file_trusted());
+
+        let path = store.horizon_path();
+        let before = fs::read_to_string(&path).unwrap();
+
+        assert!(
+            before.contains("\"is_coinbase\":true"),
+            "setup needs a coinbase UTXO in the horizon"
+        );
+
+        // `true` -> `false` adds one byte. Dividing a positive multi-digit
+        // integer by ten removes one decimal digit, keeping the file length
+        // exactly unchanged while changing semantic state.
+        let smaller_minted = minted / 10;
+        assert_eq!(
+            minted.to_string().len(),
+            smaller_minted.to_string().len() + 1
+        );
+
+        let after = before
+            .replacen("\"is_coinbase\":true", "\"is_coinbase\":false", 1)
+            .replacen(
+                &format!("\"minted\":{minted}"),
+                &format!("\"minted\":{smaller_minted}"),
+                1,
+            );
+
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "setup must bypass the old length-only check"
+        );
+
+        fs::write(&path, after).unwrap();
+
+        assert!(
+            !store.is_own_file_trusted(),
+            "same-length horizon mutation must invalidate the local seal"
+        );
+
+        let err = store
+            .load_or_new(NetworkId::Devnet)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("pruned datadir failed the validation record"),
+            "got: {err}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pruned_validation_seal_rejects_header_content_change() {
+        use nightfall_crypto::WalletKeys;
+
+        let dir = std::env::temp_dir().join(format!("nf-prune-seal-hd-{}", now_unix()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+        for i in 0..12u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+
+        chain.prune_keep(4).unwrap();
+        store.save(&chain).unwrap();
+        assert!(store.is_own_file_trusted());
+
+        let path = store.headers_path();
+        let before = fs::read_to_string(&path).unwrap();
+        let headers = load_jsonl_headers(&path).unwrap();
+
+        let old_ts = headers[0].timestamp_unix;
+        let new_ts = if old_ts % 10 == 9 {
+            old_ts - 1
+        } else {
+            old_ts + 1
+        };
+
+        assert_eq!(old_ts.to_string().len(), new_ts.to_string().len());
+
+        let needle = format!("\"timestamp_unix\":{old_ts}");
+        let replacement = format!("\"timestamp_unix\":{new_ts}");
+        assert!(before.contains(&needle));
+
+        let after = before.replacen(&needle, &replacement, 1);
+
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "setup must bypass the old length-only check"
+        );
+
+        fs::write(&path, after).unwrap();
+
+        assert!(
+            !store.is_own_file_trusted(),
+            "same-length compact-header mutation must invalidate the local seal"
+        );
+
+        let err = store
+            .load_or_new(NetworkId::Devnet)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("pruned datadir failed the validation record"),
+            "got: {err}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn migration_keeps_the_identical_chain() {
         use nightfall_crypto::WalletKeys;
