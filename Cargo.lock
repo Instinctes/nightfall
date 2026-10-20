@@ -3004,6 +3004,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nightfall-light-verify"
+version = "1.0.5"
+dependencies = [
+ "nightfall-crypto",
+ "nightfall-types",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "nightfall-mobile"
 version = "1.0.9"
 dependencies = [
