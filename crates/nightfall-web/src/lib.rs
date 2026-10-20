@@ -66,7 +66,6 @@ fn dump(w: &Wallet) -> Result<String, JsError> {
     w.export_state().map_err(err)
 }
 
-#[wasm_bindgen]
 pub fn create_wallet(birth_height: f64) -> Result<JsValue, JsError> {
     let keys = WalletKeys::generate();
     let phrase = keys.to_mnemonic();
@@ -79,7 +78,6 @@ pub fn create_wallet(birth_height: f64) -> Result<JsValue, JsError> {
     JsValue::from_str(&out.to_string()).pipe_ok()
 }
 
-#[wasm_bindgen]
 pub fn restore_wallet(phrase: &str, birth_height: f64) -> Result<JsValue, JsError> {
     let keys = WalletKeys::from_mnemonic(phrase).map_err(err)?;
     let w = Wallet::in_memory(NetworkId::Mainnet, keys, height(birth_height));
@@ -90,27 +88,22 @@ pub fn restore_wallet(phrase: &str, birth_height: f64) -> Result<JsValue, JsErro
     JsValue::from_str(&out.to_string()).pipe_ok()
 }
 
-#[wasm_bindgen]
 pub fn wallet_address(state: &str) -> Result<String, JsError> {
     Ok(load(state)?.address_string())
 }
 
-#[wasm_bindgen]
 pub fn wallet_phrase(state: &str) -> Result<String, JsError> {
     Ok(load(state)?.recovery_phrase())
 }
 
-#[wasm_bindgen]
 pub fn wallet_view_key(state: &str) -> Result<String, JsError> {
     Ok(load(state)?.view_key_string())
 }
 
-#[wasm_bindgen]
 pub fn wallet_scan_from(state: &str) -> Result<f64, JsError> {
     Ok(load(state)?.scan_from() as f64)
 }
 
-#[wasm_bindgen]
 pub fn wallet_info(state: &str) -> Result<JsValue, JsError> {
     let w = load(state)?;
     let out = json!({
@@ -123,7 +116,6 @@ pub fn wallet_info(state: &str) -> Result<JsValue, JsError> {
     JsValue::from_str(&out.to_string()).pipe_ok()
 }
 
-#[wasm_bindgen]
 pub fn reset_scan(state: &str) -> Result<JsValue, JsError> {
     let mut w = load(state)?;
     w.reset_scan().map_err(err)?;
@@ -165,7 +157,6 @@ fn qr_svg(text: &str) -> Result<String, JsError> {
         .build())
 }
 
-#[wasm_bindgen]
 pub fn ingest_page(
     state: &str,
     outputs_json: &str,
@@ -186,7 +177,6 @@ pub fn ingest_page(
     JsValue::from_str(&out.to_string()).pipe_ok()
 }
 
-#[wasm_bindgen]
 pub fn wallet_balance(state: &str, tip: f64) -> Result<JsValue, JsError> {
     let w = load(state)?;
     let b = w.balances(height(tip), MATURITY);
@@ -201,7 +191,6 @@ pub fn wallet_balance(state: &str, tip: f64) -> Result<JsValue, JsError> {
     JsValue::from_str(&out.to_string()).pipe_ok()
 }
 
-#[wasm_bindgen]
 pub fn wallet_history(state: &str) -> Result<JsValue, JsError> {
     let w = load(state)?;
     let rows: Vec<_> = w
@@ -234,7 +223,6 @@ pub fn probe_crypto() -> Result<String, JsError> {
     Ok(format!("ok {}", out.range_proof.len()))
 }
 
-#[wasm_bindgen]
 pub fn build_send(
     state: &str,
     to: &str,
