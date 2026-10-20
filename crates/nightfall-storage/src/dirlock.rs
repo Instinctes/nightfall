@@ -102,8 +102,13 @@ pub fn acquire(dir: &Path) -> Result<DirLock, LockError> {
 ///
 /// A symlink at the lock path would otherwise let acquisition write its
 /// `pid` line straight through to an unrelated target before any caller's
-/// own path checks run. `O_NOFOLLOW` makes the refusal atomic on Unix; the
-/// metadata check also covers Windows, which has no equivalent open flag.
+/// own path checks run. On Unix `O_NOFOLLOW` makes the refusal atomic. Windows
+/// has no equivalent open flag, so there the `symlink_metadata` check is a
+/// best-effort guard that is not atomic against an entry swapped between the
+/// check and the open (a TOCTOU window); an atomic Windows refusal would need a
+/// `CreateFile` reparse-tag check, which is not done here. The lock path lives
+/// inside a datadir the operator controls, so this is a defence-in-depth guard,
+/// not a boundary against a local attacker who can already write there.
 fn open_lock_file(path: &Path) -> Result<File, LockError> {
     if let Ok(md) = std::fs::symlink_metadata(path) {
         if md.file_type().is_symlink() {

@@ -157,6 +157,10 @@ pub(crate) enum Fault {
     AfterBackup,
     /// Fail partway through installing the staged replacement.
     DuringInstall,
+    /// Fail the durability fsync taken right after the journal is written.
+    SyncFail,
+    /// Fail removing the journal after a verified reset.
+    RemovalFail,
 }
 
 fn run(opts: &RecoverOpts, fault: Fault) -> anyhow::Result<RecoverReport> {
@@ -199,14 +203,10 @@ fn run(opts: &RecoverOpts, fault: Fault) -> anyhow::Result<RecoverReport> {
     }
 
     // A prior interrupted recovery must be resolved (backup restored) first.
-    if datadir.join(RECOVERY_JOURNAL).is_file() {
-        anyhow::bail!(
-            "an earlier recover-stalled-fork did not finish ({} is present). Restore \
-             that run's backup into the datadir and delete {} before running recovery again.",
-            RECOVERY_JOURNAL,
-            RECOVERY_JOURNAL
-        );
-    }
+    // The shared guard is fail-closed: it uses symlink_metadata, so a dangling
+    // or non-regular journal entry (e.g. a planted symlink) is refused and never
+    // followed.
+    store.refuse_if_interrupted_recovery()?;
 
     // Confirm the network and genesis from chain-meta.json — never guess them.
     let meta_path = datadir.join("chain-meta.json");
@@ -228,17 +228,15 @@ fn run(opts: &RecoverOpts, fault: Fault) -> anyhow::Result<RecoverReport> {
     }
     let fresh_tmpl = Chain::new_fair(network)?;
     let expected_genesis = fresh_tmpl.genesis_hash.to_hex();
-    if let Some(g) = &stored_genesis {
-        if g != &expected_genesis {
-            anyhow::bail!(
-                "the datadir's recorded genesis {} does not match the {} genesis {}. \
-                 This is not a genuine {} chain; refusing.",
-                g,
-                network.as_str(),
-                expected_genesis,
-                network.as_str()
-            );
-        }
+    if stored_genesis != expected_genesis {
+        anyhow::bail!(
+            "the datadir's recorded genesis {} does not match the {} genesis {}. \
+             This is not a genuine {} chain; refusing.",
+            stored_genesis,
+            network.as_str(),
+            expected_genesis,
+            network.as_str()
+        );
     }
 
     let (previous_height, previous_tip) = store
@@ -267,7 +265,8 @@ fn run(opts: &RecoverOpts, fault: Fault) -> anyhow::Result<RecoverReport> {
     // destructive move. From here a crash leaves the journal, which every load
     // path refuses to start over until the backup is restored.
     write_journal(datadir, &backup_dir, network)?;
-    let _ = sync_dir(datadir);
+    // The journal's directory entry must be durable before anything is moved.
+    checked_sync(datadir, fault == Fault::SyncFail)?;
 
     // Move the originals into the backup. Everything moved is recoverable from
     // `backup_dir`.
@@ -286,7 +285,10 @@ fn run(opts: &RecoverOpts, fault: Fault) -> anyhow::Result<RecoverReport> {
             )
         })?;
     }
-    let _ = sync_dir(datadir);
+    // Both the source (entries removed) and the backup (entries added) must be
+    // durable at this rename boundary.
+    checked_sync(datadir, false)?;
+    checked_sync(&backup_dir, false)?;
 
     if fault == Fault::AfterBackup {
         anyhow::bail!(
@@ -314,7 +316,7 @@ fn run(opts: &RecoverOpts, fault: Fault) -> anyhow::Result<RecoverReport> {
         })?;
     }
     let _ = fs::remove_dir_all(&staging);
-    let _ = sync_dir(datadir);
+    checked_sync(datadir, false)?;
 
     // Verify the reset without going through load_or_new (which refuses while
     // the journal is present). Read the just-written metadata directly.
@@ -326,9 +328,17 @@ fn run(opts: &RecoverOpts, fault: Fault) -> anyhow::Result<RecoverReport> {
     })?;
 
     // The reset is complete and verified: remove the journal so a normal start
-    // is allowed again, and make that durable.
-    let _ = fs::remove_file(datadir.join(RECOVERY_JOURNAL));
-    let _ = sync_dir(datadir);
+    // is allowed again, and make that durable. A removal failure is propagated,
+    // so we never report success with the journal still present.
+    if fault == Fault::RemovalFail {
+        anyhow::bail!(
+            "injected journal-removal failure; the journal is still present, so a \
+             normal start keeps refusing until it is removed."
+        );
+    }
+    fs::remove_file(datadir.join(RECOVERY_JOURNAL))
+        .with_context(|| format!("removing {RECOVERY_JOURNAL}"))?;
+    checked_sync(datadir, false)?;
 
     Ok(RecoverReport {
         backup_dir,
@@ -412,6 +422,16 @@ fn verify_fresh_datadir(
     Ok(())
 }
 
+/// fsync a directory, surfacing the error. Durability is part of the safety
+/// boundary here, so these failures are propagated rather than ignored; `fail`
+/// is the test-only injection point.
+fn checked_sync(dir: &Path, fail: bool) -> anyhow::Result<()> {
+    if fail {
+        anyhow::bail!("injected directory-sync failure for {}", dir.display());
+    }
+    sync_dir(dir).with_context(|| format!("fsync {}", dir.display()))
+}
+
 fn write_journal(datadir: &Path, backup_dir: &Path, network: NetworkId) -> anyhow::Result<()> {
     let body = serde_json::json!({
         "backup": backup_dir.display().to_string(),
@@ -419,7 +439,14 @@ fn write_journal(datadir: &Path, backup_dir: &Path, network: NetworkId) -> anyho
         "started_unix": now_unix(),
     });
     let path = datadir.join(RECOVERY_JOURNAL);
-    let mut f = fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+    // create_new: fail atomically (O_EXCL on Unix, CREATE_NEW on Windows) if
+    // anything already exists at the path, so a planted symlink is never
+    // followed or overwritten.
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .with_context(|| format!("creating {} (it must not already exist)", path.display()))?;
     f.write_all(&serde_json::to_vec_pretty(&body)?)?;
     // The journal itself must reach disk before the originals are moved.
     f.sync_all()?;
@@ -457,7 +484,7 @@ fn present_chain_files(dir: &Path) -> anyhow::Result<Vec<&'static str>> {
     Ok(out)
 }
 
-fn read_meta_identity(meta_path: &Path) -> anyhow::Result<(NetworkId, Option<String>)> {
+fn read_meta_identity(meta_path: &Path) -> anyhow::Result<(NetworkId, String)> {
     let raw = fs::read_to_string(meta_path)
         .with_context(|| format!("reading {}", meta_path.display()))?;
     let v: serde_json::Value =
@@ -472,10 +499,17 @@ fn read_meta_identity(meta_path: &Path) -> anyhow::Result<(NetworkId, Option<Str
         "devnet" => NetworkId::Devnet,
         other => anyhow::bail!("{} names an unknown network {other:?}", meta_path.display()),
     };
-    let genesis = v
-        .get("genesis_hash")
-        .and_then(|g| g.as_str())
-        .map(String::from);
+    // A reset needs a confirmed identity: a missing, null or non-string
+    // genesis_hash means the datadir cannot be identified, so refuse rather than
+    // reset on an unconfirmed chain.
+    let genesis = match v.get("genesis_hash") {
+        Some(serde_json::Value::String(g)) if !g.is_empty() => g.clone(),
+        _ => anyhow::bail!(
+            "{} has no valid genesis_hash; refusing to reset a chain whose identity \
+             cannot be confirmed.",
+            meta_path.display()
+        ),
+    };
     Ok((net, genesis))
 }
 
@@ -590,6 +624,106 @@ mod tests {
 
     fn journal_present(datadir: &Path) -> bool {
         datadir.join(RECOVERY_JOURNAL).is_file()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_journal_is_refused_and_writes_no_external_target() {
+        let dir = unique_tmp("journalsym");
+        seed_chain(&dir, NetworkId::Devnet, codec::Format::Binary, 1);
+        // A dangling symlink at the journal path, pointing outside the datadir.
+        let outside = unique_tmp("journalsym-out").join("external-target");
+        std::os::unix::fs::symlink(&outside, dir.join(RECOVERY_JOURNAL)).unwrap();
+
+        let err = recover_stalled_fork(&opts(&dir, NetworkId::Devnet, true)).unwrap_err();
+        assert!(err.to_string().contains("interrupted"), "{err}");
+        assert!(
+            !outside.exists(),
+            "recovery must not create the symlink target"
+        );
+        assert!(backup_dirs(&dir).is_empty());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_missing_genesis_is_refused() {
+        let dir = unique_tmp("nogenesis");
+        seed_chain(&dir, NetworkId::Devnet, codec::Format::Binary, 1);
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("chain-meta.json")).unwrap())
+                .unwrap();
+        v.as_object_mut().unwrap().remove("genesis_hash");
+        fs::write(
+            dir.join("chain-meta.json"),
+            serde_json::to_vec_pretty(&v).unwrap(),
+        )
+        .unwrap();
+
+        let err = recover_stalled_fork(&opts(&dir, NetworkId::Devnet, true)).unwrap_err();
+        assert!(err.to_string().contains("genesis"), "{err}");
+        assert!(backup_dirs(&dir).is_empty());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_null_genesis_is_refused() {
+        let dir = unique_tmp("nullgenesis");
+        seed_chain(&dir, NetworkId::Devnet, codec::Format::Binary, 1);
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("chain-meta.json")).unwrap())
+                .unwrap();
+        v["genesis_hash"] = serde_json::Value::Null;
+        fs::write(
+            dir.join("chain-meta.json"),
+            serde_json::to_vec_pretty(&v).unwrap(),
+        )
+        .unwrap();
+
+        let err = recover_stalled_fork(&opts(&dir, NetworkId::Devnet, true)).unwrap_err();
+        assert!(err.to_string().contains("genesis"), "{err}");
+        assert!(backup_dirs(&dir).is_empty());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_sync_failure_preserves_the_originals_and_leaves_the_journal() {
+        let dir = unique_tmp("syncfault");
+        seed_chain(&dir, NetworkId::Devnet, codec::Format::Binary, 2);
+        let blocks_before = fs::read(dir.join("blocks.bin")).unwrap();
+
+        let err = run(&opts(&dir, NetworkId::Devnet, true), Fault::SyncFail).unwrap_err();
+        assert!(err.to_string().contains("sync"), "{err}");
+
+        // The sync fails before the first move, so the originals are untouched;
+        // the journal is left, so a normal start refuses.
+        assert!(journal_present(&dir));
+        assert_eq!(fs::read(dir.join("blocks.bin")).unwrap(), blocks_before);
+        assert!(ChainStore::new(&dir)
+            .load_or_new(NetworkId::Devnet)
+            .is_err());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_journal_removal_failure_does_not_report_success() {
+        let dir = unique_tmp("removalfault");
+        seed_chain(&dir, NetworkId::Devnet, codec::Format::Binary, 2);
+
+        let err = run(&opts(&dir, NetworkId::Devnet, true), Fault::RemovalFail).unwrap_err();
+        assert!(err.to_string().contains("journal"), "{err}");
+
+        // The reset finished but the journal was not removed, so a normal start
+        // still refuses — fail-closed rather than a false success.
+        assert!(journal_present(&dir));
+        assert!(ChainStore::new(&dir)
+            .load_or_new(NetworkId::Devnet)
+            .is_err());
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -824,7 +958,7 @@ mod tests {
         fs::write(dir.join(RECOVERY_JOURNAL), b"{\"backup\":\"somewhere\"}").unwrap();
 
         let err = recover_stalled_fork(&opts(&dir, NetworkId::Devnet, true)).unwrap_err();
-        assert!(err.to_string().contains("did not finish"), "{err}");
+        assert!(err.to_string().contains("interrupted"), "{err}");
 
         fs::remove_dir_all(&dir).ok();
     }

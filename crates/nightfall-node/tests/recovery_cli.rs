@@ -226,3 +226,33 @@ fn an_interrupted_recovery_blocks_a_normal_start() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_journal_is_refused_and_touches_no_external_target() {
+    // The recovery journal is checked on every normal start. A dangling symlink
+    // planted at its path must be refused outright, never followed to its
+    // target (which exists() would do, reporting a misleading "not found").
+    let dir = unique_tmp("symjournal");
+    assert!(run(&dir, &["init"]).status.success(), "init failed");
+    let victim = unique_tmp("symjournal-victim").join("external-target");
+    std::os::unix::fs::symlink(&victim, dir.join(".recovery-journal.json")).unwrap();
+
+    let out = run(&dir, &["status"]);
+    assert!(
+        !out.status.success(),
+        "a symlinked journal must be refused, not followed"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("interrupted") && stderr.contains("symlink"),
+        "the refusal must flag the suspicious symlink journal: {stderr}"
+    );
+    assert!(
+        !victim.exists(),
+        "the external symlink target must never be created or written"
+    );
+    assert!(backup_dirs(&dir).is_empty());
+
+    std::fs::remove_dir_all(&dir).ok();
+}

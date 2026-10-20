@@ -636,13 +636,30 @@ impl ChainStore {
     /// silently proceed over an unfinished recovery.
     pub fn refuse_if_interrupted_recovery(&self) -> anyhow::Result<()> {
         let journal = self.dir.join(RECOVERY_JOURNAL);
-        if !journal.exists() {
-            return Ok(());
-        }
-        let backup = fs::read_to_string(&journal)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| v.get("backup").and_then(|b| b.as_str()).map(String::from));
+        // symlink_metadata, not exists(): a dangling symlink at the journal path
+        // must be caught too (exists() follows it and reports "not found"), and
+        // the entry must never be followed.
+        let md = match fs::symlink_metadata(&journal) {
+            Ok(md) => md,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(anyhow::anyhow!("checking {}: {e}", journal.display())),
+        };
+        let detail = if md.file_type().is_file() {
+            fs::read_to_string(&journal)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| v.get("backup").and_then(|b| b.as_str()).map(String::from))
+                .map(|b| format!("The original chain is backed up at {b}."))
+                .unwrap_or_else(|| {
+                    "The original chain is in the recovery-backup-* directory.".to_string()
+                })
+        } else if md.file_type().is_symlink() {
+            format!(
+                "{RECOVERY_JOURNAL} is a symlink, which is suspicious; it will not be followed."
+            )
+        } else {
+            format!("{RECOVERY_JOURNAL} is not a regular file, which is suspicious.")
+        };
         anyhow::bail!(
             "an interrupted recover-stalled-fork was found in {} ({} is present),\n\
              so the datadir may be only half-reset and cannot be trusted.\n\
@@ -650,11 +667,7 @@ impl ChainStore {
              Restore the backup into the datadir and delete {}, then try again.",
             self.dir.display(),
             RECOVERY_JOURNAL,
-            backup
-                .map(|b| format!("The original chain is backed up at {b}."))
-                .unwrap_or_else(
-                    || "The original chain is in the recovery-backup-* directory.".to_string()
-                ),
+            detail,
             RECOVERY_JOURNAL,
         )
     }
@@ -947,8 +960,18 @@ pub fn wallet_dir(datadir: &Path) -> PathBuf {
 ///
 /// This is what keeps the recovery journal and the backup from disagreeing
 /// after a crash: the journal must reach disk before the originals are moved.
-/// On Unix an open directory handle can be synced directly; on Windows a
-/// directory handle needs `FILE_FLAG_BACKUP_SEMANTICS`.
+///
+/// On Unix an open directory handle can be synced directly, and the error is
+/// propagated. Windows has no user-space directory fsync: `FlushFileBuffers`
+/// on a directory handle fails with `ERROR_ACCESS_DENIED` (5) or
+/// `ERROR_INVALID_FUNCTION` (1), and NTFS instead orders directory-entry
+/// (rename/create) metadata through its own journal. So on Windows the file
+/// contents are what carry durability — each file is `sync_all`'d when written
+/// (the journal included) — and this call recognises the expected
+/// directory-flush-unsupported result as the no-op it is, while still surfacing
+/// a genuine failure such as being unable to open the directory at all. The
+/// rename-ordering guarantee is therefore weaker on Windows than on Unix; that
+/// is a platform limitation, not something this function can close.
 pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -958,11 +981,26 @@ pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
     {
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        OpenOptions::new()
+        const ERROR_INVALID_FUNCTION: i32 = 1;
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        let handle = OpenOptions::new()
             .read(true)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(dir)?
-            .sync_all()
+            .open(dir)?;
+        match handle.sync_all() {
+            Ok(()) => Ok(()),
+            // Flushing a directory handle is not supported on Windows; NTFS
+            // journals the metadata itself, so this is a no-op, not a failure.
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(ERROR_ACCESS_DENIED) | Some(ERROR_INVALID_FUNCTION)
+                ) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
     #[cfg(not(any(unix, windows)))]
     {

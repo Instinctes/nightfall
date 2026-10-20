@@ -20,7 +20,10 @@ hand. This command is that move, made safe and explicit.
   anything, and removes it only once the reset is complete and verified. While
   the journal exists, every load path — the daemon, Core, and the CLI — refuses
   to start, so an interrupted reset can never be mistaken for a healthy fresh
-  chain.
+  chain. The journal is created **exclusively** (`create_new`), and both the
+  writer and the shared start-up guard inspect the path with `symlink_metadata`,
+  so a journal that is a symlink or any other non-regular file is refused and
+  **never followed** to an external target.
 - Backs the current chain files up into a **freshly created, uniquely named**
   directory (`recovery-backup-<nanos>-<n>`), fsyncing at each step, and never
   deletes or reuses a backup.
@@ -38,10 +41,13 @@ hand. This command is that move, made safe and explicit.
   same lock a running node or a Core wallet holds), so it refuses rather than
   race a live writer. There is no recovery RPC and no automatic mining.
 - Requires an explicit `--network`, an existing `--datadir`, and `--force`.
-- Confirms the datadir's network **and genesis** from `chain-meta.json`, and
-  refuses an ambiguous datadir — a mixed binary/JSON layout, no readable
-  `chain-meta.json`, a symlinked or non-regular chain file, or a chain for a
-  different network — rather than guessing.
+- Confirms the datadir's network **and genesis** from `chain-meta.json`. A
+  valid recorded genesis is **required**: a missing, null or non-string
+  `genesis_hash` is refused before anything is backed up or staged, so a reset
+  never runs on a datadir whose identity cannot be confirmed. It also refuses an
+  ambiguous datadir — a mixed binary/JSON layout, no readable `chain-meta.json`,
+  a symlinked or non-regular chain file, or a chain for a different network —
+  rather than guessing.
 - This is a manual escape hatch, **not** a promise that every liveness problem
   is fixed. It resets to genesis; you resync.
 
@@ -77,10 +83,32 @@ To recover by hand:
 
 Your original chain is intact in the backup, and the wallet was never touched.
 
-## Platform note
+## Durability and the platform note
 
-Durability uses an fsync of the data directory after the journal write and the
-file moves. This is implemented for both Unix (an fsync of the directory
-handle) and Windows (via `FILE_FLAG_BACKUP_SEMANTICS`, which Windows requires to
-open a directory handle), so there is no unconditional directory sync that only
-works on one platform.
+Each file that matters is `sync_all`'d when it is written — the journal before
+any originals move, the staged chain before it is installed — so file **contents**
+are durable on every platform. The ordering of the directory entries (the
+journal appearing, then the originals moving to the backup, then the staged files
+appearing) is then made durable with a directory fsync at each boundary, and
+any error from that fsync is **propagated**, not discarded: a sync failure
+before the first move leaves the originals untouched and the journal in place, so
+start-up refuses rather than reporting a half-reset chain as healthy.
+
+Directory fsync differs by platform, and this is an honest limitation rather
+than an equivalence:
+
+- **Unix** fsyncs the directory handle directly; the error is surfaced.
+- **Windows** has no user-space directory fsync. `FlushFileBuffers` on a
+  directory handle returns `ERROR_ACCESS_DENIED`/`ERROR_INVALID_FUNCTION`, and
+  NTFS instead orders directory-entry metadata through its own journal. The code
+  recognises that specific result as the no-op it is (while still surfacing a
+  real failure such as being unable to open the directory), so the
+  rename-ordering guarantee is **weaker on Windows than on Unix**. File-content
+  durability is unaffected because it comes from the per-file `sync_all`.
+
+The data-directory lock's symlink refusal has the same shape of limitation:
+`O_NOFOLLOW` makes it atomic on Unix, while on Windows the `symlink_metadata`
+check is a best-effort guard with a TOCTOU window (an atomic refusal there would
+need a `CreateFile` reparse-tag check). The lock lives inside an
+operator-controlled datadir, so this is defence-in-depth, not a boundary against
+a local attacker who can already write there.
