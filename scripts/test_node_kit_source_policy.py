@@ -42,7 +42,7 @@ def validate_policy(source):
     ]
     if len(builds) != 1:
         raise ValueError("expected exactly one active cargo build")
-    args = shlex.split(builds[0].split("cargo build", 1)[1])
+    args = shlex.split(builds[0].split("cargo build", 1)[1].split(")", 1)[0])
     if "--locked" not in args:
         raise ValueError("installer build must use --locked")
     if "nightfall-node" not in args or "--release" not in args:
