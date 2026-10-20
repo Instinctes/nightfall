@@ -173,6 +173,12 @@ fn main() -> anyhow::Result<()> {
     };
 
     let store = ChainStore::new(&datadir);
+    if !matches!(
+        &cli.command,
+        Commands::Banner | Commands::RecoverStalledFork { .. }
+    ) {
+        store.refuse_unfinished_recovery()?;
+    }
 
     match cli.command {
         Commands::Banner => {

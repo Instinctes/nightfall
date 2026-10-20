@@ -28,9 +28,15 @@ fn directory(p: &Path) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(unix)]
 fn sync_dir(p: &Path) -> Result<()> {
     File::open(p)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_p: &Path) -> Result<()> {
+    bail!("offline recovery is supported only on Unix with durable directory fsync")
 }
 fn sync_files(p: &Path, names: &[&str]) -> Result<()> {
     for name in names {
@@ -66,6 +72,9 @@ fn inject(point: &str) -> Result<()> {
 
 pub fn recover(dir: &Path, network: NetworkId) -> Result<PathBuf> {
     directory(dir)?;
+    if !cfg!(unix) {
+        bail!("offline recovery is supported only on Unix; no chain files changed");
+    }
     if file_state(&dir.join(JOURNAL))? {
         bail!(
             "unfinished recovery journal {} — inspect and restore backup before retrying",
@@ -189,7 +198,13 @@ pub fn recover(dir: &Path, network: NetworkId) -> Result<PathBuf> {
         }
         sync_dir(dir)?;
         inject("verify")?;
-        let checked = store.load_or_new(network)?;
+        // Verify installed files through the isolated stage.
+        // Never bypass the journal guard on the active datadir.
+        for name in [block_file, META] {
+            fs::copy(dir.join(name), staged.join(name))
+                .with_context(|| format!("reading back installed {name}"))?;
+        }
+        let checked = staged_store.load_or_new(network)?;
         let fresh = nightfall_consensus::Chain::new_fair(network)?;
         if checked.tip_hash() != fresh.tip_hash()
             || checked.block_count() != fresh.block_count()
@@ -234,7 +249,7 @@ pub fn recover(dir: &Path, network: NetworkId) -> Result<PathBuf> {
     Ok(backup)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use nightfall_crypto::WalletKeys;

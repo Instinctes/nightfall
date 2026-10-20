@@ -1,5 +1,7 @@
 //! Exercise clap requirements and the actual OS-level lock through nightfalld.
-use nightfall_storage::{dirlock, ChainStore};
+#[cfg(unix)]
+use nightfall_storage::dirlock;
+use nightfall_storage::ChainStore;
 use nightfall_types::NetworkId;
 use std::{
     fs,
@@ -34,6 +36,7 @@ fn cli(args: &[&str]) -> std::process::Output {
         .output()
         .unwrap()
 }
+#[cfg(unix)]
 #[test]
 fn explicit_flags_required_and_lock_refuses_live_holder() {
     let tmp = Tmp::new();
@@ -83,6 +86,7 @@ fn explicit_flags_required_and_lock_refuses_live_holder() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("WITHOUT --mine"));
 }
 
+#[cfg(unix)]
 #[test]
 fn running_real_daemon_refuses_recovery_via_cli() {
     use std::{process::Stdio, thread, time::Duration};
@@ -136,4 +140,61 @@ fn running_real_daemon_refuses_recovery_via_cli() {
     let _ = daemon.kill();
     let _ = daemon.wait();
     assert!(locked, "daemon never acquired its data-directory lock");
+}
+
+#[test]
+fn interrupted_layout_refuses_status_and_daemon_without_mutation() {
+    let tmp = Tmp::new();
+    let block = tmp.0.join("blocks.bin");
+    let backup = tmp.0.join("recovery-original-backup");
+    fs::create_dir(&backup).unwrap();
+    fs::rename(&block, backup.join("blocks.bin")).unwrap();
+
+    let old_meta = fs::read(tmp.0.join("chain-meta.json")).unwrap();
+    let old_blocks = fs::read(backup.join("blocks.bin")).unwrap();
+
+    fs::write(
+        tmp.0.join(".stalled-fork-recovery-in-progress"),
+        b"BACKUP=demo",
+    )
+    .unwrap();
+
+    let path = tmp.0.to_str().unwrap();
+
+    for command in ["status", "run"] {
+        let output = cli(&["--network", "devnet", "--datadir", path, command]);
+
+        assert!(!output.status.success(), "{command} unexpectedly started");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("unfinished stalled-fork recovery"),
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(!block.exists());
+        assert_eq!(fs::read(tmp.0.join("chain-meta.json")).unwrap(), old_meta);
+        assert_eq!(fs::read(backup.join("blocks.bin")).unwrap(), old_blocks);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_recovery_explicitly_refuses_without_changes() {
+    let tmp = Tmp::new();
+    let original = fs::read(tmp.0.join("blocks.bin")).unwrap();
+
+    let output = cli(&[
+        "--network",
+        "devnet",
+        "--datadir",
+        tmp.0.to_str().unwrap(),
+        "recover-stalled-fork",
+        "--force",
+    ]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("supported only on Unix"));
+
+    assert_eq!(fs::read(tmp.0.join("blocks.bin")).unwrap(), original);
+    assert!(!tmp.0.join(".stalled-fork-recovery-in-progress").exists());
 }

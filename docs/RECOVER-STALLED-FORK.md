@@ -17,3 +17,23 @@ A crash between individual renames can leave `.stalled-fork-recovery-in-progress
 ## Development test gates
 
 The offline unit tests cover JSON/binary, a genuine pruned UTXO horizon, backup restore to the exact original tip, wallet file identity, unique repeat backups, wrong-network refusal, symlinks, incomplete journal and debug-only injected staging/move/verify failures. The integration test uses the real CLI and the shared OS filesystem lock to simulate an active node/wallet holder; the lock policy itself is identical for both applications. Debug-only fault injection is not compiled into release builds.
+
+## Normal start refusal and supported platforms
+
+An unfinished `.stalled-fork-recovery-in-progress` journal makes
+normal daemon start and shared ChainStore load/save entry points
+fail closed. This also covers Core through the shared storage API.
+
+Recovery verifies installed files using an isolated staging
+directory without bypassing the active datadir journal guard.
+
+Do not delete an unfinished recovery journal without restoring
+and independently verifying the original chain first.
+
+Offline destructive recovery is supported only on Unix platforms
+with durable directory fsync. Windows recovery explicitly refuses
+before moving chain files. Ordinary Windows operation is unchanged.
+
+CI executes journal and CLI refusal regressions on Linux,
+macOS and Windows. Cross-platform validation must pass before
+portability or release readiness is claimed.
