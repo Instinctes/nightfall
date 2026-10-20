@@ -1,10 +1,10 @@
 //! End-to-end tests for `nightfalld recover-stalled-fork`, driven through the
 //! real binary.
 //!
-//! The one thing a direct call to the recovery helper cannot prove is that a
-//! running node or wallet makes the command refuse: `main()` takes the
-//! data-directory lock before dispatching, so the refusal only happens for a
-//! real process. These tests hold that same lock and spawn the actual binary.
+//! Several boundaries only hold for a real process: the data-directory lock is
+//! taken by `main()` before dispatch, input validation happens before that lock
+//! (so a bad `--datadir` is never created), and the recovery journal is checked
+//! on every normal start. These tests spawn the actual binary to exercise them.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -41,23 +41,23 @@ fn run(datadir: &Path, args: &[&str]) -> std::process::Output {
 
 fn backup_dirs(datadir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(datadir)
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.is_dir()
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("recovery-backup-"))
-                    .unwrap_or(false)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.is_dir()
+                        && p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| n.starts_with("recovery-backup-"))
+                            .unwrap_or(false)
+                })
+                .collect()
         })
-        .collect()
+        .unwrap_or_default()
 }
 
 #[test]
 fn a_running_node_lock_makes_recovery_refuse() {
     let dir = unique_tmp("locked");
-
-    // Set up a real chain first (this process releases the lock on exit).
     assert!(run(&dir, &["init"]).status.success(), "init failed");
 
     // Hold the data-directory lock, exactly as a running node or wallet would.
@@ -73,7 +73,6 @@ fn a_running_node_lock_makes_recovery_refuse() {
         stderr.contains("already using"),
         "the refusal must name the lock holder, got: {stderr}"
     );
-    // It refused before doing anything: no backup was made.
     assert!(backup_dirs(&dir).is_empty());
 
     std::fs::remove_dir_all(&dir).ok();
@@ -82,13 +81,11 @@ fn a_running_node_lock_makes_recovery_refuse() {
 #[test]
 fn happy_path_resets_to_genesis_and_keeps_the_wallet() {
     let dir = unique_tmp("happy");
-
     assert!(run(&dir, &["init"]).status.success(), "init failed");
     assert!(
         run(&dir, &["mine", "--blocks", "3"]).status.success(),
         "mine failed"
     );
-    // Mining wrote the miner seed — a private key recovery must never touch.
     let seed_path = dir.join("miner.seed");
     let seed_before = std::fs::read(&seed_path).expect("miner.seed exists after mining");
 
@@ -108,12 +105,13 @@ fn happy_path_resets_to_genesis_and_keeps_the_wallet() {
         "summary must give the resync-without-mining next step: {stdout}"
     );
 
-    // A backup was made, the seed is byte-identical, and the chain is genesis.
     assert_eq!(backup_dirs(&dir).len(), 1);
     assert_eq!(std::fs::read(&seed_path).unwrap(), seed_before);
+    // No journal remains, and a normal start works again.
+    assert!(!dir.join(".recovery-journal.json").exists());
 
     let status = run(&dir, &["status"]);
-    assert!(status.status.success());
+    assert!(status.status.success(), "status after reset must succeed");
     let s = String::from_utf8_lossy(&status.stdout);
     assert!(
         s.lines()
@@ -129,7 +127,6 @@ fn an_explicit_network_is_required() {
     let dir = unique_tmp("net");
     assert!(run(&dir, &["init"]).status.success(), "init failed");
 
-    // No --network: the global default must not be enough for a destructive reset.
     let out = Command::new(BIN)
         .arg("--datadir")
         .arg(&dir)
@@ -139,6 +136,93 @@ fn an_explicit_network_is_required() {
     assert!(!out.status.success(), "must require an explicit --network");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("--network"), "got: {stderr}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_nonexistent_datadir_is_refused_without_creating_it() {
+    // A fresh unique path that does not exist. Recovery must refuse before the
+    // lock (which would create it).
+    let base = unique_tmp("nonexist");
+    let missing = base.join("does-not-exist");
+    assert!(!missing.exists());
+
+    let out = Command::new(BIN)
+        .arg("--datadir")
+        .arg(&missing)
+        .arg("--network")
+        .arg("devnet")
+        .args(["recover-stalled-fork", "--force"])
+        .output()
+        .expect("spawn nightfalld");
+    assert!(
+        !out.status.success(),
+        "a nonexistent datadir must be refused"
+    );
+    assert!(
+        !missing.exists(),
+        "the datadir must not be created before the refusal"
+    );
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_lock_file_is_not_followed() {
+    let dir = unique_tmp("symlock");
+    assert!(run(&dir, &["init"]).status.success(), "init failed");
+    // Replace the lock file with a symlink to an unrelated fixture.
+    let victim = unique_tmp("symlock-victim").join("victim");
+    std::fs::write(&victim, b"do not touch").unwrap();
+    let lock = dir.join(".nightfall-lock");
+    std::fs::remove_file(&lock).ok();
+    std::os::unix::fs::symlink(&victim, &lock).unwrap();
+
+    let out = run(&dir, &["recover-stalled-fork", "--force"]);
+    assert!(!out.status.success(), "a symlinked lock must be refused");
+    assert_eq!(
+        std::fs::read(&victim).unwrap(),
+        b"do not touch",
+        "the symlink target must be untouched"
+    );
+    assert!(backup_dirs(&dir).is_empty());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn an_interrupted_recovery_blocks_a_normal_start() {
+    // Reproduce the maintainer's interrupted layout: the active blocks file is
+    // in a backup, the old metadata remains, and the recovery journal is left.
+    let dir = unique_tmp("interrupted");
+    assert!(run(&dir, &["init"]).status.success(), "init failed");
+    assert!(
+        run(&dir, &["mine", "--blocks", "2"]).status.success(),
+        "mine failed"
+    );
+
+    let backup = dir.join("recovery-backup-interrupted");
+    std::fs::create_dir(&backup).unwrap();
+    std::fs::rename(dir.join("blocks.bin"), backup.join("blocks.bin")).unwrap();
+    std::fs::write(
+        dir.join(".recovery-journal.json"),
+        format!("{{\"backup\":\"{}\"}}", backup.display()),
+    )
+    .unwrap();
+
+    // A normal start must refuse rather than report a fresh zero-block chain.
+    let out = run(&dir, &["status"]);
+    assert!(
+        !out.status.success(),
+        "status must refuse over an interrupted recovery, not report a fresh chain"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("interrupted") && stderr.contains("backup"),
+        "the refusal must explain the interrupted recovery and the backup: {stderr}"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }

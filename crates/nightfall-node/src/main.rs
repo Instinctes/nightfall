@@ -139,6 +139,21 @@ fn main() -> anyhow::Result<()> {
         .any(|a| a == "--network" || a.starts_with("--network="));
     let datadir = cli.datadir.unwrap_or_else(|| default_data_dir(network));
 
+    // A destructive reset validates its inputs before the lock is taken, so a
+    // bad --datadir is not created and a symlinked lock file is not written
+    // through by lock acquisition.
+    if let Commands::RecoverStalledFork { force } = &cli.command {
+        nightfall_node::recovery::precheck(
+            &RecoverOpts {
+                datadir: datadir.clone(),
+                network,
+                force: *force,
+            },
+            network_explicit,
+            datadir_explicit,
+        )?;
+    }
+
     // One writer per data directory. The wallet takes the same lock, so a
     // node and a Core wallet cannot both open the same folder — which they
     // could before, and which produced a `blocks.bin` neither of them wrote.
@@ -335,18 +350,6 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Commands::RecoverStalledFork { force } => {
-            if !network_explicit {
-                anyhow::bail!(
-                    "recover-stalled-fork requires an explicit --network \
-                     (for example --network mainnet)"
-                );
-            }
-            if !datadir_explicit {
-                anyhow::bail!(
-                    "recover-stalled-fork requires an explicit --datadir \
-                     (the directory of the stalled node)"
-                );
-            }
             let report = nightfall_node::recovery::recover_stalled_fork(&RecoverOpts {
                 datadir: datadir.clone(),
                 network,

@@ -13,17 +13,24 @@ hand. This command is that move, made safe and explicit.
 
 ## What it does
 
-- Backs up the current chain files into a **freshly created, uniquely named**
-  directory inside the datadir (`recovery-backup-<nanos>-<n>`), and never
+- Validates its inputs **before** taking the data-directory lock, so a bad
+  `--datadir` is refused without being created and a symlinked lock file is
+  never written through.
+- Writes a **recovery journal** (`.recovery-journal.json`) before it moves
+  anything, and removes it only once the reset is complete and verified. While
+  the journal exists, every load path — the daemon, Core, and the CLI — refuses
+  to start, so an interrupted reset can never be mistaken for a healthy fresh
+  chain.
+- Backs the current chain files up into a **freshly created, uniquely named**
+  directory (`recovery-backup-<nanos>-<n>`), fsyncing at each step, and never
   deletes or reuses a backup.
-- **Stages and verifies** a fresh genesis before moving a single original file,
-  so a failure leaves the originals recoverable rather than a half-reset datadir
-  reported as success.
+- **Stages and verifies** a fresh genesis before moving a single original file;
+  on any mid-reset failure it names the backup and does **not** report success.
 - Resets the datadir to a fresh genesis, **preserving the storage format**
   (binary or JSON) and the chain metadata / headers / pruned-UTXO-horizon file
   set.
 - **Never touches** the wallet directory, `miner.seed`, the install id, the
-  lock file, or any earlier backup.
+  lock file, the journal, or any earlier backup.
 
 ## Safety boundary
 
@@ -31,9 +38,10 @@ hand. This command is that move, made safe and explicit.
   same lock a running node or a Core wallet holds), so it refuses rather than
   race a live writer. There is no recovery RPC and no automatic mining.
 - Requires an explicit `--network`, an existing `--datadir`, and `--force`.
-- Refuses an ambiguous datadir — no readable `chain-meta.json`, a symlinked or
-  non-regular chain file, or a chain for a different network — rather than
-  guessing.
+- Confirms the datadir's network **and genesis** from `chain-meta.json`, and
+  refuses an ambiguous datadir — a mixed binary/JSON layout, no readable
+  `chain-meta.json`, a symlinked or non-regular chain file, or a chain for a
+  different network — rather than guessing.
 - This is a manual escape hatch, **not** a promise that every liveness problem
   is fixed. It resets to genesis; you resync.
 
@@ -55,6 +63,24 @@ at the tip is the clean path.)
 nightfalld --datadir /var/lib/nightfall --network mainnet run --connect <peer>
 ```
 
-If anything goes wrong mid-reset, the command says so and does **not** report
-success; your original chain files are in the backup directory it named —
-move them back into the datadir to restore the previous state.
+## If a recovery is interrupted
+
+If the command is interrupted mid-reset (power loss, a kill), it leaves the
+`.recovery-journal.json` behind. The datadir may be only half-reset, so the
+node, Core and the CLI will **refuse to start** and point you at the backup.
+To recover by hand:
+
+1. Move the chain files from the named `recovery-backup-<…>` directory back
+   into the datadir.
+2. Delete `.recovery-journal.json`.
+3. Start the node normally.
+
+Your original chain is intact in the backup, and the wallet was never touched.
+
+## Platform note
+
+Durability uses an fsync of the data directory after the journal write and the
+file moves. This is implemented for both Unix (an fsync of the directory
+handle) and Windows (via `FILE_FLAG_BACKUP_SEMANTICS`, which Windows requires to
+open a directory handle), so there is no unconditional directory sync that only
+works on one platform.

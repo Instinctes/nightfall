@@ -658,6 +658,28 @@ impl ChainStore {
     ) -> anyhow::Result<Chain> {
         self.ensure_dir()?;
 
+        let journal = self.dir.join(RECOVERY_JOURNAL);
+        if journal.exists() {
+            let backup = fs::read_to_string(&journal)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| v.get("backup").and_then(|b| b.as_str()).map(String::from));
+            anyhow::bail!(
+                "an interrupted recover-stalled-fork was found in {} ({} is present),\n\
+                 so the datadir may be only half-reset and cannot be trusted to start.\n\
+                 {}\n\
+                 Restore the backup into the datadir and delete {}, then start again.",
+                self.dir.display(),
+                RECOVERY_JOURNAL,
+                backup
+                    .map(|b| format!("The original chain is backed up at {b}."))
+                    .unwrap_or_else(
+                        || "The original chain is in the recovery-backup-* directory.".to_string()
+                    ),
+                RECOVERY_JOURNAL,
+            );
+        }
+
         if self.legacy_path().exists() && !self.blocks_path().exists() {
             anyhow::bail!(
                 "This datadir contains a protocol v4 chain ({}).\n\
@@ -890,6 +912,12 @@ fn load_jsonl_headers(path: &Path) -> anyhow::Result<Vec<CompactHeader>> {
 /// This chain uses a sibling folder so an old wallet cannot mine the corpse.
 pub const DATADIR_EPOCH: &str = "n8";
 
+/// Written by `recover-stalled-fork` while it resets a datadir, and removed
+/// only when the reset has completed and been verified. Its presence means a
+/// recovery was interrupted and the datadir may be half-reset, so every load
+/// path refuses to start until the operator restores the named backup.
+pub const RECOVERY_JOURNAL: &str = ".recovery-journal.json";
+
 pub fn default_data_dir(network: NetworkId) -> PathBuf {
     let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
     base.join("nightfall")
@@ -899,6 +927,34 @@ pub fn default_data_dir(network: NetworkId) -> PathBuf {
 
 pub fn wallet_dir(datadir: &Path) -> PathBuf {
     datadir.join("wallet")
+}
+
+/// fsync a directory so a rename or a newly created file in it is durable.
+///
+/// This is what keeps the recovery journal and the backup from disagreeing
+/// after a crash: the journal must reach disk before the originals are moved.
+/// On Unix an open directory handle can be synced directly; on Windows a
+/// directory handle needs `FILE_FLAG_BACKUP_SEMANTICS`.
+pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)?
+            .sync_all()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 pub fn now_unix() -> u64 {
