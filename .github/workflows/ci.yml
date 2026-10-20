@@ -45,6 +45,9 @@ jobs:
       - name: Installer temporary swap lifecycle (mocked; no root or real swap)
         run: python3 -m unittest discover -s scripts -p 'test_installer_swap_safety.py' -v
 
+      - name: Node Kit locked source and fingerprint policy (no privileged installs)
+        run: python3 -m unittest discover -s scripts -p 'test_node_kit_source_policy.py' -v
+
       - name: Tests
         run: cargo test --workspace
 
