@@ -1,0 +1,23 @@
+[package]
+name = "nightfall-consensus-oracle"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Deliberately its own workspace.
+# The oracle must not inherit Nightfall's consensus implementation.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
+ureq = { version = "2.12.1", default-features = false }
+
+blake3 = "1"
+
+argon2 = "0.5"
+num-bigint = "0.4"
+
+bulletproofs = "5"
+curve25519-dalek = "4"
+merlin = "3"
