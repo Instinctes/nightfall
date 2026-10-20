@@ -724,6 +724,18 @@ impl ChainStore {
             chain.horizon_work = m.horizon_work.parse().unwrap_or(0);
             let horizon = load_horizon_file(&self.horizon_path())?;
             chain.ledger = horizon.clone();
+
+            // The pruning horizon is already the canonical materialized
+            // ledger state from which suffix replay resumes. Rebuild the
+            // non-consensus authenticated shadow from that exact state before
+            // applying the first retained block.
+            chain.rebuild_authenticated_shadow_from_canonical();
+            chain.verify_authenticated_shadow().map_err(|e| {
+                anyhow::anyhow!(
+                    "authenticated shadow could not be reconstructed from pruning horizon: {e}"
+                )
+            })?;
+
             chain.horizon = Some(horizon);
             chain.total_work = chain.horizon_work;
             chain.headers = load_jsonl_headers(&self.headers_path())?
@@ -1058,6 +1070,15 @@ mod tests {
         assert_eq!(loaded.first_height, 8);
         assert_eq!(loaded.blocks.len(), 4);
         assert_eq!(loaded.ledger.utxo_root(), root);
+
+        // Restarting a pruned node must reconstruct exactly the same
+        // experimental authenticated state as the chain that was saved.
+        assert_eq!(
+            loaded.authenticated_utxo_root(),
+            chain.authenticated_utxo_root()
+        );
+        loaded.verify_authenticated_shadow().unwrap();
+
         loaded.verify_supply().unwrap();
         assert!(loaded.block_by_height(0).is_none());
         assert!(loaded.block_by_height(8).is_some());
