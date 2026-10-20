@@ -13,7 +13,7 @@ use nightfall_ledger::{LedgerState, UtxoEntry, UtxoSet};
 use nightfall_types::{Hash256, Height, NetworkId};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -77,6 +77,18 @@ pub struct SnapshotManifest {
 
 fn json_format_name() -> String {
     "json".to_string()
+}
+
+/// Make namespace changes durable after publishing renamed files.
+#[cfg(unix)]
+fn sync_dir(path: &Path) -> anyhow::Result<()> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 pub struct ChainStore {
@@ -185,8 +197,14 @@ impl ChainStore {
             validated_headers_bytes,
         };
         let tmp = self.dir.join("chain-meta.json.tmp");
-        fs::write(&tmp, serde_json::to_vec_pretty(&meta)?)?;
-        fs::rename(tmp, self.meta_path())?;
+        {
+            let mut file = File::create(&tmp)?;
+            serde_json::to_writer_pretty(&mut file, &meta)?;
+            file.flush()?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp, self.meta_path())?;
+        sync_dir(&self.dir)?;
         Ok(())
     }
 
@@ -238,6 +256,66 @@ impl ChainStore {
         fs::read_to_string(self.meta_path())
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
+    }
+
+    /// Roll back an archive append that reached durable storage but whose
+    /// metadata commit did not.
+    ///
+    /// Truncation is permitted only when the prefix through
+    /// `validated_bytes` reproduces the exact locally-authenticated chain
+    /// named by the old metadata. This prevents a complete rewrite/reorg
+    /// beside stale metadata from being mistaken for an append tail.
+    fn recover_uncommitted_archive_tail(&self) -> anyhow::Result<()> {
+        let Some(meta) = self.read_meta() else {
+            return Ok(());
+        };
+
+        if meta.pruned
+            || meta.first_height != 0
+            || meta.validated_bytes == 0
+            || meta.validated_tip.is_empty()
+            || meta.validated_by.is_empty()
+            || meta.validated_by != self.install_id()
+        {
+            return Ok(());
+        }
+
+        let path = self.blocks_path();
+        let actual = match fs::metadata(&path) {
+            Ok(m) => m.len(),
+            Err(_) => return Ok(()),
+        };
+
+        if actual <= meta.validated_bytes {
+            return Ok(());
+        }
+
+        let prefix = File::open(&path)?.take(meta.validated_bytes);
+        let blocks = match codec::read_blocks(prefix, self.format()) {
+            Ok(blocks) => blocks,
+            Err(_) => return Ok(()),
+        };
+
+        let prefix_matches = blocks.len() as u64 == meta.block_count
+            && blocks
+                .last()
+                .map(|block| block.hash().to_hex() == meta.validated_tip)
+                .unwrap_or(false);
+
+        if !prefix_matches {
+            return Ok(());
+        }
+
+        let file = OpenOptions::new().write(true).open(&path)?;
+        file.set_len(meta.validated_bytes)?;
+        file.sync_all()?;
+
+        tracing::warn!(
+            discarded_bytes = actual - meta.validated_bytes,
+            "discarded uncommitted archive tail left by interrupted save"
+        );
+
+        Ok(())
     }
 
     /// Rewrite the chain file in the binary encoding.
@@ -504,7 +582,13 @@ impl ChainStore {
         for block in &chain.blocks[on_disk as usize..] {
             codec::write_block(&mut file, block, fmt)?;
         }
+
+        // Metadata is the archive commit record. Durable block bytes must
+        // therefore precede metadata publication.
         file.flush()?;
+        file.get_ref().sync_all()?;
+        drop(file);
+
         self.write_meta(chain)?;
         Ok(())
     }
@@ -606,8 +690,15 @@ impl ChainStore {
                 codec::write_block(&mut file, block, fmt)?;
             }
             file.flush()?;
+            file.get_ref().sync_all()?;
         }
-        fs::rename(tmp, self.blocks_path())?;
+
+        fs::rename(&tmp, self.blocks_path())?;
+        sync_dir(&self.dir)?;
+
+        // A crash before metadata publication leaves a complete replacement
+        // beside stale metadata. Startup will revalidate it rather than
+        // treating it as an authenticated append tail.
         self.write_meta(chain)?;
         Ok(())
     }
@@ -673,6 +764,8 @@ impl ChainStore {
         if !self.blocks_path().exists() {
             return Ok(Chain::new_fair(network)?);
         }
+
+        self.recover_uncommitted_archive_tail()?;
 
         let meta: Option<ChainMeta> = fs::read_to_string(self.meta_path())
             .ok()
@@ -1248,6 +1341,68 @@ mod tests {
         assert_eq!(reloaded.block_count(), shorter.block_count());
         assert_eq!(reloaded.tip_hash(), shorter.tip_hash());
         reloaded.verify_supply().unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn archive_uncommitted_append_is_rolled_back_on_restart() {
+        use nightfall_crypto::WalletKeys;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let dir =
+            std::env::temp_dir().join(format!("nf-crash-append-{}-{unique}", std::process::id()));
+
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+        for i in 0..3u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+
+        store.save(&chain).unwrap();
+
+        let committed_count = chain.block_count();
+        let committed_tip = chain.tip_hash();
+        let committed_bytes = fs::metadata(store.blocks_path()).unwrap().len();
+
+        chain.mine_block(&miner, vec![], now_unix() + 1000).unwrap();
+
+        // Simulate interruption after the appended block reached stable
+        // storage but before chain-meta.json was committed.
+        let fmt = store.format();
+        {
+            let mut file = BufWriter::new(
+                OpenOptions::new()
+                    .append(true)
+                    .open(store.blocks_path())
+                    .unwrap(),
+            );
+
+            codec::write_block(&mut file, chain.blocks.last().unwrap(), fmt).unwrap();
+            file.flush().unwrap();
+            file.get_ref().sync_all().unwrap();
+        }
+
+        assert!(fs::metadata(store.blocks_path()).unwrap().len() > committed_bytes);
+
+        let loaded = store.load_or_new(NetworkId::Devnet).unwrap();
+
+        assert_eq!(loaded.block_count(), committed_count);
+        assert_eq!(loaded.tip_hash(), committed_tip);
+        assert_eq!(
+            fs::metadata(store.blocks_path()).unwrap().len(),
+            committed_bytes
+        );
+
         fs::remove_dir_all(&dir).ok();
     }
 }
