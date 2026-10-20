@@ -1,0 +1,22 @@
+name: CLI backup rehearsal
+
+on:
+  pull_request:
+    paths:
+      - 'crates/nightfall-wallet/**'
+      - 'scripts/test_cli_backup_rehearsal.py'
+      - 'docs/CLI-BACKUP-REHEARSAL.md'
+      - '.github/workflows/cli-backup-rehearsal.yml'
+  workflow_dispatch:
+
+jobs:
+  disposable-devnet-recovery:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build CLI wallet from checked-in dependencies
+        run: cargo build --locked -p nightfall-wallet
+      - name: Rehearse isolated Devnet seed backup and rejection cases
+        run: python3 scripts/test_cli_backup_rehearsal.py --wallet target/debug/nightfall-wallet
