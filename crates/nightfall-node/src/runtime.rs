@@ -4,7 +4,9 @@ use crate::rpc;
 use crate::session::{
     fanout_block, fluff_tx, inbound_key, outbound_key, stem_tx, SessionHandle, SessionPool,
 };
-use nightfall_consensus::{Block, BlockTemplate, Chain, Mempool, PRUNE_KEEP_BLOCKS};
+use nightfall_consensus::{
+    Block, BlockTemplate, Chain, EphemeralStatePool, Mempool, PRUNE_KEEP_BLOCKS,
+};
 use nightfall_crypto::{default_threads, mine_parallel, Address};
 use nightfall_ledger::Transaction;
 use nightfall_p2p::{
@@ -89,6 +91,12 @@ pub const INTRO_GRACE_SECS: u64 = 30;
 pub struct NodeInner {
     pub chain: Chain,
     pub mempool: Mempool,
+
+    /// Experimental non-consensus-active ephemeral state.
+    ///
+    /// Lives beside the mempool and is reconciled whenever the
+    /// canonical chain tip changes.
+    pub ephemeral: EphemeralStatePool,
     pub store: ChainStore,
     pub network: NetworkId,
     /// Addresses we can dial back (peers' advertised listen addresses).
@@ -304,16 +312,38 @@ impl NodeInner {
     }
 
     fn bump_tip(&mut self) {
+        /*
+         * Every canonical tip transition comes through this hook:
+         *
+         * - accepted peer block,
+         * - IBD extension,
+         * - successful reorg,
+         * - locally mined block,
+         * - completed disk replay.
+         *
+         * Reconcile ephemeral state here once instead of maintaining
+         * several subtly different lifecycle paths.
+         */
+        let dropped_ephemeral = self.ephemeral.reconcile_with_chain(&self.chain);
+
+        if dropped_ephemeral > 0 {
+            tracing::info!(
+                "ephemeral state: dropped {dropped_ephemeral} state(s) after canonical tip change"
+            );
+        }
+
         self.tip_epoch.fetch_add(1, Ordering::SeqCst);
         self.stalled_on_fork.store(false, Ordering::SeqCst);
         self.fork_rewind.store(0, Ordering::SeqCst);
-        // Our chain moved, so whatever gap remains is being closed. Anything
-        // that stops moving while a peer claims more is a fork, and the mining
-        // hold-off gives up on it — see MAX_CATCHUP_WAIT_SECS.
+
+        // Our chain moved, so whatever gap remains is being closed.
+        // Anything that stops moving while a peer claims more is a fork.
         self.behind_since = now_unix();
+
         if let Ok(mut gen) = self.tip_notify.0.lock() {
             *gen = gen.wrapping_add(1);
         }
+
         self.tip_notify.1.notify_all();
     }
 
@@ -722,6 +752,7 @@ impl NodeHandle {
         let inner = NodeInner {
             chain,
             mempool: Mempool::default(),
+            ephemeral: EphemeralStatePool::new(),
             store,
             network: cfg.network,
             // Restored from peers.json so a peer added last session is

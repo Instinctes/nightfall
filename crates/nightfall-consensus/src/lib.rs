@@ -1139,6 +1139,921 @@ impl Chain {
     }
 }
 
+// --------------------------------------------------------- ephemeral state --
+
+/// Experimental, non-consensus-active ephemeral state pool.
+///
+/// Temporary protocol state lives here without touching the canonical ledger.
+///
+/// Current invariants:
+/// - deterministic identifiers,
+/// - deterministic block-height expiry,
+/// - bounded memory,
+/// - idempotent exact replay,
+/// - one active state per logical key,
+/// - deterministic conflict resolution independent of arrival order.
+///
+/// This is still NOT consensus-active.
+#[derive(Clone, Debug, Default)]
+pub struct EphemeralStatePool {
+    entries: HashMap<Hash256, EphemeralStateEntry>,
+    key_index: HashMap<Vec<u8>, Hash256>,
+
+    /// Signed network-facing states may be bound to one canonical
+    /// chain position. Raw local test states remain unanchored.
+    anchors: HashMap<Hash256, EphemeralChainAnchor>,
+
+    /// Reverse lookup: state id -> signing authority's `spend_pk`.
+    ///
+    /// Kept in lock-step with `entries` at every mutation point
+    /// (insert, conflict replacement, expiry, reorg reconciliation).
+    authority_of: HashMap<Hash256, [u8; 32]>,
+}
+
+#[derive(Clone, Debug)]
+struct EphemeralStateEntry {
+    state_key: Vec<u8>,
+    state_data: Vec<u8>,
+    created_height: Height,
+    expires_height: Height,
+}
+
+const EPHEMERAL_STATE_DOMAIN: &[u8] = b"nightfall:ephemeral-state:v1";
+
+/// Domain separation for ephemeral-state Merkle leaves.
+const EPHEMERAL_STATE_LEAF_DOMAIN: &[u8] = b"nightfall:ephemeral:state-leaf:v1";
+
+/// Domain separation for ephemeral-state Merkle internal nodes.
+const EPHEMERAL_STATE_NODE_DOMAIN: &[u8] = b"nightfall:ephemeral:state-node:v1";
+
+/// Domain separation for the empty ephemeral-state commitment.
+const EPHEMERAL_STATE_EMPTY_DOMAIN: &[u8] = b"nightfall:ephemeral:state-empty:v1";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum EphemeralStateError {
+    #[error("ephemeral state key must not be empty")]
+    EmptyKey,
+
+    #[error("ephemeral state key is too large: {len} bytes, maximum {max}")]
+    KeyTooLarge { len: usize, max: usize },
+
+    #[error("ephemeral state payload is too large: {len} bytes, maximum {max}")]
+    StateTooLarge { len: usize, max: usize },
+
+    #[error("ephemeral state TTL must be greater than zero")]
+    ZeroTtl,
+
+    #[error("ephemeral state TTL is too large: {got} blocks, maximum {max}")]
+    TtlTooLarge { got: u64, max: u64 },
+
+    #[error("ephemeral state expiry height overflow")]
+    HeightOverflow,
+
+    #[error("ephemeral state pool is full: maximum {max} entries")]
+    PoolFull { max: usize },
+
+    #[error("ephemeral state lost deterministic conflict resolution to {existing:?}")]
+    KeyConflict { existing: Hash256 },
+
+    #[error("ephemeral state proposal signature is invalid")]
+    BadSignature,
+
+    #[error("ephemeral state proposal belongs to another network")]
+    WrongNetwork,
+
+    #[error(
+        "ephemeral proposal creation height {proposal} is ahead of observed height {observed}"
+    )]
+    FutureHeight { proposal: u64, observed: u64 },
+
+    #[error("ephemeral proposal expired at height {expires}; observed height is {observed}")]
+    ProposalExpired { expires: u64, observed: u64 },
+
+    #[error("network-facing ephemeral proposal has no canonical chain anchor")]
+    MissingChainAnchor,
+
+    #[error("ephemeral proposal creation height {created} does not match anchor height {anchor}")]
+    AnchorHeightMismatch { created: u64, anchor: u64 },
+
+    #[error("ephemeral proposal chain anchor is not part of the canonical chain")]
+    AnchorNotCanonical,
+
+    #[error("ephemeral proposal authority exceeded its quota of {max} live states")]
+    AuthorityQuotaExceeded { max: usize },
+}
+
+impl EphemeralStatePool {
+    pub const MAX_ENTRIES: usize = 4_096;
+    pub const MAX_KEY_BYTES: usize = 256;
+    pub const MAX_STATE_BYTES: usize = 4 * 1024;
+    pub const MAX_TTL_BLOCKS: u64 = 1_440;
+
+    /// Upper bound on live ephemeral states attributable to one
+    /// signing authority.
+    ///
+    /// Network-facing admission uses this as a pre-authentication
+    /// gate: a single authority cannot force the node to run
+    /// signature verification for an unbounded stream of distinct
+    /// logical keys, and cannot monopolise pool capacity.
+    pub const MAX_STATES_PER_AUTHORITY: usize = 64;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Compare two conflicting states without using local arrival order.
+    ///
+    /// Priority, lowest wins:
+    /// 1. creation height
+    /// 2. expiry height
+    /// 3. cryptographic state ID
+    ///
+    /// Earlier creation prevents a later replay from extending the lifetime.
+    /// Earlier expiry makes the rule conservative if otherwise identical
+    /// proposals disagree only about TTL.
+    /// The hash finally provides an unambiguous deterministic tie-break.
+    fn candidate_wins(
+        candidate_id: Hash256,
+        candidate_created: Height,
+        candidate_expires: Height,
+        incumbent_id: Hash256,
+        incumbent_created: Height,
+        incumbent_expires: Height,
+    ) -> bool {
+        if candidate_created != incumbent_created {
+            return candidate_created < incumbent_created;
+        }
+
+        if candidate_expires != incumbent_expires {
+            return candidate_expires < incumbent_expires;
+        }
+
+        candidate_id.0 < incumbent_id.0
+    }
+
+    pub fn propose(
+        &mut self,
+        state_key: &[u8],
+        state_data: &[u8],
+        current_height: Height,
+        ttl_blocks: u64,
+    ) -> Result<Hash256, EphemeralStateError> {
+        if state_key.is_empty() {
+            return Err(EphemeralStateError::EmptyKey);
+        }
+
+        if state_key.len() > Self::MAX_KEY_BYTES {
+            return Err(EphemeralStateError::KeyTooLarge {
+                len: state_key.len(),
+                max: Self::MAX_KEY_BYTES,
+            });
+        }
+
+        if state_data.len() > Self::MAX_STATE_BYTES {
+            return Err(EphemeralStateError::StateTooLarge {
+                len: state_data.len(),
+                max: Self::MAX_STATE_BYTES,
+            });
+        }
+
+        if ttl_blocks == 0 {
+            return Err(EphemeralStateError::ZeroTtl);
+        }
+
+        if ttl_blocks > Self::MAX_TTL_BLOCKS {
+            return Err(EphemeralStateError::TtlTooLarge {
+                got: ttl_blocks,
+                max: Self::MAX_TTL_BLOCKS,
+            });
+        }
+
+        let expires = current_height
+            .0
+            .checked_add(ttl_blocks)
+            .ok_or(EphemeralStateError::HeightOverflow)?;
+
+        let expires_height = Height(expires);
+
+        let created_bytes = current_height.0.to_le_bytes();
+        let expires_bytes = expires_height.0.to_le_bytes();
+
+        let id = hash_multi(
+            EPHEMERAL_STATE_DOMAIN,
+            &[state_key, state_data, &created_bytes, &expires_bytes],
+        );
+
+        self.expire(current_height);
+
+        // Exact replay is harmless.
+        if self.entries.contains_key(&id) {
+            return Ok(id);
+        }
+
+        /*
+         * Conflict with an already-live state for the same logical key.
+         *
+         * Do NOT use arrival order. Compare canonical properties instead.
+         */
+        if let Some(existing_id) = self.key_index.get(state_key).copied() {
+            let (existing_created, existing_expires) = {
+                let existing = self
+                    .entries
+                    .get(&existing_id)
+                    .expect("key index must reference a live entry");
+
+                (existing.created_height, existing.expires_height)
+            };
+
+            let candidate_wins = Self::candidate_wins(
+                id,
+                current_height,
+                expires_height,
+                existing_id,
+                existing_created,
+                existing_expires,
+            );
+
+            if !candidate_wins {
+                return Err(EphemeralStateError::KeyConflict {
+                    existing: existing_id,
+                });
+            }
+
+            /*
+             * Candidate is canonically superior.
+             *
+             * Replacement is atomic from the pool's perspective:
+             * one key still maps to exactly one live entry.
+             */
+            self.entries.remove(&existing_id);
+            self.anchors.remove(&existing_id);
+            self.authority_of.remove(&existing_id);
+
+            self.entries.insert(
+                id,
+                EphemeralStateEntry {
+                    state_key: state_key.to_vec(),
+                    state_data: state_data.to_vec(),
+                    created_height: current_height,
+                    expires_height,
+                },
+            );
+
+            self.key_index.insert(state_key.to_vec(), id);
+
+            return Ok(id);
+        }
+
+        if self.entries.len() >= Self::MAX_ENTRIES {
+            return Err(EphemeralStateError::PoolFull {
+                max: Self::MAX_ENTRIES,
+            });
+        }
+
+        self.entries.insert(
+            id,
+            EphemeralStateEntry {
+                state_key: state_key.to_vec(),
+                state_data: state_data.to_vec(),
+                created_height: current_height,
+                expires_height,
+            },
+        );
+
+        self.key_index.insert(state_key.to_vec(), id);
+
+        Ok(id)
+    }
+
+    pub fn expire(&mut self, current_height: Height) -> usize {
+        let before = self.entries.len();
+
+        self.entries
+            .retain(|_, entry| current_height < entry.expires_height);
+
+        let stale_keys: Vec<Vec<u8>> = self
+            .key_index
+            .iter()
+            .filter_map(|(key, id)| {
+                if self.entries.contains_key(id) {
+                    None
+                } else {
+                    Some(key.clone())
+                }
+            })
+            .collect();
+
+        for key in stale_keys {
+            self.key_index.remove(&key);
+        }
+
+        let entries = &self.entries;
+        self.anchors.retain(|id, _| entries.contains_key(id));
+
+        let entries = &self.entries;
+        self.authority_of.retain(|id, _| entries.contains_key(id));
+
+        before - self.entries.len()
+    }
+
+    pub fn contains(&self, id: &Hash256) -> bool {
+        self.entries.contains_key(id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn lifetime(&self, id: &Hash256) -> Option<(Height, Height)> {
+        self.entries
+            .get(id)
+            .map(|entry| (entry.created_height, entry.expires_height))
+    }
+
+    pub fn state(&self, id: &Hash256) -> Option<(&[u8], &[u8])> {
+        self.entries
+            .get(id)
+            .map(|entry| (entry.state_key.as_slice(), entry.state_data.as_slice()))
+    }
+
+    pub fn active_id_for_key(&self, state_key: &[u8]) -> Option<Hash256> {
+        self.key_index.get(state_key).copied()
+    }
+
+    /// Deterministic cryptographic commitment to the complete live
+    /// ephemeral-state set.
+    ///
+    /// HashMap iteration order MUST NEVER affect this value. Entries are
+    /// therefore canonically ordered by their deterministic state ID before
+    /// Merkle construction.
+    ///
+    /// Every leaf commits to:
+    /// - state ID,
+    /// - state key,
+    /// - state payload,
+    /// - creation height,
+    /// - expiry height.
+    ///
+    /// This root is still experimental and is not yet placed into block
+    /// headers or used as a consensus-validity rule.
+    pub fn state_root(&self) -> Hash256 {
+        if self.entries.is_empty() {
+            return hash_multi(EPHEMERAL_STATE_EMPTY_DOMAIN, &[]);
+        }
+
+        /*
+         * Canonical ordering is mandatory because HashMap iteration order
+         * differs between processes and nodes.
+         */
+        let mut ordered: Vec<(Hash256, &EphemeralStateEntry)> = self
+            .entries
+            .iter()
+            .map(|(id, entry)| (*id, entry))
+            .collect();
+
+        ordered.sort_by(|(a, _), (b, _)| a.0.cmp(&b.0));
+
+        let mut level: Vec<Hash256> = ordered
+            .into_iter()
+            .map(|(id, entry)| {
+                let created = entry.created_height.0.to_le_bytes();
+
+                let expires = entry.expires_height.0.to_le_bytes();
+
+                hash_multi(
+                    EPHEMERAL_STATE_LEAF_DOMAIN,
+                    &[
+                        &id.0,
+                        &entry.state_key,
+                        &entry.state_data,
+                        &created,
+                        &expires,
+                    ],
+                )
+            })
+            .collect();
+
+        /*
+         * Same deterministic odd-leaf strategy already used by Nightfall's
+         * UTXO Merkle root: duplicate the final child if a level has an odd
+         * number of nodes.
+         */
+        while level.len() > 1 {
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+
+            for pair in level.chunks(2) {
+                let left = pair[0];
+
+                let right = if pair.len() == 2 { pair[1] } else { pair[0] };
+
+                next.push(hash_multi(
+                    EPHEMERAL_STATE_NODE_DOMAIN,
+                    &[&left.0, &right.0],
+                ));
+            }
+
+            level = next;
+        }
+
+        level[0]
+    }
+
+    /// Expire state using trusted canonical node height, then commit the
+    /// resulting live set.
+    ///
+    /// Callers that need a height-correct root should use this method rather
+    /// than manually combining `expire()` and `state_root()`.
+    pub fn state_root_at(&mut self, observed_height: Height) -> Hash256 {
+        self.expire(observed_height);
+        self.state_root()
+    }
+
+    /// Return active IDs in canonical deterministic order.
+    ///
+    /// This will later be useful for reconciliation, proofs and network
+    /// agreement without exposing HashMap iteration order.
+    pub fn ordered_state_ids(&self) -> Vec<Hash256> {
+        let mut ids: Vec<Hash256> = self.entries.keys().copied().collect();
+
+        ids.sort_by(|a, b| a.0.cmp(&b.0));
+
+        ids
+    }
+}
+
+// ------------------------------------------ signed ephemeral proposals --
+
+/// Domain separation for authenticated ephemeral-state proposals.
+
+/// Canonical chain position on which an ephemeral proposal was created.
+///
+/// `tip_height == None` represents the genesis anchor before block height 0.
+///
+/// Ordinary chain extension keeps the anchor valid.
+/// A reorg that removes/replaces the anchored block invalidates it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EphemeralChainAnchor {
+    pub tip_hash: Hash256,
+    pub tip_height: Option<Height>,
+}
+
+impl EphemeralChainAnchor {
+    /// Capture the node's currently canonical chain position.
+    pub fn from_chain(chain: &Chain) -> Self {
+        Self {
+            tip_hash: chain.tip_hash(),
+            tip_height: chain.tip_height(),
+        }
+    }
+
+    /// True only while the anchored block remains in canonical history.
+    pub fn is_canonical_on(&self, chain: &Chain) -> bool {
+        match self.tip_height {
+            None => self.tip_hash == chain.genesis_hash,
+            Some(height) => chain.hash_at(height.0) == Some(self.tip_hash),
+        }
+    }
+
+    fn encoded_height(&self) -> [u8; 8] {
+        self.tip_height
+            .map(|h| h.0)
+            .unwrap_or(u64::MAX)
+            .to_le_bytes()
+    }
+}
+
+const EPHEMERAL_PROPOSAL_DOMAIN: &[u8] = b"nightfall:ephemeral:proposal:v1";
+
+/// Domain separation for authority-specific logical state keys.
+const EPHEMERAL_SCOPE_DOMAIN: &[u8] = b"nightfall:ephemeral:scope:v1";
+
+/// Cryptographically authenticated ephemeral-state proposal.
+///
+/// The signature commits to:
+/// - Nightfall network,
+/// - authority,
+/// - logical key,
+/// - state payload,
+/// - creation height,
+/// - TTL.
+///
+/// A relay therefore cannot alter any of these fields without invalidating
+/// the signature.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SignedEphemeralProposal {
+    pub network: NetworkId,
+    pub authority: Address,
+    pub logical_key: Vec<u8>,
+    pub state_data: Vec<u8>,
+    pub created_height: Height,
+    pub ttl_blocks: u64,
+
+    /// Canonical chain state the proposal was created on.
+    ///
+    /// `None` is retained only for the older isolated test path.
+    /// Consensus/network-facing admission requires `Some`.
+    pub anchor: Option<EphemeralChainAnchor>,
+
+    pub signature: nightfall_crypto::SchnorrSig,
+}
+
+impl SignedEphemeralProposal {
+    /// Create an authenticated proposal using the wallet's spend key.
+    pub fn sign(
+        network: NetworkId,
+        keys: &nightfall_crypto::WalletKeys,
+        logical_key: &[u8],
+        state_data: &[u8],
+        created_height: Height,
+        ttl_blocks: u64,
+    ) -> Self {
+        let authority = keys.address();
+
+        let mut proposal = Self {
+            network,
+            authority,
+            logical_key: logical_key.to_vec(),
+            state_data: state_data.to_vec(),
+            created_height,
+            ttl_blocks,
+            anchor: None,
+            signature: nightfall_crypto::SchnorrSig {
+                r: [0u8; 32],
+                s: [0u8; 32],
+            },
+        };
+
+        let message = proposal.signing_message();
+
+        proposal.signature = nightfall_crypto::sig::sign(
+            &keys.spend_secret(),
+            &nightfall_crypto::generator_g(),
+            &message,
+        );
+
+        proposal
+    }
+
+    /// Canonical domain-separated message covered by the signature.
+
+    /// Create a proposal cryptographically bound to one canonical
+    /// Nightfall chain position.
+    pub fn sign_anchored(
+        network: NetworkId,
+        keys: &nightfall_crypto::WalletKeys,
+        logical_key: &[u8],
+        state_data: &[u8],
+        anchor: EphemeralChainAnchor,
+        created_height: Height,
+        ttl_blocks: u64,
+    ) -> Self {
+        let authority = keys.address();
+
+        let mut proposal = Self {
+            network,
+            authority,
+            logical_key: logical_key.to_vec(),
+            state_data: state_data.to_vec(),
+            created_height,
+            ttl_blocks,
+            anchor: Some(anchor),
+            signature: nightfall_crypto::SchnorrSig {
+                r: [0u8; 32],
+                s: [0u8; 32],
+            },
+        };
+
+        let message = proposal.signing_message();
+
+        proposal.signature = nightfall_crypto::sig::sign(
+            &keys.spend_secret(),
+            &nightfall_crypto::generator_g(),
+            &message,
+        );
+
+        proposal
+    }
+
+    pub fn signing_message(&self) -> [u8; 32] {
+        let height = self.created_height.0.to_le_bytes();
+        let ttl = self.ttl_blocks.to_le_bytes();
+
+        let anchor_present = [if self.anchor.is_some() { 1u8 } else { 0u8 }];
+
+        let (anchor_tip, anchor_height) = match self.anchor {
+            Some(anchor) => (anchor.tip_hash.0, anchor.encoded_height()),
+            None => ([0u8; 32], u64::MAX.to_le_bytes()),
+        };
+
+        hash_multi(
+            EPHEMERAL_PROPOSAL_DOMAIN,
+            &[
+                self.network.as_str().as_bytes(),
+                &self.authority.scan_pk,
+                &self.authority.spend_pk,
+                &anchor_present,
+                &anchor_tip,
+                &anchor_height,
+                &self.logical_key,
+                &self.state_data,
+                &height,
+                &ttl,
+            ],
+        )
+        .0
+    }
+
+    /// Verify proof of control over the authority's Nightfall spend key.
+    pub fn verify_signature(&self) -> bool {
+        let Some(public) = self.authority.spend_point() else {
+            return false;
+        };
+
+        nightfall_crypto::sig::verify(
+            &public,
+            &nightfall_crypto::generator_g(),
+            &self.signing_message(),
+            &self.signature,
+        )
+    }
+
+    /// Convert a human/application logical key into an authority-specific
+    /// deterministic namespace.
+    ///
+    /// Alice's "order-1" and Bob's "order-1" therefore cannot collide.
+    pub fn scoped_key(&self) -> Hash256 {
+        let anchor_present = [if self.anchor.is_some() { 1u8 } else { 0u8 }];
+
+        let (anchor_tip, anchor_height) = match self.anchor {
+            Some(anchor) => (anchor.tip_hash.0, anchor.encoded_height()),
+            None => ([0u8; 32], u64::MAX.to_le_bytes()),
+        };
+
+        hash_multi(
+            EPHEMERAL_SCOPE_DOMAIN,
+            &[
+                self.network.as_str().as_bytes(),
+                &self.authority.spend_pk,
+                &anchor_present,
+                &anchor_tip,
+                &anchor_height,
+                &self.logical_key,
+            ],
+        )
+    }
+}
+
+impl EphemeralStatePool {
+    /// Admit a signed ephemeral proposal.
+    ///
+    /// This is the authenticated admission path intended for future
+    /// network-facing ephemeral-state messages.
+    pub fn propose_signed(
+        &mut self,
+        expected_network: NetworkId,
+        observed_height: Height,
+        proposal: &SignedEphemeralProposal,
+    ) -> Result<Hash256, EphemeralStateError> {
+        /*
+         * The node's canonical observed height is authoritative.
+         *
+         * A proposal signer must never be able to advance the local
+         * ephemeral clock and expire somebody else's state.
+         */
+        if proposal.network != expected_network {
+            return Err(EphemeralStateError::WrongNetwork);
+        }
+
+        if proposal.logical_key.is_empty() {
+            return Err(EphemeralStateError::EmptyKey);
+        }
+
+        if proposal.logical_key.len() > Self::MAX_KEY_BYTES {
+            return Err(EphemeralStateError::KeyTooLarge {
+                len: proposal.logical_key.len(),
+                max: Self::MAX_KEY_BYTES,
+            });
+        }
+
+        if proposal.state_data.len() > Self::MAX_STATE_BYTES {
+            return Err(EphemeralStateError::StateTooLarge {
+                len: proposal.state_data.len(),
+                max: Self::MAX_STATE_BYTES,
+            });
+        }
+
+        if proposal.ttl_blocks == 0 {
+            return Err(EphemeralStateError::ZeroTtl);
+        }
+
+        if proposal.ttl_blocks > Self::MAX_TTL_BLOCKS {
+            return Err(EphemeralStateError::TtlTooLarge {
+                got: proposal.ttl_blocks,
+                max: Self::MAX_TTL_BLOCKS,
+            });
+        }
+
+        let expires = proposal
+            .created_height
+            .0
+            .checked_add(proposal.ttl_blocks)
+            .ok_or(EphemeralStateError::HeightOverflow)?;
+
+        /*
+         * Future-dated proposals are forbidden.
+         *
+         * Otherwise an attacker with a valid signing key could move
+         * expiration processing arbitrarily far into the future.
+         */
+        if proposal.created_height > observed_height {
+            return Err(EphemeralStateError::FutureHeight {
+                proposal: proposal.created_height.0,
+                observed: observed_height.0,
+            });
+        }
+
+        /*
+         * Do not resurrect a proposal whose deterministic lifetime has
+         * already ended at the node's current canonical height.
+         */
+        if observed_height.0 >= expires {
+            return Err(EphemeralStateError::ProposalExpired {
+                expires,
+                observed: observed_height.0,
+            });
+        }
+
+        /*
+         * Everything above was cheap structural validation.
+         * Authentication is checked before any pool mutation.
+         */
+        if !proposal.verify_signature() {
+            return Err(EphemeralStateError::BadSignature);
+        }
+
+        /*
+         * Expiration is driven ONLY by trusted node-observed chain height,
+         * never by an untrusted proposal field.
+         */
+        self.expire(observed_height);
+
+        let scoped_key = proposal.scoped_key();
+
+        /*
+         * Existing deterministic conflict logic still uses the signed
+         * creation height as part of the candidate's identity/order.
+         *
+         * Because created_height <= observed_height was established above,
+         * this second internal expire call can never advance the pool beyond
+         * the canonical observed height.
+         */
+        self.propose(
+            &scoped_key.0,
+            &proposal.state_data,
+            proposal.created_height,
+            proposal.ttl_blocks,
+        )
+    }
+}
+
+// ----------------------------------------- chain-bound ephemeral state --
+
+impl EphemeralStatePool {
+    /// Admit an authenticated proposal against the node's actual canonical
+    /// chain rather than trusting caller-supplied fork information.
+    pub fn propose_signed_on_chain(
+        &mut self,
+        chain: &Chain,
+        proposal: &SignedEphemeralProposal,
+    ) -> Result<Hash256, EphemeralStateError> {
+        let anchor = proposal
+            .anchor
+            .ok_or(EphemeralStateError::MissingChainAnchor)?;
+
+        if !anchor.is_canonical_on(chain) {
+            return Err(EphemeralStateError::AnchorNotCanonical);
+        }
+
+        /*
+         * Creation height is the height of the state snapshot on which
+         * the proposal was produced.
+         *
+         * Genesis has no ordinary block height and is represented as 0
+         * for the existing ephemeral lifetime model.
+         */
+        let anchor_height = anchor.tip_height.map(|h| h.0).unwrap_or(0);
+
+        if proposal.created_height.0 != anchor_height {
+            return Err(EphemeralStateError::AnchorHeightMismatch {
+                created: proposal.created_height.0,
+                anchor: anchor_height,
+            });
+        }
+
+        /*
+         * Pre-authentication quota gate.
+         *
+         * Runs BEFORE `propose_signed`, which is where signature
+         * verification happens. One signing key cannot force an
+         * unbounded stream of distinct-state verifications, and
+         * cannot monopolise pool capacity.
+         */
+        let auth_key = proposal.authority.spend_pk;
+        let in_use = self
+            .authority_of
+            .values()
+            .filter(|k| **k == auth_key)
+            .count();
+
+        if in_use >= Self::MAX_STATES_PER_AUTHORITY {
+            return Err(EphemeralStateError::AuthorityQuotaExceeded {
+                max: Self::MAX_STATES_PER_AUTHORITY,
+            });
+        }
+
+        let observed_height = chain.tip_height().unwrap_or(Height(0));
+
+        let id = self.propose_signed(chain.network, observed_height, proposal)?;
+
+        /*
+         * Store the fork identity separately from the transient payload.
+         * The scoped state key and signature already cryptographically
+         * commit to the same anchor.
+         */
+        self.anchors.insert(id, anchor);
+        self.authority_of.insert(id, auth_key);
+
+        /*
+         * Conflict replacement may have removed another state.
+         * Keep all secondary indexes exact.
+         */
+        let entries = &self.entries;
+        self.anchors
+            .retain(|state_id, _| entries.contains_key(state_id));
+
+        Ok(id)
+    }
+
+    /// Remove signed ephemeral states whose base block disappeared from
+    /// canonical history.
+    ///
+    /// Ordinary extension does not remove them because the original
+    /// anchor remains an ancestor.
+    ///
+    /// A reorg only removes a state when the block it was based on is no
+    /// longer the canonical hash at that height.
+    pub fn reconcile_with_chain(&mut self, chain: &Chain) -> usize {
+        let before = self.entries.len();
+
+        let observed_height = chain.tip_height().unwrap_or(Height(0));
+
+        self.expire(observed_height);
+
+        let invalid: Vec<Hash256> = self
+            .anchors
+            .iter()
+            .filter_map(|(id, anchor)| {
+                if anchor.is_canonical_on(chain) {
+                    None
+                } else {
+                    Some(*id)
+                }
+            })
+            .collect();
+
+        for id in invalid {
+            self.entries.remove(&id);
+            self.anchors.remove(&id);
+            self.authority_of.remove(&id);
+        }
+
+        /*
+         * Rebuild the logical-key index after reorg invalidation.
+         */
+        let entries = &self.entries;
+
+        self.key_index.retain(|_, id| entries.contains_key(id));
+
+        let entries = &self.entries;
+
+        self.anchors.retain(|id, _| entries.contains_key(id));
+
+        let entries = &self.entries;
+
+        self.authority_of.retain(|id, _| entries.contains_key(id));
+
+        before - self.entries.len()
+    }
+
+    pub fn anchor_for_id(&self, id: &Hash256) -> Option<EphemeralChainAnchor> {
+        self.anchors.get(id).copied()
+    }
+}
+
 // ----------------------------------------------------------------- mempool --
 
 #[derive(Clone, Debug, Default)]
