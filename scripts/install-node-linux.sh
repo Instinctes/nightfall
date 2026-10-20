@@ -72,31 +72,44 @@ command -v cargo >/dev/null || die "cargo still not on PATH"
 TOTAL_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
 info "memory: ${TOTAL_MB} MB"
 SWAPFILE=""
-SWAP_PATH=/var/tmp/nightfall-build.swap
-if [ "$TOTAL_MB" -lt 2048 ]; then
-    swapoff "$SWAP_PATH" 2>/dev/null || true
-    rm -f "$SWAP_PATH"
-    info "adding 2 GB of temporary swap for the build"
-    if fallocate -l 2G "$SWAP_PATH" 2>/dev/null \
-        || dd if=/dev/zero of="$SWAP_PATH" bs=1M count=2048 status=none; then
-        chmod 600 "$SWAP_PATH"
-        mkswap "$SWAP_PATH" >/dev/null 2>&1
-        if swapon "$SWAP_PATH" 2>/dev/null; then
-            SWAPFILE="$SWAP_PATH"
-        else
-            rm -f "$SWAP_PATH"
-            warn "could not enable swap — the build may run out of memory"
+SWAP_PATH=""
+BUILD=""
+
+# Only clean up objects created by this invocation. A fixed shared swap path
+# can refer to another operator's active swap or a pre-existing file.
+cleanup() {
+    local remove_swap=1
+    if [ -n "$SWAPFILE" ]; then
+        if ! swapoff "$SWAPFILE" 2>/dev/null; then
+            warn "temporary swap is still active; preserving $SWAPFILE for manual swapoff"
+            remove_swap=0
         fi
     fi
-fi
-cleanup() {
-    if [ -n "$SWAPFILE" ]; then
-        swapoff "$SWAPFILE" 2>/dev/null || true
-        rm -f "$SWAPFILE"
+    if [ -n "$SWAP_PATH" ] && [ "$remove_swap" -eq 1 ]; then
+        rm -f -- "$SWAP_PATH"
     fi
-    rm -rf "${BUILD:-}"
+    if [ -n "$BUILD" ]; then
+        rm -rf -- "$BUILD"
+    fi
 }
 trap cleanup EXIT
+
+if [ "$TOTAL_MB" -lt 2048 ]; then
+    SWAP_PATH="$(mktemp /var/tmp/nightfall-build.XXXXXXXX.swap)" \
+        || die "could not create an isolated temporary swapfile"
+    info "adding 2 GB temporary swap for the build"
+    if fallocate -l 2G "$SWAP_PATH" 2>/dev/null \
+        || dd if=/dev/zero of="$SWAP_PATH" bs=1M count=2048 status=none; then
+        if mkswap "$SWAP_PATH" >/dev/null 2>&1 \
+            && swapon "$SWAP_PATH" 2>/dev/null; then
+            SWAPFILE="$SWAP_PATH"
+        else
+            warn "could not enable swap — the build may run out of memory"
+        fi
+    else
+        warn "could not allocate swap — the build may run out of memory"
+    fi
+fi
 
 BUILD="$(mktemp -d)"
 info "fetching source"

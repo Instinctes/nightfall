@@ -1,0 +1,35 @@
+name: RPC follow lifetime regression
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/test_rpc_follow_lifetime.py'
+      - '.github/workflows/rpc-follow-lifetime.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/nightfall-node/**'
+      - 'crates/nightfall-wallet/**'
+      - 'crates/nightfall-types/**'
+      - 'crates/nightfall-crypto/**'
+      - 'crates/nightfall-ledger/**'
+      - 'crates/nightfall-consensus/**'
+      - 'crates/nightfall-storage/**'
+      - 'crates/nightfall-p2p/**'
+  workflow_dispatch:
+
+jobs:
+  real-client-follow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build exact PR node and wallet
+        run: cargo build --locked -p nightfall-node -p nightfall-wallet
+      - name: Real CLI subscription after ten minutes (isolated devnet)
+        run: >-
+          python3 scripts/test_rpc_follow_lifetime.py
+          --node target/debug/nightfalld
+          --wallet target/debug/nightfall-wallet
+          --seconds 630
