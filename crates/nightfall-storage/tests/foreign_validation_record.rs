@@ -176,3 +176,24 @@ fn an_old_record_without_an_id_is_re_verified() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Zero bytes are valid only for a bodyless pruned/checkpoint state.
+/// An archive with no blocks has verified nothing and must remain untrusted.
+#[test]
+fn zero_byte_archive_is_not_trusted() {
+    let dir = tmpdir("zero-byte-archive");
+    let store = ChainStore::new(&dir);
+
+    let chain = store.load_or_new(NetworkId::Devnet).unwrap();
+
+    store.save(&chain).unwrap();
+
+    assert_eq!(std::fs::metadata(store.blocks_path()).unwrap().len(), 0);
+
+    assert!(
+        !store.is_own_file_trusted(),
+        "an empty archive must not become trusted merely because its metadata is local"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}

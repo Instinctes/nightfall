@@ -104,6 +104,27 @@ nightfalld --network mainnet export-snapshot --out /tmp/nf-snap
 nightfalld --network mainnet --datadir /new/datadir import-snapshot --from /tmp/nf-snap
 ```
 
+That archival snapshot path is unchanged: the importer still re-checks every
+block's PoW and the supply invariant.
+
+For a faster fresh bootstrap using the checkpoint already trusted by the binary:
+
+```bash
+nightfalld --network mainnet export-checkpoint-snapshot --out /tmp/nf-checkpoint.json
+nightfalld --network mainnet --datadir /new/fresh/datadir import-checkpoint-snapshot --from /tmp/nf-checkpoint.json
+```
+
+Checkpoint-state import is mainnet-only, requires fresh chain state, and is
+disabled whenever `NIGHTFALL_NO_ASSUME_VALID` is present. The snapshot is
+verified against the newest compiled checkpoint, its authenticated header
+chain, UTXO root, kernel sum, supply invariant and maturity-sensitive output
+metadata. Blocks after that checkpoint are synchronized and fully validated
+normally.
+
+The exporter requires an archival chain. With the current compiled checkpoint
+at height 25,000, this optimization removes historical body replay only through
+height 25,000; updating that checkpoint is a separate review and release action.
+
 **On macOS:**
 
 ```bash

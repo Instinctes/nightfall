@@ -82,6 +82,11 @@ enum Commands {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Export authenticated state at the newest compiled mainnet checkpoint.
+    ExportCheckpointSnapshot {
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Rewrite the chain file in the compact binary encoding.
     ///
     /// Measured on mainnet at 31,288 blocks: 152.3 MiB as JSON, 42.2 MiB
@@ -96,6 +101,14 @@ enum Commands {
     MigrateStorage,
     /// Load a snapshot directory. Every block is re-checked; this is not a trust shortcut.
     ImportSnapshot {
+        #[arg(long)]
+        from: PathBuf,
+    },
+    /// Import authenticated checkpoint state into fresh mainnet chain state.
+    ///
+    /// This relies on the checkpoint compiled into this binary and is disabled
+    /// when `NIGHTFALL_NO_ASSUME_VALID` is set.
+    ImportCheckpointSnapshot {
         #[arg(long)]
         from: PathBuf,
     },
@@ -213,6 +226,16 @@ fn main() -> anyhow::Result<()> {
             println!("network........ {:?}", snap.network);
             println!("verify......... importer re-checks PoW and supply");
         }
+        Commands::ExportCheckpointSnapshot { out } => {
+            println!("exporting...... {}", out.display());
+            let snap = store.export_checkpoint_snapshot(&out, network)?;
+            println!("checkpoint..... {}", snap.checkpoint_height);
+            println!("headers........ {}", snap.headers.len());
+            println!("utxos.......... {}", snap.utxos.len());
+            println!("recent_bodies.. {}", snap.recent_bodies.len());
+            println!("network........ {:?}", snap.network);
+            println!("verify......... anchored to compiled checkpoint");
+        }
         Commands::MigrateStorage => {
             // Rewriting the chain file under a running node would have the
             // daemon appending to a file this command is about to rename.
@@ -239,6 +262,13 @@ fn main() -> anyhow::Result<()> {
             println!("importing...... {}", from.display());
             println!("verify......... full PoW + supply (not trusted)");
             let chain = store.import_snapshot(&from, network)?;
+            print_status(&chain, &datadir, network, 0, 0);
+        }
+        Commands::ImportCheckpointSnapshot { from } => {
+            println!("importing...... {}", from.display());
+            println!("verify......... compiled checkpoint + authenticated state");
+            let chain = store.import_checkpoint_snapshot(&from, network)?;
+            println!("next_sync...... height {}", chain.next_height().0);
             print_status(&chain, &datadir, network, 0, 0);
         }
         Commands::Run {
