@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod codec;
+mod cutthrough_state_v1;
 pub mod dirlock;
 pub use codec::Format;
 
