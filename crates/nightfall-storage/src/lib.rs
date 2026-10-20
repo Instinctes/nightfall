@@ -253,6 +253,7 @@ impl ChainStore {
     ///
     /// Returns the old and new sizes in bytes.
     pub fn migrate_to_binary(&self) -> anyhow::Result<(u64, u64)> {
+        self.refuse_if_interrupted_recovery()?;
         if self.format() == Format::Binary {
             anyhow::bail!("this datadir is already binary");
         }
@@ -315,6 +316,7 @@ impl ChainStore {
     /// Copy `blocks.jsonl` plus a small manifest. The importer still verifies
     /// every block — this is a faster start, not a trust shortcut.
     pub fn export_snapshot(&self, out: &Path) -> anyhow::Result<SnapshotManifest> {
+        self.refuse_if_interrupted_recovery()?;
         if self
             .read_meta()
             .map(|m| m.pruned || m.first_height > 0)
@@ -357,6 +359,7 @@ impl ChainStore {
     /// checks. `validated_bytes` is forced to 0 so a copied file is never
     /// trusted as if this node had already verified it.
     pub fn import_snapshot(&self, from: &Path, network: NetworkId) -> anyhow::Result<Chain> {
+        self.refuse_if_interrupted_recovery()?;
         // A snapshot may be either format, and the two are not
         // interchangeable by filename. Pick the file that is there, and
         // remember what it is.
@@ -624,6 +627,38 @@ impl ChainStore {
     /// Throttled by time rather than by block count: block rate depends on the
     /// machine, and a line every N blocks is a flood on a fast one and silence
     /// on a slow one.
+    /// Refuse to operate on a datadir whose recovery was interrupted.
+    ///
+    /// `recover-stalled-fork` leaves [`RECOVERY_JOURNAL`] behind if it is
+    /// interrupted mid-reset, so the datadir may be only half-reset. Every
+    /// entry point that reads or rewrites the chain calls this, so a normal
+    /// start, a storage migration or a snapshot export/import can never
+    /// silently proceed over an unfinished recovery.
+    pub fn refuse_if_interrupted_recovery(&self) -> anyhow::Result<()> {
+        let journal = self.dir.join(RECOVERY_JOURNAL);
+        if !journal.exists() {
+            return Ok(());
+        }
+        let backup = fs::read_to_string(&journal)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("backup").and_then(|b| b.as_str()).map(String::from));
+        anyhow::bail!(
+            "an interrupted recover-stalled-fork was found in {} ({} is present),\n\
+             so the datadir may be only half-reset and cannot be trusted.\n\
+             {}\n\
+             Restore the backup into the datadir and delete {}, then try again.",
+            self.dir.display(),
+            RECOVERY_JOURNAL,
+            backup
+                .map(|b| format!("The original chain is backed up at {b}."))
+                .unwrap_or_else(
+                    || "The original chain is in the recovery-backup-* directory.".to_string()
+                ),
+            RECOVERY_JOURNAL,
+        )
+    }
+
     pub fn load_or_new(&self, network: NetworkId) -> anyhow::Result<Chain> {
         let started = std::time::Instant::now();
         let mut last = started;
@@ -657,28 +692,7 @@ impl ChainStore {
         mut on_progress: impl FnMut(u64, u64),
     ) -> anyhow::Result<Chain> {
         self.ensure_dir()?;
-
-        let journal = self.dir.join(RECOVERY_JOURNAL);
-        if journal.exists() {
-            let backup = fs::read_to_string(&journal)
-                .ok()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                .and_then(|v| v.get("backup").and_then(|b| b.as_str()).map(String::from));
-            anyhow::bail!(
-                "an interrupted recover-stalled-fork was found in {} ({} is present),\n\
-                 so the datadir may be only half-reset and cannot be trusted to start.\n\
-                 {}\n\
-                 Restore the backup into the datadir and delete {}, then start again.",
-                self.dir.display(),
-                RECOVERY_JOURNAL,
-                backup
-                    .map(|b| format!("The original chain is backed up at {b}."))
-                    .unwrap_or_else(
-                        || "The original chain is in the recovery-backup-* directory.".to_string()
-                    ),
-                RECOVERY_JOURNAL,
-            );
-        }
+        self.refuse_if_interrupted_recovery()?;
 
         if self.legacy_path().exists() && !self.blocks_path().exists() {
             anyhow::bail!(
@@ -1024,6 +1038,42 @@ fn getrandom_bytes(out: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An interrupted recovery marks the datadir unsafe for every entry
+    /// point that reads or rewrites the chain, not only a normal start.
+    #[test]
+    fn an_interrupted_recovery_is_refused_everywhere() {
+        use nightfall_crypto::WalletKeys;
+        let dir =
+            std::env::temp_dir().join(format!("nf-journal-{}-{}", std::process::id(), now_unix()));
+        fs::create_dir_all(&dir).unwrap();
+        // A JSON chain, so migrate_to_binary would otherwise have work to do.
+        fs::write(dir.join(codec::BLOCKS_JSONL), b"").unwrap();
+        let store = ChainStore::new(&dir);
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+        let miner = WalletKeys::generate().address();
+        chain.mine_block(&miner, vec![], now_unix() - 60).unwrap();
+        store.save(&chain).unwrap();
+
+        fs::write(dir.join(RECOVERY_JOURNAL), b"{\"backup\":\"bk\"}").unwrap();
+
+        let load = store
+            .load_or_new(NetworkId::Devnet)
+            .unwrap_err()
+            .to_string();
+        assert!(load.contains("interrupted"), "load: {load}");
+        let mig = store.migrate_to_binary().unwrap_err().to_string();
+        assert!(mig.contains("interrupted"), "migrate: {mig}");
+        let out = std::env::temp_dir().join(format!(
+            "nf-journal-out-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let exp = store.export_snapshot(&out).unwrap_err().to_string();
+        assert!(exp.contains("interrupted"), "export: {exp}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn secret_files_are_owner_only() {
