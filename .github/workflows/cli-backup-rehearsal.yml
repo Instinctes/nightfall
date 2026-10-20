@@ -3,7 +3,9 @@ name: CLI backup rehearsal
 on:
   pull_request:
     paths:
-      - 'crates/nightfall-wallet/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'scripts/test_cli_backup_rehearsal.py'
       - 'docs/CLI-BACKUP-REHEARSAL.md'
       - '.github/workflows/cli-backup-rehearsal.yml'
@@ -12,6 +14,7 @@ on:
 jobs:
   disposable-devnet-recovery:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
