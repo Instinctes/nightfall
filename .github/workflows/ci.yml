@@ -42,6 +42,8 @@ jobs:
 
       - name: Release Cargo lock policy regression tests
         run: python3 -m unittest discover -s scripts -p 'test_release_lock_policy.py' -v
+      - name: Installer temporary swap lifecycle (mocked; no root or real swap)
+        run: python3 -m unittest discover -s scripts -p 'test_installer_swap_safety.py' -v
 
       - name: Tests
         run: cargo test --workspace
