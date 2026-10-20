@@ -67,6 +67,13 @@ enum Commands {
         #[arg(long, default_value = "")]
         memo: String,
     },
+    /// Review an untrusted agent payment request and sign ONLY after local owner confirmation.
+    AgentSend {
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        intent: PathBuf,
+    },
     NodeStatus,
     /// Ask the node to re-prove the global supply invariant.
     VerifySupply,
@@ -232,6 +239,68 @@ fn main() -> anyhow::Result<()> {
                     }
                 );
             }
+        }
+
+        Commands::AgentSend { policy, intent } => {
+            use std::io::IsTerminal;
+            if !std::io::stdin().is_terminal() {
+                anyhow::bail!("owner approval requires a local interactive terminal");
+            }
+            let policy = nightfall_wallet::agent_policy::read_policy(&policy)?;
+            let intent = nightfall_wallet::agent_policy::read_intent(&intent)?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| anyhow::anyhow!("system clock before Unix epoch"))?
+                .as_secs();
+            let checked = nightfall_wallet::agent_policy::authorize(
+                &policy,
+                intent,
+                &network.to_string(),
+                &wallet.address_string(),
+                now,
+            )?;
+            println!("AGENT PAYMENT — OWNER APPROVAL REQUIRED");
+            println!("Network........ {}", network);
+            println!("Source wallet.. {}", wallet.address_string());
+            println!("Agent.......... {}", policy.agent_id);
+            println!("Recipient...... {}", checked.recipient.encode());
+            println!("Amount (darks). {}", checked.amount_darks);
+            println!("Fee (darks).... {}", checked.fee_darks);
+            println!("Memo........... {}", checked.memo);
+            println!("Request nonce.. {}", checked.nonce);
+            println!();
+            println!("This is NOT a delegated signing key or an on-chain spending limit.");
+            println!("Never run this command on an agent-controlled machine or with");
+            println!("an agent-accessible wallet seed or owner policy.");
+            print!("To send, type APPROVE {}: ", checked.nonce);
+            std::io::stdout().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            if answer.trim_end_matches(['\r', '\n']) != format!("APPROVE {}", checked.nonce) {
+                anyhow::bail!("owner declined agent payment");
+            }
+            // Re-check the clock at the point of use: owner confirmation can
+            // take longer than the intent's short allowed lifetime.
+            let signing_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| anyhow::anyhow!("system clock before Unix epoch"))?
+                .as_secs();
+            if signing_time >= checked.expires_at || signing_time >= policy.expires_at {
+                anyhow::bail!("agent intent expired before owner approval completed");
+            }
+            // Same validated construction, broadcast and pending accounting as
+            // the normal CLI send path: no alternative signer or consensus path.
+            let tx = wallet.create_payment(
+                &checked.recipient,
+                checked.amount_darks,
+                checked.fee_darks,
+                &checked.memo,
+            )?;
+            let response = rpc_call(&rpc, "submit_tx", json!({ "tx": tx }))?;
+            wallet.mark_pending_spend(&tx)?;
+            println!("Submitted....... {}", tx.txid().to_hex());
+            println!("Node............ {}", serde_json::to_string(&response)?);
+            println!("Submission is not chain confirmation.");
         }
 
         Commands::Send {

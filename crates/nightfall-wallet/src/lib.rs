@@ -19,6 +19,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 mod receipt;
 pub use receipt::{verify_receipt, PaymentReceipt, ReceiptKind, ReceiptProof, RECEIPT_VERSION};
+pub mod agent_policy;
 /// The payment request: what a payee asks for, as one checkable line.
 pub mod air;
 pub mod amount_input;
