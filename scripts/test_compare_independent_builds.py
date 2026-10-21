@@ -15,7 +15,7 @@ spec.loader.exec_module(mod)
 
 
 def receipt(**changes):
-    r = {"schema": mod.SCHEMA, "source_commit": "a" * 64,
+    r = {"schema": mod.SCHEMA, "source_commit": "a" * 40,
          "cargo_lock_sha256": "b" * 64,
          "rustc": "rustc 1.96.0 (mock)", "cargo": "cargo 1.96.0 (mock)",
          "host": "aarch64-linux-android", "profile": "release",
@@ -50,7 +50,7 @@ class IndependentBuildTests(unittest.TestCase):
         for change in ({"rustc": "rustc 1.95.0 (mock)"},
                        {"cargo_lock_sha256": "f" * 64},
                        {"host": "x86_64-unknown-linux-gnu"},
-                       {"source_commit": "e" * 64}):
+                       {"source_commit": "e" * 40}):
             with self.subTest(change=change):
                 self.assertEqual(mod.compare(receipt(), receipt(**change))[0], "INCOMPARABLE")
 
@@ -69,6 +69,19 @@ class IndependentBuildTests(unittest.TestCase):
     def test_invalid_hash_rejected(self):
         with self.assertRaises(mod.BuildEvidenceError):
             mod.validate(receipt(source_commit="a" * 63 + "Z"))
+
+
+    def test_git_commit_id_formats_are_strict(self):
+        for length in (40, 64):
+            with self.subTest(valid_length=length):
+                value = "a" * length
+                self.assertEqual(mod.validate(receipt(source_commit=value))["source_commit"], value)
+        for value in ("a" * 39, "a" * 41, "a" * 63, "a" * 65, "A" * 40):
+            with self.subTest(invalid_commit=value):
+                with self.assertRaises(mod.BuildEvidenceError):
+                    mod.validate(receipt(source_commit=value))
+        with self.assertRaises(mod.BuildEvidenceError):
+            mod.validate(receipt(cargo_lock_sha256="b" * 40))
 
     def test_duplicate_json_fields_rejected(self):
         p = self.write("duplicate.json", '{"schema":"one","schema":"two"}')
@@ -102,7 +115,7 @@ class IndependentBuildTests(unittest.TestCase):
         binary.write_bytes(b"binary test")
         def cmd(args, cwd=None):
             if args[1:] == ["rev-parse", "HEAD"]:
-                return "a" * 64
+                return "a" * 40
             if args[1:] == ["status", "--porcelain", "--untracked-files=normal"]:
                 return ""
             if args == ["rustc", "-vV"]:
@@ -116,11 +129,43 @@ class IndependentBuildTests(unittest.TestCase):
         self.assertEqual(r["profile"], "release")
         self.assertEqual(list(repo.iterdir()), [repo / "Cargo.lock"])
 
+
+    def test_record_against_real_temporary_git_sha1_repository(self):
+        repo = self.folder / "actual_git"
+        repo.mkdir()
+        (repo / "Cargo.lock").write_bytes(b"test lock")
+        subprocess.run(["git", "init", "--object-format=sha1", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", "Cargo.lock"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "-c", "user.name=Nightfall Test",
+             "-c", "user.email=nightfall@example.invalid", "commit", "-qm", "fixture"],
+            check=True)
+        binary = self.folder / "nightfalld-real"
+        binary.write_bytes(b"binary test")
+        real_command = mod.command
+
+        def mocked_toolchain_only(args, cwd=None):
+            if args[0] == "git":
+                return real_command(args, cwd=cwd)
+            if args == ["rustc", "-vV"]:
+                return "rustc 1.96.0 (mock)\\nhost: aarch64-linux-android"
+            if args == ["cargo", "--version"]:
+                return "cargo 1.96.0 (mock)"
+            raise AssertionError(args)
+
+        with patch.object(mod, "command", side_effect=mocked_toolchain_only):
+            result = mod.record(repo, ["nightfalld=" + str(binary)])
+        actual_commit = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+        self.assertEqual(len(actual_commit), 40)
+        self.assertEqual(result["source_commit"], actual_commit)
+        self.assertEqual(result["artifacts"]["nightfalld"]["bytes"], 11)
+
     def test_dirty_repo_fails_closed(self):
         repo = self.folder / "repo"
         repo.mkdir()
         (repo / "Cargo.lock").write_bytes(b"test lock")
-        with patch.object(mod, "command", side_effect=["a" * 64, " M src/main.rs"]):
+        with patch.object(mod, "command", side_effect=["a" * 40, " M src/main.rs"]):
             with self.assertRaisesRegex(mod.BuildEvidenceError, "not clean"):
                 mod.record(repo, ["nightfalld=unused"])
 
@@ -130,7 +175,7 @@ class IndependentBuildTests(unittest.TestCase):
                 repo = self.folder / "repo"
                 repo.mkdir(exist_ok=True)
                 (repo / "Cargo.lock").write_bytes(b"test lock")
-                with patch.object(mod, "command", side_effect=["a" * 64, "", "rustc 1.96.0 (mock)\nhost: aarch64-linux-android", "cargo 1.96.0 (mock)"]):
+                with patch.object(mod, "command", side_effect=["a" * 40, "", "rustc 1.96.0 (mock)\nhost: aarch64-linux-android", "cargo 1.96.0 (mock)"]):
                     with self.assertRaises(mod.BuildEvidenceError):
                         mod.record(repo, bad)
 
