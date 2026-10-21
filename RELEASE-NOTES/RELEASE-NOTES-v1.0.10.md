@@ -2,10 +2,19 @@
 
 1.0.10 is a small maintenance release on the stable 1.0.x line. It changes how
 the official Linux Node Kit installers build a node and adds an optional
-pre-install check for servers. Wallet, node and miner behaviour is the same as
-1.0.9. Same chain and genesis, protocol v8 and wire v6; no consensus, emission,
+pre-install check for servers, and the desktop mining-reward notice is smaller
+and no longer covers the page header. Wallet, node and miner behaviour is
+otherwise the same as 1.0.9. Same chain and genesis, protocol v8 and wire v6; no consensus, emission,
 reward or transaction-validity rule changes. The larger 1.1.0 roadmap feature
 set and the experimental GPU miner are not included.
+
+## Desktop
+
+- **Smaller mining-reward notice.** The animation that appears when a block
+  reward arrives is now a compact one-line chip in the top-right corner of the
+  page, below the header, and shows the amount without trailing zeros
+  (`+6 NIGHT`). The previous large card could wrap the amount over three lines
+  and cover the page title. Sound setting and timing are unchanged.
 
 ## Included community contributions
 

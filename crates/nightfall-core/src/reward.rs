@@ -73,7 +73,9 @@ impl Rewards {
         false
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, sound_enabled: bool) {
+    /// `top` is where the page content starts (below the top bar), so the chip
+    /// sits inside the top-right corner of the first card, never over the header.
+    pub fn show(&mut self, ctx: &egui::Context, sound_enabled: bool, top: f32) {
         let now = ctx.input(|input| input.time);
         if self.advance(now) && sound_enabled {
             crate::feedback::play_reward_chime();
@@ -89,42 +91,61 @@ impl Rewards {
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
         egui::Area::new(egui::Id::new("mining-reward"))
             .anchor(
-                Align2::CENTER_TOP,
-                egui::vec2(0.0, 110.0 - 10.0 * (1.0 - enter)),
+                Align2::RIGHT_TOP,
+                egui::vec2(-52.0, top + 30.0 - 8.0 * (1.0 - enter)),
             )
             .order(egui::Order::Foreground)
             .interactable(false)
             .show(ctx, |ui| {
                 ui.set_opacity(opacity);
                 egui::Frame::none()
-                    .fill(Color32::from_rgba_unmultiplied(45, 34, 69, 244))
+                    .fill(Color32::from_rgba_unmultiplied(45, 34, 69, 238))
                     .stroke(Stroke::new(
                         1.0_f32,
-                        crate::theme::ACCENT_HI.linear_multiply(0.55),
+                        crate::theme::ACCENT_HI.linear_multiply(0.45),
                     ))
-                    .rounding(Rounding::same(22.0))
-                    .inner_margin(egui::Margin::symmetric(22.0, 14.0))
+                    .rounding(Rounding::same(14.0))
+                    .inner_margin(egui::Margin {
+                        left: 8.0,
+                        right: 14.0,
+                        top: 7.0,
+                        bottom: 7.0,
+                    })
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            crate::widgets::logo(ui, 38.0);
-                            ui.add_space(10.0);
+                            crate::widgets::logo(ui, 24.0);
+                            ui.add_space(8.0);
                             ui.vertical(|ui| {
-                                ui.label(
-                                    RichText::new("MINING REWARD")
-                                        .size(10.5)
-                                        .color(crate::theme::ACCENT_HI),
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new("Mining reward")
+                                            .size(10.0)
+                                            .color(crate::theme::ACCENT_HI),
+                                    )
+                                    .extend(),
                                 );
-                                ui.label(
-                                    RichText::new(format!("+{}", Amount(reward.amount)))
-                                        .size(21.0)
-                                        .strong()
-                                        .color(Color32::WHITE),
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(compact_amount(reward.amount))
+                                            .size(15.0)
+                                            .strong()
+                                            .color(Color32::WHITE),
+                                    )
+                                    .extend(),
                                 );
                             });
                         });
                     });
             });
     }
+}
+
+/// `+6 NIGHT`, `+6.125 NIGHT`: the full eight decimals made the chip wrap.
+fn compact_amount(darks: u64) -> String {
+    let full = Amount(darks).decimal_string();
+    let trimmed = full.trim_end_matches('0').trim_end_matches('.');
+    format!("+{trimmed} {}", nightfall_types::TICKER)
 }
 
 #[cfg(test)]
@@ -164,6 +185,13 @@ mod tests {
         assert!(!rewards.advance(5.0));
         rewards.observe(&[mined("later")], false);
         assert!(rewards.advance(6.0));
+    }
+
+    #[test]
+    fn reward_amount_is_short_enough_for_one_line() {
+        assert_eq!(compact_amount(600_000_000), "+6 NIGHT");
+        assert_eq!(compact_amount(612_500_000), "+6.125 NIGHT");
+        assert_eq!(compact_amount(1), "+0.00000001 NIGHT");
     }
 
     #[test]
