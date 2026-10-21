@@ -148,7 +148,7 @@ class IndependentBuildTests(unittest.TestCase):
             if args[0] == "git":
                 return real_command(args, cwd=cwd)
             if args == ["rustc", "-vV"]:
-                return "rustc 1.96.0 (mock)\\nhost: aarch64-linux-android"
+                return "rustc 1.96.0 (mock)\nhost: aarch64-linux-android"
             if args == ["cargo", "--version"]:
                 return "cargo 1.96.0 (mock)"
             raise AssertionError(args)
