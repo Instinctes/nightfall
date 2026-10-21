@@ -13,6 +13,7 @@ BINARIES = frozenset(("nightfalld", "nightfall-wallet", "nightfall-core"))
 KEYS = frozenset(("schema", "source_commit", "cargo_lock_sha256", "rustc", "cargo", "host", "profile", "artifacts"))
 INPUTS = ("source_commit", "cargo_lock_sha256", "rustc", "cargo", "host", "profile")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+GIT_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 SAFE_TEXT = re.compile(r"[A-Za-z0-9 ._()+-]{1,120}\Z")
 HOST = re.compile(r"[a-zA-Z0-9_.-]{1,100}\Z")
 MAX_RECEIPT = 8192
@@ -58,7 +59,7 @@ def record(repo, binaries):
     repo = Path(repo)
     regular_file(repo / "Cargo.lock")
     sha = command(["git", "rev-parse", "HEAD"], cwd=repo)
-    if not HEX64.fullmatch(sha):
+    if not GIT_OBJECT_ID.fullmatch(sha):
         raise BuildEvidenceError("invalid checked-out Git commit")
     if command(["git", "status", "--porcelain", "--untracked-files=normal"], cwd=repo):
         raise BuildEvidenceError("source checkout is not clean")
@@ -101,7 +102,7 @@ def validate(r):
         raise BuildEvidenceError("unsupported or non-canonical receipt schema")
     if not all(type(r[k]) is str for k in INPUTS):
         raise BuildEvidenceError("invalid build identity types")
-    if not HEX64.fullmatch(r["source_commit"]) or not HEX64.fullmatch(r["cargo_lock_sha256"]):
+    if not GIT_OBJECT_ID.fullmatch(r["source_commit"]) or not HEX64.fullmatch(r["cargo_lock_sha256"]):
         raise BuildEvidenceError("invalid source or dependency hash")
     if not SAFE_TEXT.fullmatch(r["rustc"]) or not SAFE_TEXT.fullmatch(r["cargo"]):
         raise BuildEvidenceError("invalid toolchain identity")
