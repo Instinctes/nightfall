@@ -82,12 +82,7 @@ impl DirLock {
 pub fn acquire(dir: &Path) -> Result<DirLock, LockError> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(LOCK_FILE);
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)?;
+    let mut file = open_lock_file(&path)?;
 
     if !try_lock(&file) {
         return Err(LockError::Busy {
@@ -101,6 +96,46 @@ pub fn acquire(dir: &Path) -> Result<DirLock, LockError> {
     let _ = file.flush();
 
     Ok(DirLock { _file: file, path })
+}
+
+/// Open the lock file without following a symlink.
+///
+/// A symlink at the lock path would otherwise let acquisition write its
+/// `pid` line straight through to an unrelated target before any caller's
+/// own path checks run. On Unix `O_NOFOLLOW` makes the refusal atomic. Windows
+/// has no equivalent open flag, so there the `symlink_metadata` check is a
+/// best-effort guard that is not atomic against an entry swapped between the
+/// check and the open (a TOCTOU window); an atomic Windows refusal would need a
+/// `CreateFile` reparse-tag check, which is not done here. The lock path lives
+/// inside a datadir the operator controls, so this is a defence-in-depth guard,
+/// not a boundary against a local attacker who can already write there.
+fn open_lock_file(path: &Path) -> Result<File, LockError> {
+    if let Ok(md) = std::fs::symlink_metadata(path) {
+        if md.file_type().is_symlink() {
+            return Err(symlink_refused(path));
+        }
+    }
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(path).map_err(|e| {
+        #[cfg(unix)]
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            return symlink_refused(path);
+        }
+        LockError::Io(e)
+    })
+}
+
+fn symlink_refused(path: &Path) -> LockError {
+    LockError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("{} is a symlink; refusing to follow it", path.display()),
+    ))
 }
 
 #[cfg(unix)]
@@ -236,6 +271,21 @@ mod tests {
         let _lb = acquire(&b).expect("a different directory is a different lock");
         let _ = std::fs::remove_dir_all(a);
         let _ = std::fs::remove_dir_all(b);
+    }
+
+    /// A symlinked lock file must not be followed: acquisition would
+    /// otherwise write through to the link's target.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_lock_file_is_refused() {
+        let d = tmpdir();
+        let victim = tmpdir().join("victim");
+        std::fs::write(&victim, b"do not touch").unwrap();
+        std::os::unix::fs::symlink(&victim, d.join(LOCK_FILE)).unwrap();
+        let err = acquire(&d).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
+        let _ = std::fs::remove_dir_all(d);
     }
 
     /// A directory that does not exist yet is the normal first run.
