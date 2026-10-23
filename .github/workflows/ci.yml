@@ -120,3 +120,8 @@ jobs:
       # skipped here by the compiler rather than silently at runtime.
       - name: Wallet storage tests
         run: cargo test -p nightfall-wallet --lib
+
+      - name: Offline recovery safety (Linux macOS Windows)
+        run: |
+          cargo test -p nightfall-storage --test recovery_journal_guard
+          cargo test -p nightfall-node --test recovery_cli

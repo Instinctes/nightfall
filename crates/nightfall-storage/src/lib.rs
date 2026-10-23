@@ -88,6 +88,19 @@ impl ChainStore {
         Self { dir: dir.into() }
     }
 
+    /// Fail closed on an interrupted offline recovery.
+    pub fn refuse_unfinished_recovery(&self) -> anyhow::Result<()> {
+        let journal = self.dir.join(".stalled-fork-recovery-in-progress");
+        match fs::symlink_metadata(&journal) {
+            Ok(_) => anyhow::bail!(
+                "unfinished stalled-fork recovery at {}; stop and restore the backup before starting",
+                journal.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// The chain file this datadir actually has.
     ///
     /// Binary when `blocks.bin` exists, JSON when only `blocks.jsonl` does,
@@ -253,6 +266,7 @@ impl ChainStore {
     ///
     /// Returns the old and new sizes in bytes.
     pub fn migrate_to_binary(&self) -> anyhow::Result<(u64, u64)> {
+        self.refuse_unfinished_recovery()?;
         if self.format() == Format::Binary {
             anyhow::bail!("this datadir is already binary");
         }
@@ -315,6 +329,7 @@ impl ChainStore {
     /// Copy `blocks.jsonl` plus a small manifest. The importer still verifies
     /// every block — this is a faster start, not a trust shortcut.
     pub fn export_snapshot(&self, out: &Path) -> anyhow::Result<SnapshotManifest> {
+        self.refuse_unfinished_recovery()?;
         if self
             .read_meta()
             .map(|m| m.pruned || m.first_height > 0)
@@ -357,6 +372,7 @@ impl ChainStore {
     /// checks. `validated_bytes` is forced to 0 so a copied file is never
     /// trusted as if this node had already verified it.
     pub fn import_snapshot(&self, from: &Path, network: NetworkId) -> anyhow::Result<Chain> {
+        self.refuse_unfinished_recovery()?;
         // A snapshot may be either format, and the two are not
         // interchangeable by filename. Pick the file that is there, and
         // remember what it is.
@@ -457,6 +473,7 @@ impl ChainStore {
 
     /// Persist. Appends only what is new unless the chain shrank or diverged.
     pub fn save(&self, chain: &Chain) -> anyhow::Result<()> {
+        self.refuse_unfinished_recovery()?;
         self.ensure_dir()?;
         if chain.is_pruned() {
             return self.save_pruned(chain);
@@ -656,6 +673,7 @@ impl ChainStore {
         network: NetworkId,
         mut on_progress: impl FnMut(u64, u64),
     ) -> anyhow::Result<Chain> {
+        self.refuse_unfinished_recovery()?;
         self.ensure_dir()?;
 
         if self.legacy_path().exists() && !self.blocks_path().exists() {
