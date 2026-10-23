@@ -615,18 +615,6 @@ impl ChainStore {
         Ok(())
     }
 
-    /// Load a chain, replaying and revalidating every stored block.
-    /// Load, reporting progress to the log every few seconds.
-    ///
-    /// The silent version printed one line — "re-verifying proof of work for
-    /// the whole chain" — and then nothing for the length of the run, which on
-    /// a full chain is a quarter of an hour. Every command-line user who saw
-    /// that reasonably concluded the process had wedged, and the ones who
-    /// killed it got to start again.
-    ///
-    /// Throttled by time rather than by block count: block rate depends on the
-    /// machine, and a line every N blocks is a flood on a fast one and silence
-    /// on a slow one.
     /// Refuse to operate on a datadir whose recovery was interrupted.
     ///
     /// `recover-stalled-fork` leaves [`RECOVERY_JOURNAL`] behind if it is
@@ -672,6 +660,18 @@ impl ChainStore {
         )
     }
 
+    /// Load a chain, replaying and revalidating every stored block.
+    /// Load, reporting progress to the log every few seconds.
+    ///
+    /// The silent version printed one line — "re-verifying proof of work for
+    /// the whole chain" — and then nothing for the length of the run, which on
+    /// a full chain is a quarter of an hour. Every command-line user who saw
+    /// that reasonably concluded the process had wedged, and the ones who
+    /// killed it got to start again.
+    ///
+    /// Throttled by time rather than by block count: block rate depends on the
+    /// machine, and a line every N blocks is a flood on a fast one and silence
+    /// on a slow one.
     pub fn load_or_new(&self, network: NetworkId) -> anyhow::Result<Chain> {
         let started = std::time::Instant::now();
         let mut last = started;
