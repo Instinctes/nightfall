@@ -1195,6 +1195,59 @@ fn bodies_through_handles_max_height_after_pruning() {
     assert!(chain.bodies_through(0).is_none());
 }
 
+/// `can_rebuild_through` and `work_above` answer what `bodies_through` and
+/// the reorg work check would, without copying. The 1.0.7 fork path relies on
+/// that to turn away a lighter or too-deep branch before it copies our history.
+#[test]
+fn cheap_reorg_checks_agree_with_the_copying_ones() {
+    let miner = WalletKeys::from_seed([7; 32]).address();
+    let mut archive = devnet();
+    for i in 0..40u64 {
+        archive
+            .mine_block(&miner, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+    let mut pruned = archive.clone();
+    pruned.prune_keep(10).unwrap();
+    assert!(pruned.first_height > 0, "test needs a pruned chain");
+
+    for chain in [&archive, &pruned] {
+        let tip = chain.tip_height().unwrap().0;
+        for h in 0..=tip + 3 {
+            assert_eq!(
+                chain.can_rebuild_through(h),
+                chain.bodies_through(h).is_some(),
+                "height {h}, first_height {}",
+                chain.first_height
+            );
+        }
+        for h in chain.first_height.saturating_sub(1)..=tip {
+            let expected: u128 = chain
+                .blocks
+                .iter()
+                .filter(|b| b.header.height.0 > h)
+                .map(|b| b.work())
+                .sum();
+            assert_eq!(chain.work_above(h), expected, "height {h}");
+        }
+        assert_eq!(chain.work_above(tip), 0);
+        assert_eq!(chain.work_above(u64::MAX), 0);
+    }
+    // The comparison it stands in for: horizon + prefix + suffix vs total.
+    let tip = archive.tip_height().unwrap().0;
+    let ancestor = tip - 5;
+    let prefix: u128 = archive
+        .bodies_through(ancestor)
+        .unwrap()
+        .iter()
+        .map(|b| b.work())
+        .sum();
+    assert_eq!(
+        archive.horizon_work + prefix + archive.work_above(ancestor),
+        archive.total_work
+    );
+}
+
 #[test]
 fn oversized_block_is_rejected_before_pow() {
     let mut chain = devnet();

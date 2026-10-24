@@ -40,11 +40,11 @@
 //! closing it. Closing it needs a proof system that can authorise a spend
 //! without publishing a per-input signature.
 
-use crate::{MAX_BLOCK_INPUTS, MAX_BLOCK_KERNELS, MAX_BLOCK_OUTPUTS};
 use nightfall_crypto::{domain, hash_multi, Commitment, KernelFeature, Output, TxKernel};
 use nightfall_types::Hash256;
 use serde::{Deserialize, Serialize};
 
+use crate::{MAX_BLOCK_INPUTS, MAX_BLOCK_KERNELS, MAX_BLOCK_OUTPUTS};
 use crate::tx::{Input, Transaction};
 
 /// The aggregated contents of a block.
