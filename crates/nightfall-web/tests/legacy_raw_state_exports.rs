@@ -36,11 +36,11 @@ fn directly_attached_attributes_before(source: &str, needle: &str) -> String {
 fn legacy_raw_state_helpers_are_not_wasm_exports() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
-    let lib = fs::read_to_string(manifest.join("src/lib.rs"))
-        .expect("read nightfall-web src/lib.rs");
+    let lib =
+        fs::read_to_string(manifest.join("src/lib.rs")).expect("read nightfall-web src/lib.rs");
 
-    let vault = fs::read_to_string(manifest.join("src/vault.rs"))
-        .expect("read nightfall-web src/vault.rs");
+    let vault =
+        fs::read_to_string(manifest.join("src/vault.rs")).expect("read nightfall-web src/vault.rs");
 
     let hidden = [
         "create_wallet",
