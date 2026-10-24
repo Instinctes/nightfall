@@ -693,7 +693,8 @@ impl WalletState {
     /// filesystem path and cannot publish or broadcast before the host commits.
     pub fn scan_candidate(&self) -> anyhow::Result<(zeroize::Zeroizing<String>, Self)> {
         let base = zeroize::Zeroizing::new(self.require_wallet()?.export_state()?);
-        let copy = Wallet::import_state(&base)?;
+        // Our own state, not outside input: no import size bound (issue #64).
+        let copy = Wallet::import_own_state(&base)?;
         Ok((
             base,
             Self {

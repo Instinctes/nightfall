@@ -7,7 +7,34 @@ const {performance} = require('node:perf_hooks');
 const [bindingFile, nativeFile, wasmFile, fundedFile] = process.argv.slice(2);
 assert.ok(bindingFile && nativeFile && wasmFile && fundedFile,'Pass generated bindings, native fixture, new WASM fixture, and funded fixture paths.');
 globalThis.crypto ??= require('node:crypto').webcrypto;
-const {BrowserVault} = require(path.resolve(bindingFile));
+// NIGHTFALL_WIZARD_WASM_EXPORT_SURFACE_V1
+// Guard the generated JavaScript/WASM export surface (not merely Rust source).
+// This fixture test does not access live wallets or the network.
+const wasmBindings = require(path.resolve(bindingFile));
+const {BrowserVault} = wasmBindings;
+
+const forbiddenExports = [
+  'create_wallet', 'restore_wallet', 'wallet_address', 'wallet_phrase',
+  'wallet_view_key', 'wallet_scan_from', 'wallet_info', 'reset_scan',
+  'ingest_page', 'wallet_balance', 'wallet_history', 'build_send',
+];
+for (const name of forbiddenExports) {
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(wasmBindings, name),
+    false,
+    `legacy raw-state WASM export must not exist: ${name}`
+  );
+}
+for (const name of [
+  'BrowserVault', 'requestQrSvg', 'address_qr_svg', 'probe_crypto',
+]) {
+  assert.equal(
+    typeof wasmBindings[name],
+    'function',
+    `required WASM export missing: ${name}`
+  );
+}
+
 const PASSWORD = 'Nightfall public interop test password';
 // Public 256-bit zero-entropy BIP39 test vector. Never fund it.
 const PHRASE = Array(23).fill('abandon').concat('art').join(' ');
