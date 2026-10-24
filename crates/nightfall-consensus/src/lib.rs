@@ -394,10 +394,14 @@ impl Chain {
             let end = (height as usize).saturating_add(1).min(self.blocks.len());
             return Some(self.blocks[..end].to_vec());
         }
-        if height + 1 < self.first_height {
+        // Avoid `height + 1`: callers may supply `u64::MAX`.
+        // `first_height > 0` here, so comparing against its predecessor
+        // expresses the same prune boundary without overflow.
+        let before_first = self.first_height - 1;
+        if height < before_first {
             return None;
         }
-        if height + 1 == self.first_height {
+        if height == before_first {
             return Some(Vec::new());
         }
         let last = height.checked_sub(self.first_height)? as usize;
@@ -405,6 +409,36 @@ impl Chain {
             return None;
         }
         Some(self.blocks[..=last].to_vec())
+    }
+
+    /// Whether [`Self::bodies_through`] would return `Some` for `height` —
+    /// answered without copying a single block.
+    ///
+    /// On an archive node `bodies_through` copies the whole history (hundreds
+    /// of thousands of blocks, gigabytes). The fork path asks this first so it
+    /// only pays that price for a reorg it is actually going to evaluate.
+    pub fn can_rebuild_through(&self, height: u64) -> bool {
+        if self.first_height == 0 {
+            return true;
+        }
+        let before_first = self.first_height - 1;
+        if height < before_first {
+            return false;
+        }
+        height == before_first || ((height - self.first_height) as usize) < self.blocks.len()
+    }
+
+    /// Declared work of our blocks above `height`: what a reorg whose common
+    /// ancestor is `height` would replace. A candidate is only worth
+    /// rebuilding if its suffix declares more than this — the same comparison
+    /// [`Self::evaluate_reorg_at`] makes first, without the copy.
+    pub fn work_above(&self, height: u64) -> u128 {
+        let skip = height.saturating_add(1).saturating_sub(self.first_height);
+        self.blocks
+            .iter()
+            .skip(usize::try_from(skip).unwrap_or(usize::MAX))
+            .map(|b| b.work())
+            .sum()
     }
 
     fn difficulty_history(&self) -> Vec<(u64, u64)> {
