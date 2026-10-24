@@ -37,9 +37,18 @@ MIN_MACOS_ARM=11.0
 VERSION="$(grep -m1 '^version' "$ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
 BUNDLE_ID="cash.nightfall.core"
 APP_NAME="NIGHTFALLCOIN Core"
+DEFAULT_NETWORK=mainnet
 if [[ "$VERSION" == *-* ]]; then
-    echo "Use build-macos-dev-app.sh for prereleases." >&2
-    exit 1
+    # A pre-release tag only exercises the release pipeline (GitHub Actions
+    # sets this for v*-* tags). Such a DMG must never open mainnet by default:
+    # the launcher defaults to Devnet, and a pre-release build refuses mainnet
+    # on its own anyway. Local development builds: build-macos-dev-app.sh.
+    if [[ "${NIGHTFALL_ALLOW_PRERELEASE_DMG:-}" != "1" ]]; then
+        echo "Use build-macos-dev-app.sh for prereleases." >&2
+        exit 1
+    fi
+    DEFAULT_NETWORK=devnet
+    echo "==> Pre-release $VERSION: pipeline test DMG, launcher defaults to devnet"
 fi
 for NAME in "NIGHTFALLCOIN-Core-${VERSION}-macOS-arm64.dmg" "NIGHTFALLCOIN-Core-${VERSION}-macOS-intel.dmg" "SHA256SUMS-${VERSION}.txt"; do
     if [[ -e "$OUT/$NAME" ]]; then
@@ -100,16 +109,19 @@ make_app() {
     chmod +x "$APP/Contents/MacOS/"*
 
     # Launcher: Finder starts an app with no arguments, so default to mainnet
-    # while still allowing `--network devnet` from a terminal.
+    # (Devnet for a pre-release pipeline test) while still allowing
+    # `--network devnet` from a terminal.
     cat > "$APP/Contents/MacOS/nightfall-core" <<'LAUNCH'
 #!/bin/bash
 DIR="$(cd "$(dirname "$0")" && pwd)"
 if [[ $# -eq 0 ]]; then
-    exec "$DIR/nightfall-core.bin" --network "${NF_NETWORK:-mainnet}"
+    exec "$DIR/nightfall-core.bin" --network "${NF_NETWORK:-__DEFAULT_NETWORK__}"
 else
     exec "$DIR/nightfall-core.bin" "$@"
 fi
 LAUNCH
+    sed -i '' "s/__DEFAULT_NETWORK__/$DEFAULT_NETWORK/" "$APP/Contents/MacOS/nightfall-core"
+    grep -q -- "--network \"\${NF_NETWORK:-$DEFAULT_NETWORK}\"" "$APP/Contents/MacOS/nightfall-core"
     chmod +x "$APP/Contents/MacOS/nightfall-core"
 
     cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"

@@ -5,6 +5,7 @@ pub mod dandelion;
 #[cfg(test)]
 mod dandelion_adversarial_tests;
 pub mod mobile;
+pub mod recovery;
 pub mod rpc;
 pub mod runtime;
 pub mod session;

@@ -5,7 +5,7 @@
 **Do not open a public issue for anything that affects consensus, the supply
 invariant, or user funds.**
 
-Email **security@nightfallcoin.org** with:
+Email **instinctes@hotmail.com** with:
 
 - what breaks, and the shortest path to reproducing it
 - which crate and function

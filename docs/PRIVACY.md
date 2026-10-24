@@ -23,8 +23,61 @@ use the tools below.
 |---|---|
 | Dandelion++ stem/fluff | **On for negotiated peers.** Transactions use epoch-stable routes, a separate non-mineable stempool, bounded route repair and randomized fail-safe embargo before diffusion. |
 | Legacy peers | Stem capability is negotiated explicitly. Legacy sessions are not selected as Dandelion stem routes; legacy transaction messages remain fluff-compatible. |
-| Tor / SOCKS5 | **Default** (`127.0.0.1:9050`). If Tor is down, clearnet fallback. `.onion` never falls back. `NIGHTFALL_PROXY=off` disables. |
+| Tor / SOCKS5 | **Default** (`127.0.0.1:9050`). If Tor is down, clearnet fallback — unless `NIGHTFALL_PRIVACY_LOCKDOWN=1` (below). `.onion` never falls back. `NIGHTFALL_PROXY=off` disables. |
 | Dandelion++ + Tor | They protect against different observers: Dandelion++ reduces origin exposure to relay peers; Tor/SOCKS5 hides outbound peer destinations from the local network path. |
+
+### Privacy lockdown: fail closed when Tor is down
+
+By default, a node whose Tor proxy is down connects to peers **directly**,
+which shows your IP address to them. To refuse that instead, set one
+environment variable before starting:
+
+```bash
+NIGHTFALL_PRIVACY_LOCKDOWN=1
+```
+
+With it set:
+
+- Every new outgoing P2P connection must go through SOCKS5. If the proxy is
+  missing, unreachable or refuses the connection, the dial fails — there is
+  no direct fallback.
+- The node does not fetch the HTTPS peer directory (that request is direct).
+- Built-in seeds are still reached, through SOCKS5.
+- A manually added peer is refused unless a proxy is configured (resolving
+  its name would otherwise go to your DNS resolver).
+- Core's "check against nightfallcoin.org" is refused (it is a direct HTTPS
+  request).
+
+`0`, `false`, `off` and an empty value leave it off. Any other value turns it
+on — a typo must not silently allow clearnet. Restart after changing it;
+connections that are already open are not closed.
+
+Use it with a working proxy, e.g. `--proxy 127.0.0.1:9050` and Tor running.
+Lockdown with the proxy set to `off` means no outbound P2P at all.
+
+Setting it for Core, which reads it at start:
+
+```bash
+# macOS (start from Terminal; Finder does not pass the variable)
+NIGHTFALL_PRIVACY_LOCKDOWN=1 "/Applications/NIGHTFALLCOIN Core.app/Contents/MacOS/nightfall-core"
+
+# Linux
+NIGHTFALL_PRIVACY_LOCKDOWN=1 ./nightfall-core-<version>-linux-x64
+```
+
+```bat
+:: Windows (Command Prompt)
+set NIGHTFALL_PRIVACY_LOCKDOWN=1
+nightfall-core-<version>-windows-x64.exe
+```
+
+For `nightfalld` under systemd: `Environment=NIGHTFALL_PRIVACY_LOCKDOWN=1` in
+the unit.
+
+**Not covered:** inbound connections (peers that dial you see your address —
+do not open a listening port if that matters), the browser wallet, other
+programs and the operating system. This is not a complete anonymity or
+traffic-isolation guarantee.
 
 ### Tor
 

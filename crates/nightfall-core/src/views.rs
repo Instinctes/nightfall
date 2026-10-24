@@ -57,6 +57,55 @@ fn select_workspace(ctx: &egui::Context, key: &'static str, selected: usize) {
     ctx.data_mut(|data| data.insert_temp(egui::Id::new(("page-workspace", key)), selected));
 }
 
+/// The node is on a branch it can never leave by itself, and why — with the
+/// one thing that fixes it.
+///
+/// `gap` is how far back the branch left the network's chain, when the node
+/// knows. 0.9.5 showed this on the dashboard; 1.0.5's startup screen hid the
+/// dashboard until the chain matched, which on a dead branch is never, and
+/// said only "Checking the current chain". Shared by both places so the two
+/// cannot drift apart again.
+pub(crate) fn dead_branch_notice(app: &mut App, ui: &mut egui::Ui, gap: Option<u64>) {
+    let body = match gap {
+        Some(gap) => format!(
+            "This copy of the chain left the network's chain {} blocks back — past the \
+             {}-block limit a node may rewind by itself, so it will not catch up on its own. \
+             Resync the chain file. Your seed, wallet and pending payments stay. Coins mined \
+             on this branch do not exist on the network's chain and are gone.",
+            format_int(gap),
+            nightfall_consensus::MAX_REORG_DEPTH
+        ),
+        None => "The node keeps receiving a chain it cannot switch to, so it will not catch up \
+                 on its own. Resync the chain file. Your seed, wallet and pending payments stay. \
+                 Coins mined only on this copy of the chain are gone."
+            .to_string(),
+    };
+    status_banner(ui, DANGER, "Stuck on a dead branch", &body, true, |ui| {
+        ui.add_space(10.0);
+        if app.resync_confirm {
+            ui.label(
+                RichText::new(
+                    "The current chain file is moved into a backup folder and the chain is \
+                     downloaded again. This can take minutes to hours.",
+                )
+                .size(11.5)
+                .color(WARN),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if primary_button(ui, "  Resync now  ", true).clicked() {
+                    app.resync_chain(ui.ctx());
+                }
+                if ghost_button(ui, "Cancel").clicked() {
+                    app.resync_confirm = false;
+                }
+            });
+        } else if ghost_button(ui, "Resync chain, keep wallet").clicked() {
+            app.resync_confirm = true;
+        }
+    });
+}
+
 pub(crate) fn open_settings_section(app: &mut App, ctx: &egui::Context, section: usize) {
     select_workspace(ctx, "settings", section);
     app.view = View::Settings;
@@ -193,7 +242,12 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(14.0);
     }
 
-    // Chain catch-up and reorgs are background state, not user alerts.
+    // Chain catch-up and reorgs are background state, not user alerts. A dead
+    // branch is neither: nothing resolves it except a resync, so it is said.
+    if let SyncHold::DeadBranch { gap } = sync_hold {
+        dead_branch_notice(app, ui, Some(gap));
+        ui.add_space(14.0);
+    }
 
     if !app.backup_acked {
         status_banner(

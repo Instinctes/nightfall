@@ -164,6 +164,35 @@ fn a_lighter_chain_is_declined_not_accused() {
 }
 
 #[test]
+fn reorg_depth_boundary_is_inclusive() {
+    // MAX_REORG_DEPTH is the largest permitted rewind. Only a rewind
+    // strictly beyond the bound may be rejected as ReorgTooDeep.
+    let miner = WalletKeys::generate().address();
+    let mut mined = devnet();
+    let template = mined.mine_block(&miner, vec![], NOW).unwrap();
+
+    let candidate = vec![template; MAX_REORG_DEPTH + 2];
+
+    let at_limit = vec![Hash256([0xA1; 32]); MAX_REORG_DEPTH];
+    assert_eq!(reorg_rewind(&at_limit, &candidate), MAX_REORG_DEPTH);
+
+    let verdict = Chain::evaluate_reorg(NetworkId::Devnet, 0, &at_limit, candidate.clone(), NOW);
+    assert!(
+        !matches!(verdict, Err(ConsensusError::ReorgTooDeep)),
+        "a rewind exactly at MAX_REORG_DEPTH must pass the depth bound, got {verdict:?}"
+    );
+
+    let past_limit = vec![Hash256([0xA1; 32]); MAX_REORG_DEPTH + 1];
+    assert_eq!(reorg_rewind(&past_limit, &candidate), MAX_REORG_DEPTH + 1);
+
+    let verdict = Chain::evaluate_reorg(NetworkId::Devnet, 0, &past_limit, candidate, NOW);
+    assert!(
+        matches!(verdict, Err(ConsensusError::ReorgTooDeep)),
+        "a rewind past MAX_REORG_DEPTH must be refused, got {verdict:?}"
+    );
+}
+
+#[test]
 fn reorg_depth_is_the_rewind_not_the_length() {
     // Depth is how many of *our* blocks we would drop. A peer that shares
     // nothing with a 501-block history is too deep even if it only sends a
@@ -1141,5 +1170,80 @@ fn the_mempool_can_be_reconciled_against_the_chain() {
     assert!(
         mp.first_seen(&poison_id).is_none(),
         "the timestamp index has to shrink with the map"
+    );
+}
+
+#[test]
+fn bodies_through_handles_max_height_after_pruning() {
+    let mut chain = devnet();
+    let miner = WalletKeys::generate().address();
+
+    for i in 0..3u64 {
+        chain
+            .mine_block(&miner, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+
+    assert_eq!(chain.prune_keep(1).unwrap(), 2);
+    assert_eq!(chain.first_height, 2);
+
+    // A hostile/extreme height must not overflow `height + 1`.
+    assert!(chain.bodies_through(u64::MAX).is_none());
+
+    // Preserve the prune-boundary semantics.
+    assert_eq!(chain.bodies_through(1), Some(Vec::new()));
+    assert!(chain.bodies_through(0).is_none());
+}
+
+/// `can_rebuild_through` and `work_above` answer what `bodies_through` and
+/// the reorg work check would, without copying. The 1.0.7 fork path relies on
+/// that to turn away a lighter or too-deep branch before it copies our history.
+#[test]
+fn cheap_reorg_checks_agree_with_the_copying_ones() {
+    let miner = WalletKeys::from_seed([7; 32]).address();
+    let mut archive = devnet();
+    for i in 0..40u64 {
+        archive
+            .mine_block(&miner, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+    let mut pruned = archive.clone();
+    pruned.prune_keep(10).unwrap();
+    assert!(pruned.first_height > 0, "test needs a pruned chain");
+
+    for chain in [&archive, &pruned] {
+        let tip = chain.tip_height().unwrap().0;
+        for h in 0..=tip + 3 {
+            assert_eq!(
+                chain.can_rebuild_through(h),
+                chain.bodies_through(h).is_some(),
+                "height {h}, first_height {}",
+                chain.first_height
+            );
+        }
+        for h in chain.first_height.saturating_sub(1)..=tip {
+            let expected: u128 = chain
+                .blocks
+                .iter()
+                .filter(|b| b.header.height.0 > h)
+                .map(|b| b.work())
+                .sum();
+            assert_eq!(chain.work_above(h), expected, "height {h}");
+        }
+        assert_eq!(chain.work_above(tip), 0);
+        assert_eq!(chain.work_above(u64::MAX), 0);
+    }
+    // The comparison it stands in for: horizon + prefix + suffix vs total.
+    let tip = archive.tip_height().unwrap().0;
+    let ancestor = tip - 5;
+    let prefix: u128 = archive
+        .bodies_through(ancestor)
+        .unwrap()
+        .iter()
+        .map(|b| b.work())
+        .sum();
+    assert_eq!(
+        archive.horizon_work + prefix + archive.work_above(ancestor),
+        archive.total_work
     );
 }
