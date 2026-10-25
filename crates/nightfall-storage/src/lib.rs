@@ -1575,17 +1575,13 @@ mod tests {
             }
             store.save(&chain).unwrap();
 
-            let committed_len =
-                fs::metadata(store.blocks_path()).unwrap().len();
+            let committed_len = fs::metadata(store.blocks_path()).unwrap().len();
             let mut altered = chain.blocks.clone();
 
             if corrupt_body {
                 altered[0].body.kernels[0].reward_darks ^= 1;
                 assert_eq!(altered[0].hash(), chain.blocks[0].hash());
-                assert_ne!(
-                    altered[0].body.hash(),
-                    altered[0].header.body_root
-                );
+                assert_ne!(altered[0].body.hash(), altered[0].header.body_root);
             } else {
                 altered[0].header.nonce ^= 1;
                 assert_ne!(altered[0].hash(), chain.blocks[0].hash());
@@ -1598,15 +1594,8 @@ mod tests {
             }
             assert_eq!(bytes.len() as u64, committed_len);
 
-            chain
-                .mine_block(&miner, vec![], now_unix() + 1000)
-                .unwrap();
-            codec::write_block(
-                &mut bytes,
-                chain.blocks.last().unwrap(),
-                fmt,
-            )
-            .unwrap();
+            chain.mine_block(&miner, vec![], now_unix() + 1000).unwrap();
+            codec::write_block(&mut bytes, chain.blocks.last().unwrap(), fmt).unwrap();
 
             let original_corrupt_len = bytes.len() as u64;
             assert!(original_corrupt_len > committed_len);
