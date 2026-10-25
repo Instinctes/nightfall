@@ -44,8 +44,8 @@ use nightfall_crypto::{domain, hash_multi, Commitment, KernelFeature, Output, Tx
 use nightfall_types::Hash256;
 use serde::{Deserialize, Serialize};
 
-use crate::{MAX_BLOCK_INPUTS, MAX_BLOCK_KERNELS, MAX_BLOCK_OUTPUTS};
 use crate::tx::{Input, Transaction};
+use crate::{MAX_BLOCK_INPUTS, MAX_BLOCK_KERNELS, MAX_BLOCK_OUTPUTS};
 
 /// The aggregated contents of a block.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
