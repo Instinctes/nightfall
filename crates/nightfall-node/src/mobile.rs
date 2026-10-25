@@ -10,9 +10,12 @@ use crate::rpc::{self, RpcReq};
 use crate::runtime::SharedState;
 use serde_json::json;
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
+#[path = "mobile_guard.rs"]
+mod mobile_guard;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,7 +32,6 @@ const ALLOWED: &[&str] = &[
     // endpoint that anyone can hammer.
     "get_headers",
 ];
-const MAX_BODY: usize = 512 * 1024;
 const PER_IP_PER_MIN: u32 = 120;
 
 struct Rate {
@@ -48,12 +50,19 @@ pub fn spawn_mobile(addr: String, state: SharedState) {
         };
         tracing::info!("mobile API listening on {addr} (status/scan_feed/submit_tx only)");
         let rates: Arc<Mutex<HashMap<String, Rate>>> = Arc::new(Mutex::new(HashMap::new()));
+        let active = Arc::new(AtomicUsize::new(0));
         for conn in listener.incoming() {
             match conn {
-                Ok(stream) => {
+                Ok(mut stream) => {
+                    let Some(permit) = mobile_guard::admit(&active) else {
+                        let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                        let _ = write_http(&mut stream, 503, r#"{"error":"busy"}"#);
+                        continue;
+                    };
                     let st = Arc::clone(&state);
                     let rates = Arc::clone(&rates);
                     thread::spawn(move || {
+                        let _permit = permit;
                         if let Err(e) = handle(stream, st, rates) {
                             tracing::debug!("mobile client: {e}");
                         }
@@ -80,65 +89,58 @@ fn handle(
         return write_http(&mut stream, 429, "{\"error\":\"rate limited\"}");
     }
 
-    let mut buf = vec![0u8; 16_384];
-    let n = stream.read(&mut buf)?;
-    if n == 0 {
-        return Ok(());
-    }
-    let head = String::from_utf8_lossy(&buf[..n]);
-    let (headers, rest) = head.split_once("\r\n\r\n").unwrap_or((&head, ""));
-    let first = headers.lines().next().unwrap_or("");
-    let mut parts = first.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("/");
+    let request = match mobile_guard::read_timed(&mut stream) {
+        Ok(req) => req,
+        Err(mobile_guard::FramingError::TooLarge) => {
+            return write_http(&mut stream, 413, r#"{"error":"too large"}"#)
+        }
+        Err(mobile_guard::FramingError::Invalid) => {
+            return write_http(&mut stream, 400, r#"{"error":"bad framing"}"#)
+        }
+        Err(mobile_guard::FramingError::Io(e)) => return Err(e.into()),
+    };
+
+    let method = request.method.as_str();
+    let path = request.path.as_str();
 
     if method == "OPTIONS" {
         return write_http(&mut stream, 204, "");
     }
+
     if method == "GET" && (path == "/peers" || path == "/peers/") {
         let req = RpcReq {
             method: "peers".into(),
             params: json!({}),
             id: json!(1),
         };
-        let res = rpc::dispatch(&req, &state);
-        return write_http(&mut stream, 200, &serde_json::to_string(&res)?);
+        return write_http(
+            &mut stream,
+            200,
+            &serde_json::to_string(&rpc::dispatch(&req, &state))?,
+        );
     }
+
     if method == "GET" && (path == "/status" || path == "/") {
         let req = RpcReq {
             method: "status".into(),
             params: json!({}),
             id: json!(1),
         };
-        let res = rpc::dispatch(&req, &state);
-        return write_http(&mut stream, 200, &serde_json::to_string(&res)?);
-    }
-    if method != "POST" {
-        return write_http(&mut stream, 405, "{\"error\":\"POST a JSON-RPC body\"}");
+        return write_http(
+            &mut stream,
+            200,
+            &serde_json::to_string(&rpc::dispatch(&req, &state))?,
+        );
     }
 
-    let content_len = headers
-        .lines()
-        .find_map(|l| {
-            let (k, v) = l.split_once(':')?;
-            (k.eq_ignore_ascii_case("content-length")).then(|| v.trim().parse::<usize>().ok())
-        })
-        .flatten()
-        .unwrap_or(rest.len());
-    if content_len > MAX_BODY {
-        return write_http(&mut stream, 413, "{\"error\":\"body too large\"}");
+    if method != "POST" {
+        return write_http(&mut stream, 405, r#"{"error":"POST JSON-RPC"}"#);
     }
-    let mut body = rest.as_bytes().to_vec();
-    while body.len() < content_len {
-        let mut more = vec![0u8; (content_len - body.len()).min(8192)];
-        let k = stream.read(&mut more)?;
-        if k == 0 {
-            break;
-        }
-        body.extend_from_slice(&more[..k]);
-    }
-    body.truncate(content_len);
-    let text = String::from_utf8_lossy(&body);
+
+    let text = match std::str::from_utf8(&request.body) {
+        Ok(t) => t,
+        Err(_) => return write_http(&mut stream, 400, r#"{"error":"UTF-8"}"#),
+    };
     let req: RpcReq = match serde_json::from_str(text.trim()) {
         Ok(r) => r,
         Err(e) => {
@@ -165,9 +167,17 @@ fn handle(
 
 fn allow(rates: &Mutex<HashMap<String, Rate>>, ip: &str) -> bool {
     let Ok(mut g) = rates.lock() else {
-        return true;
+        return false;
     };
     let now = Instant::now();
+
+    if g.len() >= 4096 && !g.contains_key(ip) {
+        g.retain(|_, rate| now.duration_since(rate.window) <= Duration::from_secs(60));
+        if g.len() >= 4096 {
+            return false;
+        }
+    }
+
     let e = g.entry(ip.to_string()).or_insert(Rate {
         window: now,
         count: 0,
@@ -189,6 +199,7 @@ fn write_http(stream: &mut TcpStream, code: u16, body: &str) -> anyhow::Result<(
         405 => "Method Not Allowed",
         413 => "Payload Too Large",
         429 => "Too Many Requests",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     let hdr = format!(
@@ -211,7 +222,9 @@ fn write_http(stream: &mut TcpStream, code: u16, body: &str) -> anyhow::Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::ALLOWED;
+    use super::{allow, ALLOWED};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
 
     /// The public endpoint is an allow-list, and this test exists so that
     /// widening it stays a deliberate act. `get_blocks` in particular must
@@ -234,5 +247,17 @@ mod tests {
             assert!(!ALLOWED.contains(&m), "{m} must not be public");
         }
         assert_eq!(ALLOWED.len(), 7, "adding a method here needs a reason");
+    }
+    #[test]
+    fn bounded_source_buckets() {
+        let rates = Mutex::new(HashMap::new());
+
+        for i in 0..4096u32 {
+            assert!(allow(&rates, &format!("2001:db8::{i:x}")));
+        }
+
+        assert!(!allow(&rates, "2001:db8::ffff"));
+        assert!(allow(&rates, "2001:db8::1"));
+        assert_eq!(rates.lock().unwrap().len(), 4096);
     }
 }
