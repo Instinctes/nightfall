@@ -128,11 +128,19 @@ pub fn read_blocks<R: Read>(r: R, fmt: Format) -> anyhow::Result<Vec<Block>> {
             let mut i = 0usize;
             let mut first = true;
             loop {
-                match r.read_exact(&mut len_buf) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => return Err(e.into()),
+                // EOF is valid only between complete records. Once any byte
+                // of the next four-byte length prefix exists, losing the
+                // remainder means the file is truncated.
+                if r.fill_buf()?.is_empty() {
+                    break;
                 }
+                r.read_exact(&mut len_buf).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        anyhow::anyhow!("block {i} has a truncated length prefix")
+                    } else {
+                        anyhow::Error::from(e)
+                    }
+                })?;
                 // A JSON chain file in a binary datadir reads its first two
                 // characters as part of a length prefix and reports an absurd
                 // number, which tells the operator nothing. Name it instead:
@@ -236,6 +244,29 @@ mod tests {
             err.contains("truncated"),
             "a short file must say so, got: {err}"
         );
+    }
+
+    #[test]
+    fn a_partial_binary_length_prefix_is_refused() {
+        let chain = sample_chain();
+        let mut complete = Vec::new();
+        for block in &chain.blocks {
+            write_block(&mut complete, block, Format::Binary).unwrap();
+        }
+
+        let next_len = 1u32.to_le_bytes();
+        for prefix_len in 1..=3 {
+            let mut buf = complete.clone();
+            buf.extend_from_slice(&next_len[..prefix_len]);
+
+            let err = read_blocks(&buf[..], Format::Binary)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("truncated") && err.contains("length prefix"),
+                "{prefix_len}-byte partial prefix returned the wrong error: {err}"
+            );
+        }
     }
 
     #[test]
