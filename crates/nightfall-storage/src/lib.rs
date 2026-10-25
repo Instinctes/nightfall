@@ -284,11 +284,22 @@ impl ChainStore {
             Err(_) => return Ok(()),
         };
 
-        let prefix_matches = blocks.len() as u64 == meta.block_count
-            && blocks
-                .last()
-                .map(|block| block.hash().to_hex() == meta.validated_tip)
-                .unwrap_or(false);
+        // A matching tip does not authenticate an earlier block body.
+        // Full validation is limited to the exceptional crash-recovery path.
+        let prefix_matches = if let Ok(mut verified) = Chain::new_fair(meta.network) {
+            let now = now_unix();
+            let valid = blocks
+                .into_iter()
+                .all(|block| verified.apply_block(block, now).is_ok());
+
+            valid
+                && verified.verify_supply().is_ok()
+                && verified.block_count() == meta.block_count
+                && verified.tip_hash().to_hex() == meta.validated_tip
+                && verified.genesis_hash.to_hex() == meta.genesis_hash
+        } else {
+            false
+        };
 
         if !prefix_matches {
             return Ok(());
@@ -1536,5 +1547,81 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn crash_recovery_preserves_corrupted_committed_prefix() {
+        use nightfall_crypto::WalletKeys;
+
+        for corrupt_body in [false, true] {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "nf-crash-corrupt-{}-{unique}-{corrupt_body}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+
+            let store = ChainStore::new(&dir);
+            let miner = WalletKeys::generate().address();
+            let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+            for i in 0..3u64 {
+                chain
+                    .mine_block(&miner, vec![], now_unix() + i * 15)
+                    .unwrap();
+            }
+            store.save(&chain).unwrap();
+
+            let committed_len =
+                fs::metadata(store.blocks_path()).unwrap().len();
+            let mut altered = chain.blocks.clone();
+
+            if corrupt_body {
+                altered[0].body.kernels[0].reward_darks ^= 1;
+                assert_eq!(altered[0].hash(), chain.blocks[0].hash());
+                assert_ne!(
+                    altered[0].body.hash(),
+                    altered[0].header.body_root
+                );
+            } else {
+                altered[0].header.nonce ^= 1;
+                assert_ne!(altered[0].hash(), chain.blocks[0].hash());
+            }
+
+            let fmt = store.format();
+            let mut bytes = Vec::new();
+            for block in &altered {
+                codec::write_block(&mut bytes, block, fmt).unwrap();
+            }
+            assert_eq!(bytes.len() as u64, committed_len);
+
+            chain
+                .mine_block(&miner, vec![], now_unix() + 1000)
+                .unwrap();
+            codec::write_block(
+                &mut bytes,
+                chain.blocks.last().unwrap(),
+                fmt,
+            )
+            .unwrap();
+
+            let original_corrupt_len = bytes.len() as u64;
+            assert!(original_corrupt_len > committed_len);
+            fs::write(store.blocks_path(), &bytes).unwrap();
+
+            store.recover_uncommitted_archive_tail().unwrap();
+
+            assert_eq!(
+                fs::metadata(store.blocks_path()).unwrap().len(),
+                original_corrupt_len,
+                "recovery must not truncate a corrupt committed prefix"
+            );
+            assert!(store.load_or_new(NetworkId::Devnet).is_err());
+
+            fs::remove_dir_all(&dir).ok();
+        }
     }
 }
