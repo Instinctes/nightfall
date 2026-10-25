@@ -289,13 +289,9 @@ fn next_scan_page_height(
             anyhow::bail!("node returned more than 128 blocks in one RPC page");
         }
         if actual != next {
-            anyhow::bail!(
-                "non-contiguous RPC block page: expected height {next}, got {actual}"
-            );
+            anyhow::bail!("non-contiguous RPC block page: expected height {next}, got {actual}");
         }
-        next = next
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("RPC block height overflow"))?;
+        next = next.checked_add(1).ok_or_else(|| anyhow::anyhow!("RPC block height overflow"))?;
         count += 1;
     }
     if count == 0 {
