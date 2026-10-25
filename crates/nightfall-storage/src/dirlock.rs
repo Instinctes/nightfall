@@ -74,6 +74,19 @@ impl DirLock {
     }
 }
 
+// Explicitly unlock while the file descriptor is still open. Closing the
+// descriptor releases the lock too, but this avoids relying on the timing of
+// close-based lock release when a vault is reopened immediately (notably on
+// macOS). The lock file itself remains in place.
+#[cfg(unix)]
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: the descriptor is owned by self._file and is still open.
+        let _ = unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 /// Take the lock, or say who has it.
 ///
 /// Call this before touching anything in `dir`. The returned guard must be
