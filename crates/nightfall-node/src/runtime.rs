@@ -2305,6 +2305,12 @@ fn note_peer_height(state: &SharedState, height: u64) {
 /// How long a peer's claimed height stays believed without confirmation.
 pub const PEER_HEIGHT_TTL_SECS: u64 = 120;
 
+/// How often a reorg candidate copied our own history (both fork paths).
+///
+/// On an archive node each copy is the whole chain. Diagnostics and the
+/// regression test for the 1.0.6 seed that copied it for every competing tip.
+pub static REORG_PREFIX_COPIES: AtomicU64 = AtomicU64::new(0);
+
 /// Weigh a block that forks from a chain we already hold.
 ///
 /// The receiving side of a push cannot ask for anything: it has one block at a
@@ -2335,36 +2341,65 @@ fn consider_branch(state: &SharedState, block: Block, peer_label: &str) {
     // The fork root is the highest block of ours that something in the buffer
     // claims as its parent. Searching from the tip backwards finds a recent
     // fork immediately, which is the common case.
-    let Some(fork_at) = g
+    //
+    // Only the reorg window is searched: a fork deeper than MAX_REORG_DEPTH is
+    // refused by `evaluate_reorg_at` anyway, and on an archive node a miss
+    // used to hash every block since genesis while holding the state lock.
+    let window = g
         .chain
         .blocks
+        .len()
+        .saturating_sub(nightfall_consensus::MAX_REORG_DEPTH + 1);
+    let Some(fork_at) = g.chain.blocks[window..]
         .iter()
         .rposition(|b| g.branch.contains_key(&b.hash().0))
+        .map(|i| window + i)
     else {
         return;
     };
 
     // Walk forward for as far as the run is contiguous. A gap simply ends it;
     // the next push round fills in what is missing.
-    //
-    // On an archive node this prefix starts at genesis. On a pruned node
-    // it starts at `first_height` — `evaluate_reorg_at` is told that.
-    let mut candidate: Vec<Block> = g.chain.blocks[..=fork_at].to_vec();
+    let mut run: Vec<Block> = Vec::new();
     let mut cursor = g.chain.blocks[fork_at].hash().0;
-    let mut added = 0usize;
     while let Some(next) = g.branch.get(&cursor) {
-        candidate.push(next.clone());
+        run.push(next.clone());
         cursor = next.hash().0;
-        added += 1;
-        if added > MAX_BRANCH_BLOCKS {
+        if run.len() > MAX_BRANCH_BLOCKS {
             break;
         }
     }
-    if added == 0 {
+    if run.is_empty() {
         return;
     }
 
-    // Cheap rejection before rebuilding anything.
+    // Cheap rejection before copying anything.
+    //
+    // The branch wins only if its run declares more work than the blocks of
+    // ours after the fork point. Until 1.0.7 the whole prefix — on an archive
+    // node every block since genesis, gigabytes — was copied first, under the
+    // state lock, for every competing block a peer pushed. The light API
+    // waited on that lock for seconds and the copies piled up until the kernel
+    // killed the node.
+    let run_work: u128 = run.iter().map(|b| b.work()).sum();
+    let ours_after: u128 = g.chain.blocks[fork_at + 1..].iter().map(|b| b.work()).sum();
+    if run_work <= ours_after {
+        return;
+    }
+
+    // One verification at a time, before the copy.
+    let guard = Arc::clone(&g.reorg_in_flight);
+    let Some(_flight) = ReorgFlight::begin(&guard) else {
+        tracing::debug!("branch from {peer_label} skipped — a reorg is already being verified");
+        return;
+    };
+
+    // On an archive node this prefix starts at genesis. On a pruned node
+    // it starts at `first_height` — `evaluate_reorg_at` is told that.
+    let mut candidate: Vec<Block> = g.chain.blocks[..=fork_at].to_vec();
+    REORG_PREFIX_COPIES.fetch_add(1, Ordering::Relaxed);
+    candidate.extend(run);
+
     // Pruned candidate is the window only — add the horizon's work or a
     // heavier suffix always looks lighter than the live chain.
     let claimed: u128 = g.chain.horizon_work + candidate.iter().map(|b| b.work()).sum::<u128>();
@@ -2377,13 +2412,7 @@ fn consider_branch(state: &SharedState, block: Block, peer_label: &str) {
     let our_work = g.chain.total_work;
     let our_hashes = g.chain.hash_chain();
     let base = g.chain.pruned_base();
-    let guard = Arc::clone(&g.reorg_in_flight);
     drop(g);
-
-    let Some(_flight) = ReorgFlight::begin(&guard) else {
-        tracing::debug!("branch from {peer_label} skipped — a reorg is already being verified");
-        return;
-    };
 
     // Verified with the lock released. See `Chain::evaluate_reorg_at`.
     let verdict =
@@ -2774,7 +2803,18 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
         }
 
         let ancestor = common_ancestor(state, &mut stream, peer_h, &peer_tip);
-        let (network, our_work, our_hashes, prefix, rewind, guard, base) = {
+
+        // Everything cheap first; the copy of our own history last.
+        //
+        // Until 1.0.7 this block began with `bodies_through(ancestor)`, which on
+        // an archive node copies the *whole* chain — several gigabytes at
+        // 347,000 blocks — and only then asked whether the fork was too deep,
+        // whether another reorg was already being verified, and whether the
+        // peer's branch was even heavier. Every peer with a different tip (an
+        // old node on a dead fork, a competing block) made the seed do that,
+        // several at once: RSS jumped from 0.7 to 7.6 GB within seconds, the
+        // light API stopped answering, and the kernel killed the node.
+        let (rewind, guard) = {
             let g = state.lock().unwrap();
             let our_tip = g.chain.tip_height().map(|h| h.0).unwrap_or(0);
             // An ancestor above our own tip is not a place we can rewind to.
@@ -2787,26 +2827,17 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
                 g.stalled_on_fork.store(true, Ordering::SeqCst);
                 break;
             }
-            let rewind = our_tip.saturating_sub(ancestor) as usize;
-            let prefix = match g.chain.bodies_through(ancestor) {
-                Some(p) => p,
-                None => {
-                    tracing::warn!(
-                        "peer {addr} diverges below the prune horizon at height {} — not adopting",
-                        g.chain.first_height
-                    );
-                    g.stalled_on_fork.store(true, Ordering::SeqCst);
-                    break;
-                }
-            };
+            if !g.chain.can_rebuild_through(ancestor) {
+                tracing::warn!(
+                    "peer {addr} diverges below the prune horizon at height {} — not adopting",
+                    g.chain.first_height
+                );
+                g.stalled_on_fork.store(true, Ordering::SeqCst);
+                break;
+            }
             (
-                g.chain.network,
-                g.chain.total_work,
-                g.chain.hash_chain(),
-                prefix,
-                rewind,
+                our_tip.saturating_sub(ancestor) as usize,
                 Arc::clone(&g.reorg_in_flight),
-                g.chain.pruned_base(),
             )
         };
 
@@ -2825,6 +2856,7 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
             break;
         }
 
+        // One verification at a time, before anything is copied.
         let Some(_flight) = ReorgFlight::begin(&guard) else {
             tracing::debug!("peer {addr} diverges, but a reorg is already being verified");
             break;
@@ -2834,6 +2866,34 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
         if suffix.is_empty() && rewind == 0 {
             break;
         }
+
+        // The peer's branch must declare more work than the part of ours it
+        // would replace — the first thing `evaluate_reorg_at` checks. A
+        // lighter branch is turned away here, without copying our history.
+        let suffix_work: u128 = suffix.iter().map(|b| b.work()).sum();
+        let (network, our_work, our_hashes, prefix, base) = {
+            let g = state.lock().unwrap();
+            let ours_above = g.chain.work_above(ancestor);
+            if suffix_work <= ours_above {
+                tracing::debug!(
+                    "peer {addr} offers a branch from {ancestor} that is not heavier — not adopting"
+                );
+                break;
+            }
+            let Some(prefix) = g.chain.bodies_through(ancestor) else {
+                // The horizon moved while we fetched; nothing to rebuild from.
+                break;
+            };
+            REORG_PREFIX_COPIES.fetch_add(1, Ordering::Relaxed);
+            (
+                g.chain.network,
+                g.chain.total_work,
+                g.chain.hash_chain(),
+                prefix,
+                g.chain.pruned_base(),
+            )
+        };
+
         let mut candidate = prefix;
         candidate.extend(suffix);
         if candidate.is_empty() {

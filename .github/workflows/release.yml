@@ -53,10 +53,10 @@ jobs:
       # The tests gate the release. Shipping a binary from a tree that fails
       # its own exploit regression suite would be worse than shipping nothing.
       - name: Tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Build
-        run: cargo build --release -p nightfall-core -p nightfall-node -p nightfall-wallet
+        run: cargo build --release -p nightfall-core -p nightfall-node -p nightfall-wallet --locked
 
       - name: The binary must agree with the tag
         shell: pwsh
@@ -141,10 +141,10 @@ jobs:
             libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
 
       - name: Tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Build
-        run: cargo build --release -p nightfall-core -p nightfall-node -p nightfall-wallet
+        run: cargo build --release -p nightfall-core -p nightfall-node -p nightfall-wallet --locked
 
       # The seeds once ran 0.8.0 code that introduced itself as 0.7.8, because
       # the binary was built before the version bump. A tag is a promise about
@@ -195,7 +195,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       # build-macos-dmgs.sh builds with --offline --locked, so the dependency
       # set is fetched once, from Cargo.lock, before it runs.

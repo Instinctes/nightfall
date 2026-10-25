@@ -1804,7 +1804,8 @@ impl eframe::App for App {
         {
             self.rewards.preview(ctx.input(|input| input.time));
         }
-        self.rewards.show(ctx, self.reward_sound);
+        self.rewards
+            .show(ctx, self.reward_sound, 94.0 + Self::title_clearance());
         self.toasts.show(ctx);
         crate::ui_shots::step(self, ctx);
     }

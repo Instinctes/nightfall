@@ -708,7 +708,25 @@ impl Wallet {
         })?)
     }
 
+    /// Restore a wallet from state handed in from outside this process — a
+    /// browser vault, an import — which is bounded by
+    /// [`vault::MAX_PLAINTEXT_BYTES`] before it is parsed.
     pub fn import_state(blob: &str) -> anyhow::Result<Self> {
+        if blob.len() > vault::MAX_PLAINTEXT_BYTES {
+            bail!("wallet state is too large");
+        }
+        Self::import_own_state(blob)
+    }
+
+    /// Restore a working copy from this process's own [`Wallet::export_state`].
+    ///
+    /// Core clones the open wallet this way for every background scan. That
+    /// state is not outside input, and its size grows with every output the
+    /// wallet owns: a miner passes the external-import bound after some tens
+    /// of thousands of blocks, and the scan then stopped for good
+    /// ("wallet state is too large", issue #64). Not for untrusted input —
+    /// use [`Wallet::import_state`] for that.
+    pub fn import_own_state(blob: &str) -> anyhow::Result<Self> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Import<'a> {
@@ -716,9 +734,6 @@ impl Wallet {
             network: &'a str,
             seed: &'a str,
             db: WalletFile,
-        }
-        if blob.len() > vault::MAX_PLAINTEXT_BYTES {
-            bail!("wallet state is too large");
         }
         let state: Import<'_> = serde_json::from_str(blob).context("invalid wallet state")?;
         state.db.swap_journal.validate()?;
@@ -3217,6 +3232,50 @@ mod tests {
             .expect("reserved coin must still fund the lock");
         assert!(tx.inputs.iter().any(|i| i.commit.to_hex() == commit));
         fs::remove_dir_all(&d).ok();
+    }
+
+    /// Issue #64: a long-running miner's own state outgrows the bound on
+    /// external imports, and Core's background scan copies the wallet through
+    /// export/import. The copy must keep working at any size, while outside
+    /// input stays bounded.
+    #[test]
+    fn own_state_larger_than_the_old_16_mib_bound_still_copies() {
+        let keys = WalletKeys::from_seed([9u8; 32]);
+        let mut wallet = Wallet::in_memory(NetworkId::Devnet, keys, 0);
+        let mut i: u64 = 0;
+        while wallet.export_state().unwrap().len() <= 16 * 1024 * 1024 {
+            for _ in 0..4_000 {
+                i += 1;
+                let blind = Scalar::from(i);
+                wallet.test_insert_output(OwnedOutput {
+                    commit: Commitment::new(600_000_000, &blind),
+                    value: 600_000_000,
+                    blind_hex: hex::encode(blind.to_bytes()),
+                    key_offset_hex: hex::encode(Scalar::from(i + 7).to_bytes()),
+                    memo: String::new(),
+                    height: i,
+                    spent: false,
+                    is_coinbase: true,
+                });
+            }
+        }
+        let blob = wallet.export_state().unwrap();
+        assert!(blob.len() > 16 * 1024 * 1024);
+        let copy = Wallet::import_own_state(&blob).expect("own state copies at any size");
+        assert_eq!(copy.export_state().unwrap(), blob);
+        assert_eq!(copy.address_string(), wallet.address_string());
+        // Within the raised external bound, the outside path accepts it too.
+        assert!(blob.len() <= vault::MAX_PLAINTEXT_BYTES);
+        assert!(Wallet::import_state(&blob).is_ok());
+    }
+
+    #[test]
+    fn external_state_over_the_bound_is_refused_before_parsing() {
+        let blob = " ".repeat(vault::MAX_PLAINTEXT_BYTES + 1);
+        let err = Wallet::import_state(&blob)
+            .err()
+            .expect("oversized input must be refused");
+        assert!(err.to_string().contains("too large"), "{err}");
     }
 
     #[test]
