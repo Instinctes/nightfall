@@ -79,18 +79,6 @@ fn json_format_name() -> String {
     "json".to_string()
 }
 
-/// Make namespace changes durable after publishing renamed files.
-#[cfg(unix)]
-fn sync_dir(path: &Path) -> anyhow::Result<()> {
-    File::open(path)?.sync_all()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn sync_dir(_path: &Path) -> anyhow::Result<()> {
-    Ok(())
-}
-
 pub struct ChainStore {
     pub dir: PathBuf,
 }
