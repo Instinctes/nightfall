@@ -336,6 +336,7 @@ impl ChainStore {
     ///
     /// Returns the old and new sizes in bytes.
     pub fn migrate_to_binary(&self) -> anyhow::Result<(u64, u64)> {
+        self.refuse_if_interrupted_recovery()?;
         if self.format() == Format::Binary {
             anyhow::bail!("this datadir is already binary");
         }
@@ -398,6 +399,7 @@ impl ChainStore {
     /// Copy `blocks.jsonl` plus a small manifest. The importer still verifies
     /// every block — this is a faster start, not a trust shortcut.
     pub fn export_snapshot(&self, out: &Path) -> anyhow::Result<SnapshotManifest> {
+        self.refuse_if_interrupted_recovery()?;
         if self
             .read_meta()
             .map(|m| m.pruned || m.first_height > 0)
@@ -440,6 +442,7 @@ impl ChainStore {
     /// checks. `validated_bytes` is forced to 0 so a copied file is never
     /// trusted as if this node had already verified it.
     pub fn import_snapshot(&self, from: &Path, network: NetworkId) -> anyhow::Result<Chain> {
+        self.refuse_if_interrupted_recovery()?;
         // A snapshot may be either format, and the two are not
         // interchangeable by filename. Pick the file that is there, and
         // remember what it is.
@@ -709,6 +712,51 @@ impl ChainStore {
         Ok(())
     }
 
+    /// Refuse to operate on a datadir whose recovery was interrupted.
+    ///
+    /// `recover-stalled-fork` leaves [`RECOVERY_JOURNAL`] behind if it is
+    /// interrupted mid-reset, so the datadir may be only half-reset. Every
+    /// entry point that reads or rewrites the chain calls this, so a normal
+    /// start, a storage migration or a snapshot export/import can never
+    /// silently proceed over an unfinished recovery.
+    pub fn refuse_if_interrupted_recovery(&self) -> anyhow::Result<()> {
+        let journal = self.dir.join(RECOVERY_JOURNAL);
+        // symlink_metadata, not exists(): a dangling symlink at the journal path
+        // must be caught too (exists() follows it and reports "not found"), and
+        // the entry must never be followed.
+        let md = match fs::symlink_metadata(&journal) {
+            Ok(md) => md,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(anyhow::anyhow!("checking {}: {e}", journal.display())),
+        };
+        let detail = if md.file_type().is_file() {
+            fs::read_to_string(&journal)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| v.get("backup").and_then(|b| b.as_str()).map(String::from))
+                .map(|b| format!("The original chain is backed up at {b}."))
+                .unwrap_or_else(|| {
+                    "The original chain is in the recovery-backup-* directory.".to_string()
+                })
+        } else if md.file_type().is_symlink() {
+            format!(
+                "{RECOVERY_JOURNAL} is a symlink, which is suspicious; it will not be followed."
+            )
+        } else {
+            format!("{RECOVERY_JOURNAL} is not a regular file, which is suspicious.")
+        };
+        anyhow::bail!(
+            "an interrupted recover-stalled-fork was found in {} ({} is present),\n\
+             so the datadir may be only half-reset and cannot be trusted.\n\
+             {}\n\
+             Restore the backup into the datadir and delete {}, then try again.",
+            self.dir.display(),
+            RECOVERY_JOURNAL,
+            detail,
+            RECOVERY_JOURNAL,
+        )
+    }
+
     /// Load a chain, replaying and revalidating every stored block.
     /// Load, reporting progress to the log every few seconds.
     ///
@@ -754,6 +802,7 @@ impl ChainStore {
         mut on_progress: impl FnMut(u64, u64),
     ) -> anyhow::Result<Chain> {
         self.ensure_dir()?;
+        self.refuse_if_interrupted_recovery()?;
 
         if self.legacy_path().exists() && !self.blocks_path().exists() {
             anyhow::bail!(
@@ -987,6 +1036,12 @@ fn load_jsonl_headers(path: &Path) -> anyhow::Result<Vec<CompactHeader>> {
 /// This chain uses a sibling folder so an old wallet cannot mine the corpse.
 pub const DATADIR_EPOCH: &str = "n8";
 
+/// Written by `recover-stalled-fork` while it resets a datadir, and removed
+/// only when the reset has completed and been verified. Its presence means a
+/// recovery was interrupted and the datadir may be half-reset, so every load
+/// path refuses to start until the operator restores the named backup.
+pub const RECOVERY_JOURNAL: &str = ".recovery-journal.json";
+
 pub fn default_data_dir(network: NetworkId) -> PathBuf {
     let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
     base.join("nightfall")
@@ -996,6 +1051,59 @@ pub fn default_data_dir(network: NetworkId) -> PathBuf {
 
 pub fn wallet_dir(datadir: &Path) -> PathBuf {
     datadir.join("wallet")
+}
+
+/// fsync a directory so a rename or a newly created file in it is durable.
+///
+/// This is what keeps the recovery journal and the backup from disagreeing
+/// after a crash: the journal must reach disk before the originals are moved.
+///
+/// On Unix an open directory handle can be synced directly, and the error is
+/// propagated. Windows has no user-space directory fsync: `FlushFileBuffers`
+/// on a directory handle fails with `ERROR_ACCESS_DENIED` (5) or
+/// `ERROR_INVALID_FUNCTION` (1), and NTFS instead orders directory-entry
+/// (rename/create) metadata through its own journal. So on Windows the file
+/// contents are what carry durability — each file is `sync_all`'d when written
+/// (the journal included) — and this call recognises the expected
+/// directory-flush-unsupported result as the no-op it is, while still surfacing
+/// a genuine failure such as being unable to open the directory at all. The
+/// rename-ordering guarantee is therefore weaker on Windows than on Unix; that
+/// is a platform limitation, not something this function can close.
+pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const ERROR_INVALID_FUNCTION: i32 = 1;
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        let handle = OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)?;
+        match handle.sync_all() {
+            Ok(()) => Ok(()),
+            // Flushing a directory handle is not supported on Windows; NTFS
+            // journals the metadata itself, so this is a no-op, not a failure.
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(ERROR_ACCESS_DENIED) | Some(ERROR_INVALID_FUNCTION)
+                ) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 pub fn now_unix() -> u64 {
@@ -1065,6 +1173,42 @@ fn getrandom_bytes(out: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An interrupted recovery marks the datadir unsafe for every entry
+    /// point that reads or rewrites the chain, not only a normal start.
+    #[test]
+    fn an_interrupted_recovery_is_refused_everywhere() {
+        use nightfall_crypto::WalletKeys;
+        let dir =
+            std::env::temp_dir().join(format!("nf-journal-{}-{}", std::process::id(), now_unix()));
+        fs::create_dir_all(&dir).unwrap();
+        // A JSON chain, so migrate_to_binary would otherwise have work to do.
+        fs::write(dir.join(codec::BLOCKS_JSONL), b"").unwrap();
+        let store = ChainStore::new(&dir);
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+        let miner = WalletKeys::generate().address();
+        chain.mine_block(&miner, vec![], now_unix() - 60).unwrap();
+        store.save(&chain).unwrap();
+
+        fs::write(dir.join(RECOVERY_JOURNAL), b"{\"backup\":\"bk\"}").unwrap();
+
+        let load = store
+            .load_or_new(NetworkId::Devnet)
+            .unwrap_err()
+            .to_string();
+        assert!(load.contains("interrupted"), "load: {load}");
+        let mig = store.migrate_to_binary().unwrap_err().to_string();
+        assert!(mig.contains("interrupted"), "migrate: {mig}");
+        let out = std::env::temp_dir().join(format!(
+            "nf-journal-out-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let exp = store.export_snapshot(&out).unwrap_err().to_string();
+        assert!(exp.contains("interrupted"), "export: {exp}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn secret_files_are_owner_only() {

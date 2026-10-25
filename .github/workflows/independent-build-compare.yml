@@ -1,0 +1,23 @@
+name: Independent build comparison (offline)
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/compare_independent_builds.py'
+      - 'scripts/test_compare_independent_builds.py'
+      - 'docs/INDEPENDENT-BUILD-COMPARISON.md'
+      - '.github/workflows/independent-build-compare.yml'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  adversarial-fixtures:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Offline receipt parser and comparison tests
+        run: python3 -m unittest discover -s scripts -p 'test_compare_independent_builds.py' -v

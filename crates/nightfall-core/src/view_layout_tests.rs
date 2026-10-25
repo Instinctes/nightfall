@@ -968,3 +968,42 @@ fn cards_on_one_page_share_one_left_and_right_edge() {
         ragged.join("\n")
     );
 }
+
+/// 1.0.5 showed only "Checking the current chain" for a node stuck on a dead
+/// branch. The notice that replaces it must fit every supported width, with
+/// and without a known depth, and its button must lead to the confirmation
+/// rather than straight into a resync.
+#[test]
+fn the_dead_branch_notice_fits_and_asks_before_resyncing() {
+    let ctx = egui::Context::default();
+    crate::theme::apply(&ctx);
+    let dir = std::env::temp_dir().join(format!("nf-dead-branch-{}", std::process::id()));
+    let mut app = App::new(nightfall_types::NetworkId::Devnet, dir);
+    for confirm in [false, true] {
+        app.resync_confirm = confirm;
+        for gap in [Some(1_457), None] {
+            for width in [620.0, 884.0, 1180.0] {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(width, 900.0),
+                    )),
+                    ..Default::default()
+                };
+                let _ = ctx.run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let right = ui.max_rect().right();
+                        dead_branch_notice(&mut app, ui, gap);
+                        assert!(
+                            ui.min_rect().right() <= right + 1.0,
+                            "dead-branch notice overflows at {width}px (gap {gap:?}, confirm {confirm})"
+                        );
+                    });
+                });
+            }
+        }
+    }
+    // Rendering alone never starts a resync or clears the request.
+    assert!(app.resync_confirm);
+    assert!(app.node.is_none());
+}
