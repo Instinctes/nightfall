@@ -58,10 +58,11 @@ jobs:
           cargo test --locked -p nightfall-crypto --test mnemonic_boundary
       - name: Native and WASM encrypted-backup interoperability
         run: |
-          cargo run --locked --quiet -p nightfall-wallet --example vault_interop -- create target/web-fixtures/native.nfv
-          cargo run --locked --quiet -p nightfall-wallet --example vault_interop -- create-funded target/web-fixtures/funded.nfv
-          node scripts/check-vault-wasm.cjs target/web-node/nightfall_web.js target/web-fixtures/native.nfv target/web-fixtures/wasm.nfv target/web-fixtures/funded.nfv
-          cargo run --locked --quiet -p nightfall-wallet --example vault_interop -- check target/web-fixtures/wasm.nfv
+          RUN_DIR="$(mktemp -d target/web-fixtures/run-XXXXXX)"
+          cargo run --locked --quiet -p nightfall-wallet --example vault_interop -- create "$RUN_DIR/native.nfv"
+          cargo run --locked --quiet -p nightfall-wallet --example vault_interop -- create-funded "$RUN_DIR/funded.nfv"
+          node scripts/check-vault-wasm.cjs target/web-node/nightfall_web.js "$RUN_DIR/native.nfv" "$RUN_DIR/wasm.nfv" "$RUN_DIR/funded.nfv"
+          cargo run --locked --quiet -p nightfall-wallet --example vault_interop -- check "$RUN_DIR/wasm.nfv"
       - name: Record source and checksum exact deployable files
         run: |
           python3 - <<'PY'
