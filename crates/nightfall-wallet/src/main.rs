@@ -273,6 +273,35 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Validate one nonempty RPC page before advancing the CLI wallet scan.
+///
+/// get_blocks returns an inclusive, contiguous range from the requested height.
+/// A malformed page must never be folded into wallet history. In particular,
+/// u64::MAX has no successor and must not wrap the next RPC request to zero.
+fn next_scan_page_height(
+    start: u64,
+    heights: impl IntoIterator<Item = u64>,
+) -> anyhow::Result<u64> {
+    let mut next = start;
+    let mut count = 0usize;
+    for actual in heights {
+        if count == 128 {
+            anyhow::bail!("node returned more than 128 blocks in one RPC page");
+        }
+        if actual != next {
+            anyhow::bail!("non-contiguous RPC block page: expected height {next}, got {actual}");
+        }
+        next = next
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("RPC block height overflow"))?;
+        count += 1;
+    }
+    if count == 0 {
+        anyhow::bail!("empty RPC block page cannot advance scan");
+    }
+    Ok(next)
+}
+
 /// Pull blocks from the node in batches and scan them as one chain.
 ///
 /// Scanning each page on its own made reconcile treat the first page as the
@@ -298,12 +327,11 @@ fn sync(wallet: &mut Wallet, rpc: &str, from: u64) -> anyhow::Result<u32> {
         if blocks.is_empty() {
             break;
         }
-        let last = blocks.last().map(|b| b.header.height.0).unwrap_or(height);
+        // Reject malformed, repeated, out-of-order, or overflowing RPC pages
+        // before they can reach the wallet's reconciliation step.
+        let next = next_scan_page_height(height, blocks.iter().map(|b| b.header.height.0))?;
         all.extend(blocks);
-        if last < height + 1 {
-            break;
-        }
-        height = last + 1;
+        height = next;
     }
     if all.is_empty() {
         return Ok(0);
@@ -394,4 +422,49 @@ fn rpc_call(
         anyhow::bail!("node error: {e}");
     }
     Ok(res.get("result").cloned().unwrap_or(json!(null)))
+}
+
+#[cfg(test)]
+mod rpc_scan_page_tests {
+    use super::next_scan_page_height;
+
+    #[test]
+    fn accepts_one_block_and_consecutive_pages() {
+        assert_eq!(next_scan_page_height(0, [0]).unwrap(), 1);
+        assert_eq!(next_scan_page_height(10, [10, 11, 12]).unwrap(), 13);
+        assert_eq!(next_scan_page_height(0, 0..128).unwrap(), 128);
+        assert_eq!(next_scan_page_height(128, 128..130).unwrap(), 130);
+    }
+
+    #[test]
+    fn rejects_gaps_duplicates_reordering_and_wrong_starts() {
+        for page in [
+            vec![11],
+            vec![10, 10],
+            vec![10, 12],
+            vec![10, 9],
+            vec![9, 10],
+        ] {
+            assert!(
+                next_scan_page_height(10, page.clone()).is_err(),
+                "accepted malformed page: {page:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_empty_and_oversized_pages() {
+        assert!(next_scan_page_height(10, []).is_err());
+        assert!(next_scan_page_height(0, 0..129).is_err());
+    }
+
+    #[test]
+    fn does_not_wrap_rpc_height_at_u64_max() {
+        assert_eq!(
+            next_scan_page_height(u64::MAX - 1, [u64::MAX - 1]).unwrap(),
+            u64::MAX
+        );
+        assert!(next_scan_page_height(u64::MAX, [u64::MAX]).is_err());
+        assert!(next_scan_page_height(u64::MAX - 1, [u64::MAX - 1, u64::MAX]).is_err());
+    }
 }
