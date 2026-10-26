@@ -23,6 +23,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.0
+          components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: actions/setup-node@v4
         with:
@@ -36,6 +37,10 @@ jobs:
           if ! command -v wasm-bindgen >/dev/null || [ "$(wasm-bindgen --version)" != 'wasm-bindgen 0.2.100' ]; then
             cargo install wasm-bindgen-cli --version 0.2.100 --locked --force
           fi
+      - name: Formatting and wasm32 lint
+        run: |
+          cargo fmt --all --check
+          cargo clippy --locked --target wasm32-unknown-unknown -p nightfall-web -- -D warnings
       - name: Locked browser build
         run: |
           cargo build --locked --profile wasm-release --target wasm32-unknown-unknown -p nightfall-web
