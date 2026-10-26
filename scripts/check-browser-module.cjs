@@ -24,6 +24,7 @@ assert.throws(() => BrowserVault.restore(words.join(' '), password, 0), e => {
   assert.doesNotMatch(String(e), /PRIVATE_CANARY/); return true;
 });
 assert.throws(() => new BrowserVault(new Uint8Array(64 * 1024 * 1024 + 1)), /size|limit|large/i);
+assert.throws(() => BrowserVault.fromLegacy('x'.repeat(64 * 1024 * 1024), password), /too large for this browser/);
 const reopened = new BrowserVault(bytes);
 assert.throws(() => reopened.unlock('incorrect public password'));
 assert.equal(reopened.isLocked(), true);

@@ -526,8 +526,7 @@ parsing now bounds input before normalization and uses non-reflective errors
 (#71). The release also includes stricter SOCKS5 replies (#67) and removal of
 legacy raw-state WASM exports from the source API (#37). Thank you
 [@nightfall-wizard](https://github.com/nightfall-wizard) for all six contributions.
-See the [release notes](RELEASE-NOTES/RELEASE-NOTES-v1.0.12.md). The separately
-hosted web wallet remains on its tested 1.0.7 channel.
+See the [release notes](RELEASE-NOTES/RELEASE-NOTES-v1.0.12.md). The browser wallet is built separately: see [Web Wallet 1.0.12](https://github.com/Instinctes/nightfall/releases/tag/web-v1.0.12).
 
 ### 1.0.11 fixes and community contributions
 

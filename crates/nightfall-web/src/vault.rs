@@ -22,6 +22,9 @@ fn require_browser_wallet(wallet: &Wallet) -> Result<(), &'static str> {
 }
 
 fn import_browser_legacy(state: &str) -> Result<Wallet, String> {
+    if state.len() > nightfall_wallet::vault::MAX_PLAINTEXT_BYTES {
+        return Err("The legacy wallet is too large for this browser. Use Core; the original data was not changed.".into());
+    }
     let wallet =
         Wallet::import_state(state).map_err(|_| "Invalid legacy wallet state.".to_owned())?;
     require_browser_wallet(&wallet).map_err(str::to_owned)?;
@@ -42,6 +45,15 @@ fn unlock_browser_vault(vault: &mut Vault, password: &str) -> Result<(), String>
     require_browser_wallet(candidate.wallet().map_err(|e| e.to_string())?)
         .map_err(str::to_owned)?;
     *vault = candidate;
+    Ok(())
+}
+
+fn ensure_phrase_budget(phrase: &str) -> Result<(), &'static str> {
+    if phrase.len() > 1024 {
+        return Err(
+            "Recovery words are too long (maximum 1024 UTF-8 bytes). Check the copied text.",
+        );
+    }
     Ok(())
 }
 
@@ -163,6 +175,7 @@ impl BrowserVault {
         password: &str,
         birth_height: f64,
     ) -> Result<BrowserVault, JsError> {
+        ensure_phrase_budget(phrase).map_err(err)?;
         let birth = height(birth_height)?;
         // The same road in as Core and as the words check on the create screen.
         // This used to say "Invalid recovery phrase." while the create screen
@@ -213,6 +226,7 @@ impl BrowserVault {
 
     #[wasm_bindgen(js_name = checkRecovery)]
     pub fn check_recovery(&self, phrase: &str) -> Result<(), JsError> {
+        ensure_phrase_budget(phrase).map_err(err)?;
         let address = self.inner.wallet().map_err(err)?.address();
         nightfall_wallet::recovery::verify_phrase(&address, phrase).map_err(err)
     }
@@ -746,5 +760,18 @@ mod tests {
         assert!(unlock_browser_vault(&mut vault, PASSWORD).is_err());
         assert_eq!(vault.wallet().unwrap().address(), wallet.address());
         assert_eq!(vault.sealed_bytes(), bytes);
+    }
+}
+
+#[cfg(test)]
+mod browser_input_tests {
+    use super::ensure_phrase_budget;
+    #[test]
+    fn phrase_budget_is_utf8_bytes_before_word_count_or_normalization() {
+        assert!(ensure_phrase_budget(&"a".repeat(1024)).is_ok());
+        assert!(ensure_phrase_budget(&"a".repeat(1025)).is_err());
+        assert!(ensure_phrase_budget(&"🔒".repeat(256)).is_ok());
+        assert!(ensure_phrase_budget(&"🔒".repeat(257)).is_err());
+        assert!(ensure_phrase_budget(&vec!["a".repeat(50); 24].join(" ")).is_err());
     }
 }
