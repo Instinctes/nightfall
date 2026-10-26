@@ -45,6 +45,7 @@ use nightfall_types::Hash256;
 use serde::{Deserialize, Serialize};
 
 use crate::tx::{Input, Transaction};
+use crate::{MAX_BLOCK_INPUTS, MAX_BLOCK_KERNELS, MAX_BLOCK_OUTPUTS};
 
 /// The aggregated contents of a block.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +56,13 @@ pub struct BlockBody {
 }
 
 impl BlockBody {
+    /// Cheap structural bound used before expensive cryptographic validation.
+    pub fn exceeds_size_limits(&self) -> bool {
+        self.inputs.len() > MAX_BLOCK_INPUTS
+            || self.outputs.len() > MAX_BLOCK_OUTPUTS
+            || self.kernels.len() > MAX_BLOCK_KERNELS
+    }
+
     /// Merge transactions into one aggregate and sort it canonically.
     ///
     /// The coinbase transaction is folded in exactly like any other; it is
