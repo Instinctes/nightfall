@@ -468,3 +468,6 @@ mod rpc_scan_page_tests {
         assert!(next_scan_page_height(u64::MAX - 1, [u64::MAX - 1, u64::MAX]).is_err());
     }
 }
+
+#[cfg(test)]
+mod rpc_scan_integration_tests;
