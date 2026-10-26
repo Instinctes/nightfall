@@ -10,7 +10,7 @@ Protocol v8, wire v6, mainnet genesis `061a052d…`. Same chain and data format 
 | Intel Mac | `NIGHTFALLCOIN-Core-1.0.12-macOS-intel.dmg` | macOS 10.15 |
 | Windows x64 | `nightfall-core-1.0.12-windows-x64.exe` | Windows 10 |
 | Linux x64 | `nightfall-core-1.0.12-linux-x64` | GTK/X11 libraries required |
-| Mobile/browser | [Web wallet](https://nightfallcoin.org/wallet/) | Modern browser |
+| Mobile/browser | [Web wallet](https://wallet.nightfallcoin.org/) | Modern browser |
 
 Check the matching `SHA256SUMS-1.0.12.txt`, `SHA256SUMS-1.0.12-windows.txt`
 or `SHA256SUMS-1.0.12-linux.txt` before running a download. macOS bundles are

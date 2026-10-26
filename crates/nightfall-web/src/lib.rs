@@ -16,6 +16,18 @@ pub fn wasm_start() {
     console_error_panic_hook::set_once();
 }
 
+/// Identify the compiled module, so the host can refuse a mixed cached build.
+#[wasm_bindgen(js_name = buildVersion)]
+pub fn build_version() -> String {
+    env!("CARGO_PKG_VERSION").to_owned()
+}
+
+/// Maximum encrypted envelope accepted by this target, including format overhead.
+#[wasm_bindgen(js_name = maxBackupBytes)]
+pub fn max_backup_bytes() -> u32 {
+    nightfall_wallet::vault::MAX_VAULT_BYTES as u32
+}
+
 fn err(e: impl ToString) -> JsError {
     JsError::new(&e.to_string())
 }
