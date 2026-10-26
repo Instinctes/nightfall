@@ -1,0 +1,115 @@
+name: Web Wallet
+
+on:
+  push:
+    tags: ['web-v*']
+  pull_request:
+    paths:
+      - 'crates/nightfall-web/**'
+      - 'crates/nightfall-wallet/src/vault.rs'
+      - 'crates/nightfall-crypto/src/mnemonic.rs'
+      - 'scripts/check-browser-module.cjs'
+      - 'scripts/check-vault-wasm.cjs'
+      - '.github/workflows/web-wallet.yml'
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: locked WASM build and real-module tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: web-wallet-0.2.100
+      - name: Pinned binding generator
+        run: |
+          if ! command -v wasm-bindgen >/dev/null || [ "$(wasm-bindgen --version)" != 'wasm-bindgen 0.2.100' ]; then
+            cargo install wasm-bindgen-cli --version 0.2.100 --locked --force
+          fi
+      - name: Locked browser build
+        run: |
+          cargo build --locked --profile wasm-release --target wasm32-unknown-unknown -p nightfall-web
+          mkdir -p dist target/web-node target/web-fixtures
+          wasm-bindgen --target web --out-dir dist target/wasm32-unknown-unknown/wasm-release/nightfall_web.wasm
+          wasm-bindgen --target nodejs --out-dir target/web-node target/wasm32-unknown-unknown/wasm-release/nightfall_web.wasm
+          rm -f dist/*.d.ts
+      - name: Public fixture and browser boundary tests
+        run: |
+          VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then test "$GITHUB_REF_NAME" = "web-v$VERSION"; fi
+          cargo run --locked --quiet -p nightfall-web --example browser_fixture > target/web-fixtures/browser.json
+          node scripts/check-browser-module.cjs target/web-node/nightfall_web.js target/web-fixtures/browser.json "$VERSION"
+          cargo test --locked -p nightfall-web --lib
+          cargo test --locked -p nightfall-crypto --test mnemonic_boundary
+      - name: Native and WASM encrypted-backup interoperability
+        run: |
+          cargo run --locked --quiet -p nightfall-wallet --example vault_interop -- create target/web-fixtures/native.nfv
+          cargo run --locked --quiet -p nightfall-wallet --example vault_interop -- create-funded target/web-fixtures/funded.nfv
+          node scripts/check-vault-wasm.cjs target/web-node/nightfall_web.js target/web-fixtures/native.nfv target/web-fixtures/wasm.nfv target/web-fixtures/funded.nfv
+          cargo run --locked --quiet -p nightfall-wallet --example vault_interop -- check target/web-fixtures/wasm.nfv
+      - name: Record source and checksum exact deployable files
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, tomllib
+          version=tomllib.load(open('Cargo.toml','rb'))['workspace']['package']['version']
+          data={'version':version,'source_commit':os.environ['GITHUB_SHA'],'source_ref':os.environ['GITHUB_REF'],
+                'rust':subprocess.check_output(['rustc','--version'],text=True).strip(),
+                'wasm_bindgen':'0.2.100','max_backup_bytes':64*1024*1024}
+          open('dist/BUILD.json','w').write(json.dumps(data,indent=2)+'\n')
+          PY
+          VERSION="$(python3 -c 'import json; print(json.load(open("dist/BUILD.json"))["version"])')"
+          (cd dist && sha256sum BUILD.json nightfall_web.js nightfall_web_bg.wasm > "SHA256SUMS-web-$VERSION.txt")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-wallet
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: attest and publish browser module
+    if: startsWith(github.ref, 'refs/tags/web-v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-wallet
+          path: dist
+      - uses: actions/attest@v4
+        with:
+          subject-path: dist/*
+      - name: Verify origin and publish a separate browser release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#web-v}"
+          (cd dist && sha256sum -c "SHA256SUMS-web-$VERSION.txt")
+          for FILE in dist/*; do
+            gh attestation verify "$FILE" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/web-wallet.yml" \
+              --source-ref "$GITHUB_REF" --source-digest "$GITHUB_SHA"
+          done
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'Release already exists; immutable browser assets will not be replaced.' >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --draft --latest=false --title "NIGHTFALL Web Wallet $VERSION" \
+            --notes-file "RELEASE-NOTES/RELEASE-NOTES-web-v$VERSION.md"
+          gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY"
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest=false
