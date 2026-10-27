@@ -126,6 +126,16 @@ def issues(root: Path):
                 'Outdated instruction: ' + phrase
             )
 
+    if '# Start P2P + mine continuously' in guide:
+        problems.append(
+            'Outdated mining instruction.'
+        )
+
+    if '| Fee | 100% burn |' in guide:
+        problems.append(
+            'Outdated fee schedule.'
+        )
+
     if 'Do not mine without peers' not in guide:
         problems.append(
             'Missing mining isolation warning.'

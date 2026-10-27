@@ -46,7 +46,7 @@ export NF_DATA="$HOME/nightfall-mainnet"
 
 ./target/release/nightfalld --network mainnet --datadir "$NF_DATA" init
 
-# Start P2P + mine continuously
+# Start a validating node without mining
 ./target/release/nightfalld --network mainnet --datadir "$NF_DATA" run \
   --listen 0.0.0.0:17891 \
   --rpc-listen 127.0.0.1:17881
@@ -277,7 +277,7 @@ Or:
 | Coinbase maturity | 1,440 blocks |
 | Premine | 0 |
 | Tail emission | none |
-| Fee | 100% burn |
+| Fee | Burned during subsidy eras; paid to miners after subsidy ends |
 
 ---
 
