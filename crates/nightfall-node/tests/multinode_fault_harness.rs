@@ -886,3 +886,203 @@ fn partitioned_competing_chains_converge_on_heavier_work() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+/// Roadmap independence rehearsal: the origin node disappears,
+/// but two surviving nodes continue to exchange blocks.
+///
+/// All traffic is loopback devnet traffic.
+/// Peers are explicitly configured.
+/// This does not prove open-network discovery.
+#[test]
+fn three_node_survival_after_origin_failure() {
+    let root = unique_root();
+
+    fs::create_dir_all(&root).expect("create three-node lab root");
+
+    let a_spec = NodeSpec::new(&root, "origin", Ipv4Addr::new(127, 0, 0, 2));
+
+    let b_spec = NodeSpec::new(&root, "relay", Ipv4Addr::new(127, 0, 0, 3));
+
+    let c_spec = NodeSpec::new(&root, "independent", Ipv4Addr::new(127, 0, 0, 4));
+
+    for spec in [&a_spec, &b_spec, &c_spec] {
+        spec.init();
+    }
+
+    // Initial valid chain exists only at origin A.
+    a_spec.mine_blocks(1);
+
+    let forbidden = [
+        a_spec.p2p.port(),
+        a_spec.rpc.port(),
+        b_spec.p2p.port(),
+        b_spec.rpc.port(),
+        c_spec.p2p.port(),
+        c_spec.rpc.port(),
+    ];
+
+    // Both A/B directions are controlled independently.
+    // A must later be able to pull the heavier chain
+    // from B through its real outbound connection.
+
+    let b_to_a = FaultProxy::spawn(a_spec.p2p, &forbidden);
+
+    let mut also_forbidden = forbidden.to_vec();
+
+    also_forbidden.push(b_to_a.addr().port());
+
+    let a_to_b = FaultProxy::spawn(b_spec.p2p, &also_forbidden);
+
+    also_forbidden.push(a_to_b.addr().port());
+
+    let c_to_b = FaultProxy::spawn(b_spec.p2p, &also_forbidden);
+
+    // Start real node processes.
+    // No public discovery, no mainnet.
+
+    let a = Node::spawn(a_spec.clone(), false, &[a_to_b.addr()]);
+
+    let b = Node::spawn(b_spec.clone(), false, &[b_to_a.addr()]);
+
+    let c = Node::spawn(c_spec.clone(), false, &[c_to_b.addr()]);
+
+    // All nodes must initially agree.
+
+    wait_until(
+        "three nodes to sync without public discovery",
+        CONVERGE_TIMEOUT,
+        || {
+            let sa = a.status()?;
+            let sb = b.status()?;
+            let sc = c.status()?;
+
+            Ok(sa.blocks >= 1
+                && sa.same_chain(&sb)
+                && sb.same_chain(&sc)
+                && sa.peers >= 1
+                && sb.peers >= 1
+                && sc.peers >= 1)
+        },
+    )
+    .unwrap_or_else(|e| {
+        panic!(
+            "{e}\n--- A ---\n{}\n--- B ---\n{}\n--- C ---\n{}",
+            a.dump_log(),
+            b.dump_log(),
+            c.dump_log()
+        )
+    });
+
+    let before = a.status().expect("origin state before failure");
+
+    // ------------------------------------
+    // ORIGIN FAILURE
+    // ------------------------------------
+
+    // Disable both controlled A/B paths.
+
+    b_to_a.partition();
+    a_to_b.partition();
+
+    // Stop origin A completely.
+    drop(a);
+
+    // Remaining B/C connection must survive.
+
+    wait_until(
+        "remaining B/C link stays available",
+        CONNECT_TIMEOUT,
+        || Ok(b.status()?.peers >= 1 && c.status()?.peers >= 1),
+    )
+    .unwrap_or_else(|e| panic!("{e}\nB:\n{}\nC:\n{}", b.dump_log(), c.dump_log()));
+
+    // ------------------------------------
+    // SURVIVING NETWORK ADVANCES
+    // ------------------------------------
+
+    // Offline mining needs exclusive access
+    // to B's data directory.
+
+    drop(b);
+
+    b_spec.mine_blocks(1);
+
+    // Restart B while origin A remains offline.
+
+    let b = Node::spawn(b_spec.clone(), false, &[b_to_a.addr()]);
+
+    // C must obtain the new block from B
+    // without communicating with A.
+
+    wait_until("C to follow B without origin A", CONVERGE_TIMEOUT, || {
+        let sb = b.status()?;
+        let sc = c.status()?;
+
+        Ok(sb.blocks == before.blocks + 1
+            && sb.same_chain(&sc)
+            && sb.tip != before.tip
+            && sb.peers >= 1
+            && sc.peers >= 1)
+    })
+    .unwrap_or_else(|e| panic!("{e}\nB:\n{}\nC:\n{}", b.dump_log(), c.dump_log()));
+
+    let surviving = c.status().expect("independent C state");
+
+    assert!(
+        surviving.total_work > before.total_work,
+        "C did not adopt additional valid work without A"
+    );
+
+    // ------------------------------------
+    // ORIGIN RECOVERY
+    // ------------------------------------
+
+    // Restore A/B communication.
+
+    b_to_a.heal();
+    a_to_b.heal();
+
+    // Restart origin A using its old datadir.
+    // It has not seen the additional block.
+
+    let a = Node::spawn(a_spec.clone(), false, &[a_to_b.addr()]);
+
+    // A must adopt the surviving heavier chain.
+
+    wait_until(
+        "restarted A to converge with survivors",
+        CONVERGE_TIMEOUT,
+        || {
+            let sa = a.status()?;
+            let sb = b.status()?;
+            let sc = c.status()?;
+
+            Ok(sa.same_chain(&sb)
+                && sb.same_chain(&sc)
+                && sa.tip == surviving.tip
+                && sa.total_work == surviving.total_work)
+        },
+    )
+    .unwrap_or_else(|e| {
+        panic!(
+            "{e}\nA:\n{}\nB:\n{}\nC:\n{}",
+            a.dump_log(),
+            b.dump_log(),
+            c.dump_log()
+        )
+    });
+
+    // ------------------------------------
+    // CLEANUP
+    // ------------------------------------
+
+    drop(c);
+    drop(b);
+    drop(a);
+
+    drop(c_to_b);
+    drop(a_to_b);
+    drop(b_to_a);
+
+    fs::remove_dir_all(&root).expect("remove successful lab datadirs");
+}
