@@ -1,0 +1,49 @@
+name: Independence quality gate (devnet only)
+
+on:
+  pull_request:
+    paths:
+      - 'crates/nightfall-node/tests/multinode_fault_harness.rs'
+      - 'scripts/check_multinode_independence.py'
+      - '.github/workflows/independence-quality-gate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  real-node-repetition:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: 2
+      NIGHTFALL_PEERS_URL: 'off'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Runner self-test
+        run: python3 scripts/check_multinode_independence.py --self-test
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Real-node Devnet tests
+        run: python3 scripts/check_multinode_independence.py --repeats 3 --timeout-seconds 900 --report "$RUNNER_TEMP/independence-evidence.json"
+
+      - name: Evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devnet-independence-evidence
+          path: ${{ runner.temp }}/independence-evidence.json
+          if-no-files-found: warn
+          retention-days: 30
