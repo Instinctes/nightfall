@@ -72,3 +72,27 @@ Actual independence requires independently administered machines,
 documented recovery exercises, and disposable Devnet payments.
 
 Publish failures as well as successes.
+
+## Monetary-state acceptance after healing
+
+All three real-process Devnet scenarios additionally
+verify monetary-state consistency after network recovery.
+
+Acceptance conditions:
+
+- Matching chain tips and cumulative work
+- Matching UTXO roots
+- Matching minted totals
+- Matching burned fees
+- Matching circulating supply
+- Successful node supply-invariant verification
+- Agreement between status and verify_supply RPC
+- Stable chain tip throughout evidence collection
+
+These checks exercise real persisted node state
+across partitions, restarts and reorganizations.
+
+They rely on the node's own validation implementation.
+
+They do not establish an independent cryptographic
+audit, mainnet correctness or actual operator diversity.

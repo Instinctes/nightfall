@@ -350,6 +350,101 @@ fn rpc_call(addr: SocketAddr, method: &str, params: Value) -> Result<Value, Stri
     })
 }
 
+// Matching tips alone are insufficient evidence.
+// Persistent monetary and UTXO states must agree.
+//
+// RPC results are node-reported evidence.
+// They are not an independent cryptographic audit.
+
+fn validated_recovered_state(node: &Node) -> Result<(String, String, u64, u64, u64), String> {
+    let before = node.status()?;
+
+    let response = rpc_call(node.spec.rpc, "status", json!({}))?;
+
+    let status = response
+        .get("result")
+        .ok_or_else(|| "missing status RPC result".to_owned())?;
+
+    if status.get("supply_invariant_ok").and_then(Value::as_bool) != Some(true) {
+        return Err("invalid supply invariant".into());
+    }
+
+    let number = |key: &str| {
+        status
+            .get(key)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("invalid status field: {key}"))
+    };
+
+    let minted = number("minted")?;
+    let burned = number("burned_fees")?;
+    let circulating = number("circulating")?;
+
+    if minted.checked_sub(burned) != Some(circulating) {
+        return Err("minted - burned != circulating".into());
+    }
+
+    let tip = status
+        .get("tip")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing tip".to_owned())?
+        .to_owned();
+
+    let utxo_root = status
+        .get("utxo_root")
+        .and_then(Value::as_str)
+        .filter(|value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| "invalid UTXO root".to_owned())?
+        .to_owned();
+
+    // Perform the node's actual supply verification.
+
+    let proof_response = rpc_call(node.spec.rpc, "verify_supply", json!({}))?;
+
+    let proof = proof_response
+        .get("result")
+        .ok_or_else(|| "missing verify_supply result".to_owned())?;
+
+    if proof.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err("verify_supply did not succeed".into());
+    }
+
+    if proof.get("circulating_darks").and_then(Value::as_u64) != Some(circulating) {
+        return Err("supply RPC contradicts status".into());
+    }
+
+    let after = node.status()?;
+
+    // Never combine measurements from different tips.
+
+    if !before.same_chain(&after) || before.tip != tip {
+        return Err("tip changed during verification".into());
+    }
+
+    Ok((tip, utxo_root, minted, burned, circulating))
+}
+
+fn assert_recovered_state_agreement(nodes: &[&Node]) {
+    wait_until(
+        "post-recovery monetary state agreement",
+        CONVERGE_TIMEOUT,
+        || {
+            let expected = validated_recovered_state(nodes[0])?;
+
+            for node in &nodes[1..] {
+                let current = validated_recovered_state(node)?;
+
+                if current != expected {
+                    return Ok(false);
+                }
+            }
+
+            Ok(true)
+        },
+    )
+    .unwrap_or_else(|reason| panic!("post-recovery integrity failure: {reason}"));
+}
+
 fn read_log(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|e| format!("<cannot read {}: {e}>", path.display()))
 }
@@ -673,6 +768,8 @@ fn partition_cuts_real_session_and_heal_resynchronizes() {
         "the isolated valid block was not the chain adopted after healing"
     );
 
+    assert_recovered_state_agreement(&[&a, &b]);
+
     drop(b);
     drop(a);
     drop(link);
@@ -879,6 +976,8 @@ fn partitioned_competing_chains_converge_on_heavier_work() {
         "A did not move from the lighter branch to greater cumulative work"
     );
 
+    assert_recovered_state_agreement(&[&a, &b]);
+
     drop(b);
     drop(a);
     drop(b_to_a);
@@ -1075,6 +1174,8 @@ fn three_node_survival_after_origin_failure() {
     // ------------------------------------
     // CLEANUP
     // ------------------------------------
+
+    assert_recovered_state_agreement(&[&a, &b, &c]);
 
     drop(c);
     drop(b);
