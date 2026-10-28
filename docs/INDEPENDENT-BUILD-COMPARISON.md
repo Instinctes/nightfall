@@ -42,7 +42,26 @@ python3 scripts/compare_independent_builds.py compare \
 
 All receipt fields are whitelisted. Input JSON is bounded to 8 KiB; duplicates
 and unexpected metadata are rejected to prevent accidental publication of
-sensitive operator data. The test suite can run offline, including on Termux:
+sensitive operator data.
+
+### Untrusted receipt import boundary
+
+The importer reads at most **8,193 bytes**, independent of a previous
+filesystem size report. It rejects oversized input before JSON parsing.
+The opened descriptor must represent a regular file; symlinks and special
+files are rejected. Where supported, `O_NOFOLLOW` also protects against
+a symlink being substituted between path inspection and file opening.
+`O_NONBLOCK` prevents opening a FIFO from waiting for a writer.
+
+Malformed UTF-8 and decoder recursion errors fail closed. The tests cover
+size-report races, unbounded-read regressions, recursive decoder failures,
+special files and symlink substitution.
+
+These checks protect local processing of untrusted receipts. They do not
+authenticate the person producing a receipt or prove that two independently
+built binaries actually correspond to the claimed source.
+
+The test suite can run offline, including on Termux:
 
 ```sh
 python3 -m unittest discover -s scripts -p 'test_compare_independent_builds.py' -v

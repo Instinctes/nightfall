@@ -3,6 +3,8 @@
 import argparse
 import hashlib
 import json
+import os
+import stat
 import re
 import subprocess
 import sys
@@ -122,16 +124,71 @@ def validate(r):
 
 
 def read_receipt(path):
-    f = regular_file(path)
-    if f.stat().st_size > MAX_RECEIPT:
-        raise BuildEvidenceError("oversized receipt")
+    """Import at most MAX_RECEIPT + 1 bytes from a regular file.
+
+    A separate size check cannot bound a later read if the
+    file changes between stat and open. Validate the opened
+    file descriptor and enforce the limit on the read itself.
+    """
+    p = Path(path)
+
+    if p.is_symlink():
+        raise BuildEvidenceError(
+            "regular non-symlink file required"
+        )
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+
     try:
-        raw = f.read_bytes()
-        return validate(json.loads(raw.decode("utf-8"), object_pairs_hook=unique_pairs,
-                                   parse_constant=lambda v: (_ for _ in ()).throw(
-                                       BuildEvidenceError("invalid numeric constant"))))
-    except (UnicodeError, json.JSONDecodeError) as exc:
-        raise BuildEvidenceError("malformed receipt JSON") from exc
+        fd = os.open(p, flags)
+    except OSError as exc:
+        raise BuildEvidenceError(
+            "cannot open regular receipt"
+        ) from exc
+
+    with os.fdopen(fd, "rb") as file:
+        if not stat.S_ISREG(
+            os.fstat(file.fileno()).st_mode
+        ):
+            raise BuildEvidenceError(
+                "regular receipt file required"
+            )
+
+        raw = file.read(MAX_RECEIPT + 1)
+
+    if len(raw) > MAX_RECEIPT:
+        raise BuildEvidenceError(
+            "oversized receipt"
+        )
+
+    try:
+        return validate(
+            json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=unique_pairs,
+                parse_constant=lambda value: (
+                    _ for _ in ()
+                ).throw(
+                    BuildEvidenceError(
+                        "invalid numeric constant"
+                    )
+                )
+            )
+        )
+
+    except (
+        UnicodeError,
+        json.JSONDecodeError,
+        RecursionError,
+    ) as exc:
+        raise BuildEvidenceError(
+            "malformed receipt JSON"
+        ) from exc
 
 
 def compare(a, b):
