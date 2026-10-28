@@ -48,6 +48,9 @@ jobs:
       - name: Node Kit locked source and fingerprint policy (no privileged installs)
         run: python3 -m unittest discover -s scripts -p 'test_node_kit_source_policy.py' -v
 
+      - name: Node evidence receipt hardening
+        run: python3 scripts/test-node-evidence.py
+
       - name: Tests
         run: cargo test --workspace
 
