@@ -27,6 +27,10 @@ All three named tests must pass in three consecutive runs.
 Missing tests, nonzero exits, incomplete output, and timeouts fail
 the quality gate.
 
+The runner drains subprocess output continuously, retains at most 2 MiB
+in memory, and kills its isolated process group if the byte limit or
+deadline is exceeded. No unbounded temporary log file is written.
+
 The JSON receipt contains:
 
 - Exact tested source commit

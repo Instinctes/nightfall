@@ -11,7 +11,7 @@ import re
 import signal
 import subprocess
 import sys
-import tempfile
+import selectors
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -57,7 +57,185 @@ def self_test():
         "test result: ok. 0 passed; 0 failed"
     ) == set()
 
+    # Success, flooding, timeout, failure.
+
+    good = run_bounded(
+        [
+            sys.executable,
+            "-c",
+            "print('ok')",
+        ],
+        15,
+        128,
+    )
+
+    assert good == (
+        0,
+        False,
+        False,
+        "ok\n",
+    )
+
+    flood = run_bounded(
+        [
+            sys.executable,
+            "-c",
+            "print('X' * 20000)",
+        ],
+        15,
+        128,
+    )
+
+    assert flood[2]
+    assert not flood[1]
+
+    assert (
+        len(flood[3].encode("utf-8"))
+        <= 128
+    )
+
+    hang = run_bounded(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(8)",
+        ],
+        1,
+        128,
+    )
+
+    assert hang[1]
+    assert not hang[2]
+
+    failing = run_bounded(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.exit(7)",
+        ],
+        15,
+        128,
+    )
+
+    assert failing[0] == 7
+    assert not failing[1]
+    assert not failing[2]
+
     print("SELF-TEST OK")
+
+
+def run_bounded(
+    command,
+    timeout_seconds,
+    max_capture=MAX_CAPTURE,
+):
+    """Bound captured output and child lifetime."""
+
+    deadline = time.monotonic() + timeout_seconds
+
+    child = subprocess.Popen(
+        command,
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+    collected = bytearray()
+
+    timed_out = False
+    truncated = False
+
+    try:
+        with selectors.DefaultSelector() as events:
+
+            events.register(
+                child.stdout,
+                selectors.EVENT_READ,
+            )
+
+            while events.get_map():
+
+                remaining = (
+                    deadline - time.monotonic()
+                )
+
+                if remaining <= 0:
+                    timed_out = True
+                    break
+
+                ready = events.select(
+                    min(0.25, remaining)
+                )
+
+                for key, _ in ready:
+
+                    budget = (
+                        max_capture - len(collected)
+                    )
+
+                    chunk = os.read(
+                        key.fileobj.fileno(),
+                        min(65536, budget + 1),
+                    )
+
+                    if not chunk:
+                        events.unregister(key.fileobj)
+                        continue
+
+                    collected.extend(
+                        chunk[:budget]
+                    )
+
+                    if len(chunk) > budget:
+                        truncated = True
+                        break
+
+                if truncated:
+                    break
+
+        if not timed_out and not truncated:
+
+            try:
+                child.wait(
+                    timeout=max(
+                        0,
+                        deadline - time.monotonic(),
+                    )
+                )
+
+            except subprocess.TimeoutExpired:
+                timed_out = True
+
+    finally:
+
+        if (
+            timed_out
+            or truncated
+            or child.poll() is None
+        ):
+
+            try:
+                os.killpg(
+                    child.pid,
+                    signal.SIGKILL,
+                )
+
+            except ProcessLookupError:
+                pass
+
+        child.wait()
+        child.stdout.close()
+
+    return (
+        child.returncode,
+        timed_out,
+        truncated,
+        collected.decode(
+            "utf-8",
+            errors="replace",
+        ),
+    )
 
 
 def version(command):
@@ -172,44 +350,9 @@ def main():
         code = None
         timed_out = False
 
-        with tempfile.TemporaryFile(
-            mode="w+t",
-            encoding="utf-8",
-        ) as logfile:
-
-            process = subprocess.Popen(
-                cmd,
-                cwd=ROOT,
-                stdout=logfile,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-
-            try:
-                code = process.wait(
-                    timeout=args.timeout_seconds
-                )
-
-            except subprocess.TimeoutExpired:
-                timed_out = True
-
-                try:
-                    os.killpg(
-                        process.pid,
-                        signal.SIGKILL,
-                    )
-                except ProcessLookupError:
-                    pass
-
-                process.wait()
-
-            logfile.seek(0)
-
-            output = logfile.read(
-                MAX_CAPTURE + 1
-            )
-
-        truncated = len(output) > MAX_CAPTURE
+        code, timed_out, truncated, output = run_bounded(
+            cmd, args.timeout_seconds
+        )
 
         successful_tests = finished_tests(output)
 
