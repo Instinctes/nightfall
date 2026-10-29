@@ -335,10 +335,16 @@ pub fn status(network: NetworkId, addr: &str, timeout: Duration) -> Result<NodeS
     })?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
-    writeln!(stream, r#"{{"method":"status","params":{{}},"id":1}}"#)?;
+    writeln!(stream, r#"{{"method":"status","params":{{}},"id":1}}"#)
+        .with_context(|| format!("no node answering at {addr}: cannot send status request"))?;
 
     let mut line = Vec::new();
-    BufReader::new(stream.take(1 << 20)).read_until(b'\n', &mut line)?;
+    let count = BufReader::new(stream.take(1 << 20))
+        .read_until(b'\n', &mut line)
+        .with_context(|| format!("no node answering at {addr}: cannot read status reply"))?;
+    if count == 0 {
+        bail!("no node answering at {addr}: empty status reply");
+    }
     let reply: serde_json::Value =
         serde_json::from_slice(&line).context("the node's reply was not JSON")?;
     if let Some(e) = reply.get("error").filter(|e| !e.is_null()) {

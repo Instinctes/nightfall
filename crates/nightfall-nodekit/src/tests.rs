@@ -487,18 +487,31 @@ fn status_refuses_to_describe_a_node_on_another_chain() {
 
 #[test]
 fn status_explains_an_absent_node() {
-    // Bind and drop to obtain a port that is very likely closed.
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    // Reserve the port throughout the probe to prevent another process
+    // from taking it between bind and status().
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
     let e = status(
         NetworkId::Devnet,
-        &format!("127.0.0.1:{port}"),
+        &addr.to_string(),
         Duration::from_millis(500),
     )
     .unwrap_err()
     .to_string();
+    assert!(e.contains("no node answering"), "{e}");
+}
+
+#[test]
+fn status_explains_peer_disconnect_before_reply() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    });
+    let e = status(NetworkId::Devnet, &addr.to_string(), Duration::from_secs(3))
+        .unwrap_err()
+        .to_string();
+    server.join().unwrap();
     assert!(e.contains("no node answering"), "{e}");
 }
