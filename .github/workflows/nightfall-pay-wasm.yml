@@ -1,0 +1,19 @@
+
+name: Nightfall Pay WASM regression
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo test --locked -p nightfall-web pay_request_bridge
+      - run: cargo test --locked -p nightfall-wallet payment_request

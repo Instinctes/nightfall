@@ -5,6 +5,7 @@ use nightfall_types::{Amount, NetworkId, DARKS_PER_NIGHT};
 use nightfall_wallet::{LightOutput, Wallet};
 use serde_json::json;
 use wasm_bindgen::prelude::*;
+mod pay_request_bridge;
 mod vault;
 
 const MATURITY: u64 = 1_440;
