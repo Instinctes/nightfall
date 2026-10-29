@@ -1,0 +1,54 @@
+name: Consensus activation continuity
+
+on:
+  pull_request:
+    paths:
+      - 'crates/nightfall-consensus/**'
+      - 'crates/nightfall-ledger/**'
+      - 'crates/nightfall-crypto/**'
+      - 'crates/nightfall-types/**'
+      - '.github/workflows/activation-continuity.yml'
+
+  push:
+    branches: [main]
+    paths:
+      - 'crates/nightfall-consensus/**'
+      - 'crates/nightfall-ledger/**'
+      - 'crates/nightfall-crypto/**'
+      - 'crates/nightfall-types/**'
+      - '.github/workflows/activation-continuity.yml'
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  activation:
+    name: Fork boundary / ${{ matrix.os }}
+
+    runs-on: ${{ matrix.os }}
+
+    timeout-minutes: 35
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format is reproducible
+        run: cargo fmt --all -- --check
+
+      - name: Mine across fork and compare replay
+        run: >-
+          cargo test --locked -p nightfall-consensus
+          --test activation_continuity -- --nocapture
