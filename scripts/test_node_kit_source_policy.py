@@ -24,8 +24,8 @@ def validate_policy(source):
     revision = 'SOURCE_REV="$(git -C "$BUILD/nightfall" rev-parse --verify HEAD)"'
     lock = 'LOCK_SHA="$(sha256sum "$BUILD/nightfall/Cargo.lock" | awk \'{print $1}\')"'
     revisions = [
-        ('NIGHTFALL_RELEASE_TAG="v1.0.12"', "pinned release tag"),
-        ('NIGHTFALL_RELEASE_SHA="5819f6cbf057bb48118a0616bacd6c25e2b576a4"', "pinned release commit"),
+        ('NIGHTFALL_RELEASE_TAG="v1.1.1"', "pinned release tag"),
+        ('NIGHTFALL_RELEASE_SHA="84dfd96d92788cdcc40488eda2dd593ef94db88b"', "pinned release commit"),
         ('[ "$SOURCE_REV" = "$NIGHTFALL_RELEASE_SHA" ] || die "release tag does not match pinned commit"', "fail-closed tag verification"),
         (clone, "source clone"),
         (revision, "Git revision capture"),
@@ -184,7 +184,7 @@ class InstallerSourcePolicyTests(unittest.TestCase):
             ).strip()
 
             subprocess.run(
-                ["git", "-C", str(src), "tag", "v1.0.12"],
+                ["git", "-C", str(src), "tag", "v1.1.1"],
                 check=True,
             )
 
@@ -221,7 +221,7 @@ class InstallerSourcePolicyTests(unittest.TestCase):
                         os.environ,
                         REPO=src.as_uri(),
                         BUILD=str(build),
-                        NIGHTFALL_RELEASE_TAG="v1.0.12",
+                        NIGHTFALL_RELEASE_TAG="v1.1.1",
                     )
 
                     clone = (
