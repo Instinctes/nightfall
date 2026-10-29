@@ -16,12 +16,16 @@ use nightfall_node::{NodeConfig, NodeHandle, SyncHold};
 use nightfall_storage::ChainStore;
 use nightfall_types::{NetworkId, TARGET_BLOCK_TIME_SECS};
 
+use std::collections::HashSet;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const START_TIMEOUT: Duration = Duration::from_secs(10);
+// Binding can be delayed by macOS CI scheduling after cryptographic setup.
+const LISTEN_TIMEOUT: Duration = Duration::from_secs(30);
 const PEER_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL: Duration = Duration::from_millis(100);
 
@@ -53,11 +57,21 @@ impl Drop for TempDir {
 }
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("read ephemeral port")
-        .port()
+    // Avoid returning the same recently released ephemeral port for different
+    // P2P and RPC listeners or for later nodes in the same test process.
+    // Otherwise the RPC listener can bind first while the P2P worker silently
+    // fails to bind that port, and a bind-based readiness probe becomes false.
+    static USED: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+    let used = USED.get_or_init(|| Mutex::new(HashSet::new()));
+
+    for _ in 0..128 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("read ephemeral port").port();
+        if used.lock().expect("test port mutex poisoned").insert(port) {
+            return port;
+        }
+    }
+    panic!("unable to allocate unique ephemeral ports for test nodes");
 }
 
 struct TestNode {
@@ -114,7 +128,7 @@ impl TestNode {
     }
 
     fn wait_ready(&self) {
-        let deadline = Instant::now() + START_TIMEOUT;
+        let deadline = Instant::now() + LISTEN_TIMEOUT;
 
         loop {
             if TcpListener::bind(("127.0.0.1", self.p2p_port)).is_err() {
@@ -123,8 +137,10 @@ impl TestNode {
 
             if Instant::now() >= deadline {
                 panic!(
-                    "{}: P2P listener did not bind within {:?}",
-                    self.name, START_TIMEOUT
+                    "{}: P2P listener did not bind within {:?}; {}",
+                    self.name,
+                    LISTEN_TIMEOUT,
+                    self.dump()
                 );
             }
 
@@ -469,6 +485,11 @@ fn real_nodes_reorg_to_heavier_devnet_branch() {
     eprintln!("before A tip={}", before.tip);
     eprintln!("final  A {}", a.dump());
     eprintln!("final  B {}", b.dump());
+
+    // Do not leak node-owned P2P/RPC workers into the next integration test.
+    // The earlier test dropped NodeHandle without requesting a shutdown.
+    a.node.shutdown().expect("shutdown A after reorg test");
+    b.node.shutdown().expect("shutdown B after reorg test");
 }
 
 #[test]
