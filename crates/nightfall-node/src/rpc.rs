@@ -5,7 +5,7 @@
 //! a single mistyped `--rpc-listen` exposed full wallet control to the
 //! internet. Binding a non-loopback address now requires an explicit opt-in.
 
-use crate::runtime::SharedState;
+use crate::runtime::{SharedState, Shutdown, Workers};
 use nightfall_ledger::Transaction;
 use nightfall_storage::now_unix;
 use nightfall_types::{Amount, MAX_MESSAGE_BYTES, MAX_SUPPLY_NIGHT, TICKER};
@@ -15,6 +15,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+#[cfg(test)]
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -210,7 +211,12 @@ fn read_rpc_frame_with_limits(
     }
 }
 
-pub fn spawn_rpc(addr: String, state: SharedState) {
+pub(crate) fn spawn_rpc(
+    addr: String,
+    state: SharedState,
+    shutdown: Arc<Shutdown>,
+    workers: Arc<Workers>,
+) {
     if !is_loopback_addr(&addr) && std::env::var("NF_ALLOW_PUBLIC_RPC").is_err() {
         tracing::error!(
             "refusing to bind RPC to non-loopback address {addr}. \
@@ -223,7 +229,8 @@ pub fn spawn_rpc(addr: String, state: SharedState) {
 
     let active = Arc::new(AtomicUsize::new(0));
     let subscriptions = Arc::new(AtomicUsize::new(0));
-    thread::spawn(move || {
+    let client_workers = Arc::clone(&workers);
+    workers.spawn(move || {
         let listener = match TcpListener::bind(&addr) {
             Ok(l) => l,
             Err(e) => {
@@ -231,26 +238,46 @@ pub fn spawn_rpc(addr: String, state: SharedState) {
                 return;
             }
         };
+        if let Err(e) = listener.set_nonblocking(true) {
+            tracing::error!("rpc listener nonblocking {addr}: {e}");
+            return;
+        }
         tracing::info!("rpc listening on {addr}");
-        for conn in listener.incoming() {
-            match conn {
-                Ok(stream) => {
-                    // Reject BEFORE spawning: slow clients cannot create
-                    // unbounded blocked threads on a small node.
+        while !shutdown.is_requested() {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    if shutdown.is_requested() {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        break;
+                    }
+                    // Preserve the upstream connection cap: untrusted peers
+                    // must not spawn an unbounded number of worker threads.
                     let Some(slot) = reserve(&active, MAX_RPC_CONNECTIONS) else {
                         drop(stream);
                         continue;
                     };
                     let st = Arc::clone(&state);
                     let stream_budget = Arc::clone(&subscriptions);
-                    thread::spawn(move || {
+                    let stop = Arc::clone(&shutdown);
+                    let workers = Arc::clone(&client_workers);
+                    workers.spawn(move || {
                         let _slot = slot;
-                        if let Err(e) = handle_client(stream, st, stream_budget) {
+                        if let Err(e) = handle_client(stream, st, stream_budget, stop) {
                             tracing::debug!("rpc client: {e}");
                         }
                     });
                 }
-                Err(e) => tracing::warn!("rpc accept: {e}"),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if shutdown.wait_timeout(Duration::from_millis(100)) {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("rpc accept: {e}");
+                    if shutdown.wait_timeout(Duration::from_millis(100)) {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -260,16 +287,24 @@ fn handle_client(
     stream: TcpStream,
     state: SharedState,
     subscriptions: Arc<AtomicUsize>,
+    shutdown: Arc<Shutdown>,
 ) -> anyhow::Result<()> {
+    if shutdown.is_requested() {
+        return Ok(());
+    }
+    let _pending_socket = shutdown.track_socket(&stream)?;
+
+    // Normalize accepted sockets on macOS.
+    stream.set_nonblocking(false)?;
     stream.set_nodelay(true)?;
     stream.set_write_timeout(Some(RPC_FRAME_BUDGET))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
-    // Even a fully valid pipelined client cannot monopolize a slot forever.
+    // Preserve absolute frame and connection lifetime bounds.
     let deadline = Instant::now() + RPC_CONNECTION_LIFETIME;
 
     loop {
-        if Instant::now() >= deadline {
+        if shutdown.is_requested() || Instant::now() >= deadline {
             break;
         }
         let buf = match read_rpc_frame(&mut reader) {
@@ -280,9 +315,12 @@ fn handle_client(
                 writeln!(writer, "{}", serde_json::to_string(&res)?)?;
                 break;
             }
+            Err(_e) if shutdown.is_requested() => break,
             Err(e) => return Err(e.into()),
         };
-
+        if shutdown.is_requested() {
+            break;
+        }
         let text = String::from_utf8_lossy(&buf);
         let req: RpcReq = match serde_json::from_str(text.trim()) {
             Ok(r) => r,
@@ -293,14 +331,13 @@ fn handle_client(
             }
         };
         if req.method == "scan_subscribe" {
-            // Streams may be long-lived, so they consume a SEPARATE,
-            // smaller budget rather than starving ordinary wallet requests.
+            // Preserve the independent subscription budget.
             let Some(_stream_slot) = reserve(&subscriptions, MAX_RPC_STREAMS) else {
                 let res = err("too many RPC subscriptions", req.id.clone());
                 writeln!(writer, "{}", serde_json::to_string(&res)?)?;
                 break;
             };
-            handle_scan_subscribe(&req, &state, &mut writer)?;
+            handle_scan_subscribe(&req, &state, &mut writer, &shutdown)?;
             break;
         }
         let res = dispatch(&req, &state);
@@ -721,6 +758,7 @@ fn handle_scan_subscribe(
     req: &RpcReq,
     state: &SharedState,
     writer: &mut TcpStream,
+    shutdown: &Shutdown,
 ) -> anyhow::Result<()> {
     let mut from = req.params.get("from").and_then(|v| v.as_u64()).unwrap_or(0);
     let limit = req
@@ -733,6 +771,9 @@ fn handle_scan_subscribe(
     // Subscription slots and write timeouts bound resource use. Keep the
     // stream open because nightfall-wallet follow does not reconnect.
     loop {
+        if shutdown.is_requested() {
+            break;
+        }
         let snap = scan_feed_snapshot(state, from, limit);
         let scanned_to = snap
             .get("scanned_to")
@@ -757,10 +798,29 @@ fn handle_scan_subscribe(
             break;
         };
         if *guard == seen {
-            let (g, timeout) = cv
-                .wait_timeout(guard, Duration::from_secs(30))
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            if timeout.timed_out() {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let mut g = guard;
+            let mut heartbeat_due = false;
+            loop {
+                if shutdown.is_requested() || *g != seen {
+                    break;
+                }
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    heartbeat_due = true;
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                let waited = cv
+                    .wait_timeout(g, remaining.min(Duration::from_millis(250)))
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                g = waited.0;
+            }
+            if shutdown.is_requested() {
+                break;
+            }
+            if heartbeat_due {
+                drop(g);
                 let heartbeat = ok(
                     json!({
                         "from": from,
@@ -776,7 +836,6 @@ fn handle_scan_subscribe(
                 );
                 writeln!(writer, "{}", serde_json::to_string(&heartbeat)?)?;
                 writer.flush()?;
-                drop(g);
                 continue;
             }
         }

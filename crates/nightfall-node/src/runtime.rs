@@ -21,10 +21,191 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 pub type SharedState = Arc<Mutex<NodeInner>>;
+
+#[derive(Default)]
+pub(crate) struct Workers {
+    handles: Mutex<Vec<JoinHandle<()>>>,
+    accepting: AtomicBool,
+}
+
+impl Workers {
+    pub(crate) fn new() -> Self {
+        Self {
+            handles: Mutex::new(Vec::new()),
+            accepting: AtomicBool::new(true),
+        }
+    }
+
+    /// Retire completed handles before adding more.
+    /// Joining happens outside the registry lock.
+    fn reap_finished(&self) -> usize {
+        let mut finished = Vec::new();
+
+        {
+            let mut handles = self.handles.lock().unwrap();
+            let mut i = 0;
+
+            while i < handles.len() {
+                if handles[i].is_finished() {
+                    finished.push(handles.swap_remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        let n = finished.len();
+
+        for handle in finished {
+            let _ = handle.join();
+        }
+
+        n
+    }
+
+    pub(crate) fn spawn<F>(&self, work: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.reap_finished();
+
+        let mut handles = self.handles.lock().unwrap();
+
+        if !self.accepting.load(Ordering::Acquire) {
+            return;
+        }
+
+        handles.push(thread::spawn(work));
+    }
+
+    fn stop_accepting(&self) {
+        let _handles = self.handles.lock().unwrap();
+        self.accepting.store(false, Ordering::Release);
+    }
+
+    fn join_all(&self) {
+        loop {
+            let handles = {
+                let mut guard = self.handles.lock().unwrap();
+                if guard.is_empty() {
+                    break;
+                }
+                std::mem::take(&mut *guard)
+            };
+
+            for handle in handles {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Shutdown {
+    requested: AtomicBool,
+    wake: Condvar,
+    lock: Mutex<()>,
+    next_socket_id: AtomicU64,
+    pending_sockets: Mutex<HashMap<u64, TcpStream>>,
+}
+
+pub(crate) struct PendingSocket {
+    shutdown: Arc<Shutdown>,
+    id: u64,
+}
+
+impl Drop for PendingSocket {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.shutdown.pending_sockets.lock() {
+            pending.remove(&self.id);
+        }
+    }
+}
+
+impl Shutdown {
+    fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+        self.wake.notify_all();
+
+        let sockets = self
+            .pending_sockets
+            .lock()
+            .map(|mut pending| {
+                pending
+                    .drain()
+                    .map(|(_, stream)| stream)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        for stream in sockets {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    pub(crate) fn track_socket(
+        self: &Arc<Self>,
+        stream: &TcpStream,
+    ) -> std::io::Result<PendingSocket> {
+        if self.is_requested() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "node shutdown requested",
+            ));
+        }
+
+        let tracked = stream.try_clone()?;
+        let id = self.next_socket_id.fetch_add(1, Ordering::Relaxed);
+
+        let mut pending = self
+            .pending_sockets
+            .lock()
+            .map_err(|_| std::io::Error::other("pending socket registry lock poisoned"))?;
+
+        if self.is_requested() {
+            drop(pending);
+            let _ = tracked.shutdown(std::net::Shutdown::Both);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "node shutdown requested",
+            ));
+        }
+
+        pending.insert(id, tracked);
+
+        Ok(PendingSocket {
+            shutdown: Arc::clone(self),
+            id,
+        })
+    }
+
+    pub(crate) fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn wait_timeout(&self, duration: Duration) -> bool {
+        if self.is_requested() {
+            return true;
+        }
+
+        let Ok(guard) = self.lock.lock() else {
+            return self.is_requested();
+        };
+
+        if self.is_requested() {
+            return true;
+        }
+
+        let _ = self.wake.wait_timeout(guard, duration);
+        self.is_requested()
+    }
+}
 
 /// Soft cap on live sessions. A seed that sits at this number and then
 /// refuses Hello is how new wallets freeze on genesis: they never learn
@@ -192,6 +373,9 @@ pub struct NodeInner {
     /// NAT stays in real time because its outbound to a seed lives in this
     /// pool, not because anyone can dial it back.
     pub sessions: Arc<SessionPool>,
+    /// Registry for every node-owned background thread. Relay sends use the
+    /// same registry so shutdown can wait until no node worker remains.
+    pub(crate) workers: Arc<Workers>,
     /// Generation counter + condvar. Bumped with the tip so a wallet scan
     /// thread can sleep until there is something new to look at, instead of
     /// polling the whole chain every few seconds.
@@ -447,7 +631,8 @@ impl NodeInner {
             fallback_dial_block(&self.dialable_peers(), &block, self);
             return;
         }
-        fanout_block(&live, &block);
+        let workers = Arc::clone(&self.workers);
+        fanout_block(&live, &block, move |work| workers.spawn(work));
     }
 }
 
@@ -478,7 +663,8 @@ fn fallback_dial_block(peers: &[String], block: &Block, inner: &NodeInner) {
         let block = block.clone();
         let addr = addr.clone();
         let proxy = inner.proxy.clone();
-        thread::spawn(move || {
+        let workers = Arc::clone(&inner.workers);
+        workers.spawn(move || {
             if let Ok((mut s, _tor)) = connect_peer_via(&addr, 3000, proxy.as_ref()) {
                 if handshake(&mut s, network, genesis, height, tip, port, pruned, first_h).is_ok() {
                     let _ = broadcast_block(&mut s, &block);
@@ -501,7 +687,8 @@ fn fallback_stem_tx(peers: &[String], tx: &Transaction, inner: &NodeInner) {
     let first_h = inner.chain.first_height;
     let proxy = inner.proxy.clone();
     let tx = tx.clone();
-    thread::spawn(move || {
+    let workers = Arc::clone(&inner.workers);
+    workers.spawn(move || {
         if let Ok((mut s, _tor)) = connect_peer_via(&addr, 3000, proxy.as_ref()) {
             if handshake(&mut s, network, genesis, height, tip, port, pruned, first_h).is_ok() {
                 let _ = nightfall_p2p::broadcast_tx(&mut s, &tx);
@@ -528,7 +715,8 @@ fn propagate_from_inner(
 ) {
     let stem = origin || rand::random::<f64>() < DANDELION_STEM_P;
     let live = inner.sessions.all();
-    if stem && stem_tx(&live, tx, from_key) {
+    let workers = Arc::clone(&inner.workers);
+    if stem && stem_tx(&live, tx, from_key, |work| workers.spawn(work)) {
         inner
             .stem_embargo
             .insert(tx.txid().to_hex(), embargo_deadline());
@@ -538,7 +726,8 @@ fn propagate_from_inner(
         fallback_stem_tx(&inner.dialable_peers(), tx, inner);
         return;
     }
-    fluff_tx(&live, tx, from_key);
+    let workers = Arc::clone(&inner.workers);
+    fluff_tx(&live, tx, from_key, move |work| workers.spawn(work));
     inner.stem_embargo.remove(&tx.txid().to_hex());
 }
 
@@ -548,9 +737,11 @@ fn propagate_tx(state: &SharedState, tx: &Transaction, from_key: Option<&str>, o
     }
 }
 
-fn spawn_dandelion_fluff(state: SharedState) {
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(2));
+fn spawn_dandelion_fluff(state: SharedState, shutdown: Arc<Shutdown>, workers: Arc<Workers>) {
+    workers.spawn(move || loop {
+        if shutdown.wait_timeout(Duration::from_secs(2)) {
+            break;
+        }
         let now = now_unix();
         let due: Vec<Transaction> = {
             let Ok(mut g) = state.lock() else {
@@ -573,7 +764,10 @@ fn spawn_dandelion_fluff(state: SharedState) {
         };
         for tx in due {
             if let Ok(g) = state.lock() {
-                fluff_tx(&g.sessions.all(), &tx, None);
+                let workers = Arc::clone(&g.workers);
+                fluff_tx(&g.sessions.all(), &tx, None, move |work| {
+                    workers.spawn(work)
+                });
             }
         }
     });
@@ -680,9 +874,50 @@ pub struct NodeHandle {
     state: SharedState,
     mining_enabled: Arc<AtomicBool>,
     tip_notify: Arc<(Mutex<u64>, Condvar)>,
+    shutdown: Arc<Shutdown>,
+    workers: Arc<Workers>,
+    datadir: PathBuf,
 }
 
 impl NodeHandle {
+    pub fn request_shutdown(&self) {
+        self.mining_enabled.store(false, Ordering::Release);
+        self.shutdown.request();
+        self.tip_notify.1.notify_all();
+
+        let sessions = self
+            .state
+            .lock()
+            .map(|g| g.sessions.all())
+            .unwrap_or_default();
+        for session in sessions {
+            session.disconnect();
+        }
+    }
+
+    pub fn shutdown(self) -> anyhow::Result<()> {
+        self.request_shutdown();
+
+        // No new registered worker may appear after this barrier.
+        self.workers.stop_accepting();
+        self.workers.join_all();
+
+        // Persist only a fully loaded chain. During slow replay `state.chain`
+        // is only a temporary preview/genesis chain and must never overwrite
+        // the authoritative on-disk chain during shutdown.
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("node state lock poisoned during shutdown"))?;
+
+        if !state.loading {
+            state.persist()?;
+        }
+        state.persist_peers(&self.datadir);
+
+        Ok(())
+    }
+
     pub fn start(cfg: NodeConfig) -> anyhow::Result<Self> {
         if cfg.prune
             && cfg
@@ -734,6 +969,8 @@ impl NodeHandle {
             .unwrap_or_else(|| (chain.block_count(), chain.tip_hash().to_hex()));
 
         let mining_enabled = Arc::new(AtomicBool::new(cfg.mine));
+        let shutdown = Arc::new(Shutdown::default());
+        let workers = Arc::new(Workers::new());
         let tip_epoch = Arc::new(AtomicU64::new(0));
         let hashes_total = Arc::new(AtomicU64::new(0));
         let blocks_found = Arc::new(AtomicU64::new(0));
@@ -806,6 +1043,7 @@ impl NodeHandle {
             hashrate_hps: AtomicU64::new(0),
             mining_idle_reason: AtomicU8::new(0),
             sessions: Arc::clone(&sessions),
+            workers: Arc::clone(&workers),
             tip_notify: Arc::clone(&tip_notify),
             proxy: parse_proxy_cfg(cfg.proxy.as_deref())?,
             last_tor_ok: Arc::new(AtomicBool::new(false)),
@@ -814,9 +1052,19 @@ impl NodeHandle {
         };
         let state: SharedState = Arc::new(Mutex::new(inner));
 
-        rpc::spawn_rpc(cfg.rpc_listen.clone(), Arc::clone(&state));
+        rpc::spawn_rpc(
+            cfg.rpc_listen.clone(),
+            Arc::clone(&state),
+            Arc::clone(&shutdown),
+            Arc::clone(&workers),
+        );
         if let Some(addr) = cfg.mobile_listen.clone().filter(|s| !s.is_empty()) {
-            crate::mobile::spawn_mobile(addr, Arc::clone(&state));
+            crate::mobile::spawn_mobile(
+                addr,
+                Arc::clone(&state),
+                Arc::clone(&shutdown),
+                Arc::clone(&workers),
+            );
         }
 
         // HTTP directory only — fills the address book. Must not open P2P
@@ -826,13 +1074,19 @@ impl NodeHandle {
             cfg.network,
             cfg.peers_url.clone(),
             genesis_hex,
+            Arc::clone(&shutdown),
+            Arc::clone(&workers),
         );
 
         {
             let st = Arc::clone(&state);
             let datadir = cfg.datadir.clone();
-            thread::spawn(move || loop {
-                thread::sleep(Duration::from_secs(30));
+            let stop = Arc::clone(&shutdown);
+            let workers = Arc::clone(&workers);
+            workers.spawn(move || loop {
+                if stop.wait_timeout(Duration::from_secs(30)) {
+                    break;
+                }
                 if let Ok(mut g) = st.lock() {
                     if !g.loading {
                         if let Err(e) = g.persist() {
@@ -849,8 +1103,12 @@ impl NodeHandle {
             // process during sleep; the first iteration after wake sees the
             // jump and clears the stale peer height before mining resumes.
             let st = Arc::clone(&state);
-            thread::spawn(move || loop {
-                thread::sleep(Duration::from_secs(1));
+            let stop = Arc::clone(&shutdown);
+            let workers = Arc::clone(&workers);
+            workers.spawn(move || loop {
+                if stop.wait_timeout(Duration::from_secs(1)) {
+                    break;
+                }
                 let now = now_unix();
                 if let Ok(mut g) = st.lock() {
                     let last = g.last_wall_tick.load(Ordering::Relaxed);
@@ -873,13 +1131,21 @@ impl NodeHandle {
             let mine = cfg.miner.is_some();
             let network = cfg.network;
             let datadir = cfg.datadir.clone();
-            thread::spawn(move || {
+            let stop = Arc::clone(&shutdown);
+            let workers = Arc::clone(&workers);
+            let child_workers = Arc::clone(&workers);
+            workers.spawn(move || {
                 tracing::info!("loading chain from disk — RPC and the light API are already up");
                 let progress = {
                     let st = Arc::clone(&st);
+                    let stop = Arc::clone(&stop);
                     move |done: u64, total: u64| {
+                        if stop.is_requested() {
+                            return;
+                        }
+
                         if let Ok(mut g) = st.lock() {
-                            if g.loading {
+                            if !stop.is_requested() && g.loading {
                                 g.preview_blocks = done.max(1);
                                 g.preview_total = total;
                             }
@@ -888,6 +1154,11 @@ impl NodeHandle {
                 };
                 match ChainStore::new(&datadir).load_or_new_with_progress(network, progress) {
                     Ok(loaded) => {
+                        if stop.is_requested() {
+                            tracing::debug!("shutdown requested during chain replay");
+                            return;
+                        }
+
                         let blocks = loaded.block_count();
                         let tip = loaded.tip_hash().to_hex();
                         if let Ok(mut g) = st.lock() {
@@ -899,13 +1170,25 @@ impl NodeHandle {
                             g.bump_tip();
                             let _ = g.persist();
                         }
+                        if stop.is_requested() {
+                            tracing::debug!("shutdown requested before opening P2P");
+                            return;
+                        }
+
                         tracing::info!("chain ready ({blocks} blocks, tip {tip}) — opening P2P");
-                        spawn_p2p_plane(st, listen, mine);
+                        spawn_p2p_plane(st, listen, mine, stop, child_workers);
                     }
                     Err(e) => {
+                        if stop.is_requested() {
+                            tracing::debug!("shutdown requested while chain replay was failing");
+                            return;
+                        }
+
                         tracing::error!("chain load failed: {e}");
                         if let Ok(mut g) = st.lock() {
-                            g.last_dial_error = Some(format!("chain load: {e}"));
+                            if !stop.is_requested() {
+                                g.last_dial_error = Some(format!("chain load: {e}"));
+                            }
                         }
                     }
                 }
@@ -915,6 +1198,8 @@ impl NodeHandle {
                 Arc::clone(&state),
                 cfg.p2p_listen.clone(),
                 cfg.miner.is_some(),
+                Arc::clone(&shutdown),
+                Arc::clone(&workers),
             );
         }
 
@@ -922,6 +1207,9 @@ impl NodeHandle {
             state,
             mining_enabled,
             tip_notify,
+            shutdown,
+            workers,
+            datadir: cfg.datadir,
         })
     }
 
@@ -1250,10 +1538,15 @@ impl NodeHandle {
 pub const MAX_OUTBOUND_EXTRA: usize = 6;
 const DIAL_GIVE_UP: u32 = 5;
 
-fn spawn_outbound_supervisor(state: SharedState) {
-    thread::spawn(move || {
+fn spawn_outbound_supervisor(state: SharedState, shutdown: Arc<Shutdown>, workers: Arc<Workers>) {
+    let child_workers = Arc::clone(&workers);
+    workers.spawn(move || {
         let launched: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         loop {
+            if shutdown.is_requested() {
+                break;
+            }
+
             let targets = outbound_targets(&state);
             for addr in targets {
                 {
@@ -1265,14 +1558,19 @@ fn spawn_outbound_supervisor(state: SharedState) {
                 }
                 let st = Arc::clone(&state);
                 let slot = Arc::clone(&launched);
-                thread::spawn(move || {
-                    stay_connected(st, addr.clone());
+                let stop = Arc::clone(&shutdown);
+                let child_workers = Arc::clone(&child_workers);
+                let connection_workers = Arc::clone(&child_workers);
+                child_workers.spawn(move || {
+                    stay_connected(st, addr.clone(), stop, connection_workers);
                     if let Ok(mut live) = slot.lock() {
                         live.remove(&addr);
                     }
                 });
             }
-            thread::sleep(Duration::from_secs(2));
+            if shutdown.wait_timeout(Duration::from_secs(2)) {
+                break;
+            }
         }
     });
 }
@@ -1338,7 +1636,12 @@ pub fn peers_to_remember(
         .collect()
 }
 
-fn stay_connected(state: SharedState, addr: String) {
+fn stay_connected(
+    state: SharedState,
+    addr: String,
+    shutdown: Arc<Shutdown>,
+    workers: Arc<Workers>,
+) {
     let mut backoff = Duration::from_millis(250);
     let mut fails = 0u32;
     let is_seed = {
@@ -1348,7 +1651,11 @@ fn stay_connected(state: SharedState, addr: String) {
         g.network.seed_nodes().iter().any(|s| *s == addr) || g.bootstrap.iter().any(|s| s == &addr)
     };
     loop {
-        match open_outbound_session(&state, &addr) {
+        if shutdown.is_requested() {
+            return;
+        }
+
+        match open_outbound_session(&state, &addr, &shutdown, &workers) {
             Ok(()) => {
                 backoff = Duration::from_millis(250);
                 fails = 0;
@@ -1386,7 +1693,9 @@ fn stay_connected(state: SharedState, addr: String) {
                 tracing::debug!("outbound {addr}: {e}");
             }
         }
-        thread::sleep(backoff);
+        if shutdown.wait_timeout(backoff) {
+            return;
+        }
         backoff = (backoff * 2).min(Duration::from_secs(8));
     }
 }
@@ -1398,9 +1707,16 @@ fn is_self_connection(stream: &TcpStream, listen_port: u16) -> bool {
     }
 }
 
-fn open_outbound_session(state: &SharedState, addr: &str) -> anyhow::Result<()> {
+fn open_outbound_session(
+    state: &SharedState,
+    addr: &str,
+    shutdown: &Arc<Shutdown>,
+    workers: &Arc<Workers>,
+) -> anyhow::Result<()> {
     let proxy = state.lock().ok().and_then(|g| g.proxy.clone());
     let (mut stream, used_tor) = connect_peer_via(addr, 8_000, proxy.as_ref())?;
+    let pending_socket = shutdown.track_socket(&stream)?;
+
     if let Ok(g) = state.lock() {
         g.last_tor_ok.store(used_tor, Ordering::Relaxed);
     }
@@ -1461,6 +1777,9 @@ fn open_outbound_session(state: &SharedState, addr: &str) -> anyhow::Result<()> 
         g.session_height.insert(key.clone(), peer_h);
         g.sessions.insert(key, write_clone, true)
     };
+
+    drop(pending_socket);
+
     tracing::info!("outbound session {addr} height={peer_h}");
 
     // Catch up on this socket before we sit in the read loop. A NAT wallet
@@ -1485,7 +1804,7 @@ fn open_outbound_session(state: &SharedState, addr: &str) -> anyhow::Result<()> 
     }
 
     let mut reader = BufReader::new(stream);
-    let result = peer_io_loop(&mut reader, &sess, state, addr, peer_h);
+    let result = peer_io_loop(&mut reader, &sess, state, addr, peer_h, shutdown, workers);
     if let Ok(mut g) = state.lock() {
         let key = outbound_key(addr);
         g.sessions.remove(&key);
@@ -1586,7 +1905,15 @@ const REORG_FETCH_COOLDOWN_SECS: u64 = 15;
 
 /// Pull a peer's chain on a fresh socket and weigh it. Used when live
 /// `GetBlocks` cannot extend our tip — we are on a fork, not merely late.
-fn kick_reorg_fetch(state: &SharedState, sess: &SessionHandle) {
+fn kick_reorg_fetch(
+    state: &SharedState,
+    sess: &SessionHandle,
+    shutdown: &Arc<Shutdown>,
+    workers: &Arc<Workers>,
+) {
+    if shutdown.is_requested() {
+        return;
+    }
     if !sess.outbound {
         return;
     }
@@ -1607,22 +1934,43 @@ fn kick_reorg_fetch(state: &SharedState, sess: &SessionHandle) {
         }
         g.last_reorg_fetch.store(now, Ordering::Relaxed);
     }
+    if shutdown.is_requested() {
+        return;
+    }
+
     tracing::info!("peer {addr} is ahead on a fork — fetching their chain");
     let st = Arc::clone(state);
-    thread::spawn(move || {
-        if let Err(e) = sync_from_peer(&st, &addr) {
-            tracing::debug!("reorg fetch {addr}: {e}");
+    let stop = Arc::clone(shutdown);
+    let workers = Arc::clone(workers);
+
+    workers.spawn(move || {
+        if stop.is_requested() {
+            return;
+        }
+
+        if let Err(e) = sync_from_peer(&st, &addr, &stop) {
+            if !stop.is_requested() {
+                tracing::debug!("reorg fetch {addr}: {e}");
+            }
         }
     });
 }
 
-fn spawn_status_ticker(state: SharedState) {
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(400));
+fn spawn_status_ticker(state: SharedState, shutdown: Arc<Shutdown>, workers: Arc<Workers>) {
+    workers.spawn(move || {
+        if shutdown.wait_timeout(Duration::from_millis(400)) {
+            return;
+        }
+
         loop {
+            if shutdown.is_requested() {
+                break;
+            }
             let sessions = {
                 let Ok(g) = state.lock() else {
-                    thread::sleep(STATUS_TICK);
+                    if shutdown.wait_timeout(STATUS_TICK) {
+                        break;
+                    }
                     continue;
                 };
                 g.sessions.all()
@@ -1632,7 +1980,9 @@ fn spawn_status_ticker(state: SharedState) {
                     tracing::debug!("status tick {}: {e}", s.key);
                 }
             }
-            thread::sleep(STATUS_TICK);
+            if shutdown.wait_timeout(STATUS_TICK) {
+                break;
+            }
         }
     });
 }
@@ -1660,17 +2010,40 @@ pub fn merge_directory_peers(
     out
 }
 
-fn spawn_p2p_plane(state: SharedState, listen: String, mine: bool) {
+fn spawn_p2p_plane(
+    state: SharedState,
+    listen: String,
+    mine: bool,
+    shutdown: Arc<Shutdown>,
+    workers: Arc<Workers>,
+) {
     {
         let st = Arc::clone(&state);
-        thread::spawn(move || p2p_listen_loop(listen, st));
+        let stop = Arc::clone(&shutdown);
+        let workers = Arc::clone(&workers);
+        let child_workers = Arc::clone(&workers);
+        workers.spawn(move || p2p_listen_loop(listen, st, stop, child_workers));
     }
-    spawn_outbound_supervisor(Arc::clone(&state));
-    spawn_status_ticker(Arc::clone(&state));
-    spawn_dandelion_fluff(Arc::clone(&state));
+    spawn_outbound_supervisor(
+        Arc::clone(&state),
+        Arc::clone(&shutdown),
+        Arc::clone(&workers),
+    );
+    spawn_status_ticker(
+        Arc::clone(&state),
+        Arc::clone(&shutdown),
+        Arc::clone(&workers),
+    );
+    spawn_dandelion_fluff(
+        Arc::clone(&state),
+        Arc::clone(&shutdown),
+        Arc::clone(&workers),
+    );
     if mine {
         let st = Arc::clone(&state);
-        thread::spawn(move || mining_loop(st));
+        let stop = Arc::clone(&shutdown);
+        let workers = Arc::clone(&workers);
+        workers.spawn(move || mining_loop(st, stop));
     }
 }
 
@@ -1679,6 +2052,8 @@ fn spawn_directory_bootstrap(
     network: NetworkId,
     configured: Option<String>,
     genesis_hex: String,
+    shutdown: Arc<Shutdown>,
+    workers: Arc<Workers>,
 ) {
     // The directory uses direct HTTPS, not P2P SOCKS5.
     // Lockdown must never contact it directly.
@@ -1693,26 +2068,45 @@ fn spawn_directory_bootstrap(
         _ if network == NetworkId::Mainnet => DEFAULT_PEERS_DIRECTORY.to_string(),
         _ => return,
     };
-    thread::spawn(move || match fetch_directory_peers(&url, &genesis_hex) {
-        Ok(peers) if !peers.is_empty() => {
-            if let Ok(mut g) = state.lock() {
-                let mut added = 0usize;
-                for addr in peers {
-                    if !looks_like_dial_target(&addr) || !is_directory_addr(&addr) {
-                        continue;
+    workers.spawn(move || {
+        if shutdown.is_requested() {
+            return;
+        }
+
+        match fetch_directory_peers(&url, &genesis_hex) {
+            Ok(peers) if !peers.is_empty() => {
+                if shutdown.is_requested() {
+                    return;
+                }
+
+                if let Ok(mut g) = state.lock() {
+                    if shutdown.is_requested() {
+                        return;
                     }
-                    if g.peer_addrs.insert(addr.clone()) {
-                        g.bootstrap.push(addr);
-                        added += 1;
+
+                    let mut added = 0usize;
+                    for addr in peers {
+                        if !looks_like_dial_target(&addr) || !is_directory_addr(&addr) {
+                            continue;
+                        }
+                        if g.peer_addrs.insert(addr.clone()) {
+                            g.bootstrap.push(addr);
+                            added += 1;
+                        }
+                    }
+
+                    if added > 0 {
+                        tracing::info!("directory {url}: {added} listening node(s) to dial");
                     }
                 }
-                if added > 0 {
-                    tracing::info!("directory {url}: {added} listening node(s) to dial");
+            }
+            Ok(_) => tracing::debug!("directory {url}: empty"),
+            Err(e) => {
+                if !shutdown.is_requested() {
+                    tracing::info!("directory {url}: {e}");
                 }
             }
         }
-        Ok(_) => tracing::debug!("directory {url}: empty"),
-        Err(e) => tracing::info!("directory {url}: {e}"),
     });
 }
 
@@ -1853,7 +2247,12 @@ fn evict_synced_inbound(state: &SharedState, protect: &str) -> bool {
 
 // -------------------------------------------------------------------- p2p ---
 
-fn p2p_listen_loop(addr: String, state: SharedState) {
+fn p2p_listen_loop(
+    addr: String,
+    state: SharedState,
+    shutdown: Arc<Shutdown>,
+    workers: Arc<Workers>,
+) {
     let listener = match TcpListener::bind(&addr) {
         Ok(l) => l,
         Err(e) => {
@@ -1861,35 +2260,102 @@ fn p2p_listen_loop(addr: String, state: SharedState) {
             return;
         }
     };
+    if let Err(e) = listener.set_nonblocking(true) {
+        tracing::error!("p2p listener nonblocking {addr}: {e}");
+        return;
+    }
     tracing::info!("p2p listening on {addr}");
 
-    for conn in listener.incoming() {
-        match conn {
-            Ok(stream) => {
+    let pending = Arc::new(AtomicUsize::new(0));
+
+    while !shutdown.is_requested() {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if shutdown.is_requested() {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    break;
+                }
+
                 let live = state.lock().map(|g| g.sessions.len()).unwrap_or(MAX_PEERS);
+
                 // Hard cap only. Soft cap is MAX_PEERS; overflow seats exist
                 // so Hello can run and a synced miner can be asked to leave.
                 if live >= MAX_PEERS.saturating_add(IBD_ACCEPT_BURST) {
                     tracing::debug!("session burst full, dropping connection");
                     continue;
                 }
+
                 let st = Arc::clone(&state);
+                let stop = Arc::clone(&shutdown);
+                let child_workers = Arc::clone(&workers);
+                let peer_workers = Arc::clone(&child_workers);
                 let peer = stream
                     .peer_addr()
                     .map(|a| a.to_string())
                     .unwrap_or_default();
-                thread::spawn(move || {
-                    if let Err(e) = handle_peer(stream, st, peer.clone()) {
+
+                // Bound active handlers before peer Hello.
+                let limit = MAX_PEERS.saturating_add(IBD_ACCEPT_BURST);
+
+                let admitted = pending.try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    (n < limit).then_some(n + 1)
+                });
+
+                if admitted.is_err() {
+                    continue;
+                }
+
+                let seat = Arc::clone(&pending);
+
+                child_workers.spawn(move || {
+                    struct Release(Arc<AtomicUsize>);
+
+                    impl Drop for Release {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, Ordering::AcqRel);
+                        }
+                    }
+
+                    let _seat = Release(seat);
+
+                    if stop.is_requested() {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        return;
+                    }
+
+                    if let Err(e) = handle_peer(stream, st, peer.clone(), stop, peer_workers) {
                         tracing::debug!("peer {peer}: {e}");
                     }
                 });
             }
-            Err(e) => tracing::warn!("p2p accept: {e}"),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if shutdown.wait_timeout(Duration::from_millis(100)) {
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("p2p accept: {e}");
+                if shutdown.wait_timeout(Duration::from_millis(100)) {
+                    break;
+                }
+            }
         }
     }
 }
 
-fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> anyhow::Result<()> {
+fn handle_peer(
+    stream: TcpStream,
+    state: SharedState,
+    peer_label: String,
+    shutdown: Arc<Shutdown>,
+    workers: Arc<Workers>,
+) -> anyhow::Result<()> {
+    if shutdown.is_requested() {
+        return Ok(());
+    }
+
+    let pending_socket = shutdown.track_socket(&stream)?;
+
     prepare_live_socket(&stream)?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut hello_writer = stream.try_clone()?;
@@ -2038,6 +2504,10 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
         return Ok(());
     }
 
+    if shutdown.is_requested() {
+        return Ok(());
+    }
+
     if state
         .lock()
         .map(|g| g.sessions.len() >= MAX_PEERS)
@@ -2045,10 +2515,18 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
     {
         evict_synced_inbound(&state, &session_key);
     }
+
+    if shutdown.is_requested() {
+        return Ok(());
+    }
+
     let sess = {
         let g = state.lock().unwrap();
         g.sessions.insert(session_key.clone(), hello_writer, false)
     };
+
+    drop(pending_socket);
+
     // First gift: who else answers. A new install that only knows the
     // seed must leave this socket with somewhere else to dial.
     let intro = {
@@ -2056,7 +2534,15 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
         g.publishable_peers()
     };
     let _ = sess.send(&PeerMsg::Peers { addrs: intro });
-    let result = peer_io_loop(&mut reader, &sess, &state, &peer_label, peer_height);
+    let result = peer_io_loop(
+        &mut reader,
+        &sess,
+        &state,
+        &peer_label,
+        peer_height,
+        &shutdown,
+        &workers,
+    );
     if let Ok(mut g) = state.lock() {
         g.sessions.remove(&session_key);
         g.session_height.remove(&session_key);
@@ -2065,6 +2551,8 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
 }
 
 fn prepare_live_socket(stream: &TcpStream) -> std::io::Result<()> {
+    // Normalize inherited socket mode on macOS.
+    stream.set_nonblocking(false)?;
     stream.set_nodelay(true)?;
     // Long read timeout: the peer may be quiet between 15-second blocks.
     // Writes are short so a stuck announce cannot pin a session forever.
@@ -2079,9 +2567,14 @@ fn peer_io_loop(
     state: &SharedState,
     peer_label: &str,
     mut last_peer_height: u64,
+    shutdown: &Arc<Shutdown>,
+    workers: &Arc<Workers>,
 ) -> anyhow::Result<()> {
     let introduced_at = std::time::Instant::now();
     loop {
+        if shutdown.is_requested() {
+            return Ok(());
+        }
         if !sess.outbound
             && finish_introduction(state, sess, last_peer_height, introduced_at, peer_label)
         {
@@ -2090,6 +2583,9 @@ fn peer_io_loop(
         let msg = match read_msg(reader) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                if shutdown.is_requested() {
+                    return Ok(());
+                }
                 sess.send(&PeerMsg::Ping { nonce: now_unix() })?;
                 continue;
             }
@@ -2176,7 +2672,7 @@ fn peer_io_loop(
                         limit: MAX_BLOCKS_PER_REQUEST,
                     })?;
                 } else if tip != our_tip && sess.outbound {
-                    kick_reorg_fetch(state, sess);
+                    kick_reorg_fetch(state, sess, shutdown, workers);
                 }
             }
 
@@ -2284,7 +2780,7 @@ fn peer_io_loop(
                     if let Ok(g) = state.lock() {
                         g.stalled_on_fork.store(true, Ordering::SeqCst);
                     }
-                    kick_reorg_fetch(state, sess);
+                    kick_reorg_fetch(state, sess, shutdown, workers);
                 }
             }
 
@@ -2650,14 +3146,33 @@ fn push_blocks_via_session(
     }
 }
 
-fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
+fn sync_from_peer(state: &SharedState, addr: &str, shutdown: &Arc<Shutdown>) -> anyhow::Result<()> {
+    if shutdown.is_requested() {
+        return Ok(());
+    }
+
     let proxy = state.lock().ok().and_then(|g| g.proxy.clone());
     let (mut stream, used_tor) = connect_peer_via(addr, 15_000, proxy.as_ref())?;
+    let _pending_socket = shutdown.track_socket(&stream)?;
+
+    if shutdown.is_requested() {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return Ok(());
+    }
     // Connect is 15s. Pages of 128 blocks over Tor need the live-session
     // budget or a mid-chain fetch dies and looks like "sync is stuck".
     let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(120)));
+    if shutdown.is_requested() {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return Ok(());
+    }
+
     if let Ok(g) = state.lock() {
+        if shutdown.is_requested() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return Ok(());
+        }
         g.last_tor_ok.store(used_tor, Ordering::Relaxed);
     }
     let (network, genesis, our_h, tip, port, our_pruned, our_first) = {
@@ -2697,8 +3212,18 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
         }
     };
     let (peer_h, peer_tip) = (intro.height, intro.tip.clone());
+
+    if shutdown.is_requested() {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return Ok(());
+    }
+
     {
         let mut g = state.lock().unwrap();
+        if shutdown.is_requested() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return Ok(());
+        }
         g.mark_confirmed(addr.to_string());
         // Who can still answer for the whole chain, recorded the moment they
         // say so rather than discovered by an empty reply later.
@@ -2708,7 +3233,15 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
             g.archive_peers.remove(addr);
         }
     }
+    if shutdown.is_requested() {
+        return Ok(());
+    }
+
     note_peer_height(state, peer_h);
+
+    if shutdown.is_requested() {
+        return Ok(());
+    }
 
     // Learn about the rest of the network from this peer.
     if write_msg(&mut stream, &PeerMsg::GetPeers).is_ok() {
@@ -2721,6 +3254,10 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
                 }
             }
         }
+    }
+
+    if shutdown.is_requested() {
+        return Ok(());
     }
 
     // Nothing to do if we agree.
@@ -2774,7 +3311,16 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
     let mut total_applied = 0usize;
 
     for _ in 0..64 {
+        if shutdown.is_requested() {
+            return Ok(());
+        }
+
         let batch = nightfall_p2p::request_blocks(&mut stream, from, MAX_BLOCKS_PER_REQUEST)?;
+
+        if shutdown.is_requested() {
+            return Ok(());
+        }
+
         if batch.is_empty() {
             break;
         }
@@ -3100,7 +3646,7 @@ fn initial_mining_threads() -> usize {
         .clamp(1, MAX_MINING_THREADS)
 }
 
-fn mining_loop(state: SharedState) {
+fn mining_loop(state: SharedState, shutdown: Arc<Shutdown>) {
     let threads = state
         .lock()
         .ok()
@@ -3120,6 +3666,10 @@ fn mining_loop(state: SharedState) {
     }
 
     loop {
+        if shutdown.is_requested() {
+            break;
+        }
+
         let (enabled, tip_epoch, epoch_now, last_tick) = {
             let mut g = state.lock().unwrap();
             let now = now_unix();
@@ -3136,7 +3686,9 @@ fn mining_loop(state: SharedState) {
         };
 
         if !enabled {
-            thread::sleep(Duration::from_millis(300));
+            if shutdown.wait_timeout(Duration::from_millis(300)) {
+                break;
+            }
             continue;
         }
 
@@ -3159,7 +3711,9 @@ fn mining_loop(state: SharedState) {
                 .unwrap()
                 .mining_idle_reason
                 .store(1, Ordering::Relaxed);
-            thread::sleep(Duration::from_secs(1));
+            if shutdown.wait_timeout(Duration::from_secs(1)) {
+                break;
+            }
             continue;
         }
 
@@ -3210,7 +3764,9 @@ fn mining_loop(state: SharedState) {
                 .unwrap()
                 .mining_idle_reason
                 .store(2, Ordering::Relaxed);
-            thread::sleep(Duration::from_secs(1));
+            if shutdown.wait_timeout(Duration::from_secs(1)) {
+                break;
+            }
             continue;
         };
         state
@@ -3239,7 +3795,9 @@ fn mining_loop(state: SharedState) {
             if now_unix().saturating_sub(last_tick) > SLEEP_GAP_SECS {
                 return true;
             }
-            tip_epoch.load(Ordering::SeqCst) != epoch_now || !mining_flag.load(Ordering::SeqCst)
+            shutdown.is_requested()
+                || tip_epoch.load(Ordering::SeqCst) != epoch_now
+                || !mining_flag.load(Ordering::SeqCst)
         };
 
         let threads = state
@@ -3262,10 +3820,18 @@ fn mining_loop(state: SharedState) {
             continue;
         };
 
+        if shutdown.is_requested() {
+            break;
+        }
+
         let block = template.clone().seal(nonce);
 
         // --- submit under the lock (cheap) ---
         let mut g = state.lock().unwrap();
+
+        if shutdown.is_requested() {
+            break;
+        }
         let now = now_unix();
         if now.saturating_sub(g.last_wall_tick.load(Ordering::Relaxed)) > SLEEP_GAP_SECS {
             apply_clock_jump(&mut g);
@@ -3375,5 +3941,58 @@ mod sync_hold_tests {
         assert_eq!(hold, SyncHold::CompetingTip { reorging: false });
         let hold = classify_sync_hold(true, false, 0, 12_000, 17_976, Some(1));
         assert_eq!(hold, SyncHold::CompetingTip { reorging: false });
+    }
+}
+
+#[cfg(test)]
+mod shutdown_worker_reaping_regression_20261030 {
+    use super::Workers;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn completed_worker_handles_are_reaped() {
+        let workers = Workers::new();
+
+        let finished = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..64 {
+            let done = Arc::clone(&finished);
+
+            workers.spawn(move || {
+                done.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+
+        let until = Instant::now() + Duration::from_secs(5);
+
+        while finished.load(Ordering::SeqCst) < 64 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(finished.load(Ordering::SeqCst), 64);
+
+        let until = Instant::now() + Duration::from_secs(5);
+
+        while !workers
+            .handles
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|h| h.is_finished())
+            && Instant::now() < until
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        workers.reap_finished();
+
+        assert_eq!(workers.handles.lock().unwrap().len(), 0);
+
+        workers.stop_accepting();
+        workers.join_all();
     }
 }

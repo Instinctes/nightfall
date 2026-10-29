@@ -1,0 +1,51 @@
+name: PR7 shutdown portability
+
+on:
+  push:
+    branches:
+      - hardening/node-clean-shutdown
+  pull_request:
+    paths:
+      - crates/nightfall-node/src/runtime.rs
+      - crates/nightfall-node/src/rpc.rs
+      - crates/nightfall-node/src/mobile.rs
+      - crates/nightfall-node/tests/restart_recovery.rs
+      - .github/workflows/pr7-shutdown-portability.yml
+
+permissions:
+  contents: read
+
+jobs:
+  node-restart:
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Reorg shutdown and restart
+        run: |
+          cargo test --locked \
+            -p nightfall-node \
+            --test restart_recovery \
+            -j 2 \
+            -- --test-threads=1
+
+      - name: Node unit tests
+        run: |
+          cargo test --locked \
+            -p nightfall-node \
+            --lib \
+            -j 2 \
+            -- --test-threads=1
