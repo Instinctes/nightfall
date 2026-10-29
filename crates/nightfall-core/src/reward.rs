@@ -10,6 +10,7 @@ const DURATION: f64 = 2.8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Reward {
     amount: u64,
+    count: u64,
 }
 
 #[derive(Default)]
@@ -30,10 +31,16 @@ impl Rewards {
             .filter(|entry| entry.direction == Direction::Mined)
         {
             if self.seen.insert(entry.txid.clone()) && !silent && entry.amount > 0 {
-                // Catch-up batches do not create an unbounded notification queue.
-                if self.pending.len() < 32 {
+                // Keep at most one pending presentation. A fast mining burst
+                // is grouped with its full amount/count instead of 90 seconds
+                // of queued overlays and chimes. Every output is deduplicated.
+                if let Some(batch) = self.pending.back_mut() {
+                    batch.amount = batch.amount.saturating_add(entry.amount);
+                    batch.count = batch.count.saturating_add(1);
+                } else {
                     self.pending.push_back(Reward {
                         amount: entry.amount,
+                        count: 1,
                     });
                 }
             }
@@ -52,6 +59,7 @@ impl Rewards {
         self.active = Some((
             Reward {
                 amount: 100_000_000,
+                count: 1,
             },
             now - 0.7,
         ));
@@ -73,7 +81,18 @@ impl Rewards {
         false
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, sound_enabled: bool) {
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        sound_enabled: bool,
+        payment_dialog: bool,
+        top: f32,
+    ) {
+        // Neither an overlay nor its sound may interrupt payment review.
+        // Pending outputs remain deduplicated and are presented afterwards.
+        if payment_dialog {
+            return;
+        }
         let now = ctx.input(|input| input.time);
         if self.advance(now) && sound_enabled {
             crate::feedback::play_reward_chime();
@@ -89,10 +108,10 @@ impl Rewards {
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
         egui::Area::new(egui::Id::new("mining-reward"))
             .anchor(
-                Align2::CENTER_TOP,
-                egui::vec2(0.0, 110.0 - 10.0 * (1.0 - enter)),
+                Align2::RIGHT_TOP,
+                egui::vec2(-52.0, top + 30.0 - 8.0 * (1.0 - enter)),
             )
-            .order(egui::Order::Foreground)
+            .order(egui::Order::Middle)
             .interactable(false)
             .show(ctx, |ui| {
                 ui.set_opacity(opacity);
@@ -102,21 +121,25 @@ impl Rewards {
                         1.0_f32,
                         crate::theme::ACCENT_HI.linear_multiply(0.55),
                     ))
-                    .rounding(Rounding::same(22.0))
-                    .inner_margin(egui::Margin::symmetric(22.0, 14.0))
+                    .rounding(Rounding::same(14.0))
+                    .inner_margin(egui::Margin::symmetric(12.0, 7.0))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            crate::widgets::logo(ui, 38.0);
+                            crate::widgets::logo(ui, 24.0);
                             ui.add_space(10.0);
                             ui.vertical(|ui| {
                                 ui.label(
-                                    RichText::new("MINING REWARD")
-                                        .size(10.5)
-                                        .color(crate::theme::ACCENT_HI),
+                                    RichText::new(if reward.count == 1 {
+                                        "MINING REWARD".to_owned()
+                                    } else {
+                                        format!("{} MINING REWARDS", reward.count)
+                                    })
+                                    .size(10.5)
+                                    .color(crate::theme::ACCENT_HI),
                                 );
                                 ui.label(
-                                    RichText::new(format!("+{}", Amount(reward.amount)))
-                                        .size(21.0)
+                                    RichText::new(compact_amount(reward.amount))
+                                        .size(15.0)
                                         .strong()
                                         .color(Color32::WHITE),
                                 );
@@ -125,6 +148,15 @@ impl Rewards {
                     });
             });
     }
+}
+
+fn compact_amount(darks: u64) -> String {
+    let full = Amount(darks).decimal_string();
+    format!(
+        "+{} {}",
+        full.trim_end_matches('0').trim_end_matches('.'),
+        nightfall_types::TICKER
+    )
 }
 
 #[cfg(test)]
@@ -143,7 +175,16 @@ mod tests {
             spent_commits: vec![],
             raw: None,
             quarantined: false,
+            failed: false,
         }
+    }
+
+    #[test]
+    fn reward_amount_remains_exact_without_padding() {
+        assert_eq!(compact_amount(600_000_000), "+6 NIGHT");
+        assert_eq!(compact_amount(612_500_000), "+6.125 NIGHT");
+        assert_eq!(compact_amount(1), "+0.00000001 NIGHT");
+        assert_eq!(compact_amount(0), "+0 NIGHT");
     }
 
     #[test]
@@ -167,16 +208,35 @@ mod tests {
     }
 
     #[test]
-    fn catchup_is_silent_and_multiple_live_rewards_are_sequenced_once_each() {
+    fn catchup_is_silent_and_live_bursts_are_grouped_without_losing_outputs() {
         let mut rewards = Rewards::default();
         rewards.observe(&[mined("history")], true);
         rewards.observe(&[mined("one"), mined("two")], false);
         assert!(rewards.advance(0.0));
         assert!(!rewards.advance(0.1));
-        assert!(rewards.advance(3.0));
+        let (batch, _) = rewards.active.unwrap();
+        assert_eq!(batch.count, 2);
+        assert_eq!(batch.amount, 200_000_000);
+        assert!(!rewards.advance(3.0));
         assert!(!rewards.advance(6.0));
         assert!(rewards.active.is_none());
         rewards.conceal();
         assert!(rewards.pending.is_empty());
+    }
+    #[test]
+    fn payment_review_defers_animation_and_large_burst_has_one_pending_batch() {
+        let mut rewards = Rewards::default();
+        rewards.observe(&[], true);
+        let burst: Vec<_> = (0..100).map(|i| mined(&format!("public-{i}"))).collect();
+        rewards.observe(&burst, false);
+        rewards.observe(&burst, false);
+        assert_eq!(rewards.pending.len(), 1);
+        assert_eq!(rewards.pending[0].count, 100);
+        let ctx = egui::Context::default();
+        rewards.show(&ctx, false, true, 94.0);
+        assert!(rewards.active.is_none());
+        assert!(rewards.advance(0.0));
+        assert_eq!(rewards.active.unwrap().0.amount, 10_000_000_000);
+        assert!(!rewards.advance(3.0));
     }
 }

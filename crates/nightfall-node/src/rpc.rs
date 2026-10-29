@@ -11,12 +11,12 @@ use nightfall_storage::now_unix;
 use nightfall_types::{Amount, MAX_MESSAGE_BYTES, MAX_SUPPLY_NIGHT, TICKER};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct RpcReq {
@@ -60,6 +60,156 @@ pub fn is_loopback_addr(addr: &str) -> bool {
         .unwrap_or(false)
 }
 
+// Bound RPC worker resources without changing consensus or authentication.
+// Memory, thread and wall-clock bounds belong at the accept/read boundary.
+// This is process protection, not consensus validation or RPC authentication.
+const MAX_RPC_CONNECTIONS: usize = 32;
+const MAX_RPC_STREAMS: usize = 8;
+const RPC_FRAME_BUDGET: Duration = Duration::from_secs(10);
+const RPC_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const RPC_CONNECTION_LIFETIME: Duration = Duration::from_secs(600);
+
+struct RpcSlot(Arc<AtomicUsize>);
+impl Drop for RpcSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn reserve(counter: &Arc<AtomicUsize>, limit: usize) -> Option<RpcSlot> {
+    let mut current = counter.load(Ordering::Acquire);
+
+    loop {
+        if current >= limit {
+            return None;
+        }
+
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                return Some(RpcSlot(Arc::clone(counter)));
+            }
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+// A read_timeout alone is insufficient: an attacker could drip one byte
+// before each timeout. This function enforces a deadline across the ENTIRE
+// line while preserving already-buffered pipelined frames.
+fn read_rpc_frame(reader: &mut BufReader<TcpStream>) -> io::Result<Option<Vec<u8>>> {
+    read_rpc_frame_with_budget(reader, RPC_FRAME_BUDGET)
+}
+
+fn read_rpc_frame_with_budget(
+    reader: &mut BufReader<TcpStream>,
+    budget: Duration,
+) -> io::Result<Option<Vec<u8>>> {
+    read_rpc_frame_with_limits(reader, budget, RPC_IDLE_TIMEOUT)
+}
+
+// Wait for a first byte under a separate idle budget. Once a frame begins,
+// its absolute deadline cannot be extended by slowly trickling more bytes.
+// BufReader may already contain the next pipelined request.
+fn read_rpc_frame_with_limits(
+    reader: &mut BufReader<TcpStream>,
+    budget: Duration,
+    idle_timeout: Duration,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut deadline: Option<Instant> = None;
+    let mut frame = Vec::with_capacity(1024);
+
+    loop {
+        let timeout = match deadline {
+            Some(end) => {
+                let remaining = end.saturating_duration_since(Instant::now());
+
+                if remaining.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "RPC frame deadline",
+                    ));
+                }
+                remaining
+            }
+            None => idle_timeout,
+        };
+
+        reader
+            .get_mut()
+            .set_read_timeout(Some(timeout.max(Duration::from_millis(1))))?;
+
+        let (used, complete) = {
+            let available = match reader.fill_buf() {
+                Ok(data) => data,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        if deadline.is_some() {
+                            "RPC frame deadline"
+                        } else {
+                            "RPC idle timeout"
+                        },
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
+
+            if available.is_empty() {
+                return if frame.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated RPC frame",
+                    ))
+                };
+            }
+
+            if let Some(end) = deadline {
+                if Instant::now() >= end {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "RPC frame deadline",
+                    ));
+                }
+            } else {
+                deadline = Some(Instant::now() + budget);
+            }
+
+            let used = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |i| i + 1);
+
+            if frame.len().saturating_add(used) > MAX_MESSAGE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "request too large",
+                ));
+            }
+
+            frame.extend_from_slice(&available[..used]);
+            (used, frame.last() == Some(&b'\n'))
+        };
+
+        reader.consume(used);
+
+        if complete {
+            return Ok(Some(frame));
+        }
+    }
+}
+
 pub fn spawn_rpc(addr: String, state: SharedState) {
     if !is_loopback_addr(&addr) && std::env::var("NF_ALLOW_PUBLIC_RPC").is_err() {
         tracing::error!(
@@ -71,6 +221,8 @@ pub fn spawn_rpc(addr: String, state: SharedState) {
         return;
     }
 
+    let active = Arc::new(AtomicUsize::new(0));
+    let subscriptions = Arc::new(AtomicUsize::new(0));
     thread::spawn(move || {
         let listener = match TcpListener::bind(&addr) {
             Ok(l) => l,
@@ -83,9 +235,17 @@ pub fn spawn_rpc(addr: String, state: SharedState) {
         for conn in listener.incoming() {
             match conn {
                 Ok(stream) => {
+                    // Reject BEFORE spawning: slow clients cannot create
+                    // unbounded blocked threads on a small node.
+                    let Some(slot) = reserve(&active, MAX_RPC_CONNECTIONS) else {
+                        drop(stream);
+                        continue;
+                    };
                     let st = Arc::clone(&state);
+                    let stream_budget = Arc::clone(&subscriptions);
                     thread::spawn(move || {
-                        if let Err(e) = handle_client(stream, st) {
+                        let _slot = slot;
+                        if let Err(e) = handle_client(stream, st, stream_budget) {
                             tracing::debug!("rpc client: {e}");
                         }
                     });
@@ -96,25 +256,32 @@ pub fn spawn_rpc(addr: String, state: SharedState) {
     });
 }
 
-fn handle_client(stream: TcpStream, state: SharedState) -> anyhow::Result<()> {
+fn handle_client(
+    stream: TcpStream,
+    state: SharedState,
+    subscriptions: Arc<AtomicUsize>,
+) -> anyhow::Result<()> {
     stream.set_nodelay(true)?;
+    stream.set_write_timeout(Some(RPC_FRAME_BUDGET))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
+    // Even a fully valid pipelined client cannot monopolize a slot forever.
+    let deadline = Instant::now() + RPC_CONNECTION_LIFETIME;
 
     loop {
-        // Bounded read: an unbounded one is a trivial memory exhaustion vector.
-        let mut buf = Vec::with_capacity(1024);
-        let n = (&mut reader)
-            .take(MAX_MESSAGE_BYTES as u64 + 1)
-            .read_until(b'\n', &mut buf)?;
-        if n == 0 {
+        if Instant::now() >= deadline {
             break;
         }
-        if n > MAX_MESSAGE_BYTES {
-            let res = err("request too large", json!(null));
-            writeln!(writer, "{}", serde_json::to_string(&res)?)?;
-            break;
-        }
+        let buf = match read_rpc_frame(&mut reader) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                let res = err("request too large", json!(null));
+                writeln!(writer, "{}", serde_json::to_string(&res)?)?;
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         let text = String::from_utf8_lossy(&buf);
         let req: RpcReq = match serde_json::from_str(text.trim()) {
@@ -126,6 +293,13 @@ fn handle_client(stream: TcpStream, state: SharedState) -> anyhow::Result<()> {
             }
         };
         if req.method == "scan_subscribe" {
+            // Streams may be long-lived, so they consume a SEPARATE,
+            // smaller budget rather than starving ordinary wallet requests.
+            let Some(_stream_slot) = reserve(&subscriptions, MAX_RPC_STREAMS) else {
+                let res = err("too many RPC subscriptions", req.id.clone());
+                writeln!(writer, "{}", serde_json::to_string(&res)?)?;
+                break;
+            };
             handle_scan_subscribe(&req, &state, &mut writer)?;
             break;
         }
@@ -231,7 +405,7 @@ pub(crate) fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
                     // 0.8.4 "mining: true, hashrate: 0" had three different
                     // causes and looked the same from outside.
                     "mining_idle": match g.mining_idle_reason.load(Ordering::Relaxed) {
-                        1 => "behind a peer",
+                        1 => "waiting for network synchronization",
                         2 => "no template",
                         _ => "",
                     },
@@ -556,7 +730,8 @@ fn handle_scan_subscribe(
         .unwrap_or(256)
         .clamp(1, 1_024) as usize;
     let id = req.id.clone();
-
+    // Subscription slots and write timeouts bound resource use. Keep the
+    // stream open because nightfall-wallet follow does not reconnect.
     loop {
         let snap = scan_feed_snapshot(state, from, limit);
         let scanned_to = snap
@@ -620,5 +795,162 @@ mod tests {
         assert!(!is_loopback_addr("0.0.0.0:17881"));
         assert!(!is_loopback_addr("192.168.1.5:17881"));
         assert!(!is_loopback_addr("nonsense"));
+    }
+    #[test]
+    fn resource_slots_are_atomic_and_reclaimed() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let a = reserve(&active, 2).expect("slot a");
+        let b = reserve(&active, 2).expect("slot b");
+        assert!(reserve(&active, 2).is_none());
+        assert_eq!(active.load(Ordering::Acquire), 2);
+        drop(a);
+        let c = reserve(&active, 2).expect("reclaimed slot");
+        drop(b);
+        drop(c);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn framed_rpc_preserves_pipelining_and_rejects_truncated_frames() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap();
+        let sender = thread::spawn(move || {
+            let mut stream = TcpStream::connect(port).unwrap();
+            stream.write_all(b"{\"id\":1}\n{\"id\":2}\n").unwrap();
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        assert_eq!(
+            read_rpc_frame(&mut reader).unwrap(),
+            Some(b"{\"id\":1}\n".to_vec())
+        );
+        assert_eq!(
+            read_rpc_frame(&mut reader).unwrap(),
+            Some(b"{\"id\":2}\n".to_vec())
+        );
+        assert_eq!(read_rpc_frame(&mut reader).unwrap(), None);
+        sender.join().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap();
+        let sender = thread::spawn(move || {
+            let mut stream = TcpStream::connect(port).unwrap();
+            stream.write_all(b"{\"id\":3}").unwrap();
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        assert_eq!(
+            read_rpc_frame(&mut reader).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn overlong_frames_fail_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap();
+        let sender = thread::spawn(move || {
+            let mut stream = TcpStream::connect(port).unwrap();
+            let chunk = vec![b'x'; 8_192];
+            let mut remaining = MAX_MESSAGE_BYTES + 1;
+            while remaining > 0 {
+                let n = remaining.min(chunk.len());
+                if stream.write_all(&chunk[..n]).is_err() {
+                    break; // the server correctly closed the overlong connection
+                }
+                remaining -= n;
+            }
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        assert_eq!(
+            read_rpc_frame(&mut reader).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn drip_fed_partial_frames_exhaust_absolute_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap();
+        let sender = thread::spawn(move || {
+            let mut stream = TcpStream::connect(port).unwrap();
+            for _ in 0..9 {
+                if stream.write_all(b"x").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(60));
+            }
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        let start = Instant::now();
+        assert_eq!(
+            read_rpc_frame_with_budget(&mut reader, Duration::from_millis(260))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(start.elapsed() < Duration::from_secs(3));
+        sender.join().unwrap();
+    }
+    #[test]
+    fn idle_wait_does_not_consume_the_frame_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (start, ready) = std::sync::mpsc::channel();
+
+        let sender = thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            ready.recv().unwrap();
+            thread::sleep(Duration::from_millis(240));
+            s.write_all(b"{\"id\":4}\n").unwrap();
+        });
+
+        let (stream, _) = listener.accept().unwrap();
+        start.send(()).unwrap();
+        let mut reader = BufReader::new(stream);
+
+        assert_eq!(
+            read_rpc_frame_with_limits(
+                &mut reader,
+                Duration::from_millis(80),
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+            Some(b"{\"id\":4}\n".to_vec()),
+        );
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn completely_idle_connections_expire() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (start, ready) = std::sync::mpsc::channel();
+
+        let sender = thread::spawn(move || {
+            let _s = TcpStream::connect(addr).unwrap();
+            ready.recv().unwrap();
+            thread::sleep(Duration::from_millis(400));
+        });
+
+        let (stream, _) = listener.accept().unwrap();
+        start.send(()).unwrap();
+        let mut reader = BufReader::new(stream);
+
+        assert_eq!(
+            read_rpc_frame_with_limits(
+                &mut reader,
+                Duration::from_millis(40),
+                Duration::from_millis(120),
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::TimedOut,
+        );
+        sender.join().unwrap();
     }
 }

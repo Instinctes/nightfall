@@ -180,6 +180,35 @@ fn a_lighter_chain_is_declined_not_accused() {
 }
 
 #[test]
+fn reorg_depth_boundary_is_inclusive() {
+    // MAX_REORG_DEPTH is the largest permitted rewind. Only a rewind
+    // strictly beyond the bound may be rejected as ReorgTooDeep.
+    let miner = WalletKeys::generate().address();
+    let mut mined = devnet();
+    let template = mined.mine_block(&miner, vec![], NOW).unwrap();
+
+    let candidate = vec![template; MAX_REORG_DEPTH + 2];
+
+    let at_limit = vec![Hash256([0xA1; 32]); MAX_REORG_DEPTH];
+    assert_eq!(reorg_rewind(&at_limit, &candidate), MAX_REORG_DEPTH);
+
+    let verdict = Chain::evaluate_reorg(NetworkId::Devnet, 0, &at_limit, candidate.clone(), NOW);
+    assert!(
+        !matches!(verdict, Err(ConsensusError::ReorgTooDeep)),
+        "a rewind exactly at MAX_REORG_DEPTH must pass the depth bound, got {verdict:?}"
+    );
+
+    let past_limit = vec![Hash256([0xA1; 32]); MAX_REORG_DEPTH + 1];
+    assert_eq!(reorg_rewind(&past_limit, &candidate), MAX_REORG_DEPTH + 1);
+
+    let verdict = Chain::evaluate_reorg(NetworkId::Devnet, 0, &past_limit, candidate, NOW);
+    assert!(
+        matches!(verdict, Err(ConsensusError::ReorgTooDeep)),
+        "a rewind past MAX_REORG_DEPTH must be refused, got {verdict:?}"
+    );
+}
+
+#[test]
 fn reorg_depth_is_the_rewind_not_the_length() {
     // Depth is how many of *our* blocks we would drop. A peer that shares
     // nothing with a 501-block history is too deep even if it only sends a
@@ -1234,6 +1263,96 @@ fn failed_pruned_candidate_rebuild_cannot_touch_live_chain() {
     ours.verify_supply().unwrap();
 }
 
+#[test]
+fn suffix_reorg_keeps_history_and_matches_the_heavier_tip() {
+    // The seed case: one competing tip, then the network pulls ahead. The
+    // adopt must not need a second copy of the shared history.
+    let miner = WalletKeys::generate().address();
+    let mut shared = devnet();
+    for i in 0..4u64 {
+        shared
+            .mine_block(&miner, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+    let ancestor = shared.tip_height().unwrap().0;
+    let genesis = shared.block_by_height(0).unwrap().hash();
+
+    let mut ours = Chain::new_fair(NetworkId::Devnet).unwrap();
+    ours.try_ingest_blocks(shared.blocks.clone(), NOW + 1_000)
+        .unwrap();
+    ours.mine_block(&miner, vec![], NOW + 4 * TARGET_BLOCK_TIME_SECS)
+        .unwrap();
+    let stale_root = ours.ledger.utxo_root();
+
+    let mut theirs = Chain::new_fair(NetworkId::Devnet).unwrap();
+    theirs
+        .try_ingest_blocks(shared.blocks.clone(), NOW + 1_000)
+        .unwrap();
+    for i in 0..3u64 {
+        theirs
+            .mine_block(&miner, vec![], NOW + (4 + i) * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+
+    let suffix: Vec<Block> = theirs
+        .blocks
+        .iter()
+        .filter(|block| block.header.height.0 > ancestor)
+        .cloned()
+        .collect();
+    assert_eq!(suffix.len(), 3);
+    let trial = ours.prepare_suffix_trial(ancestor).unwrap();
+    let reorg = Chain::finish_suffix(trial, suffix, NOW + 10_000)
+        .unwrap()
+        .expect("heavier suffix");
+    assert!(ours.splice_suffix(reorg));
+    assert_eq!(ours.tip_hash(), theirs.tip_hash());
+    assert_eq!(ours.block_by_height(0).unwrap().hash(), genesis);
+    assert_ne!(ours.ledger.utxo_root(), stale_root);
+    ours.verify_supply().unwrap();
+    assert_eq!(ours.undos.len(), theirs.block_count() as usize);
+}
+
+#[test]
+fn a_rejected_block_does_not_move_the_ledger() {
+    let mut chain = devnet();
+    let miner = WalletKeys::generate().address();
+    chain.mine_block(&miner, vec![], NOW).unwrap();
+    let root = chain.ledger.utxo_root();
+    let work = chain.total_work;
+    let mut block = chain
+        .build_template(&miner, vec![], NOW + TARGET_BLOCK_TIME_SECS)
+        .unwrap()
+        .seal(0);
+    block.header.nonce = 0;
+    while block.pow_is_valid(chain.pow_params()) {
+        block.header.nonce = block.header.nonce.wrapping_add(1);
+    }
+    assert!(chain
+        .apply_block(block, NOW + TARGET_BLOCK_TIME_SECS)
+        .is_err());
+    assert_eq!(chain.ledger.utxo_root(), root);
+    assert_eq!(chain.total_work, work);
+    assert_eq!(chain.block_count(), 1);
+}
+
+#[test]
+fn undo_rewind_matches_the_chain_before_the_last_block() {
+    let miner = WalletKeys::generate().address();
+    let mut chain = devnet();
+    chain.mine_block(&miner, vec![], NOW).unwrap();
+    let root = chain.ledger.utxo_root();
+    let work = chain.total_work;
+    chain
+        .mine_block(&miner, vec![], NOW + TARGET_BLOCK_TIME_SECS)
+        .unwrap();
+    let undo = chain.undos.back().unwrap();
+    let mut ledger = chain.ledger.clone();
+    ledger.rewind(&undo.state);
+    assert_eq!(ledger.utxo_root(), root);
+    assert_eq!(chain.total_work - undo.work, work);
+}
+
 /// Seal a template with real work and apply it. The devnet difficulty is low
 /// enough that this is a handful of hashes, not a wait.
 fn mine_template(chain: &mut Chain, template: BlockTemplate) -> Hash256 {
@@ -1327,5 +1446,54 @@ fn the_mempool_can_be_reconciled_against_the_chain() {
     assert!(
         mp.first_seen(&poison_id).is_none(),
         "the timestamp index has to shrink with the map"
+    );
+}
+
+#[test]
+fn bodies_through_handles_max_height_after_pruning() {
+    let mut chain = devnet();
+    let miner = WalletKeys::generate().address();
+
+    for i in 0..3u64 {
+        chain
+            .mine_block(&miner, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+
+    assert_eq!(chain.prune_keep(1).unwrap(), 2);
+    assert_eq!(chain.first_height, 2);
+
+    // A hostile/extreme height must not overflow `height + 1`.
+    assert!(chain.bodies_through(u64::MAX).is_none());
+
+    // Preserve the prune-boundary semantics.
+    assert_eq!(chain.bodies_through(1), Some(Vec::new()));
+    assert!(chain.bodies_through(0).is_none());
+}
+
+#[test]
+fn oversized_block_is_rejected_before_pow() {
+    let mut chain = devnet();
+    let miner = WalletKeys::generate().address();
+
+    // Start from a structurally normal template, but deliberately do not mine it.
+    let mut block = chain.build_template(&miner, vec![], NOW).unwrap().seal(0);
+
+    // Exceed an existing consensus aggregate limit. The duplicated outputs do
+    // not need to be otherwise valid: size must win before PoW or ledger crypto.
+    let output = block.body.outputs[0].clone();
+    block
+        .body
+        .outputs
+        .resize(nightfall_ledger::MAX_BLOCK_OUTPUTS + 1, output);
+
+    let res = chain.apply_block(block, NOW);
+    assert!(
+        matches!(
+            res,
+            Err(ConsensusError::Ledger(ref msg))
+                if msg == &nightfall_ledger::LedgerError::BlockTooLarge.to_string()
+        ),
+        "oversized body must be rejected before proof of work, got {res:?}"
     );
 }

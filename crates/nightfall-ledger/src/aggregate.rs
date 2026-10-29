@@ -40,11 +40,14 @@
 //! closing it. Closing it needs a proof system that can authorise a spend
 //! without publishing a per-input signature.
 
-use nightfall_crypto::{domain, hash_multi, Commitment, KernelFeature, Output, TxKernel};
+use nightfall_crypto::{
+    domain, hash_multi, Commitment, KernelFeature, Output, SchnorrSig, TxKernel,
+};
 use nightfall_types::Hash256;
 use serde::{Deserialize, Serialize};
 
 use crate::tx::{Input, Transaction};
+use crate::{MAX_BLOCK_INPUTS, MAX_BLOCK_KERNELS, MAX_BLOCK_OUTPUTS};
 
 /// The aggregated contents of a block.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,9 +55,22 @@ pub struct BlockBody {
     pub inputs: Vec<Input>,
     pub outputs: Vec<Output>,
     pub kernels: Vec<TxKernel>,
+    /// Σ of every transaction's stealth offset. Binding fork on.
+    #[serde(default)]
+    pub stealth_offset: Option<[u8; 32]>,
+    /// Σ of every transaction's kernel offset. Binding fork on.
+    #[serde(default)]
+    pub kernel_offset: Option<[u8; 32]>,
 }
 
 impl BlockBody {
+    /// Cheap structural bound used before expensive cryptographic validation.
+    pub fn exceeds_size_limits(&self) -> bool {
+        self.inputs.len() > MAX_BLOCK_INPUTS
+            || self.outputs.len() > MAX_BLOCK_OUTPUTS
+            || self.kernels.len() > MAX_BLOCK_KERNELS
+    }
+
     /// Merge transactions into one aggregate and sort it canonically.
     ///
     /// The coinbase transaction is folded in exactly like any other; it is
@@ -65,9 +81,35 @@ impl BlockBody {
             body.inputs.extend(tx.inputs.iter().cloned());
             body.outputs.extend(tx.outputs.iter().cloned());
             body.kernels.extend(tx.kernels.iter().cloned());
+            body.stealth_offset = crate::tx::add_offsets(body.stealth_offset, tx.stealth_offset);
+            body.kernel_offset = crate::tx::add_offsets(body.kernel_offset, tx.kernel_offset);
         }
         body.canonicalise();
         body
+    }
+
+    /// Restore the 1.0.x shape. Every block below the binding fork is
+    /// validated, hashed and stored in this shape, so a 1.0.x node and this
+    /// one agree byte for byte on everything below the fork.
+    pub fn strip_binding(&mut self) {
+        for i in &mut self.inputs {
+            i.strip_binding();
+        }
+        for k in &mut self.kernels {
+            k.strip_binding();
+        }
+        self.stealth_offset = None;
+        self.kernel_offset = None;
+    }
+
+    pub fn has_any_binding(&self) -> bool {
+        self.stealth_offset.is_some()
+            || self.kernel_offset.is_some()
+            || self.inputs.iter().any(Input::has_binding)
+            || self
+                .kernels
+                .iter()
+                .any(|k| k.stealth_excess.is_some() || k.stealth_sig.is_some())
     }
 
     /// Sort every set into the one order the network agrees on.
@@ -87,8 +129,12 @@ impl BlockBody {
         copy == *self
     }
 
+    /// Wrapping sum, as 1.0.x release builds computed it. Below the binding
+    /// fork consensus depends on exactly this value.
     pub fn total_fee(&self) -> u64 {
-        self.kernels.iter().map(|k| k.fee_darks).sum()
+        self.kernels
+            .iter()
+            .fold(0u64, |acc, k| acc.wrapping_add(k.fee_darks))
     }
 
     pub fn total_reward(&self) -> u64 {
@@ -115,11 +161,23 @@ impl BlockBody {
 
     /// Hash over the whole aggregate. Committed to by the block header.
     pub fn hash(&self) -> Hash256 {
+        // A body without binding fields hashes exactly as in 1.0.x; that is
+        // what keeps every pre-fork block's root unchanged.
+        let bound = self.has_any_binding();
         let mut parts: Vec<Vec<u8>> = Vec::new();
         for i in &self.inputs {
             let mut v = i.commit.0.to_vec();
             v.extend_from_slice(&i.sig.r);
             v.extend_from_slice(&i.sig.s);
+            if bound {
+                v.extend_from_slice(&i.input_key.unwrap_or_default());
+                let ks = i.key_sig.unwrap_or(SchnorrSig {
+                    r: [0; 32],
+                    s: [0; 32],
+                });
+                v.extend_from_slice(&ks.r);
+                v.extend_from_slice(&ks.s);
+            }
             parts.push(v);
         }
         for o in &self.outputs {
@@ -132,7 +190,22 @@ impl BlockBody {
             let mut v = k.signing_message();
             v.extend_from_slice(&k.excess_sig.r);
             v.extend_from_slice(&k.excess_sig.s);
+            if bound {
+                v.extend_from_slice(&k.stealth_excess.unwrap_or_default());
+                let ss = k.stealth_sig.unwrap_or(SchnorrSig {
+                    r: [0; 32],
+                    s: [0; 32],
+                });
+                v.extend_from_slice(&ss.r);
+                v.extend_from_slice(&ss.s);
+            }
             parts.push(v);
+        }
+        if bound {
+            parts.push(self.stealth_offset.unwrap_or_default().to_vec());
+            parts.push(self.kernel_offset.unwrap_or_default().to_vec());
+            let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
+            return hash_multi(domain::TXBODY_BOUND, &refs);
         }
         let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
         hash_multi(domain::TXBODY, &refs)

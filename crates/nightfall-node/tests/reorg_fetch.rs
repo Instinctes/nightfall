@@ -2,9 +2,9 @@
 
 use nightfall_consensus::MAX_REORG_DEPTH;
 use nightfall_node::runtime::{
-    merge_directory_peers, mining_should_wait, outbound_dial_list, peers_to_remember,
-    pick_eviction_victim, reorg_fetch_cap, EvictionCandidate, IBD_BEHIND, MAX_CATCHUP_WAIT_SECS,
-    MAX_OUTBOUND_EXTRA, MAX_REORG_FETCH, PEER_HEIGHT_TTL_SECS,
+    merge_directory_peers, mining_should_wait, next_fetch_height, outbound_dial_list,
+    peers_to_remember, pick_eviction_victim, reorg_fetch_cap, EvictionCandidate, IBD_BEHIND,
+    MAX_CATCHUP_WAIT_SECS, MAX_OUTBOUND_EXTRA, MAX_REORG_FETCH, PEER_HEIGHT_TTL_SECS,
 };
 
 #[test]
@@ -36,8 +36,15 @@ fn a_peer_thousands_ahead_on_a_shallow_fork_is_still_fetched() {
 
 #[test]
 fn a_liar_advertising_u64_max_is_capped() {
-    let cap = reorg_fetch_cap(u64::MAX - 1, 0);
-    assert_eq!(cap, MAX_REORG_FETCH);
+    assert_eq!(reorg_fetch_cap(u64::MAX - 1, 0), MAX_REORG_FETCH);
+    assert_eq!(reorg_fetch_cap(u64::MAX, 0), MAX_REORG_FETCH);
+}
+
+#[test]
+fn fetch_height_stops_at_u64_max() {
+    assert_eq!(next_fetch_height(41), Some(42));
+    assert_eq!(next_fetch_height(u64::MAX - 1), Some(u64::MAX));
+    assert_eq!(next_fetch_height(u64::MAX), None);
 }
 
 #[test]
@@ -103,6 +110,46 @@ fn a_fresh_ahead_peer_holds_mining() {
     assert_eq!(
         mining_should_wait(1_900, 1_899, 2_500, now, now, now),
         Some(601)
+    );
+}
+
+#[test]
+fn a_fresh_ahead_peer_holds_mining_however_long_the_sync_takes() {
+    // The catch-up escape must NOT apply while a live peer is known to be
+    // ahead. Every initial sync is longer than MAX_CATCHUP_WAIT_SECS, so
+    // letting the window expire here starts mining at the low historical
+    // difficulty of a stale tip and forks the node onto a private chain.
+    //
+    // Observed on mainnet: a node 196,000 blocks behind mined block 94,080
+    // eleven minutes after receiving that height from a peer, then could never
+    // reorg back. 1,491 blocks were mined during one resync.
+    let start = 1_800_000_000;
+    let now = start + MAX_CATCHUP_WAIT_SECS + 1;
+    assert_eq!(
+        mining_should_wait(94_080, 94_080, 290_000, now, start, now),
+        Some(195_920),
+        "a node with a fresh peer 195,920 blocks ahead must keep waiting"
+    );
+
+    // Still true much later -- a long sync is not evidence of isolation.
+    let much_later = start + 86_400;
+    assert_eq!(
+        mining_should_wait(94_080, 94_080, 290_000, much_later, start, much_later),
+        Some(195_920)
+    );
+}
+
+#[test]
+fn an_ahead_peer_going_stale_still_releases_mining() {
+    // The escape must survive for the case it was written for: the peer
+    // stops answering, its height ages past the TTL, and an otherwise
+    // isolated node must not stay bricked.
+    let start = 1_800_000_000;
+    let seen = start;
+    let now = seen + PEER_HEIGHT_TTL_SECS + MAX_CATCHUP_WAIT_SECS + 1;
+    assert_eq!(
+        mining_should_wait(94_080, 94_080, 290_000, seen, start, now),
+        None
     );
 }
 

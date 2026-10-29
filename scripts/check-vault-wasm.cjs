@@ -7,7 +7,34 @@ const {performance} = require('node:perf_hooks');
 const [bindingFile, nativeFile, wasmFile, fundedFile] = process.argv.slice(2);
 assert.ok(bindingFile && nativeFile && wasmFile && fundedFile,'Pass generated bindings, native fixture, new WASM fixture, and funded fixture paths.');
 globalThis.crypto ??= require('node:crypto').webcrypto;
-const {BrowserVault} = require(path.resolve(bindingFile));
+// NIGHTFALL_WIZARD_WASM_EXPORT_SURFACE_V1
+// Guard the generated JavaScript/WASM export surface (not merely Rust source).
+// This fixture test does not access live wallets or the network.
+const wasmBindings = require(path.resolve(bindingFile));
+const {BrowserVault} = wasmBindings;
+
+const forbiddenExports = [
+  'create_wallet', 'restore_wallet', 'wallet_address', 'wallet_phrase',
+  'wallet_view_key', 'wallet_scan_from', 'wallet_info', 'reset_scan',
+  'ingest_page', 'wallet_balance', 'wallet_history', 'build_send',
+];
+for (const name of forbiddenExports) {
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(wasmBindings, name),
+    false,
+    `legacy raw-state WASM export must not exist: ${name}`
+  );
+}
+for (const name of [
+  'BrowserVault', 'requestQrSvg', 'address_qr_svg', 'probe_crypto',
+]) {
+  assert.equal(
+    typeof wasmBindings[name],
+    'function',
+    `required WASM export missing: ${name}`
+  );
+}
+
 const PASSWORD = 'Nightfall public interop test password';
 // Public 256-bit zero-entropy BIP39 test vector. Never fund it.
 const PHRASE = Array(23).fill('abandon').concat('art').join(' ');
@@ -25,7 +52,7 @@ const info = JSON.parse(vault.info());
 assert.equal(info.birth_height,42); assert.equal(info.scanned_to,42);
 assert.equal(vault.recoveryWords(),PHRASE);
 vault.checkRecovery(PHRASE.toUpperCase());
-assert.throws(()=>vault.checkRecovery('invalid phrase'),/24 recovery words/);
+assert.throws(()=>vault.checkRecovery('invalid phrase'),/That is 2 words\. Recovery needs all 24/);
 assert.equal(JSON.parse(vault.balance(42)).total,'0.00000000');
 assert.deepEqual(JSON.parse(vault.history()),[]);
 assert.throws(()=>vault.balance(NaN),/safe integer/);
@@ -76,6 +103,22 @@ assert.equal(fundedInfo.scanned_to,1);
 const TIP = 5_000, WHEN = 1_800_000_500;
 const elsewhere = BrowserVault.create(PASSWORD,0);
 const target = elsewhere.address();
+
+// The native fixture ends at block 1. A newer browser requires a current,
+// continuous scan before any signing. Do not bypass that gate in an old test.
+assert.throws(()=>funded.prepareSend(target,'1.00000000','',TIP,WHEN), /scan.*height/);
+assert.match(fundedInfo.scan_anchor, /^[a-f0-9]{64}$/);
+let from = fundedInfo.scanned_to;
+while (from < TIP) {
+  const end = Math.min(TIP, from + 1023);
+  const first = JSON.parse(funded.info()).scan_anchor;
+  const last = end.toString(16).padStart(64, '0');
+  // Public synthetic empty light pages: continuity/maturity fixture only,
+  // not a claim that a real Mainnet node served these boundaries.
+  funded.ingestAnchoredPage('[]','[]',from,end,first,last);
+  from = end;
+}
+assert.equal(JSON.parse(funded.info()).scanned_to, TIP);
 
 const before = funded.info(), beforeHistory = funded.history();
 // Two mined coins, so two history rows before any payment exists.

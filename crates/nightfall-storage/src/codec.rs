@@ -43,6 +43,129 @@ pub const BLOCKS_JSONL: &str = "blocks.jsonl";
 /// case, not the normal one.
 const MAX_RECORD_BYTES: u32 = 8 * 1024 * 1024;
 
+/// Prefix of every binary record written by a build that knows the binding
+/// fields.
+///
+/// bincode is not self-describing: the binding fields change the layout of
+/// inputs, kernels and bodies, so a 1.0.x record cannot be read as the new
+/// type. A 1.0.x record always starts with the header's protocol version,
+/// `08 00 00 00`; this prefix starts with `0xFF` and can never be one.
+pub const RECORD_V2_MAGIC: [u8; 8] = *b"\xFFNFBLK\x02\x00";
+
+fn decode_binary_record(buf: &[u8]) -> anyhow::Result<Block> {
+    if let Some(rest) = buf.strip_prefix(&RECORD_V2_MAGIC) {
+        return Ok(bincode::deserialize(rest)?);
+    }
+    let legacy: legacy::Block = bincode::deserialize(buf)?;
+    Ok(legacy.into())
+}
+
+/// The 1.0.x binary layout, kept only to read files written before the
+/// binding fields existed.
+mod legacy {
+    use nightfall_consensus::BlockHeader;
+    use nightfall_crypto::{Commitment, KernelFeature, Output, SchnorrSig, TxKernel};
+    use nightfall_ledger::{BlockBody, Input};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize)]
+    pub struct Block {
+        header: BlockHeader,
+        body: Body,
+    }
+
+    impl Block {
+        /// The 1.0.x shape of `b`. Only for blocks without binding fields.
+        pub fn from_current(b: &nightfall_consensus::Block) -> Self {
+            Self {
+                header: b.header.clone(),
+                body: Body {
+                    inputs: b
+                        .body
+                        .inputs
+                        .iter()
+                        .map(|i| LegacyInput {
+                            commit: i.commit,
+                            sig: i.sig,
+                        })
+                        .collect(),
+                    outputs: b.body.outputs.clone(),
+                    kernels: b
+                        .body
+                        .kernels
+                        .iter()
+                        .map(|k| LegacyKernel {
+                            feature: k.feature,
+                            fee_darks: k.fee_darks,
+                            reward_darks: k.reward_darks,
+                            lock_height: k.lock_height,
+                            excess: k.excess,
+                            excess_sig: k.excess_sig,
+                        })
+                        .collect(),
+                },
+            }
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Body {
+        inputs: Vec<LegacyInput>,
+        outputs: Vec<Output>,
+        kernels: Vec<LegacyKernel>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct LegacyInput {
+        commit: Commitment,
+        sig: SchnorrSig,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct LegacyKernel {
+        feature: KernelFeature,
+        fee_darks: u64,
+        reward_darks: u64,
+        lock_height: u64,
+        excess: Commitment,
+        excess_sig: SchnorrSig,
+    }
+
+    impl From<Block> for nightfall_consensus::Block {
+        fn from(b: Block) -> Self {
+            nightfall_consensus::Block {
+                header: b.header,
+                body: BlockBody {
+                    inputs: b
+                        .body
+                        .inputs
+                        .into_iter()
+                        .map(|i| Input::legacy(i.commit, i.sig))
+                        .collect(),
+                    outputs: b.body.outputs,
+                    kernels: b
+                        .body
+                        .kernels
+                        .into_iter()
+                        .map(|k| TxKernel {
+                            feature: k.feature,
+                            fee_darks: k.fee_darks,
+                            reward_darks: k.reward_darks,
+                            lock_height: k.lock_height,
+                            excess: k.excess,
+                            excess_sig: k.excess_sig,
+                            stealth_excess: None,
+                            stealth_sig: None,
+                        })
+                        .collect(),
+                    stealth_offset: None,
+                    kernel_offset: None,
+                },
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Format {
     Json,
@@ -90,7 +213,16 @@ pub fn write_block<W: Write>(w: &mut W, block: &Block, fmt: Format) -> anyhow::R
             w.write_all(b"\n")?;
         }
         Format::Binary => {
-            let bytes = bincode::serialize(block)?;
+            // Blocks without binding fields — every block below the fork —
+            // keep the 1.0.x layout byte for byte, so a datadir or bootstrap
+            // archive written now still loads in 1.0.x until the fork.
+            let bytes = if block.body.has_any_binding() {
+                let mut v = RECORD_V2_MAGIC.to_vec();
+                v.extend_from_slice(&bincode::serialize(block)?);
+                v
+            } else {
+                bincode::serialize(&legacy::Block::from_current(block))?
+            };
             let len = u32::try_from(bytes.len())
                 .map_err(|_| anyhow::anyhow!("block is absurdly large: {} bytes", bytes.len()))?;
             if len > MAX_RECORD_BYTES {
@@ -128,11 +260,19 @@ pub fn read_blocks<R: Read>(r: R, fmt: Format) -> anyhow::Result<Vec<Block>> {
             let mut i = 0usize;
             let mut first = true;
             loop {
-                match r.read_exact(&mut len_buf) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => return Err(e.into()),
+                // EOF is valid only between complete records. Once any byte
+                // of the next four-byte length prefix exists, losing the
+                // remainder means the file is truncated.
+                if r.fill_buf()?.is_empty() {
+                    break;
                 }
+                r.read_exact(&mut len_buf).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        anyhow::anyhow!("block {i} has a truncated length prefix")
+                    } else {
+                        anyhow::Error::from(e)
+                    }
+                })?;
                 // A JSON chain file in a binary datadir reads its first two
                 // characters as part of a length prefix and reports an absurd
                 // number, which tells the operator nothing. Name it instead:
@@ -154,7 +294,7 @@ pub fn read_blocks<R: Read>(r: R, fmt: Format) -> anyhow::Result<Vec<Block>> {
                     anyhow::anyhow!("block {i} is truncated after {len} declared bytes: {e}")
                 })?;
                 out.push(
-                    bincode::deserialize(&buf)
+                    decode_binary_record(&buf)
                         .map_err(|e| anyhow::anyhow!("block {i} is corrupt: {e}"))?,
                 );
                 i += 1;
@@ -179,6 +319,37 @@ mod tests {
                 .unwrap();
         }
         c
+    }
+
+    /// Pre-fork blocks keep the 1.0.x byte layout; post-fork blocks carry the
+    /// v2 prefix; both read back to the identical chain.
+    #[test]
+    fn records_switch_layout_exactly_at_the_binding_fork() {
+        let mut c = Chain::new_fair(NetworkId::Devnet).unwrap();
+        let miner = WalletKeys::generate().address();
+        let fork = NetworkId::Devnet.binding_fork_height();
+        for i in 0..fork + 3 {
+            c.mine_block(&miner, vec![], 1_800_000_000 + i * 15)
+                .unwrap();
+        }
+        let mut buf = Vec::new();
+        for b in &c.blocks {
+            let mut one = Vec::new();
+            write_block(&mut one, b, Format::Binary).unwrap();
+            let body = &one[4..];
+            if b.header.height.0 < fork {
+                assert_eq!(&body[..4], &8u32.to_le_bytes(), "1.0.x layout");
+                assert_eq!(
+                    one[4..],
+                    bincode::serialize(&legacy::Block::from_current(b)).unwrap()[..]
+                );
+            } else {
+                assert_eq!(&body[..8], &RECORD_V2_MAGIC);
+            }
+            buf.extend_from_slice(&one);
+        }
+        let back = read_blocks(&buf[..], Format::Binary).unwrap();
+        assert_eq!(back, c.blocks);
     }
 
     /// The property the whole change rests on: the format is a container, not
@@ -236,6 +407,29 @@ mod tests {
             err.contains("truncated"),
             "a short file must say so, got: {err}"
         );
+    }
+
+    #[test]
+    fn a_partial_binary_length_prefix_is_refused() {
+        let chain = sample_chain();
+        let mut complete = Vec::new();
+        for block in &chain.blocks {
+            write_block(&mut complete, block, Format::Binary).unwrap();
+        }
+
+        let next_len = 1u32.to_le_bytes();
+        for prefix_len in 1..=3 {
+            let mut buf = complete.clone();
+            buf.extend_from_slice(&next_len[..prefix_len]);
+
+            let err = read_blocks(&buf[..], Format::Binary)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("truncated") && err.contains("length prefix"),
+                "{prefix_len}-byte partial prefix returned the wrong error: {err}"
+            );
+        }
     }
 
     #[test]

@@ -149,6 +149,12 @@ fn socks5_connect(stream: &mut TcpStream, dest: &str, timeout: Duration) -> std:
             "not a SOCKS5 reply",
         ));
     }
+    if head[2] != 0x00 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "SOCKS5 reply has a nonzero reserved byte",
+        ));
+    }
     if head[1] != 0x00 {
         return Err(std::io::Error::other(format!(
             "SOCKS5 CONNECT failed (code {})",
@@ -203,6 +209,44 @@ mod tests {
         assert!(looks_like_dial_target("[2001:db8::1]:17891"));
         assert!(!looks_like_dial_target("no-port"));
         assert!(!looks_like_dial_target(":17891"));
+    }
+
+    #[test]
+    fn rejects_nonzero_reserved_byte_in_socks5_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+
+        let mock = thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+
+            let mut greeting = [0u8; 3];
+            peer.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            peer.write_all(&[5, 0]).unwrap();
+
+            let mut request = [0u8; 4];
+            peer.read_exact(&mut request).unwrap();
+            assert_eq!(request, [5, 1, 0, 1]);
+
+            let mut address_and_port = [0u8; 6];
+            peer.read_exact(&mut address_and_port).unwrap();
+
+            // Malformed reply: nonzero reserved byte.
+            peer.write_all(&[5, 0, 1, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+        });
+
+        let proxy = SocksProxy {
+            addr: proxy_addr.to_string(),
+        };
+
+        let result = proxy.connect("127.0.0.1:17891", 2_000);
+
+        mock.join().unwrap();
+
+        match result {
+            Ok(_) => panic!("invalid SOCKS5 reserved byte was accepted"),
+            Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::InvalidData),
+        }
     }
 
     #[test]

@@ -110,32 +110,41 @@ Protocol-v8 consensus remains unchanged:
 
 ### Normal block acceptance
 
-Canonical validation still runs first against a scratch `LedgerState`.
+The current upstream consensus uses in-place canonical ledger
+validation together with a `StateUndo` rollback record.
 
-Only after the canonical scratch state has passed all existing block, UTXO,
-kernel and supply checks is the same accepted transition mirrored into the
-authenticated shadow tree.
+Only after the existing canonical block, UTXO, kernel and
+supply checks have passed is the transition mirrored into
+the experimental authenticated UTXO tree.
 
-The shadow transition must then match the canonical UTXO set exactly and its
-incremental root must equal an independent clean rebuild.
+The shadow transition checks its leaf map against the
+canonical UTXO set and compares its incremental root
+against an independent rebuild.
 
-If the shadow transition fails, its delta undo journal restores the exact
-pre-transition shadow state and the canonical scratch ledger is not committed.
+If the shadow transition fails, its own delta journal
+restores the prior shadow state and the canonical ledger
+is rewound with `StateUndo`.
 
-The live chain therefore cannot advance with canonical and authenticated state
-at different heights.
+Chain tip, accumulated work, headers, block history and
+the undo window are updated only after shadow success.
+
+The experimental shadow remains outside consensus data.
+Its fail-closed availability implications require review.
 
 ### Trusted local replay
 
-`apply_block_from_own_disk` also advances canonical and authenticated state as
-one logical transition.
+`apply_block_from_own_disk` retains upstream binding-field
+normalization and canonical state-only replay.
 
-The canonical state is first reconstructed on a scratch ledger. The
-authenticated delta is then checked against that result before the canonical
-scratch state becomes live.
+It captures canonical undo state before replay and mirrors
+the resulting UTXO transition into the shadow.
 
-A failed authenticated transition leaves tip, cumulative work, block history,
-headers, canonical ledger and supply state unchanged.
+On a shadow failure, the canonical ledger is rewound.
+The chain tip, accumulated work, block history and undo
+window must remain unchanged.
+
+Trusted replay is not a substitute for validating
+untrusted peer blocks.
 
 ### Pruned-chain reconstruction
 

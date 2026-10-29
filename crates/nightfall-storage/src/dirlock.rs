@@ -82,12 +82,7 @@ impl DirLock {
 pub fn acquire(dir: &Path) -> Result<DirLock, LockError> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(LOCK_FILE);
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)?;
+    let mut file = open_lock_file(&path)?;
 
     if !try_lock(&file) {
         return Err(LockError::Busy {
@@ -101,6 +96,76 @@ pub fn acquire(dir: &Path) -> Result<DirLock, LockError> {
     let _ = file.flush();
 
     Ok(DirLock { _file: file, path })
+}
+
+/// Open the lock entry itself, without following a substituted symlink/reparse
+/// point. Validate the open handle before writing any PID, including hardlinks.
+fn open_lock_file(path: &Path) -> Result<File, LockError> {
+    if let Ok(md) = std::fs::symlink_metadata(path) {
+        if md.file_type().is_symlink() {
+            return Err(symlink_refused(path));
+        }
+    }
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = opts.open(path).map_err(|e| {
+        #[cfg(unix)]
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            return symlink_refused(path);
+        }
+        LockError::Io(e)
+    })?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(symlink_refused(path));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(symlink_refused(path));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::{fs::MetadataExt, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
+        };
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(symlink_refused(path));
+        }
+        // SAFETY: file owns this live handle; info is writable and outlives the call.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
+            return Err(LockError::Io(std::io::Error::last_os_error()));
+        }
+        if info.nNumberOfLinks != 1 {
+            return Err(symlink_refused(path));
+        }
+    }
+    Ok(file)
+}
+
+fn symlink_refused(path: &Path) -> LockError {
+    LockError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "{} is a symlink, hard link or non-regular lock; refusing to write it",
+            path.display()
+        ),
+    ))
 }
 
 #[cfg(unix)]
@@ -238,7 +303,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(b);
     }
 
+    /// A symlinked lock file must not be followed: acquisition would
+    /// otherwise write through to the link's target.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_lock_file_is_refused() {
+        let d = tmpdir();
+        let victim = tmpdir().join("victim");
+        std::fs::write(&victim, b"do not touch").unwrap();
+        std::os::unix::fs::symlink(&victim, d.join(LOCK_FILE)).unwrap();
+        let err = acquire(&d).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
     /// A directory that does not exist yet is the normal first run.
+    #[test]
+    fn a_hardlinked_lock_never_overwrites_its_other_name() {
+        let dir = tmpdir();
+        let victim = dir.join("unrelated.txt");
+        std::fs::write(&victim, b"must remain unchanged").unwrap();
+        std::fs::hard_link(&victim, dir.join(LOCK_FILE)).unwrap();
+        assert!(acquire(&dir).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"must remain unchanged");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_lock_is_refused_without_waiting_for_a_writer() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tmpdir();
+        let path = CString::new(dir.join(LOCK_FILE).as_os_str().as_bytes()).unwrap();
+        // SAFETY: path is a NUL-terminated pathname in this disposable directory.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        assert!(acquire(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn a_missing_directory_is_created() {
         let d = tmpdir().join("deeper").join("still-deeper");
