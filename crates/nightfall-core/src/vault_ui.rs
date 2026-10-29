@@ -273,6 +273,45 @@ mod tests {
     }
 
     #[test]
+    fn prior_backup_diagnostic_is_hidden_on_lock_but_critical_failure_stays_visible() {
+        fn has_text(shape: &egui::epaint::Shape, needle: &str) -> bool {
+            match shape {
+                egui::epaint::Shape::Text(text) => text.galley.job.text.contains(needle),
+                egui::epaint::Shape::Vec(shapes) => shapes.iter().any(|s| has_text(s, needle)),
+                _ => false,
+            }
+        }
+        for (custody, backup, discarded, visible) in [
+            (Custody::Failed, true, true, true),
+            (Custody::Locked, true, true, false),
+            (Custody::Locked, false, true, false),
+            (Custody::Locked, false, false, true),
+        ] {
+            let ctx = egui::Context::default();
+            let mut vault = VaultUi {
+                custody,
+                feedback_is_backup: backup,
+                discard_unlock: discarded,
+                error: Some("PUBLIC UNIQUE DIAGNOSTIC".into()),
+                ..Default::default()
+            };
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    vault.show(ui, true);
+                });
+            });
+            assert_eq!(
+                output
+                    .shapes
+                    .iter()
+                    .any(|s| has_text(&s.shape, "PUBLIC UNIQUE DIAGNOSTIC")),
+                visible,
+                "{custody:?}"
+            );
+        }
+    }
+
+    #[test]
     fn backup_controls_refuse_unconfirmed_relative_or_locked_requests_and_clear_on_hide() {
         let f = Fixture::new();
         let wallet = Arc::new(Mutex::new(WalletState::empty()));
@@ -838,6 +877,7 @@ pub struct VaultUi {
     backup_password: Zeroizing<String>,
     backup_acknowledged: bool,
     notice: Option<String>,
+    feedback_is_backup: bool,
     pub error: Option<String>,
     pub payment_result: Option<Result<String, String>>,
     payment_active: bool,
@@ -859,6 +899,7 @@ impl Default for VaultUi {
             backup_password: Zeroizing::new(String::new()),
             backup_acknowledged: false,
             notice: None,
+            feedback_is_backup: false,
             error: None,
             payment_result: None,
             payment_active: false,
@@ -988,6 +1029,9 @@ impl VaultUi {
         ctx: egui::Context,
     ) {
         if action == Action::Lock {
+            self.error = None;
+            self.notice = None;
+            self.feedback_is_backup = false;
             self.discard_unlock = true;
             self.clear_fields();
             if self.busy() {
@@ -1003,6 +1047,7 @@ impl VaultUi {
             return;
         }
         let backup_action = matches!(action, Action::ExportBackup | Action::VerifyBackup);
+        self.feedback_is_backup = backup_action;
         if backup_action
             && (self.custody != Custody::Unlocked
                 || !self.backup_acknowledged
@@ -1277,13 +1322,18 @@ impl VaultUi {
                     ui.add_space(8.0);
                     ui.label(description);
                 }
-                if let Some(error) = &self.error {
-                    ui.add_space(8.0);
-                    ui.colored_label(DANGER, error);
-                }
-                if let Some(notice) = &self.notice {
-                    ui.add_space(8.0);
-                    ui.label(notice);
+                if self.custody == Custody::Failed
+                    || (!self.feedback_is_backup
+                        && !(self.custody == Custody::Locked && self.discard_unlock))
+                {
+                    if let Some(error) = &self.error {
+                        ui.add_space(8.0);
+                        ui.colored_label(DANGER, error);
+                    }
+                    if let Some(notice) = &self.notice {
+                        ui.add_space(8.0);
+                        ui.label(notice);
+                    }
                 }
                 if matches!(self.custody, Custody::Failed | Custody::Empty) {
                     return;
@@ -1439,7 +1489,15 @@ impl VaultUi {
                     if primary_button(ui, "Check backup (read only)", ready).clicked() {
                         action = Some(Action::VerifyBackup);
                     }
-                    ui.label("A successful check proves decryption and wallet identity, not chain validity, current balances or freshness. Importing old snapshots is not enabled in this development build.");
+                    if self.feedback_is_backup {
+                        if let Some(error) = &self.error {
+                            ui.colored_label(DANGER, error);
+                        }
+                        if let Some(notice) = &self.notice {
+                            ui.colored_label(SUCCESS, notice);
+                        }
+                    }
+                    ui.label("A successful check proves decryption and wallet identity, not chain validity, current balances or freshness. Importing old snapshots is not enabled in this release.");
                 }
             },
         );

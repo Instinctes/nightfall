@@ -273,6 +273,23 @@ impl NodeInner {
         self.loading
     }
 
+    /// For absence-based wallet decisions while the caller holds the state lock.
+    pub fn wallet_chain_settled(&self) -> bool {
+        if self.loading
+            || self.reorg_in_flight.load(Ordering::SeqCst)
+            || self.stalled_on_fork.load(Ordering::SeqCst)
+            || catchup_behind(self).unwrap_or(0) > 0
+        {
+            return false;
+        }
+        if !self.sessions.is_empty() {
+            self.best_peer_height > 0
+                && self.chain.tip_height().map(|h| h.0).unwrap_or(0) >= self.best_peer_height
+        } else {
+            self.network == NetworkId::Devnet && self.best_peer_height == 0
+        }
+    }
+
     pub fn persist(&mut self) -> anyhow::Result<()> {
         if let Some(keep) = self.prune_keep {
             match self.chain.prune_keep(keep) {
@@ -320,8 +337,13 @@ impl NodeInner {
     pub fn submit_tx(&mut self, tx: Transaction) -> Result<String, String> {
         self.chain.precheck_tx(&tx).map_err(|e| e.to_string())?;
         let id = tx.txid().to_hex();
-        if !self.mempool.insert(tx.clone(), now_unix()) {
-            return Ok(id);
+        match self.mempool.insert_checked(tx.clone(), now_unix()) {
+            nightfall_consensus::InsertOutcome::Added => {}
+            nightfall_consensus::InsertOutcome::Known => return Ok(id),
+            nightfall_consensus::InsertOutcome::Conflict => {
+                return Err("another pending transaction already spends one of these inputs".into())
+            }
+            nightfall_consensus::InsertOutcome::Full => return Ok(id),
         }
         // Origin always stems: the first hop is one random peer, not a
         // broadcast that paints this node as the sender.
@@ -2305,12 +2327,6 @@ fn note_peer_height(state: &SharedState, height: u64) {
 /// How long a peer's claimed height stays believed without confirmation.
 pub const PEER_HEIGHT_TTL_SECS: u64 = 120;
 
-/// How often a reorg candidate copied our own history (both fork paths).
-///
-/// On an archive node each copy is the whole chain. Diagnostics and the
-/// regression test for the 1.0.6 seed that copied it for every competing tip.
-pub static REORG_PREFIX_COPIES: AtomicU64 = AtomicU64::new(0);
-
 /// Weigh a block that forks from a chain we already hold.
 ///
 /// The receiving side of a push cannot ask for anything: it has one block at a
@@ -2341,89 +2357,79 @@ fn consider_branch(state: &SharedState, block: Block, peer_label: &str) {
     // The fork root is the highest block of ours that something in the buffer
     // claims as its parent. Searching from the tip backwards finds a recent
     // fork immediately, which is the common case.
-    //
-    // Only the reorg window is searched: a fork deeper than MAX_REORG_DEPTH is
-    // refused by `evaluate_reorg_at` anyway, and on an archive node a miss
-    // used to hash every block since genesis while holding the state lock.
-    let window = g
+    let Some(fork_at) = g
         .chain
         .blocks
-        .len()
-        .saturating_sub(nightfall_consensus::MAX_REORG_DEPTH + 1);
-    let Some(fork_at) = g.chain.blocks[window..]
         .iter()
         .rposition(|b| g.branch.contains_key(&b.hash().0))
-        .map(|i| window + i)
     else {
         return;
     };
 
-    // Walk forward for as far as the run is contiguous. A gap simply ends it;
-    // the next push round fills in what is missing.
-    let mut run: Vec<Block> = Vec::new();
+    // Only the blocks we do not already have. Copying `blocks[..=fork_at]`
+    // duplicated the whole archive on every one-block fork, which is what
+    // pushed an 8 GB seed into the OOM killer.
+    let ancestor_height = g.chain.blocks[fork_at].header.height.0;
+    let mut suffix = Vec::new();
     let mut cursor = g.chain.blocks[fork_at].hash().0;
     while let Some(next) = g.branch.get(&cursor) {
-        run.push(next.clone());
         cursor = next.hash().0;
-        if run.len() > MAX_BRANCH_BLOCKS {
+        suffix.push(next.clone());
+        if suffix.len() > MAX_BRANCH_BLOCKS {
             break;
         }
     }
-    if run.is_empty() {
+    if suffix.is_empty() {
         return;
     }
 
-    // Cheap rejection before copying anything.
-    //
-    // The branch wins only if its run declares more work than the blocks of
-    // ours after the fork point. Until 1.0.7 the whole prefix — on an archive
-    // node every block since genesis, gigabytes — was copied first, under the
-    // state lock, for every competing block a peer pushed. The light API
-    // waited on that lock for seconds and the copies piled up until the kernel
-    // killed the node.
-    let run_work: u128 = run.iter().map(|b| b.work()).sum();
-    let ours_after: u128 = g.chain.blocks[fork_at + 1..].iter().map(|b| b.work()).sum();
-    if run_work <= ours_after {
+    let our_tip = g.chain.tip_height().map(|h| h.0).unwrap_or(0);
+    let rewind = our_tip.saturating_sub(ancestor_height) as usize;
+    if rewind > nightfall_consensus::MAX_REORG_DEPTH {
+        g.stalled_on_fork.store(true, Ordering::SeqCst);
+        g.fork_rewind.store(rewind as u64, Ordering::SeqCst);
+        return;
+    }
+    let Some(rewind_work) = g.chain.rewound_work(rewind) else {
+        tracing::debug!("branch from {peer_label} rewinds further than the undo window");
+        return;
+    };
+    let suffix_work: u128 = suffix.iter().map(|block| block.work()).sum();
+    if g.chain
+        .total_work
+        .saturating_sub(rewind_work)
+        .saturating_add(suffix_work)
+        <= g.chain.total_work
+    {
         return;
     }
 
-    // One verification at a time, before the copy.
+    let trial = match g.chain.prepare_suffix_trial(ancestor_height) {
+        Ok(trial) => trial,
+        Err(error) => {
+            tracing::debug!("branch from {peer_label} not prepared: {error}");
+            return;
+        }
+    };
+    let before = g.chain.block_count();
     let guard = Arc::clone(&g.reorg_in_flight);
+    drop(g);
+
     let Some(_flight) = ReorgFlight::begin(&guard) else {
         tracing::debug!("branch from {peer_label} skipped — a reorg is already being verified");
         return;
     };
 
-    // On an archive node this prefix starts at genesis. On a pruned node
-    // it starts at `first_height` — `evaluate_reorg_at` is told that.
-    let mut candidate: Vec<Block> = g.chain.blocks[..=fork_at].to_vec();
-    REORG_PREFIX_COPIES.fetch_add(1, Ordering::Relaxed);
-    candidate.extend(run);
-
-    // Pruned candidate is the window only — add the horizon's work or a
-    // heavier suffix always looks lighter than the live chain.
-    let claimed: u128 = g.chain.horizon_work + candidate.iter().map(|b| b.work()).sum::<u128>();
-    if claimed <= g.chain.total_work {
-        return;
-    }
-
-    let before = g.chain.block_count();
-    let network = g.chain.network;
-    let our_work = g.chain.total_work;
-    let our_hashes = g.chain.hash_chain();
-    let base = g.chain.pruned_base();
-    drop(g);
-
-    // Verified with the lock released. See `Chain::evaluate_reorg_at`.
-    let verdict =
-        Chain::evaluate_reorg_at(network, our_work, &our_hashes, base, candidate, now_unix());
+    let verdict = Chain::finish_suffix(trial, suffix, now_unix());
 
     let Ok(g) = state.lock() else { return };
     let mut g = g;
     match verdict {
-        Ok(Some(chain)) => {
-            if g.chain.adopt_reorg(chain) {
-                // A reorg replaces the chain wholesale, and until 0.8.4 the
+        Ok(Some(reorg)) => {
+            if g.chain.splice_suffix(reorg) {
+                g.stalled_on_fork.store(false, Ordering::SeqCst);
+                g.fork_rewind.store(0, Ordering::SeqCst);
+                // A reorg replaces the tip, and until 0.8.4 the
                 // mempool was never told. Anything the new branch had already
                 // mined stayed behind and then poisoned every block template
                 // — which is how one node stopped mining for hours while its
@@ -2803,31 +2809,24 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
         }
 
         let ancestor = common_ancestor(state, &mut stream, peer_h, &peer_tip);
-
-        // Everything cheap first; the copy of our own history last.
-        //
-        // Until 1.0.7 this block began with `bodies_through(ancestor)`, which on
-        // an archive node copies the *whole* chain — several gigabytes at
-        // 347,000 blocks — and only then asked whether the fork was too deep,
-        // whether another reorg was already being verified, and whether the
-        // peer's branch was even heavier. Every peer with a different tip (an
-        // old node on a dead fork, a competing block) made the seed do that,
-        // several at once: RSS jumped from 0.7 to 7.6 GB within seconds, the
-        // light API stopped answering, and the kernel killed the node.
-        let (rewind, guard) = {
+        let (trial, guard) = {
             let g = state.lock().unwrap();
             let our_tip = g.chain.tip_height().map(|h| h.0).unwrap_or(0);
-            // An ancestor above our own tip is not a place we can rewind to.
-            // Until 1.0.6 `common_ancestor` returned `peer_tip - 1` whenever the
-            // peer was far ahead; the candidate built from it skipped every
-            // height in between and was rejected as "unexpected height", from
-            // every peer, for ever (issue #40).
             if ancestor > our_tip {
-                tracing::warn!("peer {addr} diverges above our tip — not adopting");
+                tracing::warn!("peer {addr} diverges below a height we can rewind — not adopting");
                 g.stalled_on_fork.store(true, Ordering::SeqCst);
                 break;
             }
-            if !g.chain.can_rebuild_through(ancestor) {
+            let rewind = (our_tip - ancestor) as usize;
+            g.fork_rewind.store(rewind as u64, Ordering::SeqCst);
+            if rewind > nightfall_consensus::MAX_REORG_DEPTH {
+                tracing::warn!(
+                    "peer {addr} diverges {rewind} blocks back — past MAX_REORG_DEPTH, not adopting"
+                );
+                g.stalled_on_fork.store(true, Ordering::SeqCst);
+                break;
+            }
+            if g.chain.is_pruned() && ancestor < g.chain.first_height {
                 tracing::warn!(
                     "peer {addr} diverges below the prune horizon at height {} — not adopting",
                     g.chain.first_height
@@ -2835,80 +2834,36 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
                 g.stalled_on_fork.store(true, Ordering::SeqCst);
                 break;
             }
-            (
-                our_tip.saturating_sub(ancestor) as usize,
-                Arc::clone(&g.reorg_in_flight),
-            )
+            let trial = match g.chain.prepare_suffix_trial(ancestor) {
+                Ok(trial) => trial,
+                Err(error) => {
+                    tracing::warn!("peer {addr} reorg not prepared: {error}");
+                    g.stalled_on_fork.store(true, Ordering::SeqCst);
+                    break;
+                }
+            };
+            (trial, Arc::clone(&g.reorg_in_flight))
         };
 
-        if rewind > 0 {
-            if let Ok(g) = state.lock() {
-                g.fork_rewind.store(rewind as u64, Ordering::SeqCst);
-            }
-        }
-        if rewind > nightfall_consensus::MAX_REORG_DEPTH {
-            tracing::warn!(
-                "peer {addr} diverges {rewind} blocks back — past MAX_REORG_DEPTH, not adopting"
-            );
-            if let Ok(g) = state.lock() {
-                g.stalled_on_fork.store(true, Ordering::SeqCst);
-            }
-            break;
-        }
-
-        // One verification at a time, before anything is copied.
         let Some(_flight) = ReorgFlight::begin(&guard) else {
             tracing::debug!("peer {addr} diverges, but a reorg is already being verified");
             break;
         };
 
         let suffix = fetch_blocks_from(&mut stream, ancestor.saturating_add(1), peer_h)?;
-        if suffix.is_empty() && rewind == 0 {
+        if suffix.is_empty() {
             break;
         }
 
-        // The peer's branch must declare more work than the part of ours it
-        // would replace — the first thing `evaluate_reorg_at` checks. A
-        // lighter branch is turned away here, without copying our history.
-        let suffix_work: u128 = suffix.iter().map(|b| b.work()).sum();
-        let (network, our_work, our_hashes, prefix, base) = {
-            let g = state.lock().unwrap();
-            let ours_above = g.chain.work_above(ancestor);
-            if suffix_work <= ours_above {
-                tracing::debug!(
-                    "peer {addr} offers a branch from {ancestor} that is not heavier — not adopting"
-                );
-                break;
-            }
-            let Some(prefix) = g.chain.bodies_through(ancestor) else {
-                // The horizon moved while we fetched; nothing to rebuild from.
-                break;
-            };
-            REORG_PREFIX_COPIES.fetch_add(1, Ordering::Relaxed);
-            (
-                g.chain.network,
-                g.chain.total_work,
-                g.chain.hash_chain(),
-                prefix,
-                g.chain.pruned_base(),
-            )
-        };
-
-        let mut candidate = prefix;
-        candidate.extend(suffix);
-        if candidate.is_empty() {
-            break;
-        }
-
-        // Shared prefix is our own file; only the suffix is verified.
-        // See `Chain::evaluate_reorg_at`.
-        let verdict =
-            Chain::evaluate_reorg_at(network, our_work, &our_hashes, base, candidate, now_unix());
+        // Only the suffix is verified. The prefix stays in the live chain.
+        let verdict = Chain::finish_suffix(trial, suffix, now_unix());
 
         let mut g = state.lock().unwrap();
         match verdict {
-            Ok(Some(chain)) => {
-                if g.chain.adopt_reorg(chain) {
+            Ok(Some(reorg)) => {
+                if g.chain.splice_suffix(reorg) {
+                    g.stalled_on_fork.store(false, Ordering::SeqCst);
+                    g.fork_rewind.store(0, Ordering::SeqCst);
                     // Same reconciliation as the other reorg path above.
                     let dropped = g
                         .mempool
@@ -3049,6 +3004,11 @@ fn catchup_behind(inner: &NodeInner) -> Option<u64> {
     if inner.stalled_on_fork.load(Ordering::SeqCst) || inner.reorg_in_flight.load(Ordering::SeqCst)
     {
         return Some(1);
+    }
+    // Devnet is deliberately usable as a local network of one. Never bypass
+    // the fork/reorg guards above, or the public-network catch-up policy.
+    if inner.network == NetworkId::Devnet && inner.sessions.is_empty() {
+        return None;
     }
     mining_should_wait(
         inner.chain.block_count(),

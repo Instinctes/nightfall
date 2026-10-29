@@ -12,10 +12,11 @@ members = [
     "crates/nightfall-core",
     "crates/nightfall-mobile",
     "crates/nightfall-web",
+    "crates/nightfall-nodekit",
 ]
 
 [workspace.package]
-version = "1.0.12"
+version = "1.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nightfallcoin/nightfall"
@@ -55,6 +56,8 @@ subtle = "2"
 # exactly; no PBKDF2 stretch, nothing to lose in translation.
 bip39 = { version = "2", default-features = false, features = ["std"] }
 anyhow = "1"
+# Node Kit: SHA256SUMS verification. Already in the lock transitively.
+sha2 = "0.10"
 dirs = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

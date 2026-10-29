@@ -53,10 +53,10 @@ jobs:
       # The tests gate the release. Shipping a binary from a tree that fails
       # its own exploit regression suite would be worse than shipping nothing.
       - name: Tests
-        run: cargo test --workspace --locked
+        run: cargo test --locked --workspace
 
       - name: Build
-        run: cargo build --release -p nightfall-core -p nightfall-node -p nightfall-wallet --locked
+        run: cargo build --locked --release --bins -p nightfall-core -p nightfall-node -p nightfall-wallet -p nightfall-nodekit
 
       - name: The binary must agree with the tag
         shell: pwsh
@@ -83,6 +83,9 @@ jobs:
             "nightfall-core.exe"   = "nightfall-core-$version-windows-x64.exe"
             "nightfalld.exe"       = "nightfalld-$version-windows-x64.exe"
             "nightfall-wallet.exe" = "nightfall-wallet-$version-windows-x64.exe"
+            "nightfall-nodekit.exe" = "nightfall-nodekit-$version-windows-x64.exe"
+            "nightfall-till.exe" = "nightfall-till-$version-windows-x64.exe"
+            "nightfall-receipt-evidence.exe" = "nightfall-receipt-evidence-$version-windows-x64.exe"
           }
           foreach ($src in $map.Keys) {
             Copy-Item "target/release/$src" "dist/$($map[$src])"
@@ -141,10 +144,10 @@ jobs:
             libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
 
       - name: Tests
-        run: cargo test --workspace --locked
+        run: cargo test --locked --workspace
 
       - name: Build
-        run: cargo build --release -p nightfall-core -p nightfall-node -p nightfall-wallet --locked
+        run: cargo build --locked --release --bins -p nightfall-core -p nightfall-node -p nightfall-wallet -p nightfall-nodekit
 
       # The seeds once ran 0.8.0 code that introduced itself as 0.7.8, because
       # the binary was built before the version bump. A tag is a promise about
@@ -168,6 +171,9 @@ jobs:
           cp target/release/nightfall-core "dist/nightfall-core-${VERSION}-linux-x64"
           cp target/release/nightfalld "dist/nightfalld-${VERSION}-linux-x64"
           cp target/release/nightfall-wallet "dist/nightfall-wallet-${VERSION}-linux-x64"
+          for tool in nightfall-nodekit nightfall-till nightfall-receipt-evidence; do
+            cp "target/release/$tool" "dist/${tool}-${VERSION}-linux-x64"
+          done
           chmod +x dist/*
           (cd dist && sha256sum nightfall*-linux-x64 > "SHA256SUMS-${VERSION}-linux.txt")
           cat "dist/SHA256SUMS-${VERSION}-linux.txt"
@@ -195,7 +201,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Tests
-        run: cargo test --workspace --locked
+        run: cargo test --locked --workspace
 
       # build-macos-dmgs.sh builds with --offline --locked, so the dependency
       # set is fetched once, from Cargo.lock, before it runs.

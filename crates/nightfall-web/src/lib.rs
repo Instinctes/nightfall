@@ -217,6 +217,7 @@ pub fn wallet_history(state: &str) -> Result<JsValue, JsError> {
                 "memo": e.memo,
                 "height": e.height,
                 "pending": e.is_pending(),
+                "failed": e.failed,
                 "timestamp": e.timestamp,
                 "txid": e.txid,
             })

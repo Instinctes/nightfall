@@ -36,13 +36,23 @@ pub struct LedgerState {
     /// Blocks a coinbase output must age before it can be spent.
     #[serde(default = "default_maturity")]
     pub coinbase_maturity: u64,
+    /// First height validated under the binding rules. A state read from
+    /// disk without the field gets the mainnet height; `Chain` re-applies
+    /// its own network's value whenever it adopts a state.
+    #[serde(default = "default_binding_height")]
+    pub binding_height: u64,
 }
 
 fn default_maturity() -> u64 {
     COINBASE_MATURITY
 }
 
+fn default_binding_height() -> u64 {
+    NetworkId::Mainnet.binding_fork_height()
+}
+
 impl LedgerState {
+    /// A fresh state with the binding rules active from height 0.
     pub fn genesis() -> Self {
         Self {
             height: Height(0),
@@ -51,6 +61,7 @@ impl LedgerState {
             supply: SupplyState::default(),
             tx_count: 0,
             coinbase_maturity: COINBASE_MATURITY,
+            binding_height: 0,
         }
     }
 
@@ -58,8 +69,20 @@ impl LedgerState {
     pub fn for_network(network: NetworkId) -> Self {
         Self {
             coinbase_maturity: coinbase_maturity(network),
+            binding_height: network.binding_fork_height(),
             ..Self::genesis()
         }
+    }
+
+    /// The same state with the binding rules starting at `height`.
+    pub fn with_binding_height(mut self, height: u64) -> Self {
+        self.binding_height = height;
+        self
+    }
+
+    /// Are the binding rules in force for a block at `height`?
+    pub fn binding_active(&self, height: Height) -> bool {
+        height.0 >= self.binding_height
     }
 
     pub fn utxo_root(&self) -> Hash256 {
@@ -88,6 +111,20 @@ impl LedgerState {
         expected_reward: u64,
         ctx: &[u8],
     ) -> Result<(), LedgerError> {
+        // Below the fork a block is judged exactly as 1.0.x judges it, which
+        // means binding fields — which 1.0.x cannot even see — must not
+        // change the verdict either way.
+        let binding = self.binding_active(height);
+        let stripped;
+        let body = if !binding && body.has_any_binding() {
+            let mut b = body.clone();
+            b.strip_binding();
+            stripped = b;
+            &stripped
+        } else {
+            body
+        };
+
         if body.outputs.is_empty() {
             return Err(LedgerError::EmptyBlock);
         }
@@ -141,6 +178,9 @@ impl LedgerState {
         }
         if self.supply.would_exceed_cap(expected_reward) {
             return Err(LedgerError::SupplyCapExceeded);
+        }
+        if binding && checked_fee_sum(&body.kernels).is_none() {
+            return Err(LedgerError::FeeOutOfRange);
         }
 
         for k in &body.kernels {
@@ -200,6 +240,21 @@ impl LedgerState {
             if !Transaction::verify_input_signature(input, &entry.output_pk) {
                 return Err(LedgerError::BadInputSignature);
             }
+            // Input key signature (binding rules).
+            if binding && !Transaction::verify_input_key(input, &entry.output_pk) {
+                return Err(LedgerError::BadInputKeySignature);
+            }
+        }
+
+        // The key balance, over the whole aggregate at once.
+        if binding {
+            key_balance(
+                &body.inputs,
+                &body.outputs,
+                &body.kernels,
+                body.stealth_offset,
+            )
+            .map_err(LedgerError::Binding)?;
         }
 
         // The balance equation, over the whole aggregate at once.
@@ -215,7 +270,12 @@ impl LedgerState {
         let kernel_sum = body
             .kernel_excess_sum()
             .ok_or(LedgerError::MalformedKernelExcess)?;
-        if Commitment::from_point(expected) != kernel_sum {
+        let offset = offset_point_h(body.kernel_offset).map_err(LedgerError::Binding)?;
+        let kernel_sum = kernel_sum
+            .point()
+            .ok_or(LedgerError::MalformedKernelExcess)?
+            + offset;
+        if expected != kernel_sum {
             return Err(LedgerError::UnbalancedBlock);
         }
 
@@ -231,7 +291,57 @@ impl LedgerState {
             });
         }
 
-        // ---- Stage 2: everything validated. Commit. ----
+        // ...and it must open to exactly the coinbase amount.
+        if binding {
+            let flagged = body
+                .outputs
+                .iter()
+                .find(|o| o.features.is_coinbase())
+                .and_then(|o| o.commit.point())
+                .ok_or(LedgerError::MalformedOutput)?;
+            let opened = flagged - nightfall_crypto::commit_public_value(coinbase.reward_darks);
+            if Some(opened) != coinbase.excess.point() {
+                return Err(LedgerError::BadCoinbaseOpening);
+            }
+        }
+
+        // Everything that can fail is decided before the set changes. A
+        // rejected block used to be applied to a full clone of the UTXO map
+        // and thrown away; that clone is what ratcheted a seed's memory up
+        // to the size of the whole history.
+        let mut new_kernels = self.kernels.clone();
+        for k in &body.kernels {
+            new_kernels
+                .add(&k.excess)
+                .ok_or(LedgerError::MalformedKernelExcess)?;
+        }
+        new_kernels
+            .add_offset(offset)
+            .ok_or(LedgerError::MalformedKernelExcess)?;
+        let mut new_supply = self.supply.clone();
+        if expected_reward > 0 {
+            new_supply.total_minted_darks = self
+                .supply
+                .total_minted_darks
+                .checked_add(expected_reward)
+                .ok_or(LedgerError::ArithmeticOverflow)?;
+            new_supply.total_burned_darks = self
+                .supply
+                .total_burned_darks
+                .checked_add(fees)
+                .ok_or(LedgerError::ArithmeticOverflow)?;
+        }
+        let projected = self
+            .utxos
+            .sum_after(
+                spent.iter().copied().map(Commitment),
+                body.outputs.iter().map(|out| out.commit),
+            )
+            .ok_or(LedgerError::Supply(SupplyError::MalformedUtxo))?;
+        supply_equation_holds(projected, &new_kernels, &new_supply).map_err(LedgerError::Supply)?;
+        let undo = self.capture_undo(body)?;
+
+        // ---- Stage 2: infallible commit. ----
         for c in &spent {
             self.utxos.remove(&Commitment(*c));
         }
@@ -246,28 +356,18 @@ impl LedgerState {
                 },
             );
         }
-        for k in &body.kernels {
-            self.kernels
-                .add(&k.excess)
-                .ok_or(LedgerError::MalformedKernelExcess)?;
-        }
-        if expected_reward > 0 {
-            self.supply.total_minted_darks = self
-                .supply
-                .total_minted_darks
-                .checked_add(expected_reward)
-                .ok_or(LedgerError::ArithmeticOverflow)?;
-            self.supply.total_burned_darks = self
-                .supply
-                .total_burned_darks
-                .checked_add(fees)
-                .ok_or(LedgerError::ArithmeticOverflow)?;
-        }
+        self.kernels = new_kernels;
+        self.supply = new_supply;
         self.tx_count += body.kernels.len() as u64;
         self.height = height;
 
-        // ---- Stage 3: the invariant must still hold. ----
-        self.verify_supply().map_err(LedgerError::Supply)?;
+        // The projection above is the check. This is the same equation on
+        // the set we just wrote, so a failure here means the projection and
+        // the set disagree — roll back rather than publish that.
+        if let Err(error) = self.verify_supply() {
+            self.rewind(&undo);
+            return Err(LedgerError::Supply(error));
+        }
         Ok(())
     }
 
@@ -305,6 +405,34 @@ impl LedgerState {
                 });
             }
         }
+        let mut new_kernels = self.kernels.clone();
+        for k in &body.kernels {
+            new_kernels
+                .add(&k.excess)
+                .ok_or(LedgerError::MalformedKernelExcess)?;
+        }
+        // A stored body below the fork never carries an offset; one at or
+        // above it does, and the accumulator has to see it exactly as it did
+        // when the block was first accepted.
+        if self.binding_active(height) {
+            let offset = offset_point_h(body.kernel_offset).map_err(LedgerError::Binding)?;
+            new_kernels
+                .add_offset(offset)
+                .ok_or(LedgerError::MalformedKernelExcess)?;
+        }
+        let mut new_supply = self.supply.clone();
+        if expected_reward > 0 {
+            new_supply.total_minted_darks = self
+                .supply
+                .total_minted_darks
+                .checked_add(expected_reward)
+                .ok_or(LedgerError::ArithmeticOverflow)?;
+            new_supply.total_burned_darks = self
+                .supply
+                .total_burned_darks
+                .checked_add(fees)
+                .ok_or(LedgerError::ArithmeticOverflow)?;
+        }
         for c in &spent {
             self.utxos.remove(&Commitment(*c));
         }
@@ -318,26 +446,55 @@ impl LedgerState {
                 },
             );
         }
-        for k in &body.kernels {
-            self.kernels
-                .add(&k.excess)
-                .ok_or(LedgerError::MalformedKernelExcess)?;
-        }
-        if expected_reward > 0 {
-            self.supply.total_minted_darks = self
-                .supply
-                .total_minted_darks
-                .checked_add(expected_reward)
-                .ok_or(LedgerError::ArithmeticOverflow)?;
-            self.supply.total_burned_darks = self
-                .supply
-                .total_burned_darks
-                .checked_add(fees)
-                .ok_or(LedgerError::ArithmeticOverflow)?;
-        }
+        self.kernels = new_kernels;
+        self.supply = new_supply;
         self.tx_count += body.kernels.len() as u64;
         self.height = height;
         Ok(())
+    }
+
+    /// What [`Self::rewind`] needs to put this ledger back where it was
+    /// before `body` was applied. Captured *before* the apply.
+    pub fn capture_undo(&self, body: &BlockBody) -> Result<StateUndo, LedgerError> {
+        let mut seen: BTreeSet<[u8; 32]> = BTreeSet::new();
+        let mut spent = Vec::with_capacity(body.inputs.len());
+        for input in &body.inputs {
+            if !seen.insert(input.commit.0) {
+                return Err(LedgerError::DoubleSpendWithinBlock);
+            }
+            let entry = self.utxos.get(&input.commit).cloned().ok_or_else(|| {
+                LedgerError::UnknownInput {
+                    commit: input.commit.to_hex(),
+                }
+            })?;
+            spent.push((input.commit, entry));
+        }
+        Ok(StateUndo {
+            spent,
+            created: body.outputs.iter().map(|out| out.commit).collect(),
+            kernels: self.kernels.clone(),
+            supply: self.supply.clone(),
+            tx_count: self.tx_count,
+            height: self.height,
+        })
+    }
+
+    /// Inverse of applying the block `undo` was captured from.
+    ///
+    /// Removes what that block created, puts back what it spent, and restores
+    /// the kernel sum, supply and height. Not a general undo of arbitrary
+    /// edits: the capture and the apply have to be a pair.
+    pub fn rewind(&mut self, undo: &StateUndo) {
+        for commit in &undo.created {
+            self.utxos.remove(commit);
+        }
+        for (commit, entry) in &undo.spent {
+            self.utxos.insert(*commit, entry.clone());
+        }
+        self.kernels = undo.kernels.clone();
+        self.supply = undo.supply.clone();
+        self.tx_count = undo.tx_count;
+        self.height = undo.height;
     }
 
     /// Mempool admission check: is this transaction valid against current state?
@@ -350,10 +507,16 @@ impl LedgerState {
         if tx.is_coinbase() {
             return Err(LedgerError::CoinbaseInMempool);
         }
-        tx.verify_stateless(ctx).map_err(|e| LedgerError::Tx {
-            index: 0,
-            source: e,
-        })?;
+        let binding = self.binding_active(next_height);
+        tx.verify_stateless_rules(ctx, binding)
+            .map_err(|e| LedgerError::Tx {
+                index: 0,
+                source: e,
+            })?;
+        // Before the fork the binding fields are optional, but a transaction
+        // that carries them must carry valid ones, or it would be relayed now
+        // and refused the moment the fork activates.
+        let check_keys = binding || tx.has_full_binding();
 
         let mut seen = BTreeSet::new();
         for input in &tx.inputs {
@@ -375,6 +538,9 @@ impl LedgerState {
             if !Transaction::verify_input_signature(input, &entry.output_pk) {
                 return Err(LedgerError::BadInputSignature);
             }
+            if check_keys && !Transaction::verify_input_key(input, &entry.output_pk) {
+                return Err(LedgerError::BadInputKeySignature);
+            }
         }
         for out in &tx.outputs {
             if self.utxos.contains(&out.commit) {
@@ -390,6 +556,21 @@ impl LedgerState {
         }
         Ok(())
     }
+}
+
+/// Ledger as it was before one block, plus the commitments that block created.
+///
+/// Small on purpose: a block spends and creates a handful of outputs. Keeping
+/// the last few hundred of these is enough to leave a fork, and it is not a
+/// second copy of the UTXO set.
+#[derive(Clone, Debug)]
+pub struct StateUndo {
+    pub spent: Vec<(Commitment, UtxoEntry)>,
+    pub created: Vec<Commitment>,
+    pub kernels: KernelAccumulator,
+    pub supply: SupplyState,
+    pub tx_count: u64,
+    pub height: Height,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -452,4 +633,12 @@ pub enum LedgerError {
     },
     #[error("supply: {0}")]
     Supply(#[source] SupplyError),
+    #[error("binding: {0}")]
+    Binding(#[source] TxError),
+    #[error("invalid input key signature")]
+    BadInputKeySignature,
+    #[error("coinbase output does not open to the coinbase amount")]
+    BadCoinbaseOpening,
+    #[error("kernel fee out of range")]
+    FeeOutOfRange,
 }

@@ -56,21 +56,21 @@ class ReleaseLockPolicyTests(unittest.TestCase):
         check_policy(self.workflow, self.macos, self.lock)
 
     def test_each_platform_test_fails_if_unlocking_is_reintroduced(self):
-        needle = "run: cargo test --workspace --locked"
+        needle = "run: cargo test --locked --workspace"
         occurrences = [m.start() for m in re.finditer(re.escape(needle), self.workflow)]
         self.assertEqual(len(occurrences), 3)
         for ordinal, at in enumerate(occurrences):
-            mutated = (self.workflow[:at] + needle[:-len(" --locked")]
+            mutated = (self.workflow[:at] + needle.replace(" --locked", "")
                        + self.workflow[at + len(needle):])
             with self.subTest(platform=ordinal), self.assertRaisesRegex(ValueError, "unlocked cargo test"):
                 check_policy(mutated, self.macos, self.lock)
 
     def test_each_direct_build_fails_if_unlocking_is_reintroduced(self):
-        needle = "cargo build --release -p nightfall-core -p nightfall-node -p nightfall-wallet --locked"
+        needle = "cargo build --locked --release --bins -p nightfall-core -p nightfall-node -p nightfall-wallet -p nightfall-nodekit"
         occurrences = [m.start() for m in re.finditer(re.escape(needle), self.workflow)]
         self.assertEqual(len(occurrences), 2)
         for ordinal, at in enumerate(occurrences):
-            mutated = (self.workflow[:at] + needle[:-len(" --locked")]
+            mutated = (self.workflow[:at] + needle.replace(" --locked", "")
                        + self.workflow[at + len(needle):])
             with self.subTest(build=ordinal), self.assertRaisesRegex(ValueError, "unlocked cargo build"):
                 check_policy(mutated, self.macos, self.lock)

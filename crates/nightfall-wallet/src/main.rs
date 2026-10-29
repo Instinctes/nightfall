@@ -86,6 +86,31 @@ enum Commands {
         #[arg(long)]
         file: PathBuf,
     },
+    /// Checkout prototype (devnet/testnet only): write an invoice and print
+    /// the payment request that settles it.
+    Invoice {
+        /// Your reference. A payment settles the invoice only by quoting it.
+        #[arg(long)]
+        reference: String,
+        /// Amount in darks. Omit to let the payer choose.
+        #[arg(long)]
+        darks: Option<u64>,
+        #[arg(long, default_value = "")]
+        description: String,
+        /// Your own deadline, seconds from now. Late payments still count.
+        #[arg(long)]
+        expires_in: Option<u64>,
+    },
+    /// Checkout prototype (devnet/testnet only): sync, then show every
+    /// invoice with its current confirmation-policy status.
+    Till {
+        /// Confirmation threshold; reaching it does not remove reorg risk.
+        #[arg(long, default_value_t = nightfall_wallet::counter::DEFAULT_CONFIRMATIONS)]
+        confirmations: u64,
+        /// Print JSON lines instead of text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -157,6 +182,16 @@ fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         _ => {}
+    }
+
+    if matches!(
+        cli.command,
+        Commands::Invoice { .. } | Commands::Till { .. }
+    ) && network == NetworkId::Mainnet
+    {
+        anyhow::bail!(
+            "the checkout commands are a devnet/testnet prototype and are not enabled on mainnet"
+        );
     }
 
     let mut wallet = Wallet::open(&datadir, network, &cli.seed_file)?;
@@ -262,6 +297,79 @@ fn main() -> anyhow::Result<()> {
             println!("node........... {}", serde_json::to_string(&res)?);
             println!();
             println!("The transaction is in the mempool until a block is mined.");
+        }
+
+        Commands::Invoice {
+            reference,
+            darks,
+            description,
+            expires_in,
+        } => {
+            let now = now_unix();
+            let invoice = nightfall_wallet::counter::Invoice {
+                reference,
+                amount_darks: darks,
+                description,
+                created_unix: now,
+                expires_unix: expires_in.map(|s| now.saturating_add(s)),
+                closed_note: None,
+            };
+            wallet.add_invoice(invoice.clone())?;
+            let address = Address::decode(&wallet.address_string())
+                .map_err(|e| anyhow::anyhow!("own address: {e}"))?;
+            let request = nightfall_wallet::counter::request_for(&invoice, address, network);
+            println!("{}", request.to_uri());
+            eprintln!();
+            eprintln!("A request is not a payment. Run `till` to see whether it was paid");
+            eprintln!(
+                "and whether the payment meets your confirmation policy (reorg risk remains)."
+            );
+        }
+
+        Commands::Till {
+            confirmations,
+            json,
+        } => {
+            let from = wallet.birth_height();
+            sync(&mut wallet, &rpc, from)?;
+            let st = rpc_call(&rpc, "status", json!({}))?;
+            let tip = st
+                .get("tip_height")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| anyhow::anyhow!("node did not report its tip height"))?;
+            for (invoice, status) in wallet.till(now_unix()) {
+                let settled = nightfall_wallet::counter::settlement(&status, tip, confirmations);
+                let state = match settled {
+                    nightfall_wallet::counter::Settlement::NotPaid => "not_paid".to_owned(),
+                    nightfall_wallet::counter::Settlement::Unconfirmed => "unconfirmed".to_owned(),
+                    nightfall_wallet::counter::Settlement::Confirming { have, need } => {
+                        format!("confirming:{have}/{need}")
+                    }
+                    nightfall_wallet::counter::Settlement::Confirmed => "confirmed".to_owned(),
+                    nightfall_wallet::counter::Settlement::ClosedByHand => "closed".to_owned(),
+                };
+                if json {
+                    println!(
+                        "{}",
+                        json!({
+                            "reference": invoice.reference,
+                            "asked_darks": invoice.amount_darks,
+                            "received_darks": status.received_darks,
+                            "invoice": status.headline(),
+                            "settlement": state,
+                            "tip_height": tip,
+                            "candidates": status.candidates.len(),
+                        })
+                    );
+                } else {
+                    println!(
+                        "{:<16} {:<28} {}",
+                        invoice.reference,
+                        status.headline(),
+                        settled.headline()
+                    );
+                }
+            }
         }
 
         Commands::About
@@ -471,3 +579,9 @@ mod rpc_scan_page_tests {
 
 #[cfg(test)]
 mod rpc_scan_integration_tests;
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}

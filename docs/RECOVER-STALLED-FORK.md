@@ -106,9 +106,10 @@ than an equivalence:
   rename-ordering guarantee is **weaker on Windows than on Unix**. File-content
   durability is unaffected because it comes from the per-file `sync_all`.
 
-The data-directory lock's symlink refusal has the same shape of limitation:
-`O_NOFOLLOW` makes it atomic on Unix, while on Windows the `symlink_metadata`
-check is a best-effort guard with a TOCTOU window (an atomic refusal there would
-need a `CreateFile` reparse-tag check). The lock lives inside an
-operator-controlled datadir, so this is defence-in-depth, not a boundary against
-a local attacker who can already write there.
+The private 1.1.0 data-directory lock is hardened beyond the original recovery
+patch. Unix opens with `O_NOFOLLOW | O_NONBLOCK`; Windows opens the reparse entry
+itself using `FILE_FLAG_OPEN_REPARSE_POINT`. Both validate the open file before
+writing a PID and reject multi-link/non-regular files. This closes the Windows
+metadata-before-open symlink substitution window at the lock entry. Parent
+directories must remain operator-controlled. The Windows branch type-checks
+locally; Windows runtime acceptance is still required.

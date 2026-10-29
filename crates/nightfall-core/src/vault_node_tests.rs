@@ -594,7 +594,10 @@ fn dead_branch_child() {
     // An hour later the payment is judged impossible and released.
     let later = nightfall_storage::now_unix() + 3_600;
     assert_eq!(alice.release_impossible_sends_at(&node, later).unwrap(), 1);
-    assert!(!alice.history().iter().any(|e| e.txid == txid));
+    assert!(alice
+        .history()
+        .iter()
+        .any(|e| e.txid == txid && e.failed && !e.is_pending()));
     alice.check_rescan_allowed().unwrap();
     // And the wallet is an ordinary one again.
     mine(&node, &alice_keys.address(), 1);
