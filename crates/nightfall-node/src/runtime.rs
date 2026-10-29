@@ -1505,6 +1505,16 @@ fn claim_ibd_from(inner: &mut NodeInner) -> u64 {
     next_ibd_claim(next, &mut inner.ibd_from)
 }
 
+/// A wire-size-limited response may contain far fewer than IBD_PAGE blocks.
+/// In that case the claim cursor's 128-height stride creates a hole even
+/// though the serving peer has more blocks. Recover the exact successor now,
+/// instead of waiting for four speculative pages and their timeouts. The next
+/// page still goes through normal consensus validation.
+fn next_ibd_claim_after_short_page(next_needed: u64, ibd_from: &mut u64) -> u64 {
+    *ibd_from = next_needed;
+    next_ibd_claim(next_needed, ibd_from)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IbdPage {
     Applied(usize),
@@ -2228,6 +2238,7 @@ fn peer_io_loop(
                 if blocks.len() > MAX_BLOCKS_PER_REQUEST {
                     return Err(anyhow::anyhow!("peer sent an oversized block batch"));
                 }
+                let short_response = blocks.len() < MAX_BLOCKS_PER_REQUEST;
                 let outcome = {
                     let mut g = state.lock().unwrap();
                     let outcome = apply_ibd_page(&mut g, blocks, now_unix());
@@ -2246,6 +2257,16 @@ fn peer_io_loop(
                     let next = next_needed_height(&g);
                     let behind = peer_covers_height(last_peer_height, next);
                     match outcome {
+                        IbdPage::Applied(_) if behind && short_response => {
+                            // P2P caps bytes as well as block count. Do not
+                            // jump 128 heights when the peer delivered fewer.
+                            let next = next_needed_height(&g);
+                            tracing::debug!("short IBD response; request successor {next}");
+                            (
+                                Some(next_ibd_claim_after_short_page(next, &mut g.ibd_from)),
+                                false,
+                            )
+                        }
                         IbdPage::Applied(_) | IbdPage::Buffered if behind => {
                             (Some(claim_ibd_from(&mut g)), false)
                         }
@@ -2974,6 +2995,13 @@ pub fn next_fetch_height(height: u64) -> Option<u64> {
 }
 
 /// Download blocks `[from_height ..= peer_height]` in pages.
+/// A short page is not the end of the peer's chain: blocks may have been
+/// trimmed to fit the P2P byte ceiling. Only the advertised height (or an
+/// empty response handled by the caller) ends the download.
+fn continue_fetch_after_page(received: usize, next_height: u64, peer_height: u64) -> bool {
+    received > 0 && next_height <= peer_height
+}
+
 fn fetch_blocks_from(
     stream: &mut TcpStream,
     from_height: u64,
@@ -2997,7 +3025,7 @@ fn fetch_blocks_from(
             break;
         };
         from = next_from;
-        if n < MAX_BLOCKS_PER_REQUEST || from > peer_height {
+        if !continue_fetch_after_page(n, from, peer_height) {
             break;
         }
     }
@@ -3343,7 +3371,10 @@ fn mining_loop(state: SharedState) {
 
 #[cfg(test)]
 mod ibd_claim_tests {
-    use super::{next_ibd_claim, IBD_MAX_AHEAD, IBD_PAGE};
+    use super::{
+        continue_fetch_after_page, next_ibd_claim, next_ibd_claim_after_short_page, IBD_MAX_AHEAD,
+        IBD_PAGE,
+    };
 
     #[test]
     fn distinct_pages_then_rewind_at_the_cap() {
@@ -3369,6 +3400,50 @@ mod ibd_claim_tests {
         let advanced = next_ibd_claim(200, &mut ibd_from);
         assert_eq!(advanced, 200);
         assert_eq!(ibd_from, 200 + IBD_PAGE);
+    }
+
+    #[test]
+    fn short_wire_page_reclaims_immediate_missing_height() {
+        let mut cursor = 0;
+
+        assert_eq!(next_ibd_claim(0, &mut cursor), 0);
+        assert_eq!(cursor, IBD_PAGE);
+
+        assert_eq!(next_ibd_claim_after_short_page(3, &mut cursor), 3);
+
+        assert_eq!(next_ibd_claim_after_short_page(6, &mut cursor), 6);
+
+        assert_eq!(cursor, 6 + IBD_PAGE);
+    }
+
+    #[test]
+    fn regular_full_pages_stay_parallel() {
+        let mut cursor = 0;
+
+        assert_eq!(next_ibd_claim(0, &mut cursor), 0);
+        assert_eq!(next_ibd_claim(0, &mut cursor), IBD_PAGE);
+        assert_eq!(next_ibd_claim(0, &mut cursor), IBD_PAGE * 2);
+    }
+
+    #[test]
+    fn short_page_does_not_end_a_long_fork_fetch() {
+        assert!(continue_fetch_after_page(3, 103, 2_000));
+        assert!(continue_fetch_after_page(1, 2_000, 2_000));
+
+        assert!(!continue_fetch_after_page(3, 2_001, 2_000));
+        assert!(!continue_fetch_after_page(0, 103, 2_000));
+    }
+
+    #[test]
+    fn short_page_claim_saturates_near_u64_limit() {
+        let mut cursor = u64::MAX;
+
+        assert_eq!(
+            next_ibd_claim_after_short_page(u64::MAX - 2, &mut cursor),
+            u64::MAX - 2
+        );
+
+        assert_eq!(cursor, u64::MAX);
     }
 }
 
