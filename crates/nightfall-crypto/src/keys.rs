@@ -172,6 +172,14 @@ pub struct ViewKey {
 }
 
 impl ViewKey {
+    /// Public receiving address derived without an authorising spend secret.
+    pub fn address(&self) -> Address {
+        Address {
+            scan_pk: (generator_g() * self.scan_sk).compress().to_bytes(),
+            spend_pk: self.spend_pk,
+        }
+    }
+
     pub fn spend_point(&self) -> Option<RistrettoPoint> {
         CompressedRistretto(self.spend_pk).decompress()
     }
@@ -269,6 +277,7 @@ mod tests {
         let k = WalletKeys::generate();
         let v = k.view_key();
         let decoded = ViewKey::decode(&v.encode()).unwrap();
+        assert_eq!(decoded.address(), k.address());
         assert_eq!(decoded.spend_pk, v.spend_pk);
         // The view key type simply has no method returning the spend secret.
         // This is enforced by the type system, not by convention.

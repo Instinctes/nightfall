@@ -119,13 +119,30 @@ input_msg  = H(commit)
 output_msg = H(features, commit, Ke, Ko, range_proof, payload)
 ```
 
-Every consensus-relevant field is signed by exactly one of the three. **None
-binds a transaction body** — see §2.0; a block dissolves its transactions, so a
-body-bound signature would stop verifying.
+None of the three binds a transaction body — see §2.0; a block dissolves its
+transactions, so a body-bound signature would stop verifying. From protocol
+1.1.0 inputs and outputs are bound to their transaction by keys instead (§1.6).
 
-Replaying a captured input signature is useless: the output leaves the UTXO set
-the moment it is spent. Re-routing value is prevented by the kernel, which
-requires knowledge of the input's blinding factor that no third party has.
+### 1.6 Transaction binding (protocol 1.1.0, from height 500,000)
+
+```
+input:   input_key Ki = ki·G,  key_sig under Ki + h·Ko over H(commit ‖ Ki)
+         h = Hs(Ki ‖ Ko)
+kernel:  stealth_excess X = x·G,  stealth_sig by x over H(kernel_msg ‖ X)
+tx/body: stealth_offset s, kernel_offset k   (public scalars, summed on aggregation)
+
+key balance:    Σ Ki − Σ Ke = Σ X + s·G
+value balance:  Σout − Σin + fee·G − reward·G = Σ excess + k·H
+coinbase:       commit(coinbase output) − reward·G = excess(coinbase kernel)
+fees:           every kernel fee ≤ 90,000,000 NIGHT, sums checked
+```
+
+The construction follows Litecoin MWEB's stealth offsets. Below the activation
+height the fields are stripped and blocks are validated, hashed and stored
+exactly as in 1.0.x. Wallets attach `input_key`, `key_sig`, `stealth_excess`
+and `stealth_sig` on both sides of the height, so a transaction built before it
+stays valid after it; `kernel_offset` is only used once the next block is at or
+above the activation height.
 
 ---
 
@@ -353,6 +370,9 @@ Per block (stateful):
 - minting would not exceed the cap
 - coinbase is transaction 0 and the only one
 - every input exists in the UTXO set, is mature, and is correctly signed
+- from height 500,000: every input key signature verifies, the key balance and
+  the offset value balance hold, the coinbase output opens to the coinbase
+  amount, and fees are in range (§1.6)
 - `tx_root`, `utxo_root` and `kernel_sum` match after application
 - **the supply invariant still holds**
 

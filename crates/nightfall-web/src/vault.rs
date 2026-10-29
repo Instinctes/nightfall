@@ -350,7 +350,7 @@ impl BrowserVault {
         let wallet = self.inner.wallet().map_err(err)?;
         let rows: Vec<_> = wallet.history().iter().take(80).map(|e| json!({
             "direction":e.direction.label(), "amount":Amount(e.amount).decimal_string(), "fee":Amount(e.fee).decimal_string(),
-            "memo":e.memo, "height":e.height, "pending":e.is_pending(), "timestamp":e.timestamp, "txid":e.txid,
+            "memo":e.memo, "height":e.height, "pending":e.is_pending(), "failed":e.failed, "timestamp":e.timestamp, "txid":e.txid,
             "quarantined":e.quarantined, "retryable":pending_transaction(wallet, &e.txid).is_ok(),
         })).collect();
         serde_json::to_string(&rows).map_err(err)

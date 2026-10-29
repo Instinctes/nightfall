@@ -116,6 +116,10 @@ impl PowParams {
     }
 }
 
+/// Mainnet activation height of the binding rules. See
+/// [`NetworkId::binding_fork_height`].
+pub const BINDING_FORK_HEIGHT_MAINNET: u64 = 500_000;
+
 /// Max timestamp drift into the future (seconds).
 ///
 /// v4 allowed ±2 h on a 15-second chain, which is 480 block intervals of
@@ -252,6 +256,22 @@ impl NetworkId {
                 iterations: 1,
                 lanes: 1,
             },
+        }
+    }
+
+    /// First height at which the binding rules apply: fresh input keys, the
+    /// block-wide key balance, kernel offsets, the coinbase opening rule and
+    /// bounded fees. Below it a block is validated exactly as 1.0.x did.
+    ///
+    /// Consensus-critical. Moving it is a new release, and only before the
+    /// old height has been reached.
+    pub fn binding_fork_height(self) -> u64 {
+        match self {
+            Self::Mainnet => BINDING_FORK_HEIGHT_MAINNET,
+            Self::Testnet => 0,
+            // Low but not zero, so the test suite can mine across the fork
+            // and check both rule sets on one chain.
+            Self::Devnet => 20,
         }
     }
 

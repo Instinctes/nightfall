@@ -52,26 +52,56 @@ pub fn build_coinbase(
         inputs: vec![],
         outputs: vec![output],
         kernels: vec![],
+        stealth_offset: None,
+        kernel_offset: None,
     };
 
-    // Kernel excess = Σ out_blinds (no inputs).
+    // Kernel excess = Σ out_blinds (no inputs). No kernel offset, ever: the
+    // binding rules require the coinbase kernel's excess to open the coinbase
+    // output exactly, which is what pins the subsidy to the flagged output.
     // `lock_height` carries the block height, which pins a coinbase kernel to
     // exactly one height and stops it being replayed at another.
     let excess_secret = secrets.blind;
-    tx.kernels = vec![build_kernel(
+    let mut kernel = build_kernel(
         KernelFeature::Coinbase,
         0,
         reward_darks,
         height,
         &excess_secret,
-    )];
+    );
+    // Key balance with no inputs: −Ke = X + s·G  ⇒  x = −r − s.
+    let s = nightfall_crypto::random_scalar();
+    kernel.attach_stealth(&(-secrets.ephemeral - s));
+    tx.kernels = vec![kernel];
+    tx.stealth_offset = Some(s.to_bytes());
     Ok(tx)
+}
+
+/// Options for building a transfer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BuildRules {
+    /// Add a random kernel offset. Only valid once the next block is at or
+    /// above the binding fork; a wallet that does not know the height leaves
+    /// it off, and the transaction is then valid on both sides of the fork.
+    pub kernel_offset: bool,
+}
+
+impl BuildRules {
+    /// The rules for a transaction aimed at block `next_height` on `network`.
+    pub fn for_height(network: nightfall_types::NetworkId, next_height: u64) -> Self {
+        Self {
+            kernel_offset: next_height >= network.binding_fork_height(),
+        }
+    }
 }
 
 /// Build a transfer. Change is returned to `change_to`.
 ///
 /// Fee is burned in full: it appears only as the public `fee·G` term in the
 /// balance equation and is credited to nobody.
+///
+/// Always carries the binding fields and never a kernel offset, so the result
+/// is valid on both sides of the binding fork. See [`build_transfer_with`].
 pub fn build_transfer(
     owner: &WalletKeys,
     spendables: &[Spendable],
@@ -80,6 +110,30 @@ pub fn build_transfer(
     change_to: &Address,
     lock_height: u64,
     ctx: &[u8],
+) -> Result<Transaction, BuildError> {
+    build_transfer_with(
+        owner,
+        spendables,
+        payments,
+        fee_darks,
+        change_to,
+        lock_height,
+        ctx,
+        BuildRules::default(),
+    )
+}
+
+/// [`build_transfer`] with explicit [`BuildRules`].
+#[allow(clippy::too_many_arguments)]
+pub fn build_transfer_with(
+    owner: &WalletKeys,
+    spendables: &[Spendable],
+    payments: &[Payment],
+    fee_darks: u64,
+    change_to: &Address,
+    lock_height: u64,
+    ctx: &[u8],
+    rules: BuildRules,
 ) -> Result<Transaction, BuildError> {
     if spendables.is_empty() {
         return Err(BuildError::NoInputs);
@@ -105,11 +159,13 @@ pub fn build_transfer(
 
     let mut outputs = Vec::new();
     let mut out_blind_sum = Scalar::ZERO;
+    let mut out_ephemeral_sum = Scalar::ZERO;
 
     for p in payments {
         let (o, s) =
             create_output(&p.to, p.amount, &p.memo, ctx).map_err(|_| BuildError::OutputFailed)?;
         out_blind_sum += s.blind;
+        out_ephemeral_sum += s.ephemeral;
         outputs.push(o);
     }
 
@@ -118,38 +174,22 @@ pub fn build_transfer(
     let (change_out, change_secrets) =
         create_output(change_to, change, "", ctx).map_err(|_| BuildError::OutputFailed)?;
     out_blind_sum += change_secrets.blind;
+    out_ephemeral_sum += change_secrets.ephemeral;
     outputs.push(change_out);
 
     let in_blind_sum: Scalar = spendables.iter().fold(Scalar::ZERO, |acc, s| acc + s.blind);
 
-    // Σout − Σin + fee·G = excess·H  ⇒  excess = Σ out_blinds − Σ in_blinds
-    let excess_secret = out_blind_sum - in_blind_sum;
-
-    let mut tx = Transaction {
-        version: TX_VERSION,
-        inputs: spendables
-            .iter()
-            .map(|s| Input {
-                commit: s.commit,
-                sig: nightfall_crypto::SchnorrSig {
-                    r: [0u8; 32],
-                    s: [0u8; 32],
-                },
-            })
-            .collect(),
-        outputs,
-        kernels: vec![],
+    // Σout − Σin + fee·G = excess·H + k·H  ⇒  excess = Σ out_blinds − Σ in_blinds − k
+    let kernel_offset = if rules.kernel_offset {
+        Some(nightfall_crypto::random_scalar())
+    } else {
+        None
     };
+    let excess_secret = out_blind_sum - in_blind_sum - kernel_offset.unwrap_or(Scalar::ZERO);
 
-    tx.kernels = vec![build_kernel(
-        KernelFeature::Plain,
-        fee_darks,
-        0,
-        lock_height,
-        &excess_secret,
-    )];
-
-    for (i, s) in spendables.iter().enumerate() {
+    let mut inputs = Vec::with_capacity(spendables.len());
+    let mut in_key_sum = Scalar::ZERO;
+    for s in spendables {
         // Sanity: the secret must actually open the output key we are spending.
         debug_assert_eq!(
             Commitment::new(s.value, &s.blind),
@@ -157,13 +197,42 @@ pub fn build_transfer(
             "spendable blind does not open its commitment"
         );
         let msg = Transaction::input_message(&s.commit);
-        tx.inputs[i].sig = sig::sign(&s.spend_secret, &generator_g(), &msg);
+        let output_pk = (generator_g() * s.spend_secret).compress().to_bytes();
+        let ki = nightfall_crypto::derive_input_secret(&s.spend_secret, &s.commit);
+        let (input_key, key_sig) =
+            nightfall_crypto::sign_input_key(&ki, &s.spend_secret, &s.commit, &output_pk);
+        in_key_sum += ki;
+        inputs.push(Input {
+            commit: s.commit,
+            sig: sig::sign(&s.spend_secret, &generator_g(), &msg),
+            input_key: Some(input_key),
+            key_sig: Some(key_sig),
+        });
     }
 
-    let _ = owner; // owner is implied by the per-output spend secrets
+    let mut kernel = build_kernel(
+        KernelFeature::Plain,
+        fee_darks,
+        0,
+        lock_height,
+        &excess_secret,
+    );
+    // Σ Ki − Σ Ke = X + s·G  ⇒  x = Σ ki − Σ r − s
+    let stealth_offset = nightfall_crypto::random_scalar();
+    kernel.attach_stealth(&(in_key_sum - out_ephemeral_sum - stealth_offset));
 
-    // Transaction builders must never return a transaction that the ledger
-    // will reject solely because its shape exceeds consensus limits.
+    let tx = Transaction {
+        version: TX_VERSION,
+        inputs,
+        outputs,
+        kernels: vec![kernel],
+        stealth_offset: Some(stealth_offset.to_bytes()),
+        kernel_offset: kernel_offset.map(|k| k.to_bytes()),
+    };
+
+    let _ = owner; // owner is implied by the per-output spend secrets
+                   // Transaction builders must never return a transaction that the ledger
+                   // will reject solely because its shape exceeds consensus limits.
     tx.check_shape()?;
     Ok(tx)
 }
