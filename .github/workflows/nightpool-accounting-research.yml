@@ -1,0 +1,43 @@
+name: Nightpool accounting reference
+
+on:
+  pull_request:
+    paths:
+      - 'research/nightpool/**'
+      - 'docs/NIGHTPOOL-ACCOUNTING-RESEARCH.md'
+      - '.github/workflows/nightpool-accounting-research.yml'
+
+  push:
+    branches: [main]
+    paths:
+      - 'research/nightpool/**'
+      - 'docs/NIGHTPOOL-ACCOUNTING-RESEARCH.md'
+      - '.github/workflows/nightpool-accounting-research.yml'
+
+jobs:
+
+  unit:
+
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.12']
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Adversarial accounting tests
+        run: |
+          python -m unittest discover \
+            -s research/nightpool \
+            -p 'test_*.py' -v
+
+      - name: Offline synthetic demonstration
+        run: |
+          python research/nightpool/payout_reference.py --demo
