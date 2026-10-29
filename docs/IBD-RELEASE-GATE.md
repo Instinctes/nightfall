@@ -67,3 +67,25 @@ No changes to genesis, consensus, emission,
 keys, RPC or chain storage.
 
 No mainnet state is read or written.
+
+
+### CI stdout regression (2026-10-29)
+
+The Rust integration test itself passed, but the
+Python gate initially rejected its output.
+
+`--nocapture` allows the test's `eprintln!`
+diagnostics to appear inside the harness status
+line, defeating the strict `test ... ok` parser.
+
+Use `--show-output` instead.
+
+Rust reports the canonical single-test status
+and then prints captured diagnostics for
+passing tests.
+
+The process exit code, test identity, output
+limit and timeout are still checked.
+
+This is a harness repair, not proof of
+mainnet synchronization performance.

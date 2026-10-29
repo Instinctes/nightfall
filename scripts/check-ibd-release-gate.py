@@ -305,7 +305,7 @@ def main():
         TEST_NAME,
         '--',
         '--exact',
-        '--nocapture',
+        '--show-output',
         '--test-threads=1',
     ]
 
