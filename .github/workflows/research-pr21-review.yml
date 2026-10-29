@@ -1,0 +1,34 @@
+name: Research PR21 - authenticated UTXO review
+on:
+  push:
+    branches: [feat/authenticated-state-chain-shadow-v2]
+  pull_request:
+    paths:
+      - 'crates/nightfall-ledger/**'
+      - 'crates/nightfall-consensus/**'
+      - 'crates/nightfall-storage/**'
+      - 'docs/REVIEW-EVIDENCE-PR21.md'
+      - '.github/workflows/research-pr21-review.yml'
+      - 'scripts/research-protocol-guard.py'
+permissions:
+  contents: read
+jobs:
+  boundaries-and-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Guard mainnet protocol identity
+        run: python3 scripts/research-protocol-guard.py
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Authenticated-state consensus, storage, and ledger tests
+        run: cargo test --locked -p nightfall-ledger -p nightfall-consensus -p nightfall-storage
+      - name: Strict targeted Clippy
+        run: cargo clippy --locked -p nightfall-ledger -p nightfall-consensus -p nightfall-storage --all-targets -- -D warnings
+      - name: Compile node integration
+        run: cargo check --locked -p nightfall-node
