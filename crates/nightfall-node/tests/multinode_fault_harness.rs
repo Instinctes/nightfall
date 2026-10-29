@@ -633,6 +633,7 @@ fn relay_bidirectional(downstream: TcpStream, upstream: TcpStream) {
 // ---------------------------------------------------------------- scenarios
 
 #[test]
+#[ignore = "real multi-node; run via independence-quality-gate"]
 fn partition_cuts_real_session_and_heal_resynchronizes() {
     let root = unique_root();
     fs::create_dir_all(&root).expect("create harness root");
@@ -778,6 +779,7 @@ fn partition_cuts_real_session_and_heal_resynchronizes() {
 }
 
 #[test]
+#[ignore = "real multi-node; run via independence-quality-gate"]
 fn partitioned_competing_chains_converge_on_heavier_work() {
     let root = unique_root();
     fs::create_dir_all(&root).expect("create harness root");
@@ -993,6 +995,7 @@ fn partitioned_competing_chains_converge_on_heavier_work() {
 /// Peers are explicitly configured.
 /// This does not prove open-network discovery.
 #[test]
+#[ignore = "real multi-node; run via independence-quality-gate"]
 fn three_node_survival_after_origin_failure() {
     let root = unique_root();
 

@@ -341,6 +341,7 @@ def main():
         "--test",
         "multinode_fault_harness",
         "--",
+        "--ignored",
         "--test-threads=1",
     ]
 

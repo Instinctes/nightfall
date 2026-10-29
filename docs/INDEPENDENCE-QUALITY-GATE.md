@@ -43,6 +43,12 @@ The receipt contains no wallet keys, credentials, or chain data.
 
 ## Reproduction
 
+The three real-process tests are ignored by regular workspace tests.
+The dedicated independence gate runs them explicitly with `--ignored`
+and checks that all three pass in each repetition. Changes under
+`crates/nightfall-node/src/**` and `crates/nightfall-p2p/src/**`
+also trigger the dedicated pull-request workflow.
+
 Run from the source repository:
 
     python3 scripts/check_multinode_independence.py --self-test

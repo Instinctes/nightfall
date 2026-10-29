@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - 'crates/nightfall-node/tests/multinode_fault_harness.rs'
+      - 'crates/nightfall-node/src/**'
+      - 'crates/nightfall-p2p/src/**'
       - 'scripts/check_multinode_independence.py'
       - '.github/workflows/independence-quality-gate.yml'
   workflow_dispatch:
