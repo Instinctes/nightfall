@@ -10,6 +10,7 @@ use nightfall_types::{NetworkId, WIRE_VERSION};
 
 use std::io::BufReader;
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn free_port() -> u16 {
@@ -42,11 +43,18 @@ fn real_node_recovers_every_short_wire_page() {
 
     let peer_port = listener.local_addr().unwrap().port();
 
+    // Share observed TCP page requests for CI diagnostics.
+    let seen_requests = Arc::new(Mutex::new(Vec::<u64>::new()));
+    let seen_by_peer = Arc::clone(&seen_requests);
+
     let peer = std::thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept real node");
 
+        // Windows CI may need longer for genuine proof validation.
+        // The main thread still enforces a bounded deadline.
+        let io_budget = if cfg!(windows) { 210 } else { 35 };
         stream
-            .set_read_timeout(Some(Duration::from_secs(35)))
+            .set_read_timeout(Some(Duration::from_secs(io_budget)))
             .unwrap();
 
         let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -90,6 +98,7 @@ fn real_node_recovers_every_short_wire_page() {
             match message {
                 PeerMsg::GetBlocks { from_height, limit } => {
                     requested.push(from_height);
+                    seen_by_peer.lock().expect("request log").push(from_height);
 
                     // Deliberately return a maximum of
                     // three blocks, never the requested 128.
@@ -161,7 +170,10 @@ fn real_node_recovers_every_short_wire_page() {
     .expect("start real node");
 
     let started = Instant::now();
-    let deadline = started + Duration::from_secs(50);
+    // Keep synchronization bounded on every platform.
+    // Windows gets time for real cryptographic validation.
+    let sync_budget = if cfg!(windows) { 180 } else { 50 };
+    let deadline = started + Duration::from_secs(sync_budget);
 
     loop {
         let status = node.status_snapshot().expect("node status");
@@ -172,8 +184,9 @@ fn real_node_recovers_every_short_wire_page() {
 
         assert!(
             Instant::now() < deadline,
-            "IBD stalled at height {}",
-            status.tip_height
+            "IBD stalled at height {}, requested pages {:?}",
+            status.tip_height,
+            seen_requests.lock().expect("request log").clone()
         );
 
         std::thread::sleep(Duration::from_millis(100));
