@@ -497,9 +497,18 @@ const SYSTEM_PREFIXES: &[&str] = &[
     "/var/lib/systemd",
 ];
 
+/// Absolute in the sense of the machine the unit or site file is for.
+///
+/// systemd, launchd and Caddy files describe a Unix server, so the check
+/// follows Unix rules on every host: a Windows operator preparing a Linux
+/// server's unit must get the same answer as one on the server itself.
+fn server_absolute(p: &Path) -> bool {
+    p.to_string_lossy().starts_with('/')
+}
+
 pub fn render_service(spec: &ServiceSpec) -> Result<String> {
     for (what, p) in [("binary", &spec.binary), ("datadir", &spec.datadir)] {
-        if !p.is_absolute() {
+        if !server_absolute(p) {
             bail!("{what} must be an absolute path; a service does not start in your shell's directory");
         }
         let s = p.to_string_lossy();
@@ -658,7 +667,7 @@ pub fn render_caddy(spec: &SelfHostSpec) -> Result<String> {
     if d.ends_with("nightfallcoin.org") {
         bail!("this is for your own domain; nightfallcoin.org is already served");
     }
-    if !spec.wallet_dir.is_absolute() {
+    if !server_absolute(&spec.wallet_dir) {
         bail!("wallet directory must be an absolute path");
     }
     let dir = spec.wallet_dir.to_string_lossy();
