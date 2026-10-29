@@ -1,0 +1,28 @@
+name: Termux Restart Guard
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/termux_restart_guard.py'
+      - 'scripts/test_termux_restart_guard.py'
+      - 'docs/TERMUX-RESTART-GUARD.md'
+      - '.github/workflows/termux-restart-guard.yml'
+
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: python3 -m unittest discover -s scripts -p 'test_termux_restart_guard.py' -v
