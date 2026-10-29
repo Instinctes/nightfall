@@ -2297,7 +2297,7 @@ fn p2p_listen_loop(
                 // Bound active handlers before peer Hello.
                 let limit = MAX_PEERS.saturating_add(IBD_ACCEPT_BURST);
 
-                let admitted = pending.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                let admitted = pending.try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                     (n < limit).then_some(n + 1)
                 });
 
