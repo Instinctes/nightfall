@@ -248,6 +248,20 @@ mod tests {
         }
         assert_eq!(ALLOWED.len(), 7, "adding a method here needs a reason");
     }
+    /// Forwarded users can share the same transport-peer IP.
+    /// This tests the quota; it does not resolve proxy fairness.
+    #[test]
+    fn forwarded_clients_share_one_rate_bucket() {
+        let rates = Mutex::new(HashMap::new());
+        let forwarder = "127.0.0.1";
+        for _ in 0..120 {
+            assert!(allow(&rates, forwarder));
+        }
+        assert!(!allow(&rates, forwarder));
+        assert_eq!(rates.lock().unwrap().len(), 1);
+        assert!(allow(&rates, "198.51.100.7"));
+    }
+
     #[test]
     fn bounded_source_buckets() {
         let rates = Mutex::new(HashMap::new());
