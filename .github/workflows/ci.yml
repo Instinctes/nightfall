@@ -124,3 +124,10 @@ jobs:
       # skipped here by the compiler rather than silently at runtime.
       - name: Wallet storage tests
         run: cargo test -p nightfall-wallet --lib
+
+      # The Release workflow runs the whole workspace suite on Windows before
+      # it builds anything, so a Windows-only failure used to surface only
+      # after the tag. Run the same suite here, before the merge.
+      - name: Workspace tests (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test --workspace --locked --no-fail-fast
