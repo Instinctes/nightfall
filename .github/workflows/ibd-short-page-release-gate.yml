@@ -1,0 +1,54 @@
+name: IBD short-page release gate (Devnet)
+
+on:
+  pull_request:
+    paths:
+      - 'crates/nightfall-node/src/**'
+      - 'crates/nightfall-p2p/src/**'
+      - 'crates/nightfall-node/tests/ibd_short_pages.rs'
+      - 'scripts/check-ibd-release-gate.py'
+      - '.github/workflows/ibd-short-page-release-gate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  short-page-real-node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: '2'
+      NIGHTFALL_PEERS_URL: 'off'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check Python runner failure behavior
+        run: python3 scripts/check-ibd-release-gate.py --self-test
+
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+
+      - name: Repeat real TCP Devnet IBD regression
+        run: |
+          python3 scripts/check-ibd-release-gate.py \
+            --repeats 3 --timeout 300 \
+            --report "$RUNNER_TEMP/ibd-acceptance.json"
+
+      - name: Preserve evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightfall-ibd-acceptance
+          path: ${{ runner.temp }}/ibd-acceptance.json
+          if-no-files-found: warn
+          retention-days: 30
