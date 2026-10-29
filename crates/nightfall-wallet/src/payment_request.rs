@@ -45,6 +45,10 @@ pub const SCHEME: &str = "nightfall";
 /// Longest request accepted. A QR code cannot usefully hold more, and an
 /// unbounded parser is a parser someone will feed a megabyte to.
 pub const MAX_LEN: usize = 2048;
+/// Only this HTTPS origin/path may wrap a request. The fragment never forms
+/// part of the HTTP request; share recipients and browser extensions can see it.
+pub const SHARE_PREFIX: &str = "https://wallet.nightfallcoin.org/#pay=";
+pub const MAX_SHARE_LEN: usize = SHARE_PREFIX.len() + MAX_LEN * 3;
 /// Longest memo. Matches the wallet's own memo limit.
 pub const MAX_MEMO: usize = 64;
 /// Longest invoice identifier. Long enough for a UUID and a prefix.
@@ -158,6 +162,21 @@ impl PaymentRequest {
     /// sign or send anything. It answers one question: what is being asked for?
     pub fn parse(text: &str) -> Result<Self, RequestError> {
         let text = text.trim();
+        let decoded;
+        let text = if let Some(fragment) = text.strip_prefix(SHARE_PREFIX) {
+            if text.len() > MAX_SHARE_LEN {
+                return Err(RequestError::TooLong);
+            }
+            decoded = decode_component(fragment)?;
+            // Do not accept nested wrappers, unescaped delimiters or alternate
+            // encodings that allow different readers to disagree on the payload.
+            if encode_component(&decoded) != fragment {
+                return Err(RequestError::BadEncoding);
+            }
+            decoded.as_str()
+        } else {
+            text
+        };
         if text.len() > MAX_LEN {
             return Err(RequestError::TooLong);
         }
@@ -296,6 +315,21 @@ impl PaymentRequest {
         uri
     }
 
+    /// A browser-opening link. No address, amount or reference in the HTTP
+    /// path/query. Recipients still see these details; this is not encryption.
+    pub fn to_share_link(&self) -> String {
+        format!("{SHARE_PREFIX}{}", encode_component(&self.to_uri()))
+    }
+
+    /// Recognize a candidate for the UI; validation still happens in `parse`.
+    pub fn is_candidate(text: &str) -> bool {
+        let text = text.trim();
+        text.starts_with(SHARE_PREFIX)
+            || text
+                .split_once(':')
+                .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case(SCHEME))
+    }
+
     /// The amount as a person reads it, or a plain statement that there is none.
     pub fn amount_text(&self) -> String {
         match self.amount_darks {
@@ -386,6 +420,42 @@ mod tests {
 
     fn uri(query: &str) -> String {
         format!("{SCHEME}:{}?{query}", address().encode())
+    }
+
+    #[test]
+    fn share_links_preserve_exact_request_and_network() {
+        for network in ["mainnet", "testnet", "devnet"] {
+            let request = PaymentRequest::parse(&uri(&format!(
+                "network={network}&amount=8999999999999999&memo=Coffee%20%26%20tea%20%2B%20%F0%9F%8C%99&id=A%231&expires=1900000000"
+            ))).unwrap();
+            let link = request.to_share_link();
+            assert!(PaymentRequest::is_candidate(&link));
+            assert_eq!(
+                link.split('#').next(),
+                Some("https://wallet.nightfallcoin.org/")
+            );
+            assert_eq!(PaymentRequest::parse(&link).unwrap(), request);
+        }
+    }
+
+    #[test]
+    fn share_links_refuse_ambiguous_or_foreign_wrappers() {
+        let request = PaymentRequest::parse(&uri("network=devnet&amount=1")).unwrap();
+        let link = request.to_share_link();
+        for bad in [
+            link.replace("https://", "http://"),
+            link.replace(".org/", ".org.evil/"),
+            link.replace(".org/", ".org/?tracking=yes"),
+            format!("{link}&amount=2"),
+            format!("{SHARE_PREFIX}%FF"),
+            format!("{SHARE_PREFIX}%"),
+            format!("{SHARE_PREFIX}{}", encode_component(&link)),
+            format!("{SHARE_PREFIX}{}", "x".repeat(MAX_SHARE_LEN)),
+        ] {
+            assert!(PaymentRequest::parse(&bad).is_err());
+        }
+        let wrong = PaymentRequest::parse(&link).unwrap();
+        assert!(wrong.require_network(NetworkId::Mainnet).is_err());
     }
 
     #[test]

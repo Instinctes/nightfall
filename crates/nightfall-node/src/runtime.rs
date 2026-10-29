@@ -273,6 +273,23 @@ impl NodeInner {
         self.loading
     }
 
+    /// For absence-based wallet decisions while the caller holds the state lock.
+    pub fn wallet_chain_settled(&self) -> bool {
+        if self.loading
+            || self.reorg_in_flight.load(Ordering::SeqCst)
+            || self.stalled_on_fork.load(Ordering::SeqCst)
+            || catchup_behind(self).unwrap_or(0) > 0
+        {
+            return false;
+        }
+        if !self.sessions.is_empty() {
+            self.best_peer_height > 0
+                && self.chain.tip_height().map(|h| h.0).unwrap_or(0) >= self.best_peer_height
+        } else {
+            self.network == NetworkId::Devnet && self.best_peer_height == 0
+        }
+    }
+
     pub fn persist(&mut self) -> anyhow::Result<()> {
         if let Some(keep) = self.prune_keep {
             match self.chain.prune_keep(keep) {
@@ -320,8 +337,13 @@ impl NodeInner {
     pub fn submit_tx(&mut self, tx: Transaction) -> Result<String, String> {
         self.chain.precheck_tx(&tx).map_err(|e| e.to_string())?;
         let id = tx.txid().to_hex();
-        if !self.mempool.insert(tx.clone(), now_unix()) {
-            return Ok(id);
+        match self.mempool.insert_checked(tx.clone(), now_unix()) {
+            nightfall_consensus::InsertOutcome::Added => {}
+            nightfall_consensus::InsertOutcome::Known => return Ok(id),
+            nightfall_consensus::InsertOutcome::Conflict => {
+                return Err("another pending transaction already spends one of these inputs".into())
+            }
+            nightfall_consensus::InsertOutcome::Full => return Ok(id),
         }
         // Origin always stems: the first hop is one random peer, not a
         // broadcast that paints this node as the sender.
@@ -635,9 +657,14 @@ pub fn classify_sync_hold(
     catchup: Option<u64>,
 ) -> SyncHold {
     if stalled_on_fork || reorg_in_flight {
-        let gap = best_peer_height.saturating_sub(our_height).max(fork_rewind);
-        if gap > nightfall_consensus::MAX_REORG_DEPTH as u64 {
-            return SyncHold::DeadBranch { gap };
+        // Only the rewind decides. 1.0.5 also counted how far the peer was
+        // *ahead*, so a node 4,600 blocks behind on a three-block fork (issue
+        // #40) was told it sat on a dead branch "4,600 blocks back" — a number
+        // that described its lag, not its fork, and pointed at a resync when
+        // the real fault was elsewhere.
+        let _ = (our_height, best_peer_height);
+        if fork_rewind > nightfall_consensus::MAX_REORG_DEPTH as u64 {
+            return SyncHold::DeadBranch { gap: fork_rewind };
         }
         return SyncHold::CompetingTip {
             reorging: reorg_in_flight,
@@ -1010,6 +1037,11 @@ impl NodeHandle {
             .ok()
             .and_then(|g| g.proxy.clone())
             .is_some();
+        // A manual lookup must not bypass the privacy policy.
+        if !using_proxy && nightfall_p2p::privacy_lockdown_enabled() {
+            anyhow::bail!("privacy lockdown: configure SOCKS5 before adding a peer");
+        }
+
         if !using_proxy {
             use std::net::ToSocketAddrs;
             let resolved = addr
@@ -1435,7 +1467,7 @@ fn open_outbound_session(state: &SharedState, addr: &str) -> anyhow::Result<()> 
     // that just opened Core is often tens of blocks behind; one GetBlocks
     // here, then the loop chains pages if the peer is still ahead. Claim a
     // unique slice so two new outbound peers do not fetch the same page.
-    if peer_h + 1 > next || peer_tip != tip.to_hex() {
+    if peer_covers_height(peer_h, next) || peer_tip != tip.to_hex() {
         let from_height = {
             let mut g = state.lock().unwrap();
             claim_ibd_from(&mut g)
@@ -1648,6 +1680,13 @@ fn spawn_directory_bootstrap(
     configured: Option<String>,
     genesis_hex: String,
 ) {
+    // The directory uses direct HTTPS, not P2P SOCKS5.
+    // Lockdown must never contact it directly.
+    if nightfall_p2p::privacy_lockdown_enabled() {
+        tracing::warn!("privacy lockdown: direct HTTPS peer directory disabled");
+        return;
+    }
+
     let url = match configured.as_deref().map(str::trim) {
         Some("off") | Some("none") | Some("false") => return,
         Some(s) if !s.is_empty() => s.to_string(),
@@ -1700,6 +1739,27 @@ fn fetch_directory_peers(url: &str, genesis_hex: &str) -> anyhow::Result<Vec<Str
         .filter(|a| is_directory_addr(a))
         .take(MAX_PEERS_PER_MSG)
         .collect())
+}
+
+/// Whether a peer's advertised tip includes `next_height`.
+///
+/// Peer heights come from the network and may be `u64::MAX`. Expressing
+/// this as `peer_height + 1 > next_height` can overflow; the equivalent
+/// comparison below cannot.
+fn peer_covers_height(peer_height: u64, next_height: u64) -> bool {
+    peer_height >= next_height
+}
+
+#[cfg(test)]
+mod peer_height_wire_tests {
+    use super::peer_covers_height;
+
+    #[test]
+    fn untrusted_max_height_cannot_overflow() {
+        assert!(peer_covers_height(u64::MAX, u64::MAX));
+        assert!(peer_covers_height(100, 100));
+        assert!(!peer_covers_height(99, 100));
+    }
 }
 
 fn finish_introduction(
@@ -2071,6 +2131,12 @@ fn peer_io_loop(
                             .blocks_from(from_height, limit.min(MAX_BLOCKS_PER_REQUEST))
                     }
                 };
+                // Count limits alone are insufficient: 128 legitimate
+                // blocks may serialize beyond the receiver's wire-frame cap.
+                // Send the largest prefix that is guaranteed to fit. Clients
+                // paginate short byte-limited pages until the requested count
+                // or actual chain end is reached.
+                let blocks = nightfall_p2p::fit_blocks_response(blocks)?;
                 sess.send(&PeerMsg::Blocks { blocks })?;
             }
 
@@ -2093,7 +2159,7 @@ fn peer_io_loop(
                     g.session_height.insert(sess.key.clone(), height);
                     let next = next_needed_height(&g);
                     let our_tip = g.chain.tip_hash().to_hex();
-                    let want = if height + 1 > next {
+                    let want = if peer_covers_height(height, next) {
                         Some(claim_ibd_from(&mut g))
                     } else {
                         None
@@ -2166,7 +2232,7 @@ fn peer_io_loop(
                 note_peer_height(state, height);
                 let want = {
                     let mut g = state.lock().unwrap();
-                    if height + 1 > next_needed_height(&g) {
+                    if peer_covers_height(height, next_needed_height(&g)) {
                         Some(claim_ibd_from(&mut g))
                     } else {
                         None
@@ -2200,7 +2266,7 @@ fn peer_io_loop(
                 let (want, reject) = {
                     let mut g = state.lock().unwrap();
                     let next = next_needed_height(&g);
-                    let behind = last_peer_height + 1 > next;
+                    let behind = peer_covers_height(last_peer_height, next);
                     match outcome {
                         IbdPage::Applied(_) | IbdPage::Buffered if behind => {
                             (Some(claim_ibd_from(&mut g)), false)
@@ -2300,39 +2366,52 @@ fn consider_branch(state: &SharedState, block: Block, peer_label: &str) {
         return;
     };
 
-    // Walk forward for as far as the run is contiguous. A gap simply ends it;
-    // the next push round fills in what is missing.
-    //
-    // On an archive node this prefix starts at genesis. On a pruned node
-    // it starts at `first_height` — `evaluate_reorg_at` is told that.
-    let mut candidate: Vec<Block> = g.chain.blocks[..=fork_at].to_vec();
+    // Only the blocks we do not already have. Copying `blocks[..=fork_at]`
+    // duplicated the whole archive on every one-block fork, which is what
+    // pushed an 8 GB seed into the OOM killer.
+    let ancestor_height = g.chain.blocks[fork_at].header.height.0;
+    let mut suffix = Vec::new();
     let mut cursor = g.chain.blocks[fork_at].hash().0;
-    let mut added = 0usize;
     while let Some(next) = g.branch.get(&cursor) {
-        candidate.push(next.clone());
         cursor = next.hash().0;
-        added += 1;
-        if added > MAX_BRANCH_BLOCKS {
+        suffix.push(next.clone());
+        if suffix.len() > MAX_BRANCH_BLOCKS {
             break;
         }
     }
-    if added == 0 {
+    if suffix.is_empty() {
         return;
     }
 
-    // Cheap rejection before rebuilding anything.
-    // Pruned candidate is the window only — add the horizon's work or a
-    // heavier suffix always looks lighter than the live chain.
-    let claimed: u128 = g.chain.horizon_work + candidate.iter().map(|b| b.work()).sum::<u128>();
-    if claimed <= g.chain.total_work {
+    let our_tip = g.chain.tip_height().map(|h| h.0).unwrap_or(0);
+    let rewind = our_tip.saturating_sub(ancestor_height) as usize;
+    if rewind > nightfall_consensus::MAX_REORG_DEPTH {
+        g.stalled_on_fork.store(true, Ordering::SeqCst);
+        g.fork_rewind.store(rewind as u64, Ordering::SeqCst);
+        return;
+    }
+    let Some(rewind_work) = g.chain.rewound_work(rewind) else {
+        tracing::debug!("branch from {peer_label} rewinds further than the undo window");
+        return;
+    };
+    let suffix_work: u128 = suffix.iter().map(|block| block.work()).sum();
+    if g.chain
+        .total_work
+        .saturating_sub(rewind_work)
+        .saturating_add(suffix_work)
+        <= g.chain.total_work
+    {
         return;
     }
 
+    let trial = match g.chain.prepare_suffix_trial(ancestor_height) {
+        Ok(trial) => trial,
+        Err(error) => {
+            tracing::debug!("branch from {peer_label} not prepared: {error}");
+            return;
+        }
+    };
     let before = g.chain.block_count();
-    let network = g.chain.network;
-    let our_work = g.chain.total_work;
-    let our_hashes = g.chain.hash_chain();
-    let base = g.chain.pruned_base();
     let guard = Arc::clone(&g.reorg_in_flight);
     drop(g);
 
@@ -2341,16 +2420,16 @@ fn consider_branch(state: &SharedState, block: Block, peer_label: &str) {
         return;
     };
 
-    // Verified with the lock released. See `Chain::evaluate_reorg_at`.
-    let verdict =
-        Chain::evaluate_reorg_at(network, our_work, &our_hashes, base, candidate, now_unix());
+    let verdict = Chain::finish_suffix(trial, suffix, now_unix());
 
     let Ok(g) = state.lock() else { return };
     let mut g = g;
     match verdict {
-        Ok(Some(chain)) => {
-            if g.chain.adopt_reorg(chain) {
-                // A reorg replaces the chain wholesale, and until 0.8.4 the
+        Ok(Some(reorg)) => {
+            if g.chain.splice_suffix(reorg) {
+                g.stalled_on_fork.store(false, Ordering::SeqCst);
+                g.fork_rewind.store(0, Ordering::SeqCst);
+                // A reorg replaces the tip, and until 0.8.4 the
                 // mempool was never told. Anything the new branch had already
                 // mined stayed behind and then poisoned every block template
                 // — which is how one node stopped mining for hours while its
@@ -2428,23 +2507,61 @@ fn common_ancestor(
         return peer_h;
     }
 
+    // Search back from the lower tip. Probing back from a peer who is
+    // thousands of blocks ahead never looks at our chain, falls through to
+    // `peer_tip - 1`, and the caller then copies our whole archive trying to
+    // attach one block up there.
+    let our_h = state
+        .lock()
+        .ok()
+        .and_then(|g| g.chain.tip_height().map(|h| h.0))
+        .unwrap_or(0);
+    let ceiling = our_h.min(peer_h);
+    if let Some(ours) = our_hash_at(ceiling) {
+        if let Ok(batch) = nightfall_p2p::request_blocks(stream, ceiling, 1) {
+            if let Some(theirs) = batch.first() {
+                if theirs.hash().to_hex() == ours {
+                    return ceiling;
+                }
+            }
+        }
+    }
+
     let mut step = 1u64;
+    let mut lower = None;
     while step <= nightfall_consensus::MAX_REORG_DEPTH as u64 {
-        let probe = match peer_h.checked_sub(step) {
-            Some(p) => p,
-            None => break,
+        let Some(probe) = ceiling.checked_sub(step) else {
+            break;
         };
         let Ok(batch) = nightfall_p2p::request_blocks(stream, probe, 1) else {
             break;
         };
         let Some(theirs) = batch.first() else { break };
         if our_hash_at(probe) == Some(theirs.hash().to_hex()) {
-            return probe;
+            lower = Some(probe);
+            break;
         }
         step = step.saturating_mul(2);
     }
-
-    peer_h.saturating_sub(1)
+    let Some(mut lo) = lower else {
+        return ceiling.saturating_sub(nightfall_consensus::MAX_REORG_DEPTH as u64 + 1);
+    };
+    let mut hi = ceiling;
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        let Ok(batch) = nightfall_p2p::request_blocks(stream, mid, 1) else {
+            break;
+        };
+        let Some(theirs) = batch.first() else { break };
+        if our_hash_at(mid) == Some(theirs.hash().to_hex()) {
+            lo = mid;
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
 }
 
 /// How many blocks to push to a lagging peer in one sync round.
@@ -2661,10 +2778,9 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
         if batch.is_empty() {
             break;
         }
-        let next_from = batch
-            .last()
-            .map(|b| b.header.height.0 + 1)
-            .unwrap_or(from + 1);
+        // Block heights came from the peer. `u64::MAX` has no successor;
+        // stop this sync round instead of overflowing height arithmetic.
+        let next_from = batch.last().and_then(|b| b.header.height.0.checked_add(1));
 
         let mut g = state.lock().unwrap();
         let applied = g.chain.try_ingest_blocks(batch, now_unix()).unwrap_or(0);
@@ -2672,6 +2788,9 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
             total_applied += applied;
             g.bump_tip();
             let _ = g.persist();
+            let Some(next_from) = next_from else {
+                break;
+            };
             from = next_from;
             continue;
         }
@@ -2690,46 +2809,41 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
         }
 
         let ancestor = common_ancestor(state, &mut stream, peer_h, &peer_tip);
-        let (network, our_work, our_hashes, prefix, rewind, guard, base) = {
+        let (trial, guard) = {
             let g = state.lock().unwrap();
             let our_tip = g.chain.tip_height().map(|h| h.0).unwrap_or(0);
-            let rewind = our_tip.saturating_sub(ancestor) as usize;
-            let prefix = match g.chain.bodies_through(ancestor) {
-                Some(p) => p,
-                None => {
-                    tracing::warn!(
-                        "peer {addr} diverges below the prune horizon at height {} — not adopting",
-                        g.chain.first_height
-                    );
+            if ancestor > our_tip {
+                tracing::warn!("peer {addr} diverges below a height we can rewind — not adopting");
+                g.stalled_on_fork.store(true, Ordering::SeqCst);
+                break;
+            }
+            let rewind = (our_tip - ancestor) as usize;
+            g.fork_rewind.store(rewind as u64, Ordering::SeqCst);
+            if rewind > nightfall_consensus::MAX_REORG_DEPTH {
+                tracing::warn!(
+                    "peer {addr} diverges {rewind} blocks back — past MAX_REORG_DEPTH, not adopting"
+                );
+                g.stalled_on_fork.store(true, Ordering::SeqCst);
+                break;
+            }
+            if g.chain.is_pruned() && ancestor < g.chain.first_height {
+                tracing::warn!(
+                    "peer {addr} diverges below the prune horizon at height {} — not adopting",
+                    g.chain.first_height
+                );
+                g.stalled_on_fork.store(true, Ordering::SeqCst);
+                break;
+            }
+            let trial = match g.chain.prepare_suffix_trial(ancestor) {
+                Ok(trial) => trial,
+                Err(error) => {
+                    tracing::warn!("peer {addr} reorg not prepared: {error}");
                     g.stalled_on_fork.store(true, Ordering::SeqCst);
                     break;
                 }
             };
-            (
-                g.chain.network,
-                g.chain.total_work,
-                g.chain.hash_chain(),
-                prefix,
-                rewind,
-                Arc::clone(&g.reorg_in_flight),
-                g.chain.pruned_base(),
-            )
+            (trial, Arc::clone(&g.reorg_in_flight))
         };
-
-        if rewind > 0 {
-            if let Ok(g) = state.lock() {
-                g.fork_rewind.store(rewind as u64, Ordering::SeqCst);
-            }
-        }
-        if rewind > nightfall_consensus::MAX_REORG_DEPTH {
-            tracing::warn!(
-                "peer {addr} diverges {rewind} blocks back — past MAX_REORG_DEPTH, not adopting"
-            );
-            if let Ok(g) = state.lock() {
-                g.stalled_on_fork.store(true, Ordering::SeqCst);
-            }
-            break;
-        }
 
         let Some(_flight) = ReorgFlight::begin(&guard) else {
             tracing::debug!("peer {addr} diverges, but a reorg is already being verified");
@@ -2737,24 +2851,19 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
         };
 
         let suffix = fetch_blocks_from(&mut stream, ancestor.saturating_add(1), peer_h)?;
-        if suffix.is_empty() && rewind == 0 {
-            break;
-        }
-        let mut candidate = prefix;
-        candidate.extend(suffix);
-        if candidate.is_empty() {
+        if suffix.is_empty() {
             break;
         }
 
-        // Shared prefix is our own file; only the suffix is verified.
-        // See `Chain::evaluate_reorg_at`.
-        let verdict =
-            Chain::evaluate_reorg_at(network, our_work, &our_hashes, base, candidate, now_unix());
+        // Only the suffix is verified. The prefix stays in the live chain.
+        let verdict = Chain::finish_suffix(trial, suffix, now_unix());
 
         let mut g = state.lock().unwrap();
         match verdict {
-            Ok(Some(chain)) => {
-                if g.chain.adopt_reorg(chain) {
+            Ok(Some(reorg)) => {
+                if g.chain.splice_suffix(reorg) {
+                    g.stalled_on_fork.store(false, Ordering::SeqCst);
+                    g.fork_rewind.store(0, Ordering::SeqCst);
                     // Same reconciliation as the other reorg path above.
                     let dropped = g
                         .mempool
@@ -2805,8 +2914,18 @@ pub fn reorg_fetch_cap(peer_height: u64, from_height: u64) -> usize {
     if from_height > peer_height {
         return 0;
     }
-    let want = (peer_height - from_height) as usize + 1;
-    want.min(MAX_REORG_FETCH)
+    peer_height
+        .saturating_sub(from_height)
+        .saturating_add(1)
+        .min(MAX_REORG_FETCH as u64) as usize
+}
+
+/// Advance past a height supplied by an untrusted peer.
+///
+/// `u64::MAX` has no successor, so it terminates pagination instead of
+/// overflowing the node's height arithmetic.
+pub fn next_fetch_height(height: u64) -> Option<u64> {
+    height.checked_add(1)
 }
 
 /// Download blocks `[from_height ..= peer_height]` in pages.
@@ -2825,11 +2944,14 @@ fn fetch_blocks_from(
             break;
         }
         let n = batch.len();
-        from = batch
+        let next_from = batch
             .last()
-            .map(|b| b.header.height.0 + 1)
-            .unwrap_or(from + 1);
+            .and_then(|b| next_fetch_height(b.header.height.0));
         all.extend(batch);
+        let Some(next_from) = next_from else {
+            break;
+        };
+        from = next_from;
         if n < MAX_BLOCKS_PER_REQUEST || from > peer_height {
             break;
         }
@@ -2883,6 +3005,11 @@ fn catchup_behind(inner: &NodeInner) -> Option<u64> {
     {
         return Some(1);
     }
+    // Devnet is deliberately usable as a local network of one. Never bypass
+    // the fork/reorg guards above, or the public-network catch-up policy.
+    if inner.network == NetworkId::Devnet && inner.sessions.is_empty() {
+        return None;
+    }
     mining_should_wait(
         inner.chain.block_count(),
         inner.chain.tip_height().map(|h| h.0).unwrap_or(0),
@@ -2926,9 +3053,19 @@ pub fn mining_should_wait(
     if best_peer_height <= our_height {
         return None;
     }
-    if now.saturating_sub(behind_since) > MAX_CATCHUP_WAIT_SECS {
-        return None;
-    }
+    // No catch-up escape here on purpose.
+    //
+    // MAX_CATCHUP_WAIT_SECS exists so an ISOLATED node is not bricked, and
+    // isolation is already decided above by `peer_fresh`. Reaching this point
+    // means a peer confirmed a greater height within PEER_HEIGHT_TTL_SECS, so
+    // we are syncing, not alone -- and any initial sync takes far longer than
+    // the 10 minute window. Applying the escape here made a node start mining
+    // while hundreds of thousands of blocks behind, at the low historical
+    // difficulty of its own stale tip, which forks it onto a private chain
+    // exactly as this function's own doc comment warns.
+    //
+    // If the peer really does go away, its height goes stale, `peer_fresh`
+    // turns false, and the escape above still applies.
     Some(best_peer_height - our_height)
 }
 
@@ -3225,9 +3362,18 @@ mod sync_hold_tests {
 
     #[test]
     fn a_deep_fork_is_a_dead_branch() {
-        let hold = classify_sync_hold(true, false, 0, 12_000, 17_976, Some(1));
-        assert_eq!(hold, SyncHold::DeadBranch { gap: 5_976 });
         let hold = classify_sync_hold(true, false, 800, 17_000, 17_100, Some(1));
         assert_eq!(hold, SyncHold::DeadBranch { gap: 800 });
+    }
+
+    /// Issue #40: far behind is not deep. The status that 1.0.5 reported for
+    /// that node — stalled, rewind 0, 4,607 blocks behind — is a competing
+    /// tip, not a dead branch.
+    #[test]
+    fn lag_alone_never_makes_a_dead_branch() {
+        let hold = classify_sync_hold(true, false, 0, 280_537, 285_144, Some(1));
+        assert_eq!(hold, SyncHold::CompetingTip { reorging: false });
+        let hold = classify_sync_hold(true, false, 0, 12_000, 17_976, Some(1));
+        assert_eq!(hold, SyncHold::CompetingTip { reorging: false });
     }
 }

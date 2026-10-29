@@ -1,25 +1,35 @@
-# NIGHTFALLCOIN 1.0.5 — mainnet wallets
+# NIGHTFALLCOIN 1.1.1 — mainnet wallets
 
-Current release: [v1.0.5](https://github.com/Instinctes/nightfall/releases/tag/v1.0.5).
-Protocol v8, wire v6, mainnet genesis `061a052d…`. Same chain and data format as
-0.9.2. No reset, migration or seed service upgrade is required.
+Current release: [v1.1.1](https://github.com/Instinctes/nightfall/releases/tag/v1.1.1).
+Protocol v8, wire v6, mainnet genesis `061a052d…`. Same chain and data format.
+**Required upgrade:** 1.1.1 activates a consensus upgrade at block 500,000.
+Nodes, miners and pools must run 1.1.1 before that height; nothing has to be
+migrated.
 
 | Platform | Core download | Minimum |
 |---|---|---|
-| Apple Silicon | `NIGHTFALLCOIN-Core-1.0.5-macOS-arm64.dmg` | macOS 11 |
-| Intel Mac | `NIGHTFALLCOIN-Core-1.0.5-macOS-intel.dmg` | macOS 10.15 |
-| Windows x64 | `nightfall-core-1.0.5-windows-x64.exe` | Windows 10 |
-| Linux x64 | `nightfall-core-1.0.5-linux-x64` | GTK/X11 libraries required |
+| Apple Silicon | `NIGHTFALLCOIN-Core-1.1.1-macOS-arm64.dmg` | macOS 11 |
+| Intel Mac | `NIGHTFALLCOIN-Core-1.1.1-macOS-intel.dmg` | macOS 10.15 |
+| Windows x64 | `nightfall-core-1.1.1-windows-x64.exe` | Windows 10 |
+| Linux x64 | `nightfall-core-1.1.1-linux-x64` | GTK/X11 libraries required |
 | Mobile/browser | [Web wallet](https://nightfallcoin.org/wallet/) | Modern browser |
 
-Check the matching `SHA256SUMS-1.0.5.txt`, `SHA256SUMS-1.0.5-windows.txt`
-or `SHA256SUMS-1.0.5-linux.txt` before running a download. macOS bundles are
+Check the matching `SHA256SUMS-1.1.1.txt`, `SHA256SUMS-1.1.1-windows.txt`
+or `SHA256SUMS-1.1.1-linux.txt` before running a download. macOS bundles are
 ad-hoc signed for integrity checks, not Developer-ID signed or notarized.
 Windows binaries do not have a publisher signing certificate.
 
+Since 1.0.7 every file — both DMGs included — is built by
+GitHub Actions and carries a signed build provenance, so you can check which
+workflow built it from which tag:
+`gh attestation verify <file> --repo Instinctes/nightfall`. See
+[docs/RELEASE-PROVENANCE.md](../docs/RELEASE-PROVENANCE.md). That proves where a
+file came from; it does not remove the first-launch warning.
+
 Core starts on mainnet by default and includes a full node, miner and wallet.
 The macOS app bundles include the `nightfalld` and `nightfall-wallet` CLI tools;
-Windows/Linux CLI tools are separate release assets. Close Core completely
+Windows/Linux CLI tools are separate release assets, as are the Node Kit
+(`nightfall-nodekit`), the Devnet till and the receipt evidence tool. Close Core completely
 before replacing its app/binary. Back up your 24 words first; never delete
 your data directory to update.
 

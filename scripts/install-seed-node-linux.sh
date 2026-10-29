@@ -44,6 +44,10 @@ RPC_PORT=17881
 DATADIR="/var/lib/nightfall"
 BINDIR="/usr/local/bin"
 REPO="https://github.com/Instinctes/nightfall"
+# Bump both together after a reviewed Core release.
+# Refuse a moved or unexpected release tag.
+NIGHTFALL_RELEASE_TAG="v1.0.12"
+NIGHTFALL_RELEASE_SHA="5819f6cbf057bb48118a0616bacd6c25e2b576a4"
 EXPECTED_GENESIS="061a052d49607ff8f4b306c75d622ebd230cff4ec3a45a6dffc2f7738d4b20de"
 
 die() { printf '\033[31merror:\033[0m %s\n' "$1" >&2; exit 1; }
@@ -88,50 +92,64 @@ command -v cargo >/dev/null || die "cargo still not on PATH"
 TOTAL_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
 info "memory: ${TOTAL_MB} MB"
 
-# Named for this script rather than the conventional /swapfile, so a swapfile
-# the machine already had is never touched — and so a re-run always recognises
-# its own and cleans it up. The first version used /swapfile and skipped
-# creation when one existed, which meant a second run left the first run's file
-# behind while reporting that it had removed it.
 SWAPFILE=""
-SWAP_PATH=/var/tmp/nightfall-build.swap
-if [ "$TOTAL_MB" -lt 2048 ]; then
-    swapoff "$SWAP_PATH" 2>/dev/null || true
-    rm -f "$SWAP_PATH"
-    info "adding 2 GB of temporary swap for the build"
-    if fallocate -l 2G "$SWAP_PATH" 2>/dev/null \
-        || dd if=/dev/zero of="$SWAP_PATH" bs=1M count=2048 status=none; then
-        chmod 600 "$SWAP_PATH"
-        mkswap "$SWAP_PATH" >/dev/null 2>&1
-        if swapon "$SWAP_PATH" 2>/dev/null; then
-            SWAPFILE="$SWAP_PATH"
-        else
-            rm -f "$SWAP_PATH"
-            warn "could not enable swap — the build may run out of memory"
+SWAP_PATH=""
+BUILD=""
+
+# Only clean up objects created by this invocation. A fixed shared swap path
+# can refer to another operator's active swap or a pre-existing file.
+cleanup() {
+    local remove_swap=1
+    if [ -n "$SWAPFILE" ]; then
+        if ! swapoff "$SWAPFILE" 2>/dev/null; then
+            warn "temporary swap is still active; preserving $SWAPFILE for manual swapoff"
+            remove_swap=0
         fi
     fi
-fi
-# Removed again afterwards: a node at rest does not need it, and leaving a
-# swapfile behind on a small disk is a surprise for whoever looks next.
-cleanup() {
-    if [ -n "$SWAPFILE" ]; then
-        swapoff "$SWAPFILE" 2>/dev/null || true
-        rm -f "$SWAPFILE"
+    if [ -n "$SWAP_PATH" ] && [ "$remove_swap" -eq 1 ]; then
+        rm -f -- "$SWAP_PATH"
     fi
-    rm -rf "${BUILD:-}"
+    if [ -n "$BUILD" ]; then
+        rm -rf -- "$BUILD"
+    fi
 }
 trap cleanup EXIT
+
+if [ "$TOTAL_MB" -lt 2048 ]; then
+    SWAP_PATH="$(mktemp /var/tmp/nightfall-build.XXXXXXXX.swap)" \
+        || die "could not create an isolated temporary swapfile"
+    info "adding 2 GB temporary swap for the build"
+    if fallocate -l 2G "$SWAP_PATH" 2>/dev/null \
+        || dd if=/dev/zero of="$SWAP_PATH" bs=1M count=2048 status=none; then
+        if mkswap "$SWAP_PATH" >/dev/null 2>&1 \
+            && swapon "$SWAP_PATH" 2>/dev/null; then
+            SWAPFILE="$SWAP_PATH"
+        else
+            warn "could not enable swap — the build may run out of memory"
+        fi
+    else
+        warn "could not allocate swap — the build may run out of memory"
+    fi
+fi
 
 BUILD="$(mktemp -d)"
 
 info "fetching source"
-git clone --depth 1 "$REPO" "$BUILD/nightfall" >/dev/null 2>&1 \
+git clone --depth 1 --branch "$NIGHTFALL_RELEASE_TAG" "$REPO" "$BUILD/nightfall" >/dev/null 2>&1 \
     || die "clone failed — check network access to github.com"
+
+SOURCE_REV="$(git -C "$BUILD/nightfall" rev-parse --verify HEAD)" \
+    || die "could not identify source revision"
+[ "$SOURCE_REV" = "$NIGHTFALL_RELEASE_SHA" ] || die "release tag does not match pinned commit"
+LOCK_SHA="$(sha256sum "$BUILD/nightfall/Cargo.lock" | awk '{print $1}')" \
+    || die "could not hash Cargo.lock"
+info "source commit: $SOURCE_REV"
+info "Cargo.lock SHA256: $LOCK_SHA"
 
 JOBS=1
 [ "$TOTAL_MB" -ge 4096 ] && JOBS=$(nproc)
 info "building with $JOBS job(s) — several minutes on a small VPS"
-( cd "$BUILD/nightfall" && cargo build --release -j "$JOBS" -p nightfall-node ) \
+( cd "$BUILD/nightfall" && cargo build --locked --release -j "$JOBS" -p nightfall-node ) \
     || die "build failed — if it was killed without an error, it ran out of memory"
 
 install -m 0755 "$BUILD/nightfall/target/release/nightfalld" "$BINDIR/nightfalld"

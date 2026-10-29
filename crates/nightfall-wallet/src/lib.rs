@@ -8,7 +8,7 @@ use nightfall_consensus::Block;
 use nightfall_crypto::{
     scan_candidate, scan_output, Address, Commitment, ScanCandidate, WalletKeys,
 };
-use nightfall_ledger::{build_transfer, Payment, Spendable, Transaction};
+use nightfall_ledger::{build_transfer_with, Payment, Spendable, Transaction, MAX_INPUTS};
 use nightfall_storage::write_secret_file;
 use nightfall_types::{Amount, NetworkId};
 use serde::{Deserialize, Serialize};
@@ -199,11 +199,14 @@ pub struct HistoryEntry {
     /// still confirms it normally. Only the automatic re-send is withheld.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub quarantined: bool,
+    /// Locally released after canonical-chain validation. Kept for history; never retried.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub failed: bool,
 }
 
 impl HistoryEntry {
     pub fn is_pending(&self) -> bool {
-        self.height.is_none()
+        self.height.is_none() && !self.failed
     }
 
     /// Pending, imported from a backup, and therefore not acted on alone.
@@ -708,7 +711,25 @@ impl Wallet {
         })?)
     }
 
+    /// Restore a wallet from state handed in from outside this process — a
+    /// browser vault, an import — which is bounded by
+    /// [`vault::MAX_PLAINTEXT_BYTES`] before it is parsed.
     pub fn import_state(blob: &str) -> anyhow::Result<Self> {
+        if blob.len() > vault::MAX_PLAINTEXT_BYTES {
+            bail!("wallet state is too large");
+        }
+        Self::import_own_state(blob)
+    }
+
+    /// Restore a working copy from this process's own [`Wallet::export_state`].
+    ///
+    /// Core clones the open wallet this way for every background scan. That
+    /// state is not outside input, and its size grows with every output the
+    /// wallet owns: a miner passes the external-import bound after some tens
+    /// of thousands of blocks, and the scan then stopped for good
+    /// ("wallet state is too large", issue #64). Not for untrusted input —
+    /// use [`Wallet::import_state`] for that.
+    pub fn import_own_state(blob: &str) -> anyhow::Result<Self> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Import<'a> {
@@ -716,9 +737,6 @@ impl Wallet {
             network: &'a str,
             seed: &'a str,
             db: WalletFile,
-        }
-        if blob.len() > vault::MAX_PLAINTEXT_BYTES {
-            bail!("wallet state is too large");
         }
         let state: Import<'_> = serde_json::from_str(blob).context("invalid wallet state")?;
         state.db.swap_journal.validate()?;
@@ -923,6 +941,7 @@ impl Wallet {
                         // Found on chain by this wallet, not read out of a
                         // backup, and incoming besides: nothing to withhold.
                         quarantined: false,
+                        failed: false,
                     });
                 }
                 found += 1;
@@ -980,11 +999,105 @@ impl Wallet {
     /// Returns how many new outputs were discovered.
     pub fn scan_blocks(&mut self, blocks: &[Block]) -> anyhow::Result<u32> {
         self.check_chain_continuity(blocks)?;
+        self.scan_blocks_inner(blocks, false)
+    }
+
+    /// Adopt a node chain that now ends *below* this wallet's scan position.
+    ///
+    /// This is what a chain resync off a dead branch looks like from here: the
+    /// node threw away a branch the wallet had already scanned past, and the
+    /// network's chain is shorter than the abandoned one. The ordinary checks
+    /// are right to refuse that as an incremental page — the wallet would be
+    /// asked to scan a height it has "already" seen — and before 1.0.6 the
+    /// result was a wallet that waited for ever for the node to catch up with
+    /// a branch nobody else was on.
+    ///
+    /// `blocks` must be the node's whole chain from the birth height (or from
+    /// genesis). That is the one range in which absence means absence, so the
+    /// usual reconcile runs over it: outputs the chain no longer contains go,
+    /// spent flags are recomputed, and sends confirmed only on the abandoned
+    /// branch return to pending and are withheld from automatic re-sending.
+    /// Nothing is broadcast.
+    pub fn rebase_on_shorter_chain(&mut self, blocks: &[Block]) -> anyhow::Result<u32> {
+        let first = blocks
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("The node supplied no blocks to rebase on."))?;
+        let start = first.header.height.0;
+        anyhow::ensure!(
+            start == 0 || start == self.db.birth_height,
+            "A rebase needs the chain from the wallet's birth height ({}), not from {start}.",
+            self.db.birth_height
+        );
+        for (i, b) in blocks.iter().enumerate() {
+            anyhow::ensure!(
+                b.header.height.0 == start + i as u64,
+                "The node's chain has a gap at height {}. Nothing was changed.",
+                start + i as u64
+            );
+        }
+        let last = blocks.last().map(|b| b.header.height.0).unwrap_or(start);
+        anyhow::ensure!(
+            last < self.db.scanned_to,
+            "The node's chain reaches {last}, which is not below the wallet's scan at {}. Use an ordinary scan.",
+            self.db.scanned_to
+        );
+        self.scan_blocks_inner(blocks, true)
+    }
+
+    /// Preserve impossible sends as failed and release only surviving inputs.
+    /// The caller must hold the canonical node state lock through persistence.
+    /// Inputs still claimed by another pending send remain reserved.
+    pub fn release_sends(
+        &mut self,
+        txids: &[String],
+        unspend: &BTreeSet<[u8; 32]>,
+    ) -> anyhow::Result<usize> {
+        let before_history = self.db.history.clone();
+        let before_outputs = self.db.outputs.clone();
+        let mut removed = 0;
+        for entry in &mut self.db.history {
+            if entry.direction == Direction::Sent
+                && entry.is_pending()
+                && txids.contains(&entry.txid)
+            {
+                entry.failed = true;
+                entry.quarantined = true;
+                removed += 1;
+            }
+        }
+        if removed == 0 {
+            return Ok(0);
+        }
+        let still_claimed = self.pending_input_commits();
+        for o in self.db.outputs.iter_mut() {
+            if unspend.contains(&o.commit.0) && !still_claimed.contains(&o.commit.0) {
+                o.spent = false;
+            }
+        }
+        if let Err(error) = self.save() {
+            self.db.history = before_history;
+            self.db.outputs = before_outputs;
+            return Err(error);
+        }
+        Ok(removed)
+    }
+
+    fn scan_blocks_inner(
+        &mut self,
+        blocks: &[Block],
+        force_canonical: bool,
+    ) -> anyhow::Result<u32> {
         let view = self.keys.view_key();
         let known: BTreeSet<[u8; 32]> = self.db.outputs.iter().map(|o| o.commit.0).collect();
         let mut found = 0u32;
         let mut spent_commits: BTreeSet<[u8; 32]> = BTreeSet::new();
-        let mut highest = self.scan_from();
+        // A forced canonical pass replaces the scan position outright: the old
+        // one belongs to a branch the node has abandoned.
+        let mut highest = if force_canonical {
+            blocks.first().map(|b| b.header.height.0).unwrap_or(0)
+        } else {
+            self.scan_from()
+        };
         let mut new_history: Vec<HistoryEntry> = Vec::new();
         let mut confirmed: Vec<(String, u64, u64)> = Vec::new();
 
@@ -1064,6 +1177,7 @@ impl Wallet {
                             // Found on chain by this wallet, not read out of a
                             // backup, and incoming besides: nothing to withhold.
                             quarantined: false,
+                            failed: false,
                         });
                     }
                     found += 1;
@@ -1092,12 +1206,14 @@ impl Wallet {
         // height 0 is not that — treating it as one dropped every later
         // output, and a sync that stopped after the first page lost them
         // for good.
-        if covers_canonical_history(
-            blocks,
-            self.db.birth_height,
-            self.db.scanned_to,
-            &self.db.outputs,
-        ) {
+        if force_canonical
+            || covers_canonical_history(
+                blocks,
+                self.db.birth_height,
+                self.db.scanned_to,
+                &self.db.outputs,
+            )
+        {
             self.reconcile_with(blocks, &spent_commits);
         }
 
@@ -1517,19 +1633,30 @@ impl Wallet {
         // Largest first, so a payment consumes as few outputs as it can.
         available.sort_by_key(|o| std::cmp::Reverse(o.value));
 
+        let available_total = available
+            .iter()
+            .fold(0u64, |sum, o| sum.saturating_add(o.value));
+
         let mut chosen = Vec::new();
         let mut total = 0u64;
-        for o in available {
+        for o in available.into_iter().take(MAX_INPUTS) {
             if total >= target {
                 break;
             }
             total = total.saturating_add(o.value);
             chosen.push(o.to_spendable(&self.keys)?);
         }
+
         if total < target {
+            if available_total >= target {
+                bail!(
+                    "This payment would need more than {} coins (inputs), the most one transaction may spend. Your balance is spread over many small outputs, such as mining rewards. Send a smaller amount first, or send several payments in parts.",
+                    MAX_INPUTS
+                );
+            }
             bail!(
                 "insufficient funds: have {}, need {}",
-                Amount(total),
+                Amount(available_total),
                 Amount(target)
             );
         }
@@ -1631,7 +1758,7 @@ impl Wallet {
         if total < target {
             bail!("reserved outputs cover {total}, need {target}");
         }
-        Ok(build_transfer(
+        Ok(build_transfer_with(
             &self.keys,
             &inputs,
             &[Payment {
@@ -1643,7 +1770,20 @@ impl Wallet {
             &self.address(),
             0,
             self.network.proof_context(),
+            self.build_rules(tip_height),
         )?)
+    }
+
+    /// Transaction rules for a payment built at `tip_height`.
+    ///
+    /// The binding fields are always attached; a kernel offset only once the
+    /// next block is known to be at or past the fork. A caller that does not
+    /// know the height passes 0 and gets a transaction valid on both sides.
+    fn build_rules(&self, tip_height: u64) -> nightfall_ledger::BuildRules {
+        if tip_height == 0 {
+            return nightfall_ledger::BuildRules::default();
+        }
+        nightfall_ledger::BuildRules::for_height(self.network, tip_height.saturating_add(1))
     }
 
     #[cfg(test)]
@@ -1675,7 +1815,7 @@ impl Wallet {
     ) -> anyhow::Result<Transaction> {
         let target = amount.checked_add(fee).context("amount overflow")?;
         let inputs = self.select_coins_at(target, tip_height, maturity)?;
-        let tx = build_transfer(
+        let tx = build_transfer_with(
             &self.keys,
             &inputs,
             &[Payment {
@@ -1687,6 +1827,7 @@ impl Wallet {
             &self.address(),
             0,
             self.network.proof_context(),
+            self.build_rules(tip_height),
         )?;
         Ok(tx)
     }
@@ -1743,6 +1884,7 @@ impl Wallet {
                     // This wallet is making the payment right now, so it owns
                     // the decision to keep trying until a block takes it.
                     quarantined: false,
+                    failed: false,
                 },
             );
         }
@@ -3024,6 +3166,46 @@ mod tests {
     }
 
     #[test]
+    fn coin_selection_refuses_fragmented_balance_over_consensus_input_limit() {
+        let keys = WalletKeys::from_seed([7u8; 32]);
+        let mut wallet = Wallet::in_memory(NetworkId::Devnet, keys, 0);
+
+        for i in 0..=MAX_INPUTS {
+            let blind = Scalar::from((i as u64) + 1);
+            wallet.test_insert_output(OwnedOutput {
+                commit: Commitment::new(1, &blind),
+                value: 1,
+                blind_hex: hex::encode(blind.to_bytes()),
+                key_offset_hex: hex::encode(Scalar::ZERO.to_bytes()),
+                memo: String::new(),
+                height: 0,
+                spent: false,
+                is_coinbase: false,
+            });
+        }
+
+        let at_limit = wallet
+            .select_coins(MAX_INPUTS as u64)
+            .expect("exactly MAX_INPUTS inputs must remain selectable");
+        assert_eq!(at_limit.len(), MAX_INPUTS);
+
+        let err = wallet
+            .select_coins(MAX_INPUTS as u64 + 1)
+            .expect_err("MAX_INPUTS + 1 fragmented inputs must be rejected");
+        let message = err.to_string();
+        let limit_message = format!("more than {} coins", MAX_INPUTS);
+
+        assert!(
+            message.contains(&limit_message),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("spread over many small outputs"),
+            "fragmentation must be explicit: {message}"
+        );
+    }
+
+    #[test]
     fn a_reserved_coin_can_still_fund_the_swap_lock() {
         let d = tmpdir("reserved-lock");
         let mut w = Wallet::open(&d, NetworkId::Devnet, "w.seed").unwrap();
@@ -3074,6 +3256,50 @@ mod tests {
         fs::remove_dir_all(&d).ok();
     }
 
+    /// Issue #64: a long-running miner's own state outgrows the bound on
+    /// external imports, and Core's background scan copies the wallet through
+    /// export/import. The copy must keep working at any size, while outside
+    /// input stays bounded.
+    #[test]
+    fn own_state_larger_than_the_old_16_mib_bound_still_copies() {
+        let keys = WalletKeys::from_seed([9u8; 32]);
+        let mut wallet = Wallet::in_memory(NetworkId::Devnet, keys, 0);
+        let mut i: u64 = 0;
+        while wallet.export_state().unwrap().len() <= 16 * 1024 * 1024 {
+            for _ in 0..4_000 {
+                i += 1;
+                let blind = Scalar::from(i);
+                wallet.test_insert_output(OwnedOutput {
+                    commit: Commitment::new(600_000_000, &blind),
+                    value: 600_000_000,
+                    blind_hex: hex::encode(blind.to_bytes()),
+                    key_offset_hex: hex::encode(Scalar::from(i + 7).to_bytes()),
+                    memo: String::new(),
+                    height: i,
+                    spent: false,
+                    is_coinbase: true,
+                });
+            }
+        }
+        let blob = wallet.export_state().unwrap();
+        assert!(blob.len() > 16 * 1024 * 1024);
+        let copy = Wallet::import_own_state(&blob).expect("own state copies at any size");
+        assert_eq!(copy.export_state().unwrap(), blob);
+        assert_eq!(copy.address_string(), wallet.address_string());
+        // Within the raised external bound, the outside path accepts it too.
+        assert!(blob.len() <= vault::MAX_PLAINTEXT_BYTES);
+        assert!(Wallet::import_state(&blob).is_ok());
+    }
+
+    #[test]
+    fn external_state_over_the_bound_is_refused_before_parsing() {
+        let blob = " ".repeat(vault::MAX_PLAINTEXT_BYTES + 1);
+        let err = Wallet::import_state(&blob)
+            .err()
+            .expect("oversized input must be refused");
+        assert!(err.to_string().contains("too large"), "{err}");
+    }
+
     #[test]
     fn in_memory_export_import_roundtrips() {
         let keys = WalletKeys::generate();
@@ -3112,5 +3338,162 @@ mod tests {
         assert!(!wallet.has_reservations());
         drop(wallet);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn branch_block(owner: &Address, height: u64, nonce: u64) -> Block {
+        let ctx = NetworkId::Devnet.proof_context();
+        let reward = 20 * DARKS_PER_NIGHT;
+        let cb = build_coinbase(owner, reward, height, ctx).unwrap();
+        let body = BlockBody::aggregate(&[cb]);
+        let mut ledger = LedgerState::genesis();
+        ledger
+            .apply_block(&body, Height(height), reward, ctx)
+            .unwrap();
+        Block {
+            header: nightfall_consensus::BlockHeader {
+                version: nightfall_types::PROTOCOL_VERSION,
+                height: Height(height),
+                prev_hash: nightfall_types::Hash256::ZERO,
+                body_root: body.hash(),
+                utxo_root: ledger.utxo_root(),
+                kernel_sum: ledger.kernel_sum(),
+                timestamp_unix: 1_800_000_000 + height,
+                difficulty: 1,
+                nonce,
+                reward_darks: reward,
+            },
+            body,
+        }
+    }
+
+    /// The community report behind 1.0.6: a node resynced off a dead branch
+    /// whose tip was *taller* than the network's chain. Every scan asked for
+    /// a height the wallet had "already" seen, and the wallet waited for ever.
+    /// Rebasing on the whole shorter chain must drop the branch's coins, move
+    /// the scan position down, and anchor it on the network's chain.
+    #[test]
+    fn a_wallet_rebases_onto_a_shorter_chain_after_a_dead_branch() {
+        let d = tmpdir("rebase-shorter");
+        let mut w = Wallet::open(&d, NetworkId::Devnet, "w.seed").unwrap();
+        let me = w.address();
+        let stranger = WalletKeys::generate().address();
+        let reward = 20 * DARKS_PER_NIGHT;
+
+        let dead: Vec<Block> = (0..=5).map(|h| branch_block(&me, h, h)).collect();
+        w.scan_blocks(&dead).unwrap();
+        assert_eq!(w.outputs().len(), 6);
+        assert_eq!(w.scanned_to(), 5);
+
+        // The network's chain shares block 0 and is three blocks shorter.
+        let mut net = vec![dead[0].clone()];
+        net.extend((1..=3).map(|h| branch_block(&stranger, h, 100 + h)));
+        // An ordinary page from the overlap is refused or meaningless here;
+        // the rebase is the path.
+        w.rebase_on_shorter_chain(&net).unwrap();
+        assert_eq!(
+            w.outputs().len(),
+            1,
+            "coins mined on the dead branch must go"
+        );
+        assert_eq!(w.balance().darks(), reward);
+        assert_eq!(w.scanned_to(), 3);
+        assert_eq!(w.scan_anchor(), net[3].hash().to_hex());
+
+        // Ordinary paging continues from the new anchor.
+        let next = vec![net[3].clone(), branch_block(&me, 4, 104)];
+        w.scan_blocks(&next).unwrap();
+        assert_eq!(w.scanned_to(), 4);
+        assert_eq!(w.balance().darks(), 2 * reward);
+
+        // A chain that is not shorter is not a rebase.
+        let mut taller = net.clone();
+        taller.push(next[1].clone());
+        taller.push(branch_block(&stranger, 5, 105));
+        assert!(w.rebase_on_shorter_chain(&taller).is_err());
+        // Nor is a range that does not start at the birth height.
+        assert!(w.rebase_on_shorter_chain(&net[1..]).is_err());
+        fs::remove_dir_all(&d).ok();
+    }
+
+    /// Releasing a send that can never confirm returns its surviving inputs,
+    /// except one still claimed by another pending send.
+    #[test]
+    fn releasing_an_impossible_send_returns_only_unclaimed_inputs() {
+        let d = tmpdir("release-sends");
+        let mut w = Wallet::open(&d, NetworkId::Devnet, "w.seed").unwrap();
+        let me = w.address();
+        let blocks: Vec<Block> = (0..=2).map(|h| branch_block(&me, h, h)).collect();
+        w.scan_blocks(&blocks).unwrap();
+        let c: Vec<[u8; 32]> = w.outputs().iter().map(|o| o.commit.0).collect();
+        let pending = |txid: &str, inputs: Vec<[u8; 32]>| HistoryEntry {
+            direction: Direction::Sent,
+            amount: 1,
+            fee: 1,
+            memo: String::new(),
+            height: None,
+            txid: txid.into(),
+            timestamp: 0,
+            spent_commits: inputs,
+            raw: None,
+            quarantined: false,
+            failed: false,
+        };
+        w.db.history.push(pending("dead", vec![c[0], c[1]]));
+        w.db.history.push(pending("other", vec![c[1]]));
+        for o in w.db.outputs.iter_mut() {
+            if o.commit.0 == c[0] || o.commit.0 == c[1] {
+                o.spent = true;
+            }
+        }
+        let unspend: BTreeSet<[u8; 32]> = [c[0], c[1]].into_iter().collect();
+        // Inject a write failure before the atomic rename. Neither history nor
+        // input availability may change on error, including after reopening.
+        w.save().unwrap();
+        let before = w.export_state().unwrap();
+        let disk = fs::read(&w.db_path).unwrap();
+        let temporary = w.db_path.with_extension("json.tmp");
+        fs::create_dir(&temporary).unwrap();
+        assert!(w.release_sends(&["dead".to_string()], &unspend).is_err());
+        assert_eq!(w.export_state().unwrap(), before);
+        assert_eq!(fs::read(&w.db_path).unwrap(), disk);
+        fs::remove_dir(&temporary).unwrap();
+        assert_eq!(w.release_sends(&["dead".to_string()], &unspend).unwrap(), 1);
+        assert!(w
+            .history()
+            .iter()
+            .any(|e| e.txid == "dead" && e.failed && !e.is_pending()));
+        assert!(!w.resendable().iter().any(|(txid, _)| txid == "dead"));
+        assert!(w.history().iter().any(|e| e.txid == "other"));
+        let spent = |commit: [u8; 32]| {
+            w.outputs()
+                .iter()
+                .find(|o| o.commit.0 == commit)
+                .unwrap()
+                .spent
+        };
+        assert!(
+            !spent(c[0]),
+            "an input only the released send held must return"
+        );
+        assert!(
+            spent(c[1]),
+            "an input another pending send still claims stays reserved"
+        );
+        let reopened = Wallet::open(&d, NetworkId::Devnet, "w.seed").unwrap();
+        assert!(reopened
+            .history()
+            .iter()
+            .any(|e| e.txid == "dead" && e.failed));
+        assert!(!reopened.pending_input_commits().contains(&c[0]));
+        assert!(reopened.pending_input_commits().contains(&c[1]));
+        // Old snapshots without the new flag remain readable and pending.
+        let mut old = serde_json::to_value(pending("old", vec![c[2]])).unwrap();
+        old.as_object_mut().unwrap().remove("failed");
+        assert!(serde_json::from_value::<HistoryEntry>(old)
+            .unwrap()
+            .is_pending());
+        // Releasing an unknown or already-released send changes nothing.
+        assert_eq!(w.release_sends(&["dead".to_string()], &unspend).unwrap(), 0);
+        fs::remove_dir_all(&d).ok();
     }
 }

@@ -86,6 +86,31 @@ enum Commands {
         #[arg(long)]
         file: PathBuf,
     },
+    /// Checkout prototype (devnet/testnet only): write an invoice and print
+    /// the payment request that settles it.
+    Invoice {
+        /// Your reference. A payment settles the invoice only by quoting it.
+        #[arg(long)]
+        reference: String,
+        /// Amount in darks. Omit to let the payer choose.
+        #[arg(long)]
+        darks: Option<u64>,
+        #[arg(long, default_value = "")]
+        description: String,
+        /// Your own deadline, seconds from now. Late payments still count.
+        #[arg(long)]
+        expires_in: Option<u64>,
+    },
+    /// Checkout prototype (devnet/testnet only): sync, then show every
+    /// invoice with its current confirmation-policy status.
+    Till {
+        /// Confirmation threshold; reaching it does not remove reorg risk.
+        #[arg(long, default_value_t = nightfall_wallet::counter::DEFAULT_CONFIRMATIONS)]
+        confirmations: u64,
+        /// Print JSON lines instead of text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -157,6 +182,16 @@ fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         _ => {}
+    }
+
+    if matches!(
+        cli.command,
+        Commands::Invoice { .. } | Commands::Till { .. }
+    ) && network == NetworkId::Mainnet
+    {
+        anyhow::bail!(
+            "the checkout commands are a devnet/testnet prototype and are not enabled on mainnet"
+        );
     }
 
     let mut wallet = Wallet::open(&datadir, network, &cli.seed_file)?;
@@ -264,6 +299,79 @@ fn main() -> anyhow::Result<()> {
             println!("The transaction is in the mempool until a block is mined.");
         }
 
+        Commands::Invoice {
+            reference,
+            darks,
+            description,
+            expires_in,
+        } => {
+            let now = now_unix();
+            let invoice = nightfall_wallet::counter::Invoice {
+                reference,
+                amount_darks: darks,
+                description,
+                created_unix: now,
+                expires_unix: expires_in.map(|s| now.saturating_add(s)),
+                closed_note: None,
+            };
+            wallet.add_invoice(invoice.clone())?;
+            let address = Address::decode(&wallet.address_string())
+                .map_err(|e| anyhow::anyhow!("own address: {e}"))?;
+            let request = nightfall_wallet::counter::request_for(&invoice, address, network);
+            println!("{}", request.to_uri());
+            eprintln!();
+            eprintln!("A request is not a payment. Run `till` to see whether it was paid");
+            eprintln!(
+                "and whether the payment meets your confirmation policy (reorg risk remains)."
+            );
+        }
+
+        Commands::Till {
+            confirmations,
+            json,
+        } => {
+            let from = wallet.birth_height();
+            sync(&mut wallet, &rpc, from)?;
+            let st = rpc_call(&rpc, "status", json!({}))?;
+            let tip = st
+                .get("tip_height")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| anyhow::anyhow!("node did not report its tip height"))?;
+            for (invoice, status) in wallet.till(now_unix()) {
+                let settled = nightfall_wallet::counter::settlement(&status, tip, confirmations);
+                let state = match settled {
+                    nightfall_wallet::counter::Settlement::NotPaid => "not_paid".to_owned(),
+                    nightfall_wallet::counter::Settlement::Unconfirmed => "unconfirmed".to_owned(),
+                    nightfall_wallet::counter::Settlement::Confirming { have, need } => {
+                        format!("confirming:{have}/{need}")
+                    }
+                    nightfall_wallet::counter::Settlement::Confirmed => "confirmed".to_owned(),
+                    nightfall_wallet::counter::Settlement::ClosedByHand => "closed".to_owned(),
+                };
+                if json {
+                    println!(
+                        "{}",
+                        json!({
+                            "reference": invoice.reference,
+                            "asked_darks": invoice.amount_darks,
+                            "received_darks": status.received_darks,
+                            "invoice": status.headline(),
+                            "settlement": state,
+                            "tip_height": tip,
+                            "candidates": status.candidates.len(),
+                        })
+                    );
+                } else {
+                    println!(
+                        "{:<16} {:<28} {}",
+                        invoice.reference,
+                        status.headline(),
+                        settled.headline()
+                    );
+                }
+            }
+        }
+
         Commands::About
         | Commands::NodeStatus
         | Commands::VerifySupply
@@ -271,6 +379,35 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Validate one nonempty RPC page before advancing the CLI wallet scan.
+///
+/// get_blocks returns an inclusive, contiguous range from the requested height.
+/// A malformed page must never be folded into wallet history. In particular,
+/// u64::MAX has no successor and must not wrap the next RPC request to zero.
+fn next_scan_page_height(
+    start: u64,
+    heights: impl IntoIterator<Item = u64>,
+) -> anyhow::Result<u64> {
+    let mut next = start;
+    let mut count = 0usize;
+    for actual in heights {
+        if count == 128 {
+            anyhow::bail!("node returned more than 128 blocks in one RPC page");
+        }
+        if actual != next {
+            anyhow::bail!("non-contiguous RPC block page: expected height {next}, got {actual}");
+        }
+        next = next
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("RPC block height overflow"))?;
+        count += 1;
+    }
+    if count == 0 {
+        anyhow::bail!("empty RPC block page cannot advance scan");
+    }
+    Ok(next)
 }
 
 /// Pull blocks from the node in batches and scan them as one chain.
@@ -298,12 +435,11 @@ fn sync(wallet: &mut Wallet, rpc: &str, from: u64) -> anyhow::Result<u32> {
         if blocks.is_empty() {
             break;
         }
-        let last = blocks.last().map(|b| b.header.height.0).unwrap_or(height);
+        // Reject malformed, repeated, out-of-order, or overflowing RPC pages
+        // before they can reach the wallet's reconciliation step.
+        let next = next_scan_page_height(height, blocks.iter().map(|b| b.header.height.0))?;
         all.extend(blocks);
-        if last < height + 1 {
-            break;
-        }
-        height = last + 1;
+        height = next;
     }
     if all.is_empty() {
         return Ok(0);
@@ -394,4 +530,58 @@ fn rpc_call(
         anyhow::bail!("node error: {e}");
     }
     Ok(res.get("result").cloned().unwrap_or(json!(null)))
+}
+
+#[cfg(test)]
+mod rpc_scan_page_tests {
+    use super::next_scan_page_height;
+
+    #[test]
+    fn accepts_one_block_and_consecutive_pages() {
+        assert_eq!(next_scan_page_height(0, [0]).unwrap(), 1);
+        assert_eq!(next_scan_page_height(10, [10, 11, 12]).unwrap(), 13);
+        assert_eq!(next_scan_page_height(0, 0..128).unwrap(), 128);
+        assert_eq!(next_scan_page_height(128, 128..130).unwrap(), 130);
+    }
+
+    #[test]
+    fn rejects_gaps_duplicates_reordering_and_wrong_starts() {
+        for page in [
+            vec![11],
+            vec![10, 10],
+            vec![10, 12],
+            vec![10, 9],
+            vec![9, 10],
+        ] {
+            assert!(
+                next_scan_page_height(10, page.clone()).is_err(),
+                "accepted malformed page: {page:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_empty_and_oversized_pages() {
+        assert!(next_scan_page_height(10, []).is_err());
+        assert!(next_scan_page_height(0, 0..129).is_err());
+    }
+
+    #[test]
+    fn does_not_wrap_rpc_height_at_u64_max() {
+        assert_eq!(
+            next_scan_page_height(u64::MAX - 1, [u64::MAX - 1]).unwrap(),
+            u64::MAX
+        );
+        assert!(next_scan_page_height(u64::MAX, [u64::MAX]).is_err());
+        assert!(next_scan_page_height(u64::MAX - 1, [u64::MAX - 1, u64::MAX]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod rpc_scan_integration_tests;
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
