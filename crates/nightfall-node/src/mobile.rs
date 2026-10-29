@@ -12,7 +12,9 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+#[cfg(test)]
+use std::thread;
 use std::time::{Duration, Instant};
 
 const ALLOWED: &[&str] = &[
@@ -39,30 +41,48 @@ const REQUEST_BUDGET: Duration = Duration::from_secs(20);
 fn connection_pool(
     workers: usize,
     queued: usize,
+    registry: Arc<Workers>,
+    shutdown: Arc<Shutdown>,
     handle: impl Fn(TcpStream, Instant) + Send + Sync + 'static,
 ) -> std::io::Result<mpsc::SyncSender<(TcpStream, Instant)>> {
     let (tx, rx) = mpsc::sync_channel::<(TcpStream, Instant)>(queued);
+
     let rx = Arc::new(Mutex::new(rx));
     let handle = Arc::new(handle);
-    for index in 0..workers {
+
+    for _index in 0..workers {
         let rx = Arc::clone(&rx);
         let handle = Arc::clone(&handle);
-        thread::Builder::new()
-            .name(format!("light-api-{index}"))
-            .spawn(move || loop {
-                let item = match rx.lock() {
-                    Ok(receiver) => receiver.recv(),
-                    Err(_) => break,
-                };
-                match item {
-                    Ok((stream, accepted)) if accepted.elapsed() < REQUEST_BUDGET => {
-                        handle(stream, accepted)
+        let stop = Arc::clone(&shutdown);
+
+        registry.spawn(move || loop {
+            if stop.is_requested() {
+                break;
+            }
+
+            let item = match rx.lock() {
+                Ok(receiver) => receiver.recv_timeout(Duration::from_millis(100)),
+                Err(_) => break,
+            };
+
+            match item {
+                Ok((stream, accepted)) if accepted.elapsed() < REQUEST_BUDGET => {
+                    if !stop.is_requested() {
+                        handle(stream, accepted);
                     }
-                    Ok(_) => {} // Queue time counts against the same request deadline.
-                    Err(_) => break,
                 }
-            })?;
+
+                Ok(_) => {}
+
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break;
+                }
+            }
+        });
     }
+
     Ok(tx)
 }
 
@@ -78,6 +98,7 @@ pub(crate) fn spawn_mobile(
     workers: Arc<Workers>,
 ) {
     let client_workers = Arc::clone(&workers);
+
     workers.spawn(move || {
         let listener = match TcpListener::bind(&addr) {
             Ok(l) => l,
@@ -88,15 +109,46 @@ pub(crate) fn spawn_mobile(
         };
 
         if let Err(e) = listener.set_nonblocking(true) {
-            tracing::error!("mobile listener nonblocking {addr}: {e}");
+            tracing::error!("mobile nonblocking listener {addr}: {e}");
             return;
         }
 
-        tracing::info!("mobile API listening on {addr} (status/scan_feed/submit_tx only)");
-        // Only opt in behind an HTTP proxy that overwrites/appends XFF. A raw
-        // TCP forwarder such as socat cannot establish a trustworthy client IP.
+        tracing::info!("mobile API listening on {addr}");
+
         let trust_proxy = std::env::var("NIGHTFALL_TRUST_LOOPBACK_PROXY").as_deref() == Ok("1");
+
         let rates: Arc<Mutex<HashMap<String, Rate>>> = Arc::new(Mutex::new(HashMap::new()));
+
+        let handler_stop = Arc::clone(&shutdown);
+
+        let queue = match connection_pool(
+            WORKERS,
+            QUEUED_CONNECTIONS,
+            Arc::clone(&client_workers),
+            Arc::clone(&shutdown),
+            move |stream, accepted| {
+                if handler_stop.is_requested() {
+                    return;
+                }
+
+                if let Err(e) = handle(
+                    stream,
+                    Arc::clone(&state),
+                    Arc::clone(&rates),
+                    accepted,
+                    trust_proxy,
+                    Arc::clone(&handler_stop),
+                ) {
+                    tracing::debug!("mobile client: {e}");
+                }
+            },
+        ) {
+            Ok(q) => q,
+            Err(e) => {
+                tracing::error!("mobile workers: {e}");
+                return;
+            }
+        };
 
         while !shutdown.is_requested() {
             match listener.accept() {
@@ -106,30 +158,27 @@ pub(crate) fn spawn_mobile(
                         break;
                     }
 
-                    let st = Arc::clone(&state);
-                    let rates = Arc::clone(&rates);
-                    let stop = Arc::clone(&shutdown);
-                    let workers = Arc::clone(&client_workers);
-
-                    workers.spawn(move || {
-                        if let Err(e) = handle(stream, st, rates, stop) {
-                            tracing::debug!("mobile client: {e}");
-                        }
-                    });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if shutdown.wait_timeout(Duration::from_millis(100)) {
-                        break;
+                    // Normalize macOS accepted sockets.
+                    if stream.set_nonblocking(false).is_err() {
+                        continue;
                     }
+
+                    let _ = queue.try_send((stream, Instant::now()));
                 }
+
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    shutdown.wait_timeout(Duration::from_millis(100));
+                }
+
                 Err(e) => {
                     tracing::warn!("mobile accept: {e}");
-                    if shutdown.wait_timeout(Duration::from_millis(100)) {
-                        break;
-                    }
+
+                    shutdown.wait_timeout(Duration::from_millis(100));
                 }
             }
         }
+
+        drop(queue);
     });
 }
 
@@ -137,21 +186,23 @@ fn handle(
     mut stream: TcpStream,
     state: SharedState,
     rates: Arc<Mutex<HashMap<String, Rate>>>,
+    accepted: Instant,
+    trust_proxy: bool,
     shutdown: Arc<Shutdown>,
 ) -> anyhow::Result<()> {
     if shutdown.is_requested() {
         return Ok(());
     }
 
+    stream.set_nonblocking(false)?;
+
     let _pending_socket = shutdown.track_socket(&stream)?;
 
-    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(20)))?;
-    let peer = stream
-        .peer_addr()
-        .map(|a| a.ip().to_string())
-        .unwrap_or_else(|_| "unknown".into());
-    if !allow(&rates, &peer) {
+    stream.set_write_timeout(Some(REQUEST_BUDGET))?;
+    let peer = stream.peer_addr().map(|a| a.ip()).ok();
+    let deadline = accepted + REQUEST_BUDGET;
+    let (headers, mut body) = read_headers(&mut stream, deadline)?;
+    if !allow(&rates, &rate_key(peer, &headers, trust_proxy)) {
         return write_http(&mut stream, 429, "{\"error\":\"rate limited\"}");
     }
     let first = headers.lines().next().unwrap_or("");
@@ -425,10 +476,16 @@ mod tests {
         let (entered, entries) = mpsc::channel();
         let (release, releases) = mpsc::channel();
         let releases = Mutex::new(releases);
-        let pool = connection_pool(1, 1, move |_, _| {
-            entered.send(thread::current().id()).unwrap();
-            releases.lock().unwrap().recv().unwrap();
-        })
+        let pool = connection_pool(
+            1,
+            1,
+            Arc::new(Workers::new()),
+            Arc::new(Shutdown::default()),
+            move |_, _| {
+                entered.send(thread::current().id()).unwrap();
+                releases.lock().unwrap().recv().unwrap();
+            },
+        )
         .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let socket = || {

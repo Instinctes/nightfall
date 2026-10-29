@@ -294,6 +294,8 @@ fn handle_client(
     }
     let _pending_socket = shutdown.track_socket(&stream)?;
 
+    // Normalize accepted sockets on macOS.
+    stream.set_nonblocking(false)?;
     stream.set_nodelay(true)?;
     stream.set_write_timeout(Some(RPC_FRAME_BUDGET))?;
     let mut reader = BufReader::new(stream.try_clone()?);

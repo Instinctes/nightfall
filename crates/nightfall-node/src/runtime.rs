@@ -33,17 +33,46 @@ pub(crate) struct Workers {
 }
 
 impl Workers {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             handles: Mutex::new(Vec::new()),
             accepting: AtomicBool::new(true),
         }
     }
 
+    /// Retire completed handles before adding more.
+    /// Joining happens outside the registry lock.
+    fn reap_finished(&self) -> usize {
+        let mut finished = Vec::new();
+
+        {
+            let mut handles = self.handles.lock().unwrap();
+            let mut i = 0;
+
+            while i < handles.len() {
+                if handles[i].is_finished() {
+                    finished.push(handles.swap_remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        let n = finished.len();
+
+        for handle in finished {
+            let _ = handle.join();
+        }
+
+        n
+    }
+
     pub(crate) fn spawn<F>(&self, work: F)
     where
         F: FnOnce() + Send + 'static,
     {
+        self.reap_finished();
+
         let mut handles = self.handles.lock().unwrap();
 
         if !self.accepting.load(Ordering::Acquire) {
@@ -2237,6 +2266,8 @@ fn p2p_listen_loop(
     }
     tracing::info!("p2p listening on {addr}");
 
+    let pending = Arc::new(AtomicUsize::new(0));
+
     while !shutdown.is_requested() {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -2263,7 +2294,30 @@ fn p2p_listen_loop(
                     .map(|a| a.to_string())
                     .unwrap_or_default();
 
+                // Bound active handlers before peer Hello.
+                let limit = MAX_PEERS.saturating_add(IBD_ACCEPT_BURST);
+
+                let admitted = pending.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    (n < limit).then_some(n + 1)
+                });
+
+                if admitted.is_err() {
+                    continue;
+                }
+
+                let seat = Arc::clone(&pending);
+
                 child_workers.spawn(move || {
+                    struct Release(Arc<AtomicUsize>);
+
+                    impl Drop for Release {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, Ordering::AcqRel);
+                        }
+                    }
+
+                    let _seat = Release(seat);
+
                     if stop.is_requested() {
                         let _ = stream.shutdown(std::net::Shutdown::Both);
                         return;
@@ -2497,6 +2551,8 @@ fn handle_peer(
 }
 
 fn prepare_live_socket(stream: &TcpStream) -> std::io::Result<()> {
+    // Normalize inherited socket mode on macOS.
+    stream.set_nonblocking(false)?;
     stream.set_nodelay(true)?;
     // Long read timeout: the peer may be quiet between 15-second blocks.
     // Writes are short so a stuck announce cannot pin a session forever.
@@ -3885,5 +3941,58 @@ mod sync_hold_tests {
         assert_eq!(hold, SyncHold::CompetingTip { reorging: false });
         let hold = classify_sync_hold(true, false, 0, 12_000, 17_976, Some(1));
         assert_eq!(hold, SyncHold::CompetingTip { reorging: false });
+    }
+}
+
+#[cfg(test)]
+mod shutdown_worker_reaping_regression_20261030 {
+    use super::Workers;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn completed_worker_handles_are_reaped() {
+        let workers = Workers::new();
+
+        let finished = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..64 {
+            let done = Arc::clone(&finished);
+
+            workers.spawn(move || {
+                done.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+
+        let until = Instant::now() + Duration::from_secs(5);
+
+        while finished.load(Ordering::SeqCst) < 64 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(finished.load(Ordering::SeqCst), 64);
+
+        let until = Instant::now() + Duration::from_secs(5);
+
+        while !workers
+            .handles
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|h| h.is_finished())
+            && Instant::now() < until
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        workers.reap_finished();
+
+        assert_eq!(workers.handles.lock().unwrap().len(), 0);
+
+        workers.stop_accepting();
+        workers.join_all();
     }
 }
