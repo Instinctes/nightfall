@@ -1,19 +1,21 @@
-# NIGHTFALLCOIN 1.0.11 — mainnet wallets
+# NIGHTFALLCOIN 1.1.0 — mainnet wallets
 
-Current release: [v1.0.11](https://github.com/Instinctes/nightfall/releases/tag/v1.0.11).
-Protocol v8, wire v6, mainnet genesis `061a052d…`. Same chain and data format as
-0.9.2. No reset, migration or seed service upgrade is required.
+Current release: [v1.1.0](https://github.com/Instinctes/nightfall/releases/tag/v1.1.0).
+Protocol v8, wire v6, mainnet genesis `061a052d…`. Same chain and data format.
+**Required upgrade:** 1.1.0 activates a consensus upgrade at block 500,000.
+Nodes, miners and pools must run 1.1.0 before that height; nothing has to be
+migrated.
 
 | Platform | Core download | Minimum |
 |---|---|---|
-| Apple Silicon | `NIGHTFALLCOIN-Core-1.0.11-macOS-arm64.dmg` | macOS 11 |
-| Intel Mac | `NIGHTFALLCOIN-Core-1.0.11-macOS-intel.dmg` | macOS 10.15 |
-| Windows x64 | `nightfall-core-1.0.11-windows-x64.exe` | Windows 10 |
-| Linux x64 | `nightfall-core-1.0.11-linux-x64` | GTK/X11 libraries required |
+| Apple Silicon | `NIGHTFALLCOIN-Core-1.1.0-macOS-arm64.dmg` | macOS 11 |
+| Intel Mac | `NIGHTFALLCOIN-Core-1.1.0-macOS-intel.dmg` | macOS 10.15 |
+| Windows x64 | `nightfall-core-1.1.0-windows-x64.exe` | Windows 10 |
+| Linux x64 | `nightfall-core-1.1.0-linux-x64` | GTK/X11 libraries required |
 | Mobile/browser | [Web wallet](https://nightfallcoin.org/wallet/) | Modern browser |
 
-Check the matching `SHA256SUMS-1.0.11.txt`, `SHA256SUMS-1.0.11-windows.txt`
-or `SHA256SUMS-1.0.11-linux.txt` before running a download. macOS bundles are
+Check the matching `SHA256SUMS-1.1.0.txt`, `SHA256SUMS-1.1.0-windows.txt`
+or `SHA256SUMS-1.1.0-linux.txt` before running a download. macOS bundles are
 ad-hoc signed for integrity checks, not Developer-ID signed or notarized.
 Windows binaries do not have a publisher signing certificate.
 
@@ -26,7 +28,8 @@ file came from; it does not remove the first-launch warning.
 
 Core starts on mainnet by default and includes a full node, miner and wallet.
 The macOS app bundles include the `nightfalld` and `nightfall-wallet` CLI tools;
-Windows/Linux CLI tools are separate release assets. Close Core completely
+Windows/Linux CLI tools are separate release assets, as are the Node Kit
+(`nightfall-nodekit`), the Devnet till and the receipt evidence tool. Close Core completely
 before replacing its app/binary. Back up your 24 words first; never delete
 your data directory to update.
 

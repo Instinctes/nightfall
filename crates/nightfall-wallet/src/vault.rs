@@ -30,7 +30,12 @@ const LANES: u32 = 4;
 /// vault's plaintext. 16 MiB until 1.0.11, which a long-running miner's wallet
 /// outgrew (about 25,000 owned outputs, issue #64); 256 MiB leaves years of
 /// room while still refusing absurd input before any parsing or KDF work.
+#[cfg(not(target_arch = "wasm32"))]
 pub const MAX_PLAINTEXT_BYTES: usize = 256 * 1024 * 1024;
+/// Browser envelope budget, including header/tag, before decryption/KDF.
+/// Native Core retains its larger budget for long-running miners.
+#[cfg(target_arch = "wasm32")]
+pub const MAX_PLAINTEXT_BYTES: usize = 64 * 1024 * 1024 - HEADER_LEN - TAG_LEN;
 pub const MAX_VAULT_BYTES: usize = MAX_PLAINTEXT_BYTES + HEADER_LEN + TAG_LEN;
 
 #[derive(Debug, Error, PartialEq, Eq)]

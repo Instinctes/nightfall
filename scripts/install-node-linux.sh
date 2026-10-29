@@ -30,6 +30,10 @@ RPC_PORT=17881
 DATADIR="/var/lib/nightfall"
 BINDIR="/usr/local/bin"
 REPO="https://github.com/Instinctes/nightfall"
+# Bump both together after a reviewed Core release.
+# Refuse a moved or unexpected release tag.
+NIGHTFALL_RELEASE_TAG="v1.0.12"
+NIGHTFALL_RELEASE_SHA="5819f6cbf057bb48118a0616bacd6c25e2b576a4"
 EXPECTED_GENESIS="061a052d49607ff8f4b306c75d622ebd230cff4ec3a45a6dffc2f7738d4b20de"
 MINE=0
 
@@ -113,10 +117,11 @@ fi
 
 BUILD="$(mktemp -d)"
 info "fetching source"
-git clone --depth 1 "$REPO" "$BUILD/nightfall" >/dev/null 2>&1 \
+git clone --depth 1 --branch "$NIGHTFALL_RELEASE_TAG" "$REPO" "$BUILD/nightfall" >/dev/null 2>&1 \
     || die "clone failed — check network access to github.com"
 SOURCE_REV="$(git -C "$BUILD/nightfall" rev-parse --verify HEAD)" \
     || die "could not identify source revision"
+[ "$SOURCE_REV" = "$NIGHTFALL_RELEASE_SHA" ] || die "release tag does not match pinned commit"
 LOCK_SHA="$(sha256sum "$BUILD/nightfall/Cargo.lock" | awk '{print $1}')" \
     || die "could not hash Cargo.lock"
 info "source commit: $SOURCE_REV"

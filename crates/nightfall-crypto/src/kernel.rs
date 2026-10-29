@@ -60,6 +60,14 @@ pub struct TxKernel {
     pub excess: Commitment,
     /// Schnorr signature over generator `H` proving knowledge of `excess`.
     pub excess_sig: SchnorrSig,
+    /// Stealth excess `X = x·G` — this kernel's share of the block-wide key
+    /// balance. Required from the binding fork on; stripped below it. See
+    /// [`crate::binding`].
+    #[serde(default)]
+    pub stealth_excess: Option<[u8; 32]>,
+    /// Signature by `x` over the kernel message and `X`.
+    #[serde(default)]
+    pub stealth_sig: Option<SchnorrSig>,
 }
 
 impl TxKernel {
@@ -107,6 +115,31 @@ impl TxKernel {
         }
         let msg = self.signing_message();
         schnorr::verify(&excess_point, &generator_h(), &msg, &self.excess_sig)
+    }
+
+    /// Attach a stealth excess for secret `x`.
+    pub fn attach_stealth(&mut self, x: &Scalar) {
+        let point = (crate::commit::generator_g() * x).compress().to_bytes();
+        let msg = crate::binding::kernel_stealth_message(&self.signing_message(), &point);
+        self.stealth_excess = Some(point);
+        self.stealth_sig = Some(schnorr::sign(x, &crate::commit::generator_g(), &msg));
+    }
+
+    /// The stealth excess, if present and well-formed with a valid signature.
+    ///
+    /// `None` means "absent or invalid"; the ledger requires `Some` from the
+    /// binding fork on.
+    pub fn verified_stealth_excess(&self) -> Option<RistrettoPoint> {
+        let (point, sig) = (self.stealth_excess?, self.stealth_sig?);
+        let x = curve25519_dalek::ristretto::CompressedRistretto(point).decompress()?;
+        let msg = crate::binding::kernel_stealth_message(&self.signing_message(), &point);
+        schnorr::verify(&x, &crate::commit::generator_g(), &msg, &sig).then_some(x)
+    }
+
+    /// Remove the binding fields, restoring the 1.0.x shape.
+    pub fn strip_binding(&mut self) {
+        self.stealth_excess = None;
+        self.stealth_sig = None;
     }
 
     /// Stable identifier, used to canonicalise kernel ordering in a block.
@@ -179,6 +212,8 @@ pub fn build_kernel(
             r: [0u8; 32],
             s: [0u8; 32],
         },
+        stealth_excess: None,
+        stealth_sig: None,
     };
     let msg = kernel.signing_message();
     kernel.excess_sig = schnorr::sign(excess_secret, &generator_h(), &msg);

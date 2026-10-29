@@ -1,6 +1,7 @@
 """Offline adversarial test cases; no download, compilation, keys or network."""
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -92,6 +93,131 @@ class IndependentBuildTests(unittest.TestCase):
         p = self.write("large.json", " " * (mod.MAX_RECEIPT + 1))
         with self.assertRaisesRegex(mod.BuildEvidenceError, "oversized"):
             mod.read_receipt(p)
+
+    def test_receipt_growth_cannot_bypass_read_limit(self):
+        # A malicious file may grow after metadata was
+        # checked. A small reported size is not authority.
+
+        valid = json.dumps(receipt())
+        oversized = valid + " " * (mod.MAX_RECEIPT + 64)
+
+        path = self.write("growing.json", oversized)
+        real = path.stat()
+
+        class MisleadingStat:
+            st_mode = real.st_mode
+            st_size = 1
+
+        with patch.object(
+            Path,
+            "stat",
+            return_value=MisleadingStat()
+        ):
+            with self.assertRaisesRegex(
+                mod.BuildEvidenceError,
+                "oversized"
+            ):
+                mod.read_receipt(path)
+
+
+    def test_receipt_import_never_uses_unbounded_read_bytes(self):
+        path = self.write(
+            "bounded.json",
+            json.dumps(receipt())
+        )
+
+        with patch.object(
+            Path,
+            "read_bytes",
+            side_effect=AssertionError(
+                "unbounded read_bytes must not be used"
+            )
+        ):
+            imported = mod.read_receipt(path)
+
+        self.assertEqual(
+            imported["schema"],
+            mod.SCHEMA
+        )
+
+
+    def test_recursive_json_error_fails_closed(self):
+        path = self.write(
+            "recursive.json",
+            json.dumps(receipt())
+        )
+
+        # Simulates a decoder recursion failure across
+        # supported Python versions.
+
+        with patch.object(
+            mod.json,
+            "loads",
+            side_effect=RecursionError(
+                "synthetic nesting failure"
+            )
+        ):
+            with self.assertRaisesRegex(
+                mod.BuildEvidenceError,
+                "malformed receipt JSON"
+            ):
+                mod.read_receipt(path)
+
+
+    def test_special_file_rejected(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("FIFO requires POSIX")
+
+        path = self.folder / "receipt-pipe"
+        os.mkfifo(path)
+
+        # O_NONBLOCK prevents a FIFO read from hanging.
+        # Descriptor type validation rejects it.
+
+        with self.assertRaisesRegex(
+            mod.BuildEvidenceError,
+            "regular"
+        ):
+            mod.read_receipt(path)
+
+
+    def test_symlink_swap_is_rejected_on_posix(self):
+        if not getattr(os, "O_NOFOLLOW", 0):
+            self.skipTest("O_NOFOLLOW unavailable")
+
+        original = self.write(
+            "original.json",
+            json.dumps(receipt())
+        )
+
+        alias = self.folder / "receipt-alias"
+        alias.symlink_to(original)
+
+        # Simulate an earlier path check reporting
+        # that the destination is not a symlink.
+        # O_NOFOLLOW must still reject the open.
+
+        with patch.object(
+            Path,
+            "is_symlink",
+            return_value=False
+        ):
+            with self.assertRaises(
+                mod.BuildEvidenceError
+            ):
+                mod.read_receipt(alias)
+
+
+    def test_invalid_utf8_receipt_rejected(self):
+        path = self.folder / "invalid-utf8.json"
+        path.write_bytes(bytes([255]))
+
+        with self.assertRaisesRegex(
+            mod.BuildEvidenceError,
+            "malformed"
+        ):
+            mod.read_receipt(path)
+
 
     def test_symlink_receipt_and_binary_rejected(self):
         p = self.write("original", "abc")

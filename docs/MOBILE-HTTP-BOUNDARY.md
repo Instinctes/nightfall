@@ -1,62 +1,78 @@
-# Mobile HTTP Boundary — experimental security hardening
+# Mobile Light API: resource and proxy boundary
 
-Security hardening for Nightfall's public light-client API.
+This document describes the current mainline
+implementation after the PR #70 forward-port.
 
-No change to V8 consensus, emission, P2P wire format,
-wallet keys or RPC method allowlist.
+It is not an independent security audit.
 
-## Limits
+## Resource limits
 
-- Maximum 64 concurrent handlers
-- Maximum 4096 unique-IP rate buckets
-- Existing per-IP 120/minute rate policy retained
-- Maximum 16 KiB HTTP header
-- Maximum 512 KiB HTTP body
-- 20-second absolute request-read deadline
-- Duplicate Content-Length rejected
-- Transfer-Encoding rejected
-- One request processed per connection
+- Only allow-listed Light API RPC methods
+  are accessible.
 
-## Testing
+- Full RPC mining and full-block methods
+  are intentionally excluded.
 
-Offline Rust format, focused tests, cargo check and Clippy.
-Tests cover fragmented requests, malformed framing,
-oversized bodies, admission limits and source-bucket limits.
+- 8 fixed workers process a bounded queue
+  of 16 connections.
 
-## Reverse proxies and shared quotas
+- Excess sockets are dropped.
 
-The source IP is taken from the accepted TCP socket (`peer_addr`).
-This is a **transport peer address**, not a verified wallet-user IP.
+- Queue time counts toward the 20-second
+  request budget.
 
-When a TCP forwarder sends public port 80 to loopback port 17888,
-all downstream wallet users can appear as `127.0.0.1`. The existing
-120-requests-per-minute source bucket is then **shared by every user**
-behind that forwarder. Heavy traffic from one client can trigger HTTP
-429 for unrelated wallets. This is an availability limitation, not a
-wallet-specific restriction. The 64-active-handler limit is global
-regardless of whether a forwarder is present; saturation returns 503.
+- HTTP headers are limited to 16 KiB.
 
-No trusted-proxy mode is implemented here. The listener must **not**
-interpret untrusted `X-Forwarded-For`, `Forwarded`, or arbitrary PROXY
-headers as authenticated identities. Those values can be spoofed when
-the direct listener is reachable. A loopback TCP forwarder does not
-preserve the originating client IP by itself.
+- Request bodies are limited to 512 KiB.
 
-Operators using this patch behind a forwarder should enforce their own
-per-client admission controls at a trusted, correctly configured edge,
-keep the light listener inaccessible to untrusted direct connections,
-and account for its additional shared 120/minute quota. Edge limits do
-**not** remove the listener's shared quota: production suitability
-requires an explicit load test with multiple independent clients.
+- Duplicate Content-Length and
+  Transfer-Encoding are rejected.
 
-A future opt-in proxy-identity feature needs a defined trusted-peer
-boundary and separate adversarial review before it is enabled.
+- Rate limits are 120 requests per minute.
 
-## Limitations
+- The source table is bounded to 4096 entries.
 
-These controls do not prevent distributed denial of service,
-network censorship, malicious chain data, wallet compromise,
-or privacy leaks outside this listener.
+## TCP forwarders
 
-TLS requires a trusted reverse proxy.
-Security review and production soak tests are required.
+A plain TCP forwarder can present all clients
+as 127.0.0.1.
+
+Without explicit proxy trust, these clients
+share one 120-per-minute source bucket.
+
+## Trusted local HTTP reverse proxy
+
+NIGHTFALL_TRUST_LOOPBACK_PROXY=1
+
+This setting is only for a locally controlled
+HTTP reverse proxy that correctly overwrites
+or appends trusted X-Forwarded-For values.
+
+It must not be enabled without such a proxy.
+
+Requests from non-loopback socket peers
+ignore forwarded-client headers.
+
+No PROXY protocol v1/v2 support is claimed.
+
+## Regression coverage
+
+Tests check:
+
+1. Shared quotas behind raw TCP forwarding.
+2. Separate quotas for trusted local clients.
+3. No quota bypass from untrusted headers.
+
+## Compatibility
+
+The former PR #70 handler, which could
+spawn up to 64 handler threads, has not
+been restored over the newer mainline
+fixed-worker implementation.
+
+This avoids weakening the current
+resource protection.
+
+Real-client load testing, protocol review,
+security review and maintainer approval
+remain necessary before release.
