@@ -45,6 +45,11 @@ use zeroize::{Zeroize, Zeroizing};
 /// A 256-bit seed is 24 words under BIP-39.
 pub const MNEMONIC_WORDS: usize = 24;
 
+// Limit untrusted input at the crypto API boundary,
+// not only at wallet UI entry points.
+// Reject before normalization or intermediate allocation.
+const MAX_MNEMONIC_INPUT_BYTES: usize = 1024;
+
 #[derive(Debug, Error)]
 pub enum MnemonicError {
     /// Covers unknown words, a bad checksum, and unsupported lengths. The
@@ -77,6 +82,11 @@ impl WalletKeys {
     /// Whitespace and case are normalised, because a user copying words off
     /// paper produces neither consistently.
     pub fn from_mnemonic(phrase: &str) -> Result<Self, MnemonicError> {
+        if phrase.len() > MAX_MNEMONIC_INPUT_BYTES {
+            return Err(MnemonicError::Invalid(
+                "recovery phrase exceeds 1024 UTF-8 bytes".into(),
+            ));
+        }
         let spaced = Zeroizing::new(phrase.split_whitespace().collect::<Vec<_>>().join(" "));
         let normalised = Zeroizing::new(spaced.to_lowercase());
 
@@ -85,8 +95,10 @@ impl WalletKeys {
             return Err(MnemonicError::WrongLength(count));
         }
 
+        // Never propagate third-party diagnostics from
+        // recovery input into logs or support reports.
         let mnemonic = Mnemonic::parse_normalized(&normalised)
-            .map_err(|e| MnemonicError::Invalid(e.to_string()))?;
+            .map_err(|_| MnemonicError::Invalid("invalid word or checksum".into()))?;
 
         let (mut entropy, len) = mnemonic.to_entropy_array();
         if len != 32 {

@@ -615,6 +615,18 @@ impl ChainStore {
         Ok(())
     }
 
+    /// Load a chain, replaying and revalidating every stored block.
+    /// Load, reporting progress to the log every few seconds.
+    ///
+    /// The silent version printed one line — "re-verifying proof of work for
+    /// the whole chain" — and then nothing for the length of the run, which on
+    /// a full chain is a quarter of an hour. Every command-line user who saw
+    /// that reasonably concluded the process had wedged, and the ones who
+    /// killed it got to start again.
+    ///
+    /// Throttled by time rather than by block count: block rate depends on the
+    /// machine, and a line every N blocks is a flood on a fast one and silence
+    /// on a slow one.
     /// Refuse to operate on a datadir whose recovery was interrupted.
     ///
     /// `recover-stalled-fork` leaves [`RECOVERY_JOURNAL`] behind if it is
@@ -660,18 +672,6 @@ impl ChainStore {
         )
     }
 
-    /// Load a chain, replaying and revalidating every stored block.
-    /// Load, reporting progress to the log every few seconds.
-    ///
-    /// The silent version printed one line — "re-verifying proof of work for
-    /// the whole chain" — and then nothing for the length of the run, which on
-    /// a full chain is a quarter of an hour. Every command-line user who saw
-    /// that reasonably concluded the process had wedged, and the ones who
-    /// killed it got to start again.
-    ///
-    /// Throttled by time rather than by block count: block rate depends on the
-    /// machine, and a line every N blocks is a flood on a fast one and silence
-    /// on a slow one.
     pub fn load_or_new(&self, network: NetworkId) -> anyhow::Result<Chain> {
         let started = std::time::Instant::now();
         let mut last = started;
@@ -771,7 +771,8 @@ impl ChainStore {
             let m = meta.as_ref().expect("pruned load has meta");
             chain.first_height = m.first_height;
             chain.horizon_work = m.horizon_work.parse().unwrap_or(0);
-            let horizon = load_horizon_file(&self.horizon_path())?;
+            let horizon = load_horizon_file(&self.horizon_path())?
+                .with_binding_height(network.binding_fork_height());
             chain.ledger = horizon.clone();
             chain.horizon = Some(horizon);
             chain.total_work = chain.horizon_work;
@@ -917,6 +918,9 @@ fn load_horizon_file(path: &Path) -> anyhow::Result<LedgerState> {
         },
         tx_count: file.tx_count,
         coinbase_maturity: file.coinbase_maturity,
+        // The file does not say which network it belongs to; the loader
+        // re-applies the right height for the chain it is building.
+        binding_height: nightfall_types::NetworkId::Mainnet.binding_fork_height(),
     })
 }
 

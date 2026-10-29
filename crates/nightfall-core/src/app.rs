@@ -211,6 +211,8 @@ pub struct App {
     pub till_reference: String,
     pub till_amount: String,
     pub till_description: String,
+    pub till_confirmations: u64,
+    pub till_expiry_hours: u64,
 
     // Air. `air_pending` is the request this online side wrote and is waiting
     // for an answer to; `air_frames` is whatever this side is currently showing
@@ -384,6 +386,12 @@ impl App {
             till_reference: String::new(),
             till_amount: String::new(),
             till_description: String::new(),
+            till_confirmations: std::fs::read_to_string(datadir.join("till-confirmations"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .filter(|n| (1..=10000).contains(n))
+                .unwrap_or(10),
+            till_expiry_hours: 0,
             air_input: String::new(),
             air_pending: None,
             air_incoming: None,
@@ -1129,7 +1137,7 @@ impl App {
                 // it cannot be traced back to this node. With almost no peers
                 // that one hop is also the only hop, and nothing re-sends it.
                 // Say so now, while the sender is still looking at the screen.
-                let peers = self.status.as_ref().map(|s| s.peers).unwrap_or(0);
+                let peers = self.status.as_ref().map(|s| s.live_peers).unwrap_or(0);
                 if peers < 3 {
                     self.toasts.error(
                         ctx,
@@ -1804,8 +1812,12 @@ impl eframe::App for App {
         {
             self.rewards.preview(ctx.input(|input| input.time));
         }
-        self.rewards
-            .show(ctx, self.reward_sound, 94.0 + Self::title_clearance());
+        self.rewards.show(
+            ctx,
+            self.reward_sound,
+            self.send_confirm || self.retry_payment.is_some(),
+            94.0 + Self::title_clearance(),
+        );
         self.toasts.show(ctx);
         crate::ui_shots::step(self, ctx);
     }
@@ -2036,7 +2048,7 @@ impl App {
                 )
                 .show(ctx, |ui| {
                     let tip = self.tip_height();
-                    let peers = self.status.as_ref().map(|s| s.peers).unwrap_or(0);
+                    let peers = self.status.as_ref().map(|s| s.live_peers).unwrap_or(0);
                     screen_header(
                         ui,
                         &self.network.to_string(),

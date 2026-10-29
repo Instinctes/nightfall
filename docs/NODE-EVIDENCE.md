@@ -46,6 +46,11 @@ infrastructure, node honesty, consensus validation or coin supply.
   miner addresses and transaction identifiers are deliberately absent.
 - Running twice can reveal ordinary reorgs. Do not mine if peers are absent or
   your chain is behind. This program takes no automatic recovery action.
+- Imported receipts are capped at 16 KiB. Their warnings and
+  OBSERVED/CAUTION assessment are recomputed from the
+  included status samples, not trusted as stored labels.
+  This detects internally inconsistent reports, not
+  fabricated but self-consistent RPC data.
 - For reproducible comparison, only schema-v1 allowlisted fields are accepted.
   Do not commit live receipts to a public repository without reviewing them.
 

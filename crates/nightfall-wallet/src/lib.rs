@@ -8,7 +8,7 @@ use nightfall_consensus::Block;
 use nightfall_crypto::{
     scan_candidate, scan_output, Address, Commitment, ScanCandidate, WalletKeys,
 };
-use nightfall_ledger::{build_transfer, Payment, Spendable, Transaction, MAX_INPUTS};
+use nightfall_ledger::{build_transfer_with, Payment, Spendable, Transaction, MAX_INPUTS};
 use nightfall_storage::write_secret_file;
 use nightfall_types::{Amount, NetworkId};
 use serde::{Deserialize, Serialize};
@@ -199,11 +199,14 @@ pub struct HistoryEntry {
     /// still confirms it normally. Only the automatic re-send is withheld.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub quarantined: bool,
+    /// Locally released after canonical-chain validation. Kept for history; never retried.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub failed: bool,
 }
 
 impl HistoryEntry {
     pub fn is_pending(&self) -> bool {
-        self.height.is_none()
+        self.height.is_none() && !self.failed
     }
 
     /// Pending, imported from a backup, and therefore not acted on alone.
@@ -938,6 +941,7 @@ impl Wallet {
                         // Found on chain by this wallet, not read out of a
                         // backup, and incoming besides: nothing to withhold.
                         quarantined: false,
+                        failed: false,
                     });
                 }
                 found += 1;
@@ -1040,13 +1044,9 @@ impl Wallet {
         self.scan_blocks_inner(blocks, true)
     }
 
-    /// Forget sends that provably cannot confirm on the node's current chain,
-    /// and make the coins they were holding spendable again.
-    ///
-    /// The caller decides which ones — it is the side that can see the node's
-    /// UTXO set — and passes the inputs that still exist there in `unspend`.
-    /// An input still claimed by another pending send stays reserved.
-    /// Returns how many history entries were removed.
+    /// Preserve impossible sends as failed and release only surviving inputs.
+    /// The caller must hold the canonical node state lock through persistence.
+    /// Inputs still claimed by another pending send remain reserved.
     pub fn release_sends(
         &mut self,
         txids: &[String],
@@ -1054,11 +1054,17 @@ impl Wallet {
     ) -> anyhow::Result<usize> {
         let before_history = self.db.history.clone();
         let before_outputs = self.db.outputs.clone();
-        let before = self.db.history.len();
-        self.db.history.retain(|e| {
-            !(e.direction == Direction::Sent && e.is_pending() && txids.contains(&e.txid))
-        });
-        let removed = before - self.db.history.len();
+        let mut removed = 0;
+        for entry in &mut self.db.history {
+            if entry.direction == Direction::Sent
+                && entry.is_pending()
+                && txids.contains(&entry.txid)
+            {
+                entry.failed = true;
+                entry.quarantined = true;
+                removed += 1;
+            }
+        }
         if removed == 0 {
             return Ok(0);
         }
@@ -1171,6 +1177,7 @@ impl Wallet {
                             // Found on chain by this wallet, not read out of a
                             // backup, and incoming besides: nothing to withhold.
                             quarantined: false,
+                            failed: false,
                         });
                     }
                     found += 1;
@@ -1751,7 +1758,7 @@ impl Wallet {
         if total < target {
             bail!("reserved outputs cover {total}, need {target}");
         }
-        Ok(build_transfer(
+        Ok(build_transfer_with(
             &self.keys,
             &inputs,
             &[Payment {
@@ -1763,7 +1770,20 @@ impl Wallet {
             &self.address(),
             0,
             self.network.proof_context(),
+            self.build_rules(tip_height),
         )?)
+    }
+
+    /// Transaction rules for a payment built at `tip_height`.
+    ///
+    /// The binding fields are always attached; a kernel offset only once the
+    /// next block is known to be at or past the fork. A caller that does not
+    /// know the height passes 0 and gets a transaction valid on both sides.
+    fn build_rules(&self, tip_height: u64) -> nightfall_ledger::BuildRules {
+        if tip_height == 0 {
+            return nightfall_ledger::BuildRules::default();
+        }
+        nightfall_ledger::BuildRules::for_height(self.network, tip_height.saturating_add(1))
     }
 
     #[cfg(test)]
@@ -1795,7 +1815,7 @@ impl Wallet {
     ) -> anyhow::Result<Transaction> {
         let target = amount.checked_add(fee).context("amount overflow")?;
         let inputs = self.select_coins_at(target, tip_height, maturity)?;
-        let tx = build_transfer(
+        let tx = build_transfer_with(
             &self.keys,
             &inputs,
             &[Payment {
@@ -1807,6 +1827,7 @@ impl Wallet {
             &self.address(),
             0,
             self.network.proof_context(),
+            self.build_rules(tip_height),
         )?;
         Ok(tx)
     }
@@ -1863,6 +1884,7 @@ impl Wallet {
                     // This wallet is making the payment right now, so it owns
                     // the decision to keep trying until a block takes it.
                     quarantined: false,
+                    failed: false,
                 },
             );
         }
@@ -3414,6 +3436,7 @@ mod tests {
             spent_commits: inputs,
             raw: None,
             quarantined: false,
+            failed: false,
         };
         w.db.history.push(pending("dead", vec![c[0], c[1]]));
         w.db.history.push(pending("other", vec![c[1]]));
@@ -3423,8 +3446,23 @@ mod tests {
             }
         }
         let unspend: BTreeSet<[u8; 32]> = [c[0], c[1]].into_iter().collect();
+        // Inject a write failure before the atomic rename. Neither history nor
+        // input availability may change on error, including after reopening.
+        w.save().unwrap();
+        let before = w.export_state().unwrap();
+        let disk = fs::read(&w.db_path).unwrap();
+        let temporary = w.db_path.with_extension("json.tmp");
+        fs::create_dir(&temporary).unwrap();
+        assert!(w.release_sends(&["dead".to_string()], &unspend).is_err());
+        assert_eq!(w.export_state().unwrap(), before);
+        assert_eq!(fs::read(&w.db_path).unwrap(), disk);
+        fs::remove_dir(&temporary).unwrap();
         assert_eq!(w.release_sends(&["dead".to_string()], &unspend).unwrap(), 1);
-        assert!(!w.history().iter().any(|e| e.txid == "dead"));
+        assert!(w
+            .history()
+            .iter()
+            .any(|e| e.txid == "dead" && e.failed && !e.is_pending()));
+        assert!(!w.resendable().iter().any(|(txid, _)| txid == "dead"));
         assert!(w.history().iter().any(|e| e.txid == "other"));
         let spent = |commit: [u8; 32]| {
             w.outputs()
@@ -3441,6 +3479,19 @@ mod tests {
             spent(c[1]),
             "an input another pending send still claims stays reserved"
         );
+        let reopened = Wallet::open(&d, NetworkId::Devnet, "w.seed").unwrap();
+        assert!(reopened
+            .history()
+            .iter()
+            .any(|e| e.txid == "dead" && e.failed));
+        assert!(!reopened.pending_input_commits().contains(&c[0]));
+        assert!(reopened.pending_input_commits().contains(&c[1]));
+        // Old snapshots without the new flag remain readable and pending.
+        let mut old = serde_json::to_value(pending("old", vec![c[2]])).unwrap();
+        old.as_object_mut().unwrap().remove("failed");
+        assert!(serde_json::from_value::<HistoryEntry>(old)
+            .unwrap()
+            .is_pending());
         // Releasing an unknown or already-released send changes nothing.
         assert_eq!(w.release_sends(&["dead".to_string()], &unspend).unwrap(), 0);
         fs::remove_dir_all(&d).ok();

@@ -80,6 +80,156 @@ class Tests(unittest.TestCase):
         self.assertIn("mining enabled while behind with no explicit idle hold", w)
         self.assertIn("fork recovery active", w)
 
+    def test_resealed_misleading_receipt_is_rejected(self):
+        # Recomputing SHA-256 cannot conceal an
+        # internally inconsistent health assessment.
+
+        isolated = state(
+            live_peers=0,
+            best_peer_height=120
+        )
+
+        base = dict(
+            schema="nightfall-node-evidence-v1",
+            scope="untrusted-local-rpc-claims-not-consensus-proof",
+            samples=[isolated, isolated],
+            checks=["status", "verify_supply"],
+            assessment="OBSERVED",
+            warnings=[]
+        )
+
+        with self.assertRaisesRegex(
+            kit.EvidenceError,
+            "disagree"
+        ):
+            kit.verify_receipt(kit.seal(base))
+
+        correct = kit.assess(
+            isolated,
+            isolated
+        )
+
+        self.assertIn(
+            "no live peers",
+            correct
+        )
+
+        base["assessment"] = "CAUTION"
+        base["warnings"] = correct
+
+        kit.verify_receipt(
+            kit.seal(base)
+        )
+
+        base["warnings"] = correct[:-1]
+
+        with self.assertRaisesRegex(
+            kit.EvidenceError,
+            "disagree"
+        ):
+            kit.verify_receipt(kit.seal(base))
+
+
+    def test_invalid_warnings_fail_closed_without_traceback(self):
+
+        s = state()
+
+        base = dict(
+            schema="nightfall-node-evidence-v1",
+            scope="untrusted-local-rpc-claims-not-consensus-proof",
+            samples=[s, s],
+            checks=["status", "verify_supply"],
+            assessment="OBSERVED",
+            warnings=[]
+        )
+
+        attacks = [
+            [{"not": "hashable"}],
+            [["nested"]],
+            ["no live peers", "no live peers"],
+            ["not registered"]
+        ]
+
+        for bad in attacks:
+
+            with self.subTest(bad=bad):
+                with self.assertRaises(
+                    kit.EvidenceError
+                ):
+
+                    base["warnings"] = bad
+
+                    kit.verify_receipt(
+                        kit.seal(base)
+                    )
+
+
+    def test_compare_limits_size_and_encoding(self):
+
+        s = state()
+
+        receipt = kit.seal(dict(
+            schema="nightfall-node-evidence-v1",
+            scope="untrusted-local-rpc-claims-not-consensus-proof",
+            samples=[s, s],
+            checks=["status", "verify_supply"],
+            assessment="OBSERVED",
+            warnings=[]
+        ))
+
+        with tempfile.TemporaryDirectory() as tmp:
+
+            a = pathlib.Path(tmp) / "good.json"
+            b = pathlib.Path(tmp) / "untrusted.json"
+
+            a.write_text(
+                json.dumps(receipt),
+                encoding="utf-8"
+            )
+
+            result = kit.compare(a, a)
+
+            self.assertEqual(
+                "SAME_REPORTED_TIP",
+                result["comparison"]
+            )
+
+            b.write_bytes(
+                b" " * (kit.MAX_RECEIPT_BYTES + 1)
+            )
+
+            with self.assertRaisesRegex(
+                kit.EvidenceError,
+                "input limit"
+            ):
+                kit.compare(a, b)
+
+            b.write_bytes(bytes([255]))
+
+            with self.assertRaisesRegex(
+                kit.EvidenceError,
+                "UTF-8"
+            ):
+                kit.compare(a, b)
+
+            receipt["payload"]["samples"][0][
+                "live_peers"
+            ] = 0
+
+            b.write_text(
+                json.dumps(
+                    kit.seal(receipt["payload"])
+                ),
+                encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(
+                kit.EvidenceError,
+                "disagree"
+            ):
+                kit.compare(a, b)
+
+
     def test_rpc_network_boundary(self):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.bind(("127.0.0.1", 0))

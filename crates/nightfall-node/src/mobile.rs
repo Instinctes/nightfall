@@ -30,6 +30,41 @@ const ALLOWED: &[&str] = &[
 ];
 const MAX_BODY: usize = 512 * 1024;
 const PER_IP_PER_MIN: u32 = 120;
+const WORKERS: usize = 8;
+const QUEUED_CONNECTIONS: usize = 16;
+const MAX_RATE_KEYS: usize = 4096;
+const REQUEST_BUDGET: Duration = Duration::from_secs(20);
+
+/// Fixed workers and a bounded queue prevent per-connection stack/allocator growth.
+fn connection_pool(
+    workers: usize,
+    queued: usize,
+    handle: impl Fn(TcpStream, Instant) + Send + Sync + 'static,
+) -> std::io::Result<mpsc::SyncSender<(TcpStream, Instant)>> {
+    let (tx, rx) = mpsc::sync_channel::<(TcpStream, Instant)>(queued);
+    let rx = Arc::new(Mutex::new(rx));
+    let handle = Arc::new(handle);
+    for index in 0..workers {
+        let rx = Arc::clone(&rx);
+        let handle = Arc::clone(&handle);
+        thread::Builder::new()
+            .name(format!("light-api-{index}"))
+            .spawn(move || loop {
+                let item = match rx.lock() {
+                    Ok(receiver) => receiver.recv(),
+                    Err(_) => break,
+                };
+                match item {
+                    Ok((stream, accepted)) if accepted.elapsed() < REQUEST_BUDGET => {
+                        handle(stream, accepted)
+                    }
+                    Ok(_) => {} // Queue time counts against the same request deadline.
+                    Err(_) => break,
+                }
+            })?;
+    }
+    Ok(tx)
+}
 
 struct Rate {
     window: Instant,
@@ -58,6 +93,9 @@ pub(crate) fn spawn_mobile(
         }
 
         tracing::info!("mobile API listening on {addr} (status/scan_feed/submit_tx only)");
+        // Only opt in behind an HTTP proxy that overwrites/appends XFF. A raw
+        // TCP forwarder such as socat cannot establish a trustworthy client IP.
+        let trust_proxy = std::env::var("NIGHTFALL_TRUST_LOOPBACK_PROXY").as_deref() == Ok("1");
         let rates: Arc<Mutex<HashMap<String, Rate>>> = Arc::new(Mutex::new(HashMap::new()));
 
         while !shutdown.is_requested() {
@@ -116,14 +154,6 @@ fn handle(
     if !allow(&rates, &peer) {
         return write_http(&mut stream, 429, "{\"error\":\"rate limited\"}");
     }
-
-    let mut buf = vec![0u8; 16_384];
-    let n = stream.read(&mut buf)?;
-    if n == 0 {
-        return Ok(());
-    }
-    let head = String::from_utf8_lossy(&buf[..n]);
-    let (headers, rest) = head.split_once("\r\n\r\n").unwrap_or((&head, ""));
     let first = headers.lines().next().unwrap_or("");
     let mut parts = first.split_whitespace();
     let method = parts.next().unwrap_or("");
@@ -154,35 +184,27 @@ fn handle(
         return write_http(&mut stream, 405, "{\"error\":\"POST a JSON-RPC body\"}");
     }
 
-    let content_len = headers
-        .lines()
-        .find_map(|l| {
-            let (k, v) = l.split_once(':')?;
-            (k.eq_ignore_ascii_case("content-length")).then(|| v.trim().parse::<usize>().ok())
-        })
-        .flatten()
-        .unwrap_or(rest.len());
-    if content_len > MAX_BODY {
-        return write_http(&mut stream, 413, "{\"error\":\"body too large\"}");
-    }
-    let mut body = rest.as_bytes().to_vec();
+    let content_len = match body_length(&headers) {
+        Ok(n) if n <= MAX_BODY => n,
+        Ok(_) => return write_http(&mut stream, 413, "{\"error\":\"body too large\"}"),
+        Err(_) => return write_http(&mut stream, 400, "{\"error\":\"invalid HTTP framing\"}"),
+    };
+    body.truncate(content_len);
     while body.len() < content_len {
-        let mut more = vec![0u8; (content_len - body.len()).min(8192)];
-        let k = stream.read(&mut more)?;
-        if k == 0 {
-            break;
-        }
+        let mut more = [0u8; 8192];
+        let wanted = (content_len - body.len()).min(more.len());
+        let k = read_before(&mut stream, &mut more[..wanted], deadline)?;
+        anyhow::ensure!(k > 0, "truncated HTTP body");
         body.extend_from_slice(&more[..k]);
     }
-    body.truncate(content_len);
-    let text = String::from_utf8_lossy(&body);
+    let text = std::str::from_utf8(&body)?;
     let req: RpcReq = match serde_json::from_str(text.trim()) {
         Ok(r) => r,
         Err(e) => {
             return write_http(
                 &mut stream,
                 400,
-                &format!("{{\"error\":\"bad json: {e}\"}}"),
+                &json!({"error": format!("bad json: {e}")}).to_string(),
             );
         }
     };
@@ -190,21 +212,107 @@ fn handle(
         return write_http(
             &mut stream,
             403,
-            &format!(
-                "{{\"error\":\"method '{}' is not available on the mobile API\"}}",
-                req.method
-            ),
+            &json!({"error": format!("method '{}' is not available on the mobile API", req.method)}).to_string(),
         );
     }
     let res = rpc::dispatch(&req, &state);
     write_http(&mut stream, 200, &serde_json::to_string(&res)?)
 }
 
-fn allow(rates: &Mutex<HashMap<String, Rate>>, ip: &str) -> bool {
-    let Ok(mut g) = rates.lock() else {
-        return true;
+fn read_before(stream: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> anyhow::Result<usize> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|d| !d.is_zero())
+        .ok_or_else(|| anyhow::anyhow!("request deadline expired"))?;
+    stream.set_read_timeout(Some(remaining))?;
+    Ok(stream.read(buf)?)
+}
+
+fn read_headers(stream: &mut TcpStream, deadline: Instant) -> anyhow::Result<(String, Vec<u8>)> {
+    let mut bytes = Vec::new();
+    loop {
+        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+            anyhow::ensure!(end + 4 <= 16384, "headers too large");
+            let headers = std::str::from_utf8(&bytes[..end])?.to_owned();
+            return Ok((headers, bytes[end + 4..].to_vec()));
+        }
+        anyhow::ensure!(bytes.len() < 16384, "headers too large");
+        let mut buf = [0u8; 4096];
+        let n = read_before(stream, &mut buf, deadline)?;
+        anyhow::ensure!(n > 0, "truncated HTTP headers");
+        bytes.extend_from_slice(&buf[..n]);
+    }
+}
+
+fn body_length(headers: &str) -> anyhow::Result<usize> {
+    let mut length = None;
+    for line in headers.lines().skip(1) {
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("invalid header"))?;
+        anyhow::ensure!(
+            !name.eq_ignore_ascii_case("transfer-encoding"),
+            "chunked bodies unsupported"
+        );
+        if name.eq_ignore_ascii_case("content-length") {
+            anyhow::ensure!(length.is_none(), "duplicate content length");
+            let value = value.trim();
+            anyhow::ensure!(
+                !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()),
+                "invalid content length"
+            );
+            length = Some(value.parse()?);
+        }
+    }
+    length.ok_or_else(|| anyhow::anyhow!("content length required"))
+}
+
+/// Whose budget a request is charged to.
+///
+/// Normally the socket's address. The one exception is a reverse proxy on the
+/// same machine (someone self-hosting the web wallet in front of their own
+/// node): every request then arrives from loopback, and without this all of
+/// that proxy's users would share one 120-per-minute bucket — a single fresh
+/// wallet scan would lock everyone else out. So when, and only when, the
+/// socket peer is loopback AND the operator opted in using
+/// NIGHTFALL_TRUST_LOOPBACK_PROXY=1, the last `X-Forwarded-For` entry (the one the
+/// local proxy itself appended) names the client. A remote peer cannot use
+/// the header to pick someone else's bucket or to get a fresh one: from
+/// anywhere but loopback it is ignored.
+fn rate_key(peer: Option<std::net::IpAddr>, headers: &str, trust_proxy: bool) -> String {
+    let Some(peer) = peer else {
+        return "unknown".into();
     };
-    let now = Instant::now();
+    if trust_proxy && peer.is_loopback() {
+        let forwarded = headers.lines().skip(1).find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case("x-forwarded-for")
+                .then_some(v)
+        });
+        if let Some(ip) = forwarded
+            .and_then(|v| v.rsplit(',').next())
+            .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok())
+        {
+            return format!("fwd:{ip}");
+        }
+    }
+    peer.to_string()
+}
+
+fn allow(rates: &Mutex<HashMap<String, Rate>>, ip: &str) -> bool {
+    allow_at(rates, ip, Instant::now())
+}
+
+fn allow_at(rates: &Mutex<HashMap<String, Rate>>, ip: &str, now: Instant) -> bool {
+    let Ok(mut g) = rates.lock() else {
+        return false;
+    };
+    // Bounded table; expiry runs before admission, including for new addresses.
+    g.retain(|_, rate| now.saturating_duration_since(rate.window) < Duration::from_secs(60));
+    if !g.contains_key(ip) && g.len() >= MAX_RATE_KEYS {
+        return false;
+    }
     let e = g.entry(ip.to_string()).or_insert(Rate {
         window: now,
         count: 0,
@@ -213,7 +321,7 @@ fn allow(rates: &Mutex<HashMap<String, Rate>>, ip: &str) -> bool {
         e.window = now;
         e.count = 0;
     }
-    e.count += 1;
+    e.count = e.count.saturating_add(1);
     e.count <= PER_IP_PER_MIN
 }
 
@@ -248,7 +356,126 @@ fn write_http(stream: &mut TcpStream, code: u16, body: &str) -> anyhow::Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::ALLOWED;
+    use super::{rate_key, ALLOWED};
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> Option<IpAddr> {
+        Some(s.parse().unwrap())
+    }
+
+    #[test]
+    fn rate_table_is_bounded_expires_and_never_overflows() {
+        use super::*;
+        let rates = Mutex::new(HashMap::new());
+        let now = Instant::now();
+        for n in 0..MAX_RATE_KEYS {
+            assert!(allow_at(&rates, &n.to_string(), now));
+        }
+        assert!(!allow_at(&rates, "extra", now));
+        for _ in 1..PER_IP_PER_MIN {
+            assert!(allow_at(&rates, "0", now));
+        }
+        assert!(!allow_at(&rates, "0", now));
+        rates.lock().unwrap().get_mut("0").unwrap().count = u32::MAX;
+        assert!(!allow_at(&rates, "0", now));
+        assert!(allow_at(&rates, "extra", now + Duration::from_secs(60)));
+        assert_eq!(rates.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn http_framing_refuses_ambiguous_lengths_and_chunking() {
+        use super::body_length;
+        assert_eq!(
+            body_length("POST / HTTP/1.1\r\nContent-Length: 12").unwrap(),
+            12
+        );
+        for headers in [
+            "",
+            "Content-Length: 1\r\nContent-Length: 1",
+            "Transfer-Encoding: chunked\r\nContent-Length: 1",
+            "Content-Length: -1",
+            "Content-Length: +1",
+            "Content-Length: abc",
+        ] {
+            assert!(body_length(&format!("POST / HTTP/1.1\r\n{headers}")).is_err());
+        }
+    }
+
+    #[test]
+    fn split_http_headers_and_expired_deadlines_are_handled() {
+        use super::*;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let writer = thread::spawn(move || {
+            client.write_all(b"POST / HTTP/1.1\r\nContent-Len").unwrap();
+            thread::sleep(Duration::from_millis(20));
+            client.write_all(b"gth: 2\r\n\r\n{}").unwrap();
+        });
+        let (header, _) =
+            read_headers(&mut server, Instant::now() + Duration::from_secs(2)).unwrap();
+        assert_eq!(body_length(&header).unwrap(), 2);
+        writer.join().unwrap();
+        assert!(read_before(&mut server, &mut [0u8; 1], Instant::now()).is_err());
+    }
+
+    #[test]
+    fn worker_pool_reuses_workers_and_rejects_excess_sockets() {
+        use super::*;
+        let (entered, entries) = mpsc::channel();
+        let (release, releases) = mpsc::channel();
+        let releases = Mutex::new(releases);
+        let pool = connection_pool(1, 1, move |_, _| {
+            entered.send(thread::current().id()).unwrap();
+            releases.lock().unwrap().recv().unwrap();
+        })
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = || {
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (server, _) = listener.accept().unwrap();
+            drop(client);
+            server
+        };
+        pool.try_send((socket(), Instant::now())).unwrap();
+        let first = entries.recv_timeout(Duration::from_secs(2)).unwrap();
+        pool.try_send((socket(), Instant::now())).unwrap();
+        assert!(matches!(
+            pool.try_send((socket(), Instant::now())),
+            Err(mpsc::TrySendError::Full(_))
+        ));
+        release.send(()).unwrap();
+        assert_eq!(entries.recv_timeout(Duration::from_secs(2)).unwrap(), first);
+        release.send(()).unwrap();
+        drop(pool);
+    }
+
+    /// Behind a local reverse proxy each user gets their own budget; from
+    /// anywhere else the header is worthless, so nobody can dodge the limit
+    /// or spend someone else's by writing it.
+    #[test]
+    fn only_a_local_proxy_may_say_who_the_client_is() {
+        let h = "POST / HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 203.0.113.9, 198.51.100.4";
+        assert_eq!(rate_key(ip("127.0.0.1"), h, false), "127.0.0.1");
+        assert_eq!(rate_key(ip("127.0.0.1"), h, true), "fwd:198.51.100.4");
+        assert_eq!(rate_key(ip("::1"), h, true), "fwd:198.51.100.4");
+        assert_eq!(rate_key(ip("192.0.2.7"), h, true), "192.0.2.7");
+        let lower = "POST / HTTP/1.1\r\nx-forwarded-for:  2001:db8::5 ";
+        assert_eq!(rate_key(ip("127.0.0.1"), lower, true), "fwd:2001:db8::5");
+        // Garbage in the header falls back to the socket, never to a free bucket.
+        let junk = "POST / HTTP/1.1\r\nX-Forwarded-For: not-an-ip";
+        assert_eq!(rate_key(ip("127.0.0.1"), junk, true), "127.0.0.1");
+        assert_eq!(
+            rate_key(ip("127.0.0.1"), "POST / HTTP/1.1", true),
+            "127.0.0.1"
+        );
+        // The request line itself is never read as a header.
+        assert_eq!(
+            rate_key(ip("127.0.0.1"), "X-Forwarded-For: 1.2.3.4", true),
+            "127.0.0.1"
+        );
+        assert_eq!(rate_key(None, h, true), "unknown");
+    }
 
     /// The public endpoint is an allow-list, and this test exists so that
     /// widening it stays a deliberate act. `get_blocks` in particular must

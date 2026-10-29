@@ -20,10 +20,13 @@ INSTALLERS = (
 
 
 def validate_policy(source):
-    clone = 'git clone --depth 1 "$REPO" "$BUILD/nightfall"'
+    clone = 'git clone --depth 1 --branch "$NIGHTFALL_RELEASE_TAG" "$REPO" "$BUILD/nightfall"'
     revision = 'SOURCE_REV="$(git -C "$BUILD/nightfall" rev-parse --verify HEAD)"'
     lock = 'LOCK_SHA="$(sha256sum "$BUILD/nightfall/Cargo.lock" | awk \'{print $1}\')"'
     revisions = [
+        ('NIGHTFALL_RELEASE_TAG="v1.1.1"', "pinned release tag"),
+        ('NIGHTFALL_RELEASE_SHA="84dfd96d92788cdcc40488eda2dd593ef94db88b"', "pinned release commit"),
+        ('[ "$SOURCE_REV" = "$NIGHTFALL_RELEASE_SHA" ] || die "release tag does not match pinned commit"', "fail-closed tag verification"),
         (clone, "source clone"),
         (revision, "Git revision capture"),
         (lock, "Cargo.lock checksum capture"),
@@ -65,6 +68,8 @@ class InstallerSourcePolicyTests(unittest.TestCase):
         for path in INSTALLERS:
             source = path.read_text(encoding="utf-8")
             mutations = {
+                "unpinned branch": source.replace('--branch "$NIGHTFALL_RELEASE_TAG" ', "", 1),
+                "tag check disabled": source.replace('[ "$SOURCE_REV" = "$NIGHTFALL_RELEASE_SHA" ] || die "release tag does not match pinned commit"', ":", 1),
                 "unlocked build": source.replace(
                     "cargo build --locked", "cargo build", 1
                 ),
@@ -107,6 +112,7 @@ class InstallerSourcePolicyTests(unittest.TestCase):
                 fragment = identity_fragment(source)
                 runner = (
                     "set -euo pipefail\n"
+                    + f'NIGHTFALL_RELEASE_SHA="{revision}"\n'
                     "info() { printf '%s\\n' \"$*\"; }\n"
                     "die() { printf '%s\\n' \"$*\" >&2; exit 17; }\n"
                     + fragment
@@ -118,6 +124,24 @@ class InstallerSourcePolicyTests(unittest.TestCase):
                 self.assertEqual(good.returncode, 0, good.stderr)
                 self.assertIn("source commit: " + revision, good.stdout)
                 self.assertIn("Cargo.lock SHA256: " + checksum, good.stdout)
+                wrong = runner.replace(
+                    f'NIGHTFALL_RELEASE_SHA="{revision}"',
+                    'NIGHTFALL_RELEASE_SHA="' + "0" * 40 + '"',
+                    1,
+                )
+                rejected = subprocess.run(
+                    ["bash", "-c", wrong],
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertEqual(
+                    rejected.returncode, 17, rejected.stderr
+                )
+                self.assertIn(
+                    "release tag does not match pinned commit",
+                    rejected.stderr,
+                )
                 lock.unlink()
                 bad = subprocess.run(
                     ["bash", "-c", runner], env=env, text=True, capture_output=True
@@ -125,6 +149,110 @@ class InstallerSourcePolicyTests(unittest.TestCase):
                 self.assertEqual(bad.returncode, 17)
                 self.assertIn("could not hash Cargo.lock", bad.stderr)
 
+
+
+    def test_tag_clone_uses_released_commit_not_moving_main(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "origin"
+            src.mkdir()
+
+            subprocess.run(
+                ["git", "init", "-q", str(src)],
+                check=True,
+            )
+
+            lock = src / "Cargo.lock"
+            lock.write_text("release\\n", encoding="utf-8")
+
+            subprocess.run(
+                ["git", "-C", str(src), "add", "Cargo.lock"],
+                check=True,
+            )
+
+            commit = [
+                "git", "-C", str(src),
+                "-c", "user.name=Fixture",
+                "-c", "user.email=fixture@example.invalid",
+                "commit", "-qm",
+            ]
+
+            subprocess.run(commit + ["release"], check=True)
+
+            tagged = subprocess.check_output(
+                ["git", "-C", str(src), "rev-parse", "HEAD"],
+                text=True,
+            ).strip()
+
+            subprocess.run(
+                ["git", "-C", str(src), "tag", "v1.1.1"],
+                check=True,
+            )
+
+            lock.write_text(
+                "moving development\\n",
+                encoding="utf-8",
+            )
+
+            subprocess.run(
+                ["git", "-C", str(src), "add", "Cargo.lock"],
+                check=True,
+            )
+
+            subprocess.run(
+                commit + ["development"],
+                check=True,
+            )
+
+            main = subprocess.check_output(
+                ["git", "-C", str(src), "rev-parse", "HEAD"],
+                text=True,
+            ).strip()
+
+            self.assertNotEqual(tagged, main)
+
+            for installer in INSTALLERS:
+                with self.subTest(installer=installer.name):
+                    build = Path(d) / (
+                        installer.name + "-build"
+                    )
+                    build.mkdir()
+
+                    env = dict(
+                        os.environ,
+                        REPO=src.as_uri(),
+                        BUILD=str(build),
+                        NIGHTFALL_RELEASE_TAG="v1.1.1",
+                    )
+
+                    clone = (
+                        'git clone --depth 1 --branch '
+                        '"$NIGHTFALL_RELEASE_TAG" '
+                        '"$REPO" "$BUILD/nightfall"'
+                    )
+
+                    self.assertIn(
+                        clone,
+                        installer.read_text(encoding="utf-8"),
+                    )
+
+                    subprocess.run(
+                        ["bash", "-c", clone],
+                        env=env,
+                        check=True,
+                        capture_output=True,
+                    )
+
+                    checkout = subprocess.check_output(
+                        [
+                            "git", "-C",
+                            str(build / "nightfall"),
+                            "rev-parse", "HEAD",
+                        ],
+                        text=True,
+                    ).strip()
+
+                    self.assertEqual(checkout, tagged)
+                    self.assertNotEqual(checkout, main)
 
 if __name__ == "__main__":
     unittest.main()
