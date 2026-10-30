@@ -210,6 +210,16 @@ pub struct NodeInner {
     /// Tor exits and produced 51 hung SYN_SENT while the seed sat one
     /// socket away.
     pub confirmed_peers: HashSet<String>,
+    /// Peers explicitly disabled for this process lifetime.
+    ///
+    /// Supervisors, handshakes, gossip, and directory discovery must not
+    /// silently re-enable one. `add_peer` is the explicit re-enable path.
+    suppressed_peers: HashSet<String>,
+    /// Advertised dial address belonging to each live inbound session.
+    ///
+    /// Inbound session keys contain the observed ephemeral source port,
+    /// so this mapping is required to disconnect a logically removed peer.
+    inbound_peer_addrs: HashMap<String, String>,
     /// Set when a peer is ahead and their blocks do not connect to our tip.
     /// Mining on that tip deepens a fork; this does not expire with the
     /// catch-up window.
@@ -375,6 +385,7 @@ impl NodeInner {
             .map(|s| s.to_string())
             .chain(self.bootstrap.iter().cloned())
             .chain(self.peer_addrs.iter().cloned())
+            .filter(|addr| !self.suppressed_peers.contains(addr))
             .collect();
 
         // Archives first when we are behind.
@@ -431,6 +442,9 @@ impl NodeInner {
     }
 
     fn mark_confirmed(&mut self, addr: String) {
+        if self.suppressed_peers.contains(&addr) {
+            return;
+        }
         self.confirmed_peers.insert(addr.clone());
         self.peer_addrs.insert(addr);
     }
@@ -799,6 +813,8 @@ impl NodeHandle {
             last_reorg_fetch: AtomicU64::new(0),
             last_wall_tick: AtomicU64::new(now_unix()),
             confirmed_peers: HashSet::new(),
+            suppressed_peers: HashSet::new(),
+            inbound_peer_addrs: HashMap::new(),
             stalled_on_fork: AtomicBool::new(false),
             fork_rewind: AtomicU64::new(0),
             mining_threads: Arc::clone(&mining_threads),
@@ -1059,10 +1075,71 @@ impl NodeHandle {
         if g.peer_addrs.len() >= MAX_PEERS {
             anyhow::bail!("peer limit reached");
         }
+        g.suppressed_peers.remove(addr);
         g.peer_addrs.insert(addr.to_string());
-        g.bootstrap.push(addr.to_string());
+        if !g.bootstrap.iter().any(|a| a == addr) {
+            g.bootstrap.push(addr.to_string());
+        }
         tracing::info!("peer added: {addr}");
         Ok(())
+    }
+
+    /// Stop dialling a peer and close an existing outbound session to it.
+    ///
+    /// Removing the address from every dial source is important: closing the
+    /// socket alone would let the outbound supervisor reconnect immediately.
+    /// A later `add_peer` call can explicitly enable the peer again.
+    pub fn remove_peer(&self, addr: &str) -> anyhow::Result<bool> {
+        let addr = addr.trim();
+        if !looks_like_dial_target(addr) {
+            anyhow::bail!("enter an address as host:port");
+        }
+
+        let (removed, sessions) = {
+            let mut g = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("node state lock poisoned"))?;
+
+            let newly_suppressed = g.suppressed_peers.insert(addr.to_string());
+            let removed = g.peer_addrs.remove(addr) | g.confirmed_peers.remove(addr) | {
+                let before = g.bootstrap.len();
+                g.bootstrap.retain(|a| a != addr);
+                g.bootstrap.len() != before
+            };
+
+            let mut sessions = Vec::new();
+
+            if let Some(session) = g.sessions.get(&outbound_key(addr)) {
+                sessions.push(session);
+            }
+
+            let inbound_keys: Vec<String> = g
+                .inbound_peer_addrs
+                .iter()
+                .filter(|(_, peer_addr)| peer_addr.as_str() == addr)
+                .map(|(key, _)| key.clone())
+                .collect();
+
+            for key in inbound_keys {
+                if let Some(session) = g.sessions.get(&key) {
+                    sessions.push(session);
+                }
+            }
+
+            (removed || newly_suppressed, sessions)
+        };
+
+        let had_sessions = !sessions.is_empty();
+        for session in sessions {
+            session.disconnect();
+        }
+
+        if removed || had_sessions {
+            tracing::info!("peer removed: {addr}");
+        }
+
+        Ok(removed || had_sessions)
     }
 
     /// Addresses this node will dial.
@@ -1348,6 +1425,14 @@ fn stay_connected(state: SharedState, addr: String) {
         g.network.seed_nodes().iter().any(|s| *s == addr) || g.bootstrap.iter().any(|s| s == &addr)
     };
     loop {
+        if state
+            .lock()
+            .map(|g| g.suppressed_peers.contains(&addr))
+            .unwrap_or(true)
+        {
+            return;
+        }
+
         match open_outbound_session(&state, &addr) {
             Ok(()) => {
                 backoff = Duration::from_millis(250);
@@ -1358,6 +1443,13 @@ fn stay_connected(state: SharedState, addr: String) {
             }
             Err(e) => {
                 let msg = e.to_string();
+                if state
+                    .lock()
+                    .map(|g| g.suppressed_peers.contains(&addr))
+                    .unwrap_or(true)
+                {
+                    return;
+                }
                 if !msg.contains("self-dial") {
                     if let Ok(mut g) = state.lock() {
                         g.last_dial_error = Some(format!("{addr}: {msg}"));
@@ -1457,6 +1549,9 @@ fn open_outbound_session(state: &SharedState, addr: &str) -> anyhow::Result<()> 
     let write_clone = stream.try_clone()?;
     let sess = {
         let mut g = state.lock().unwrap();
+        if g.suppressed_peers.contains(addr) {
+            anyhow::bail!("peer removed");
+        }
         let key = outbound_key(addr);
         g.session_height.insert(key.clone(), peer_h);
         g.sessions.insert(key, write_clone, true)
@@ -1701,6 +1796,9 @@ fn spawn_directory_bootstrap(
                     if !looks_like_dial_target(&addr) || !is_directory_addr(&addr) {
                         continue;
                     }
+                    if g.suppressed_peers.contains(&addr) {
+                        continue;
+                    }
                     if g.peer_addrs.insert(addr.clone()) {
                         g.bootstrap.push(addr);
                         added += 1;
@@ -1899,7 +1997,7 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
         (g.network, g.chain.genesis_hash)
     };
 
-    let (session_key, peer_height) = match read_msg(&mut reader)? {
+    let (session_key, peer_height, peer_addr) = match read_msg(&mut reader)? {
         PeerMsg::Hello {
             wire,
             network: net,
@@ -1964,19 +2062,39 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
                 )?;
                 return Ok(());
             }
-            // Learn an address we can dial back. Without this the peer can
-            // reach us but we can never reach them, so our blocks never
-            // propagate outward and both nodes fork apart while mining.
-            if let Some(addr) = dialable_addr(&peer_label, listen_port) {
+            // Learn the dialable identity before accepting the session.
+            // The inbound socket itself is keyed by the observed ephemeral
+            // source port, so suppression must use the advertised listen
+            // address instead.
+            let peer_addr = dialable_addr(&peer_label, listen_port);
+
+            if let Some(addr) = peer_addr.as_ref() {
+                let suppressed = state
+                    .lock()
+                    .map(|g| g.suppressed_peers.contains(addr))
+                    .unwrap_or(true);
+
+                if suppressed {
+                    tracing::info!("refused removed peer {addr}");
+                    write_msg(
+                        &mut hello_writer,
+                        &PeerMsg::Error {
+                            message: "peer disabled".into(),
+                        },
+                    )?;
+                    return Ok(());
+                }
+
                 let mut g = state.lock().unwrap();
                 if g.peer_addrs.len() < MAX_PEERS {
                     g.mark_confirmed(addr.clone());
                     tracing::info!("learned peer address {addr} running {agent}");
                 }
                 if g.peer_agents.len() < MAX_PEERS * 2 {
-                    g.peer_agents.insert(addr, agent.clone());
+                    g.peer_agents.insert(addr.clone(), agent.clone());
                 }
             }
+
             // Always key inbound sockets by the observed connection, never
             // by the advertised listen address. See `outbound_key`.
             let session_key = inbound_key(&peer_label);
@@ -2008,7 +2126,7 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
                     first_height: our_first,
                 },
             )?;
-            (session_key, peer_height)
+            (session_key, peer_height, peer_addr)
         }
         other => {
             write_msg(
@@ -2046,7 +2164,21 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
         evict_synced_inbound(&state, &session_key);
     }
     let sess = {
-        let g = state.lock().unwrap();
+        let mut g = state.lock().unwrap();
+
+        // remove_peer may have raced with the handshake after HelloOk.
+        // Never install a session for a peer that became suppressed.
+        if let Some(addr) = peer_addr.as_ref() {
+            if g.suppressed_peers.contains(addr) {
+                tracing::info!("discarded inbound session from removed peer {addr}");
+                g.session_height.remove(&session_key);
+                return Ok(());
+            }
+
+            g.inbound_peer_addrs
+                .insert(session_key.clone(), addr.clone());
+        }
+
         g.sessions.insert(session_key.clone(), hello_writer, false)
     };
     // First gift: who else answers. A new install that only knows the
@@ -2060,6 +2192,7 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
     if let Ok(mut g) = state.lock() {
         g.sessions.remove(&session_key);
         g.session_height.remove(&session_key);
+        g.inbound_peer_addrs.remove(&session_key);
     }
     result
 }
@@ -2115,7 +2248,10 @@ fn peer_io_loop(
                 for a in addrs.into_iter().take(MAX_PEERS_PER_MSG) {
                     // Only accept things that parse as a socket address, so a
                     // peer cannot feed us arbitrary strings to dial.
-                    if a.parse::<std::net::SocketAddr>().is_ok() && g.peer_addrs.len() < MAX_PEERS {
+                    if a.parse::<std::net::SocketAddr>().is_ok()
+                        && g.peer_addrs.len() < MAX_PEERS
+                        && !g.suppressed_peers.contains(&a)
+                    {
                         g.peer_addrs.insert(a);
                     }
                 }
@@ -2716,7 +2852,10 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
         if let Ok(PeerMsg::Peers { addrs }) = read_msg(&mut reader) {
             let mut g = state.lock().unwrap();
             for a in addrs.into_iter().take(MAX_PEERS_PER_MSG) {
-                if a.parse::<std::net::SocketAddr>().is_ok() && g.peer_addrs.len() < MAX_PEERS {
+                if a.parse::<std::net::SocketAddr>().is_ok()
+                    && g.peer_addrs.len() < MAX_PEERS
+                    && !g.suppressed_peers.contains(&a)
+                {
                     g.peer_addrs.insert(a);
                 }
             }
