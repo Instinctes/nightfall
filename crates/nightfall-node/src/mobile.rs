@@ -134,6 +134,12 @@ fn handle(
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("/");
 
+    // A status GET or browser preflight is a bodyless, single-frame request.
+    // Reject ambiguous metadata before any public RPC dispatch.
+    if (method == "GET" || method == "OPTIONS") && !read_only_frame_ok(&headers, &body) {
+        return write_http(&mut stream, 400, r#"{"error":"invalid HTTP framing"}"#);
+    }
+
     if method == "OPTIONS" {
         return write_http(&mut stream, 204, "");
     }
@@ -219,6 +225,43 @@ fn read_headers(stream: &mut TcpStream, deadline: Instant) -> anyhow::Result<(St
     }
 }
 
+// Never allow a read-only request to smuggle a body or ambiguous framing.
+// Connection: close is defense in depth, not a reason to accept invalid frames.
+fn read_only_frame_ok(headers: &str, buffered: &[u8]) -> bool {
+    if !buffered.is_empty() {
+        return false;
+    }
+
+    let mut seen_zero_length = false;
+
+    for line in headers.split("\r\n").skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+
+        if name.is_empty()
+            || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            || value.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f)
+        {
+            return false;
+        }
+
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return false;
+        }
+
+        if name.eq_ignore_ascii_case("content-length") {
+            if seen_zero_length || value.trim() != "0" {
+                return false;
+            }
+
+            seen_zero_length = true;
+        }
+    }
+
+    true
+}
+
 fn body_length(headers: &str) -> anyhow::Result<usize> {
     let mut length = None;
     for line in headers.lines().skip(1) {
@@ -283,16 +326,20 @@ fn allow_at(rates: &Mutex<HashMap<String, Rate>>, ip: &str, now: Instant) -> boo
     let Ok(mut g) = rates.lock() else {
         return false;
     };
-    // Bounded table; expiry runs before admission, including for new addresses.
-    g.retain(|_, rate| now.saturating_duration_since(rate.window) < Duration::from_secs(60));
+    // Existing sources use the O(1) fast path. Sweep the table only when
+    // admitting a new source would exceed the fixed memory bound.
     if !g.contains_key(ip) && g.len() >= MAX_RATE_KEYS {
-        return false;
+        g.retain(|_, rate| now.saturating_duration_since(rate.window) < Duration::from_secs(60));
+
+        if g.len() >= MAX_RATE_KEYS {
+            return false;
+        }
     }
     let e = g.entry(ip.to_string()).or_insert(Rate {
         window: now,
         count: 0,
     });
-    if now.duration_since(e.window) > Duration::from_secs(60) {
+    if now.saturating_duration_since(e.window) >= Duration::from_secs(60) {
         e.window = now;
         e.count = 0;
     }
@@ -355,6 +402,59 @@ mod tests {
         assert!(!allow_at(&rates, "0", now));
         assert!(allow_at(&rates, "extra", now + Duration::from_secs(60)));
         assert_eq!(rates.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn read_only_request_has_unambiguous_empty_body() {
+        use super::read_only_frame_ok;
+
+        let good = "GET /status HTTP/1.1\r\nHost: localhost";
+
+        assert!(read_only_frame_ok(good, b""));
+
+        assert!(read_only_frame_ok(
+            "OPTIONS / HTTP/1.1\r\nContent-Length: 0",
+            b""
+        ));
+
+        assert!(!read_only_frame_ok(good, b"unexpected"));
+
+        for bad in [
+            "Content-Length: 1",
+            "Content-Length: 0\r\nContent-Length: 0",
+            "Transfer-Encoding: chunked",
+            "Content-Length: 0\r\nTransfer-Encoding: identity",
+            "invalid-header-line",
+        ] {
+            assert!(!read_only_frame_ok(&format!("{good}\r\n{bad}"), b""));
+        }
+    }
+
+    #[test]
+    fn known_source_at_capacity_resets_without_losing_new_client_reclamation() {
+        use super::*;
+
+        let rates = Mutex::new(HashMap::new());
+        let now = Instant::now();
+
+        for n in 0..MAX_RATE_KEYS {
+            assert!(allow_at(&rates, &n.to_string(), now));
+        }
+
+        assert!(!allow_at(&rates, "extra", now));
+
+        for _ in 1..PER_IP_PER_MIN {
+            assert!(allow_at(&rates, "0", now));
+        }
+
+        assert!(!allow_at(&rates, "0", now));
+
+        let at_boundary = now + Duration::from_secs(60);
+
+        assert!(allow_at(&rates, "0", at_boundary));
+        assert!(allow_at(&rates, "new", at_boundary));
+
+        assert_eq!(rates.lock().unwrap().len(), 2);
     }
 
     #[test]
