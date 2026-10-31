@@ -705,6 +705,11 @@ impl Chain {
                 });
             }
         }
+        // Trusted replay still authenticates the stored body, after
+        // applying the existing pre-fork binding compatibility rule.
+        if block.body.hash() != block.header.body_root {
+            return Err(ConsensusError::BadTxRoot);
+        }
         let subsidy = self
             .emission
             .reward_at(block.header.height, self.ledger.supply.total_minted_darks)

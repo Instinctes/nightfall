@@ -465,6 +465,30 @@ fn tampered_body_breaks_the_body_root() {
 }
 
 #[test]
+fn own_disk_replay_rejects_a_body_that_no_longer_matches_its_header() {
+    let mut source = devnet();
+    let miner = WalletKeys::generate().address();
+    let mut block = source.mine_block(&miner, vec![], NOW).unwrap();
+
+    // Keep the validated header unchanged but alter the stored body.
+    let duplicate = block.body.outputs[0].clone();
+    block.body.outputs.push(duplicate);
+
+    let mut replay = devnet();
+    let tip_before = replay.tip_hash();
+    let count_before = replay.block_count();
+
+    let result = replay.apply_block_from_own_disk(block);
+
+    assert!(
+        matches!(result, Err(ConsensusError::BadTxRoot)),
+        "trusted replay accepted a body that no longer matches its header: {result:?}"
+    );
+    assert_eq!(replay.tip_hash(), tip_before);
+    assert_eq!(replay.block_count(), count_before);
+}
+
+#[test]
 fn block_body_is_canonically_ordered() {
     let mut chain = devnet();
     let miner = WalletKeys::generate().address();
