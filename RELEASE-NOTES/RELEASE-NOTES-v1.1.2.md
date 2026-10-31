@@ -2,7 +2,7 @@
 
 1.1.2 is a maintenance release on the 1.1.x line. It fixes initial sync when
 a peer sends short block pages, lets one peer no longer hold back fork
-recovery from another, and makes block storage survive a power cut. The
+recovery from another, and recovers interrupted appends to the block archive. The
 consensus rules are exactly those of 1.1.1: the upgrade still activates at
 **block 500,000**, and supply, emission, block reward, block time and proof
 of work are unchanged.
@@ -23,13 +23,14 @@ Nodes on 1.1.1 stay fully compatible. Nodes still on 1.0.x must upgrade to
   fetches used to be shared by the whole node, so one peer could hold back
   recovery from another peer offering a heavier chain. Each peer now has its
   own pause, in a bounded table.
-- **Block storage survives a power cut — #18.** `blocks.bin` is synced to
+- **Recover interrupted archive appends — #18.** `blocks.bin` is synced to
   disk before `chain-meta.json` is written, and the metadata is replaced
   atomically. If the computer stops in the middle of an append, the node
   rolls back to the last confirmed state on the next start, but only when the
   data up to that point still matches its own validation record. A data
   folder that belongs to another network is refused before anything in it is
-  changed.
+  changed. This protects the archive append path; it does not make multi-file
+  pruned state or every filesystem and hardware failure crash-atomic.
 - **Stricter public light API — #86.** The read-only `GET` and `OPTIONS`
   requests must not carry a body or ambiguous framing, and the rate limiter
   no longer scans its whole table on every request.
