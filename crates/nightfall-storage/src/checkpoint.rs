@@ -472,6 +472,7 @@ fn chain_from_checkpoint_snapshot_with_pin(
          */
         tx_count: 0,
         coinbase_maturity: maturity,
+        binding_height: network.binding_fork_height(),
     };
 
     ledger
