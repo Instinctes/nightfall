@@ -74,7 +74,7 @@ if (existsSync(DL)) {
     }
     for (const f of have) {
         const oldVersion = f.match(new RegExp(RELEASE_VERSION))?.[0];
-        const retainedRelease = /^(?:NIGHTFALLCOIN-Core-|nightfall-core-|nightfall-wallet-|nightfalld-|SHA256SUMS-)/.test(f)
+        const retainedRelease = /^(?:NIGHTFALLCOIN-Core-|nightfall-core-|nightfall-wallet-|nightfalld-|nightfall-nodekit-|nightfall-till-|nightfall-receipt-evidence-|SHA256SUMS-)/.test(f)
             && archivedVersions.has(oldVersion);
         if (!referenced.has(f) && !retainedRelease) problems.push(`downloads/${f} is present but nothing links to it`);
     }
