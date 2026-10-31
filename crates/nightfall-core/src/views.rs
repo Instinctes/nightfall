@@ -13,7 +13,7 @@ use nightfall_types::{
 // Not to be confused with `vault_ui::PaymentRequest`, which is a job handed to
 // the payment worker — a payment this wallet is about to make. This one is what
 // somebody else asked for, before anyone has agreed to it.
-use nightfall_wallet::payment_request::{self, PaymentRequest};
+use nightfall_wallet::payment_request::PaymentRequest;
 use nightfall_wallet::Direction;
 use std::time::{Duration, Instant};
 
@@ -743,7 +743,9 @@ fn activity_row(ui: &mut egui::Ui, e: &nightfall_wallet::HistoryEntry, now: u64)
                         ui.set_width(mid);
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(e.direction.label()).size(13.0).strong());
-                            if e.is_pending() {
+                            if e.failed {
+                                badge(ui, "not completed", TEXT_DIM);
+                            } else if e.is_pending() {
                                 ui.horizontal(|ui| {
                                     dot(ui, WARN, true);
                                     ui.add_space(2.0);
@@ -751,7 +753,12 @@ fn activity_row(ui: &mut egui::Ui, e: &nightfall_wallet::HistoryEntry, now: u64)
                                 });
                             }
                         });
-                        let sub = if e.memo.is_empty() {
+                        let sub = if e.failed {
+                            format!(
+                                "Released after chain verification · {}",
+                                ago(e.timestamp, now)
+                            )
+                        } else if e.memo.is_empty() {
                             match e.height {
                                 Some(h) => format!("block {h} · {}", ago(e.timestamp, now)),
                                 None => format!("not in a block yet · {}", ago(e.timestamp, now)),
@@ -1264,10 +1271,7 @@ pub fn payment_request_card(
 ) -> Option<PaymentRequest> {
     let text = field.trim();
     // Cheap gate: only text that claims to be a request gets parsed at all.
-    if !text
-        .split_once(':')
-        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case(payment_request::SCHEME))
-    {
+    if !PaymentRequest::is_candidate(text) {
         return None;
     }
 
@@ -1299,6 +1303,13 @@ pub fn payment_request_card(
                 kv(ui, "Their reference", RichText::new(&request.invoice));
             }
             kv(ui, "Network", RichText::new(request.network.as_str()));
+            if let Some(deadline) = request.expires_unix {
+                kv(
+                    ui,
+                    "Payee deadline",
+                    RichText::new(deadline_text(deadline, now_unix())),
+                );
+            }
 
             if let Err(error) = &payable {
                 ui.add_space(6.0);
@@ -1406,14 +1417,14 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                     .desired_rows(2)
                     .desired_width(f32::INFINITY)
                     .font(egui::TextStyle::Monospace)
-                    .hint_text("nf1… or nightfall:…"),
+                    .hint_text("nf1… or a Nightfall payment link"),
             );
 
             // Live validation — a wrong address must never reach a signature.
             // Untouched by the redesign: this is the check that stands between a
             // typo and a payment that cannot come back.
             let trimmed = app.send_to.trim().to_string();
-            addr_state = if trimmed.is_empty() || trimmed.starts_with("nightfall:") {
+            addr_state = if trimmed.is_empty() || PaymentRequest::is_candidate(&trimmed) {
                 None
             } else if trimmed == own_address {
                 Some(Err("This is your own address".to_string()))
@@ -1426,7 +1437,7 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 None => {
                     ui.label(
                         RichText::new(
-                            "Paste an address or review a nightfall: payment request below.",
+                            "Paste an address, nightfall: request or HTTPS payment link.",
                         )
                         .size(11.0)
                         .color(TEXT_DIM),
@@ -1891,6 +1902,20 @@ pub fn receive(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     );
 }
 
+fn deadline_text(deadline: u64, now: u64) -> String {
+    if deadline <= now {
+        "Deadline passed · late payments still count".to_owned()
+    } else {
+        let seconds = deadline - now;
+        format!(
+            "Deadline in {}h {}m {}s · payee policy",
+            seconds / 3600,
+            seconds % 3600 / 60,
+            seconds % 60
+        )
+    }
+}
+
 /// One invoice as the till shows it.
 ///
 /// Separate from the card so it can be measured at every width with content
@@ -1928,6 +1953,13 @@ pub fn invoice_row(
             );
         }
     });
+    if let Some(deadline) = invoice.expires_unix {
+        ui.label(
+            RichText::new(deadline_text(deadline, now_unix()))
+                .size(11.0)
+                .color(TEXT_DIM),
+        );
+    }
     if let Some(note) = &invoice.closed_note {
         ui.label(
             RichText::new(format!("Closed by you: {note}"))
@@ -1957,6 +1989,40 @@ pub fn invoice_row(
             .color(WARN),
         );
     }
+}
+
+/// Whether a settled invoice is deep enough to hand over the goods.
+///
+/// "Paid" says the right payment arrived. This line says how likely it is to
+/// stay arrived: a payment one block deep can still be removed by a
+/// reorganisation, and a till that shows only "Paid" invites the merchant to
+/// ship at exactly that moment. Silent for invoices nothing has settled.
+pub fn settlement_line(
+    ui: &mut egui::Ui,
+    state: &nightfall_wallet::counter::InvoiceStatus,
+    tip_height: u64,
+) {
+    settlement_line_with_policy(
+        ui,
+        state,
+        tip_height,
+        nightfall_wallet::counter::DEFAULT_CONFIRMATIONS,
+    );
+}
+fn settlement_line_with_policy(
+    ui: &mut egui::Ui,
+    state: &nightfall_wallet::counter::InvoiceStatus,
+    tip_height: u64,
+    need: u64,
+) {
+    use nightfall_wallet::counter::{settlement, Settlement};
+    let settled = settlement(state, tip_height, need);
+    let tone = match settled {
+        Settlement::NotPaid | Settlement::ClosedByHand => return,
+        Settlement::Confirmed => SUCCESS,
+        Settlement::Unconfirmed | Settlement::Confirming { .. } => WARN,
+    };
+    ui.label(RichText::new(settled.headline()).size(11.0).color(tone));
 }
 
 /// The till: invoices this wallet asked to be paid, and where each one stands.
@@ -2024,6 +2090,51 @@ fn counter_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, address: 
             }
         });
         ui.add_space(GAP_MD);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Confirmation policy");
+            if ui
+                .add(egui::DragValue::new(&mut app.till_confirmations).range(1..=10000))
+                .changed()
+            {
+                if let Err(problem) = std::fs::write(
+                    app.datadir.join("till-confirmations"),
+                    app.till_confirmations.to_string(),
+                ) {
+                    app.toasts.error(
+                        ctx,
+                        format!("Could not save confirmation policy: {problem}"),
+                    );
+                }
+            }
+            egui::ComboBox::from_id_salt("invoice-expiry")
+                .selected_text(if app.till_expiry_hours == 0 {
+                    "No deadline".to_owned()
+                } else {
+                    match app.till_expiry_hours {
+                        1 => "1 hour".to_owned(),
+                        168 => "7 days".to_owned(),
+                        n => format!("{n} hours"),
+                    }
+                })
+                .show_ui(ui, |ui| {
+                    for (hours, label) in [
+                        (0, "No deadline"),
+                        (1, "1 hour"),
+                        (24, "24 hours"),
+                        (168, "7 days"),
+                    ] {
+                        ui.selectable_value(&mut app.till_expiry_hours, hours, label);
+                    }
+                });
+        });
+        ui.label(
+            RichText::new(
+                "Confirmation thresholds do not remove reorg risk. Late payments still count.",
+            )
+            .size(11.0)
+            .color(TEXT_DIM),
+        );
+        ui.add_space(GAP_MD);
         if primary_button(ui, "Add invoice", true).clicked() {
             let amount = app.till_amount.trim();
             let parsed = if amount.is_empty() {
@@ -2039,7 +2150,8 @@ fn counter_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, address: 
                         amount_darks,
                         description: app.till_description.clone(),
                         created_unix: now,
-                        expires_unix: None,
+                        expires_unix: (app.till_expiry_hours > 0)
+                            .then(|| now.saturating_add(app.till_expiry_hours * 3600)),
                         closed_note: None,
                     };
                     let added = app
@@ -2067,13 +2179,14 @@ fn counter_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, address: 
         }
 
         divider(ui);
-        let takings: u64 = till
-            .iter()
-            .map(|(_, s)| if s.is_settled() { s.received_darks } else { 0 })
-            .fold(0, u64::saturating_add);
+        let takings = nightfall_wallet::counter::confirmed_takings_darks(
+            till.iter().map(|(_, status)| status),
+            app.tip_height(),
+            app.till_confirmations,
+        );
         kv(
             ui,
-            "Taken in (settled invoices only)",
+            "Taken in (confirmation threshold met)",
             RichText::new(format!("{}", Amount(takings))).color(SUCCESS),
         );
         ui.add_space(8.0);
@@ -2085,6 +2198,11 @@ fn counter_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, address: 
             hairline(ui);
             ui.add_space(6.0);
             invoice_row(ui, invoice, state);
+            if app.till_confirmations == nightfall_wallet::counter::DEFAULT_CONFIRMATIONS {
+                settlement_line(ui, state, app.tip_height());
+            } else {
+                settlement_line_with_policy(ui, state, app.tip_height(), app.till_confirmations);
+            }
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
                 if ghost_button(ui, "Copy request").clicked() {
@@ -2099,6 +2217,17 @@ fn counter_card(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, address: 
                     ctx.copy_text(request.to_uri());
                     app.toasts
                         .success(ctx, "Request copied — it carries this invoice's reference");
+                }
+                if ghost_button(ui, "Copy payment link").clicked() {
+                    if let Ok(to) = Address::decode(address) {
+                        let request =
+                            nightfall_wallet::counter::request_for(invoice, to, app.network);
+                        ctx.copy_text(request.to_share_link());
+                        app.toasts.success(
+                            ctx,
+                            "Payment link copied — share only with the intended payer",
+                        );
+                    }
                 }
                 if invoice.closed_note.is_none() && ghost_button(ui, "Close by hand").clicked() {
                     close = Some(invoice.reference.clone());
@@ -2530,13 +2659,7 @@ pub fn mining(app: &mut App, ui: &mut egui::Ui) {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             let mut enabled = app.reward_sound;
-            if ui
-                .checkbox(&mut enabled, "Reward-Sound")
-                .on_hover_text(
-                    "Play a quiet chime for each new mining reward. Saved for the next launch.",
-                )
-                .changed()
-            {
+            if crate::widgets::check(ui, &mut enabled, "Mining reward sound") {
                 app.set_reward_sound(enabled);
             }
         });
@@ -2571,6 +2694,15 @@ pub fn mining(app: &mut App, ui: &mut egui::Ui) {
             });
         });
 
+        if mining {
+            if let Some(status) = &app.status {
+                if !status.mining_idle.is_empty() {
+                    ui.label(
+                        RichText::new(format!("Waiting: {}", status.mining_idle)).color(TEXT_DIM),
+                    );
+                }
+            }
+        }
         ui.add_space(16.0);
         let lifetime = lifetime_mined(app);
         metric_grid(
@@ -2808,8 +2940,8 @@ fn peers_zero_reason(app: &App, peers: usize, blocks: u64) -> Option<String> {
     if peers > 0 {
         return None;
     }
-    if crate::app::IS_DEV_BUILD {
-        return Some("Local test build: zero peers is expected. Start mining to create Devnet test coins; this app does not sync Mainnet and test coins have no value.".into());
+    if app.network == NetworkId::Devnet {
+        return Some("Local Devnet: zero peers is expected. Start mining to create Devnet test coins; this app does not sync Mainnet and test coins have no value.".into());
     }
     let s = app.status.as_ref()?;
     if s.loading {
@@ -2826,14 +2958,13 @@ fn peers_zero_reason(app: &App, peers: usize, blocks: u64) -> Option<String> {
     if blocks <= 1 {
         msg.push_str(&format!(
             "This node is still at genesis. Allow outbound TCP {port} \
-             (Windows Defender often blocks it). 0.7.3+ also fetches listeners \
-             from nightfallcoin.org/peers."
+             through your firewall. Other listeners are available from nightfallcoin.org/peers."
         ));
     } else {
         msg.push_str(&format!(
             "No live socket. Outbound to a seed on port {port} is enough — \
              you do not have to be reachable. If this stays at zero, {port} is \
-             blocked or the compiled seed is full; 0.7.3+ asks \
+             blocked or the compiled seed is full; Core asks \
              https://nightfallcoin.org/peers for other listeners."
         ));
     }
