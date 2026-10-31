@@ -155,6 +155,8 @@ pub struct VaultStore {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Checkpoint {
+    #[cfg(test)]
+    DiskFull,
     PartialWritten,
     TemporaryWritten,
     FileSynced,
@@ -600,6 +602,14 @@ impl VaultStore {
         if self.crash == Some(_point) {
             // Test subprocess only. No destructors run; the OS releases locks.
             std::process::exit(73);
+        }
+        #[cfg(test)]
+        if self.fault == Some(Checkpoint::DiskFull) && _point == Checkpoint::PartialWritten {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "Injected disk full after partial ciphertext write",
+            )
+            .into());
         }
         #[cfg(test)]
         if self.fault == Some(_point) {
@@ -1076,6 +1086,7 @@ mod tests {
             spent_commits: vec![[3; 32]],
             raw: Some("public fixture raw transaction".into()),
             quarantined: false,
+            failed: false,
         });
         wallet
     }
@@ -1092,6 +1103,8 @@ mod tests {
                 inputs: vec![],
                 outputs: vec![],
                 kernels: vec![],
+                stealth_offset: None,
+                kernel_offset: None,
             })
             .unwrap(),
         );
@@ -1143,6 +1156,8 @@ mod tests {
                 inputs: vec![],
                 outputs: vec![],
                 kernels: vec![],
+                stealth_offset: None,
+                kernel_offset: None,
             })
             .unwrap(),
         );
@@ -1583,6 +1598,46 @@ mod tests {
                 store.wallet().unwrap().scanned_to(),
                 if committed { 99 } else { 75 }
             );
+        }
+    }
+
+    #[test]
+    fn failed_payment_release_is_atomic_across_encrypted_save_failures() {
+        for point in [
+            Checkpoint::DiskFull,
+            Checkpoint::PartialWritten,
+            Checkpoint::TemporaryWritten,
+            Checkpoint::FileSynced,
+            Checkpoint::Renamed,
+            Checkpoint::DirectorySynced,
+        ] {
+            let f = Fixture::new();
+            let mut store = f.initialized();
+            let before = fs::read(f.snapshot()).unwrap();
+            let txid = "cd".repeat(32);
+            store.fault = Some(point);
+            assert!(store
+                .update(|wallet| wallet.release_sends(
+                    std::slice::from_ref(&txid),
+                    &std::collections::BTreeSet::new()
+                ))
+                .is_err());
+            let committed = matches!(point, Checkpoint::Renamed | Checkpoint::DirectorySynced);
+            if committed {
+                assert!(
+                    store.wallet().is_err(),
+                    "uncertain commit must lock the session"
+                );
+            } else {
+                assert!(store.wallet().unwrap().history()[0].is_pending());
+                assert_eq!(fs::read(f.snapshot()).unwrap(), before);
+            }
+            drop(store);
+            let mut reopened = f.open();
+            reopened.unlock(PASSWORD).unwrap();
+            let entry = &reopened.wallet().unwrap().history()[0];
+            assert_eq!(entry.failed, committed);
+            assert_eq!(entry.is_pending(), !committed);
         }
     }
 

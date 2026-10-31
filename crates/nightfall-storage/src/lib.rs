@@ -13,7 +13,7 @@ use nightfall_ledger::{LedgerState, UtxoEntry, UtxoSet};
 use nightfall_types::{Hash256, Height, NetworkId};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -59,10 +59,10 @@ struct ChainMeta {
     validated_horizon_bytes: u64,
     #[serde(default)]
     validated_headers_bytes: u64,
-    /// Content hash of the pruned UTXO horizon.
+
+    /// The exact bytes that this installation committed to disk.
     #[serde(default)]
     validated_horizon_hash: String,
-    /// Content hash of the compact-header prefix.
     #[serde(default)]
     validated_headers_hash: String,
 }
@@ -259,8 +259,7 @@ impl ChainStore {
         Some((m.block_count, m.validated_tip, m.genesis_hash))
     }
 
-    /// True when on-disk chain content still matches this node's validation
-    /// record closely enough to use the trusted replay path.
+    /// True when on-disk files are byte-for-byte what this node last validated.
     pub fn is_own_file_trusted(&self) -> bool {
         let Some(m) = self.read_meta() else {
             return false;
@@ -321,6 +320,87 @@ impl ChainStore {
         fs::read_to_string(self.meta_path())
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
+    }
+
+    /// Roll back an archive append that reached durable storage but whose
+    /// metadata commit did not.
+    ///
+    /// Truncation is permitted only when the prefix through
+    /// `validated_bytes` reproduces the exact locally-authenticated chain
+    /// named by the old metadata. This prevents a complete rewrite/reorg
+    /// beside stale metadata from being mistaken for an append tail.
+    fn recover_uncommitted_archive_tail(&self, network: NetworkId) -> anyhow::Result<()> {
+        let Some(meta) = self.read_meta() else {
+            return Ok(());
+        };
+
+        // Never repair a datadir that belongs to another network: the caller
+        // refuses it, and a refusal must leave the files exactly as they were.
+        if meta.network != network
+            || Chain::new_fair(network)
+                .map(|c| c.genesis_hash.to_hex() != meta.genesis_hash)
+                .unwrap_or(true)
+        {
+            return Ok(());
+        }
+
+        if meta.pruned
+            || meta.first_height != 0
+            || meta.validated_bytes == 0
+            || meta.validated_tip.is_empty()
+            || meta.validated_by.is_empty()
+            || meta.validated_by != self.install_id()
+        {
+            return Ok(());
+        }
+
+        let path = self.blocks_path();
+        let actual = match fs::metadata(&path) {
+            Ok(m) => m.len(),
+            Err(_) => return Ok(()),
+        };
+
+        if actual <= meta.validated_bytes {
+            return Ok(());
+        }
+
+        let prefix = File::open(&path)?.take(meta.validated_bytes);
+        let blocks = match codec::read_blocks(prefix, self.format()) {
+            Ok(blocks) => blocks,
+            Err(_) => return Ok(()),
+        };
+
+        // A matching tip does not authenticate an earlier block body.
+        // Full validation is limited to the exceptional crash-recovery path.
+        let prefix_matches = if let Ok(mut verified) = Chain::new_fair(meta.network) {
+            let now = now_unix();
+            let valid = blocks
+                .into_iter()
+                .all(|block| verified.apply_block(block, now).is_ok());
+
+            valid
+                && verified.verify_supply().is_ok()
+                && verified.block_count() == meta.block_count
+                && verified.tip_hash().to_hex() == meta.validated_tip
+                && verified.genesis_hash.to_hex() == meta.genesis_hash
+        } else {
+            false
+        };
+
+        if !prefix_matches {
+            return Ok(());
+        }
+
+        let file = OpenOptions::new().write(true).open(&path)?;
+        file.set_len(meta.validated_bytes)?;
+        file.sync_all()?;
+
+        tracing::warn!(
+            discarded_bytes = actual - meta.validated_bytes,
+            "discarded uncommitted archive tail left by interrupted save"
+        );
+
+        Ok(())
     }
 
     /// Rewrite the chain file in the binary encoding.
@@ -508,8 +588,6 @@ impl ChainStore {
             horizon_work: String::new(),
             validated_horizon_bytes: 0,
             validated_headers_bytes: 0,
-            validated_horizon_hash: String::new(),
-            validated_headers_hash: String::new(),
         };
         fs::write(self.meta_path(), serde_json::to_vec_pretty(&meta)?)?;
         let chain = self.load_or_new(network)?;
@@ -592,7 +670,13 @@ impl ChainStore {
         for block in &chain.blocks[on_disk as usize..] {
             codec::write_block(&mut file, block, fmt)?;
         }
-        flush_and_sync(&mut file)?;
+
+        // Metadata is the archive commit record. Durable block bytes must
+        // therefore precede metadata publication.
+        file.flush()?;
+        file.get_ref().sync_all()?;
+        drop(file);
+
         self.write_meta(chain)?;
         Ok(())
     }
@@ -633,7 +717,7 @@ impl ChainStore {
             for block in chain.blocks.iter().skip(already) {
                 codec::write_block(&mut file, block, fmt)?;
             }
-            flush_and_sync(&mut file)?;
+            file.flush()?;
         }
 
         self.write_meta(chain)?;
@@ -648,11 +732,9 @@ impl ChainStore {
                 serde_json::to_writer(&mut file, h)?;
                 file.write_all(b"\n")?;
             }
-            flush_and_sync(&mut file)?;
+            file.flush()?;
         }
-        let dst = self.headers_path();
-        fs::rename(&tmp, &dst)?;
-        sync_parent_dir(&dst)?;
+        fs::rename(tmp, self.headers_path())?;
         Ok(())
     }
 
@@ -661,14 +743,8 @@ impl ChainStore {
             anyhow::bail!("pruned chain is missing its UTXO horizon");
         };
         let tmp = self.dir.join("utxo-horizon.json.tmp");
-        {
-            let mut file = File::create(&tmp)?;
-            file.write_all(&serde_json::to_vec(&horizon_to_file(horizon))?)?;
-            file.sync_all()?;
-        }
-        let dst = self.horizon_path();
-        fs::rename(&tmp, &dst)?;
-        sync_parent_dir(&dst)?;
+        fs::write(&tmp, serde_json::to_vec(&horizon_to_file(horizon))?)?;
+        fs::rename(tmp, self.horizon_path())?;
         Ok(())
     }
 
@@ -680,11 +756,9 @@ impl ChainStore {
             for block in &chain.blocks {
                 codec::write_block(&mut file, block, fmt)?;
             }
-            flush_and_sync(&mut file)?;
+            file.flush()?;
         }
-        let dst = self.blocks_path();
-        fs::rename(&tmp, &dst)?;
-        sync_parent_dir(&dst)?;
+        fs::rename(tmp, self.blocks_path())?;
         Ok(())
     }
 
@@ -703,15 +777,32 @@ impl ChainStore {
             for block in &chain.blocks {
                 codec::write_block(&mut file, block, fmt)?;
             }
-            flush_and_sync(&mut file)?;
+            file.flush()?;
+            file.get_ref().sync_all()?;
         }
-        let dst = self.blocks_path();
-        fs::rename(&tmp, &dst)?;
-        sync_parent_dir(&dst)?;
+
+        fs::rename(&tmp, self.blocks_path())?;
+        sync_dir(&self.dir)?;
+
+        // A crash before metadata publication leaves a complete replacement
+        // beside stale metadata. Startup will revalidate it rather than
+        // treating it as an authenticated append tail.
         self.write_meta(chain)?;
         Ok(())
     }
 
+    /// Load a chain, replaying and revalidating every stored block.
+    /// Load, reporting progress to the log every few seconds.
+    ///
+    /// The silent version printed one line — "re-verifying proof of work for
+    /// the whole chain" — and then nothing for the length of the run, which on
+    /// a full chain is a quarter of an hour. Every command-line user who saw
+    /// that reasonably concluded the process had wedged, and the ones who
+    /// killed it got to start again.
+    ///
+    /// Throttled by time rather than by block count: block rate depends on the
+    /// machine, and a line every N blocks is a flood on a fast one and silence
+    /// on a slow one.
     /// Refuse to operate on a datadir whose recovery was interrupted.
     ///
     /// `recover-stalled-fork` leaves [`RECOVERY_JOURNAL`] behind if it is
@@ -757,18 +848,6 @@ impl ChainStore {
         )
     }
 
-    /// Load a chain, replaying and revalidating every stored block.
-    /// Load, reporting progress to the log every few seconds.
-    ///
-    /// The silent version printed one line — "re-verifying proof of work for
-    /// the whole chain" — and then nothing for the length of the run, which on
-    /// a full chain is a quarter of an hour. Every command-line user who saw
-    /// that reasonably concluded the process had wedged, and the ones who
-    /// killed it got to start again.
-    ///
-    /// Throttled by time rather than by block count: block rate depends on the
-    /// machine, and a line every N blocks is a flood on a fast one and silence
-    /// on a slow one.
     pub fn load_or_new(&self, network: NetworkId) -> anyhow::Result<Chain> {
         let started = std::time::Instant::now();
         let mut last = started;
@@ -820,11 +899,9 @@ impl ChainStore {
             return Ok(Chain::new_fair(network)?);
         }
 
-        let meta: Option<ChainMeta> = fs::read_to_string(self.meta_path())
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok());
-
-        if let Some(m) = &meta {
+        // Identity first, repair second: a datadir for another network is
+        // refused before anything in it is touched.
+        if let Some(m) = self.read_meta() {
             if m.network != network {
                 anyhow::bail!(
                     "datadir holds a {:?} chain but {:?} was requested",
@@ -834,9 +911,15 @@ impl ChainStore {
             }
         }
 
-        // A matching local validation record permits the fast replay path.
-        // Trusted replay still binds each stored body to its validated header
-        // and checks chain linkage. Pruned sidecars are content-hashed separately.
+        self.recover_uncommitted_archive_tail(network)?;
+
+        let meta: Option<ChainMeta> = fs::read_to_string(self.meta_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok());
+
+        // Trust our own past validation only if the blocks file is byte-for-byte
+        // what it was when we recorded it. Any edit, truncation or corruption
+        // changes the length and forces a full re-verification.
         let current_bytes = fs::metadata(self.blocks_path())
             .map(|m| m.len())
             .unwrap_or(0);
@@ -868,7 +951,8 @@ impl ChainStore {
             let m = meta.as_ref().expect("pruned load has meta");
             chain.first_height = m.first_height;
             chain.horizon_work = m.horizon_work.parse().unwrap_or(0);
-            let horizon = load_horizon_file(&self.horizon_path())?;
+            let horizon = load_horizon_file(&self.horizon_path())?
+                .with_binding_height(network.binding_fork_height());
             chain.ledger = horizon.clone();
             chain.horizon = Some(horizon);
             chain.total_work = chain.horizon_work;
@@ -1014,6 +1098,9 @@ fn load_horizon_file(path: &Path) -> anyhow::Result<LedgerState> {
         },
         tx_count: file.tx_count,
         coinbase_maturity: file.coinbase_maturity,
+        // The file does not say which network it belongs to; the loader
+        // re-applies the right height for the chain it is building.
+        binding_height: nightfall_types::NetworkId::Mainnet.binding_fork_height(),
     })
 }
 
@@ -1305,6 +1392,372 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// The whole point of the conversion: a node that ran on JSON and a node
+    /// that converted must hold the same chain. Tip, height, and UTXO root —
+    /// if any of the three moved, the format changed meaning, and the format
+    /// is not allowed to mean anything.
+    #[test]
+    fn migration_keeps_the_identical_chain() {
+        use nightfall_crypto::WalletKeys;
+        let dir = std::env::temp_dir().join(format!("nf-mig-{}", now_unix()));
+        fs::create_dir_all(&dir).unwrap();
+        // A fresh datadir now defaults to binary, so lay down the historic
+        // file first: this test is about converting an old node.
+        fs::write(dir.join(codec::BLOCKS_JSONL), b"").unwrap();
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+        for i in 0..8u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+        store.save(&chain).unwrap();
+        assert_eq!(store.format(), Format::Json, "fresh datadir starts as json");
+
+        let (before, after) = store.migrate_to_binary().unwrap();
+        assert!(after < before, "{after} B is not smaller than {before} B");
+        assert_eq!(store.format(), Format::Binary);
+        assert!(
+            dir.join("blocks.jsonl.pre-binary").exists(),
+            "the old file must survive so the operator can go back"
+        );
+        assert!(!dir.join(codec::BLOCKS_JSONL).exists());
+
+        let loaded = store.load_or_new(NetworkId::Devnet).unwrap();
+        assert_eq!(loaded.tip_hash(), chain.tip_hash());
+        assert_eq!(loaded.block_count(), chain.block_count());
+        assert_eq!(loaded.ledger.utxo_root(), chain.ledger.utxo_root());
+        loaded.verify_supply().unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// After converting, the node keeps mining into the file it now has.
+    /// Appending to the abandoned .jsonl would silently split the chain in
+    /// two, with the newer half in the file nothing reads.
+    #[test]
+    fn blocks_mined_after_migration_land_in_the_binary_file() {
+        use nightfall_crypto::WalletKeys;
+        let dir = std::env::temp_dir().join(format!("nf-mig-app-{}", now_unix()));
+        fs::create_dir_all(&dir).unwrap();
+        // A fresh datadir now defaults to binary, so lay down the historic
+        // file first: this test is about converting an old node.
+        fs::write(dir.join(codec::BLOCKS_JSONL), b"").unwrap();
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+        for i in 0..4u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+        store.save(&chain).unwrap();
+        store.migrate_to_binary().unwrap();
+
+        let mut chain = store.load_or_new(NetworkId::Devnet).unwrap();
+        for i in 4..9u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+            // save() appends only what is not on disk yet, so this exercises
+            // the incremental write path, not a rewrite.
+            store.save(&chain).unwrap();
+        }
+        let tip = chain.tip_hash();
+
+        let reloaded = store.load_or_new(NetworkId::Devnet).unwrap();
+        assert_eq!(reloaded.block_count(), chain.block_count());
+        assert_eq!(reloaded.tip_hash(), tip);
+        reloaded.verify_supply().unwrap();
+        // The stale file must not have grown a single byte.
+        let stale = fs::read_to_string(dir.join("blocks.jsonl.pre-binary")).unwrap();
+        assert_eq!(
+            stale.lines().count(),
+            4,
+            "the abandoned file was written to after the swap"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrating_an_already_binary_datadir_is_refused() {
+        use nightfall_crypto::WalletKeys;
+        let dir = std::env::temp_dir().join(format!("nf-mig-twice-{}", now_unix()));
+        fs::create_dir_all(&dir).unwrap();
+        // A fresh datadir now defaults to binary, so lay down the historic
+        // file first: this test is about converting an old node.
+        fs::write(dir.join(codec::BLOCKS_JSONL), b"").unwrap();
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+        chain.mine_block(&miner, vec![], now_unix()).unwrap();
+        store.save(&chain).unwrap();
+        store.migrate_to_binary().unwrap();
+
+        let err = store.migrate_to_binary().unwrap_err().to_string();
+        assert!(err.contains("already binary"), "got: {err}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Snapshots written before the binary format exist in the wild, and a
+    /// datadir created today reads bincode. Importing one into the other must
+    /// convert, not copy: a straight copy puts JSON in a file the node is
+    /// about to parse as bincode, and the node then refuses to start.
+    #[test]
+    fn a_json_snapshot_imports_into_a_binary_datadir() {
+        use nightfall_crypto::WalletKeys;
+        let src = std::env::temp_dir().join(format!("nf-xsnap-src-{}", now_unix()));
+        let out = std::env::temp_dir().join(format!("nf-xsnap-out-{}", now_unix()));
+        let dest = std::env::temp_dir().join(format!("nf-xsnap-dst-{}", now_unix()));
+        fs::create_dir_all(&src).unwrap();
+        // An old node: JSON on disk.
+        fs::write(src.join(codec::BLOCKS_JSONL), b"").unwrap();
+        let store = ChainStore::new(&src);
+        assert_eq!(store.format(), Format::Json);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+        for i in 0..3u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+        store.save(&chain).unwrap();
+        let snap = store.export_snapshot(&out).unwrap();
+        assert_eq!(snap.format, "json");
+
+        // A new node: binary by default.
+        let dest_store = ChainStore::new(&dest);
+        let imported = dest_store.import_snapshot(&out, NetworkId::Devnet).unwrap();
+        assert_eq!(imported.tip_hash(), chain.tip_hash());
+        assert_eq!(dest_store.format(), Format::Binary);
+        imported.verify_supply().unwrap();
+
+        // And it survives a restart, which is where a mis-copied file shows up.
+        let reloaded = dest_store.load_or_new(NetworkId::Devnet).unwrap();
+        assert_eq!(reloaded.tip_hash(), chain.tip_hash());
+
+        fs::remove_dir_all(&src).ok();
+        fs::remove_dir_all(&out).ok();
+        fs::remove_dir_all(&dest).ok();
+    }
+
+    /// The bug this test exists for: `rewrite_all` and `rewrite_bodies` wrote
+    /// raw JSON regardless of the datadir's format. A reorg that shortens the
+    /// chain takes that path, so a converted node would have quietly written a
+    /// JSON file named blocks.bin and refused to start on the next restart.
+    #[test]
+    fn a_rewrite_keeps_the_format_the_datadir_is_in() {
+        use nightfall_crypto::WalletKeys;
+        let dir = std::env::temp_dir().join(format!("nf-rewrite-{}", now_unix()));
+        fs::create_dir_all(&dir).unwrap();
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+        for i in 0..6u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+        store.save(&chain).unwrap();
+        assert_eq!(store.format(), Format::Binary);
+
+        // Shorter chain than what is on disk: this is the reorg path, and it
+        // rewrites the whole file instead of appending.
+        let mut shorter = Chain::new_fair(NetworkId::Devnet).unwrap();
+        for i in 0..3u64 {
+            shorter
+                .mine_block(&miner, vec![], now_unix() + 1000 + i * 15)
+                .unwrap();
+        }
+        store.save(&shorter).unwrap();
+
+        assert!(!dir.join(format!("{}.tmp", codec::BLOCKS_BIN)).exists());
+        let reloaded = store.load_or_new(NetworkId::Devnet).unwrap();
+        assert_eq!(reloaded.block_count(), shorter.block_count());
+        assert_eq!(reloaded.tip_hash(), shorter.tip_hash());
+        reloaded.verify_supply().unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wrong_network_open_leaves_an_uncommitted_tail_untouched() {
+        use nightfall_crypto::WalletKeys;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("nf-wrong-net-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+        for i in 0..3u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+        store.save(&chain).unwrap();
+
+        // A durable but uncommitted fourth block: the interrupted-append window.
+        chain.mine_block(&miner, vec![], now_unix() + 1000).unwrap();
+        {
+            let mut file = BufWriter::new(
+                OpenOptions::new()
+                    .append(true)
+                    .open(store.blocks_path())
+                    .unwrap(),
+            );
+            codec::write_block(&mut file, chain.blocks.last().unwrap(), store.format()).unwrap();
+            file.flush().unwrap();
+            file.get_ref().sync_all().unwrap();
+        }
+        let before = fs::read(store.blocks_path()).unwrap();
+        let meta_before = fs::read(store.meta_path()).unwrap();
+
+        let err = store
+            .load_or_new(NetworkId::Mainnet)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("was requested"), "{err}");
+
+        assert_eq!(fs::read(store.blocks_path()).unwrap(), before);
+        assert_eq!(fs::read(store.meta_path()).unwrap(), meta_before);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_uncommitted_append_is_rolled_back_on_restart() {
+        use nightfall_crypto::WalletKeys;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let dir =
+            std::env::temp_dir().join(format!("nf-crash-append-{}-{unique}", std::process::id()));
+
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+        for i in 0..3u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+
+        store.save(&chain).unwrap();
+
+        let committed_count = chain.block_count();
+        let committed_tip = chain.tip_hash();
+        let committed_bytes = fs::metadata(store.blocks_path()).unwrap().len();
+
+        chain.mine_block(&miner, vec![], now_unix() + 1000).unwrap();
+
+        // Simulate interruption after the appended block reached stable
+        // storage but before chain-meta.json was committed.
+        let fmt = store.format();
+        {
+            let mut file = BufWriter::new(
+                OpenOptions::new()
+                    .append(true)
+                    .open(store.blocks_path())
+                    .unwrap(),
+            );
+
+            codec::write_block(&mut file, chain.blocks.last().unwrap(), fmt).unwrap();
+            file.flush().unwrap();
+            file.get_ref().sync_all().unwrap();
+        }
+
+        assert!(fs::metadata(store.blocks_path()).unwrap().len() > committed_bytes);
+
+        let loaded = store.load_or_new(NetworkId::Devnet).unwrap();
+
+        assert_eq!(loaded.block_count(), committed_count);
+        assert_eq!(loaded.tip_hash(), committed_tip);
+        assert_eq!(
+            fs::metadata(store.blocks_path()).unwrap().len(),
+            committed_bytes
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn crash_recovery_preserves_corrupted_committed_prefix() {
+        use nightfall_crypto::WalletKeys;
+
+        for corrupt_body in [false, true] {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "nf-crash-corrupt-{}-{unique}-{corrupt_body}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+
+            let store = ChainStore::new(&dir);
+            let miner = WalletKeys::generate().address();
+            let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+            for i in 0..3u64 {
+                chain
+                    .mine_block(&miner, vec![], now_unix() + i * 15)
+                    .unwrap();
+            }
+            store.save(&chain).unwrap();
+
+            let committed_len = fs::metadata(store.blocks_path()).unwrap().len();
+            let mut altered = chain.blocks.clone();
+
+            if corrupt_body {
+                altered[0].body.kernels[0].reward_darks ^= 1;
+                assert_eq!(altered[0].hash(), chain.blocks[0].hash());
+                assert_ne!(altered[0].body.hash(), altered[0].header.body_root);
+            } else {
+                altered[0].header.nonce ^= 1;
+                assert_ne!(altered[0].hash(), chain.blocks[0].hash());
+            }
+
+            let fmt = store.format();
+            let mut bytes = Vec::new();
+            for block in &altered {
+                codec::write_block(&mut bytes, block, fmt).unwrap();
+            }
+            assert_eq!(bytes.len() as u64, committed_len);
+
+            chain.mine_block(&miner, vec![], now_unix() + 1000).unwrap();
+            codec::write_block(&mut bytes, chain.blocks.last().unwrap(), fmt).unwrap();
+
+            let original_corrupt_len = bytes.len() as u64;
+            assert!(original_corrupt_len > committed_len);
+            fs::write(store.blocks_path(), &bytes).unwrap();
+
+            store
+                .recover_uncommitted_archive_tail(NetworkId::Devnet)
+                .unwrap();
+
+            assert_eq!(
+                fs::metadata(store.blocks_path()).unwrap().len(),
+                original_corrupt_len,
+                "recovery must not truncate a corrupt committed prefix"
+            );
+            assert!(store.load_or_new(NetworkId::Devnet).is_err());
+
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
+
     #[test]
     fn same_size_block_mutation_makes_load_fail_closed() {
         use nightfall_crypto::WalletKeys;
@@ -1538,193 +1991,6 @@ mod tests {
             "same-size headers mutation must invalidate the validation record"
         );
 
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    /// The whole point of the conversion: a node that ran on JSON and a node
-    /// that converted must hold the same chain. Tip, height, and UTXO root —
-    /// if any of the three moved, the format changed meaning, and the format
-    /// is not allowed to mean anything.
-    #[test]
-    fn migration_keeps_the_identical_chain() {
-        use nightfall_crypto::WalletKeys;
-        let dir = std::env::temp_dir().join(format!("nf-mig-{}", now_unix()));
-        fs::create_dir_all(&dir).unwrap();
-        // A fresh datadir now defaults to binary, so lay down the historic
-        // file first: this test is about converting an old node.
-        fs::write(dir.join(codec::BLOCKS_JSONL), b"").unwrap();
-        let store = ChainStore::new(&dir);
-        let miner = WalletKeys::generate().address();
-        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
-        for i in 0..8u64 {
-            chain
-                .mine_block(&miner, vec![], now_unix() + i * 15)
-                .unwrap();
-        }
-        store.save(&chain).unwrap();
-        assert_eq!(store.format(), Format::Json, "fresh datadir starts as json");
-
-        let (before, after) = store.migrate_to_binary().unwrap();
-        assert!(after < before, "{after} B is not smaller than {before} B");
-        assert_eq!(store.format(), Format::Binary);
-        assert!(
-            dir.join("blocks.jsonl.pre-binary").exists(),
-            "the old file must survive so the operator can go back"
-        );
-        assert!(!dir.join(codec::BLOCKS_JSONL).exists());
-
-        let loaded = store.load_or_new(NetworkId::Devnet).unwrap();
-        assert_eq!(loaded.tip_hash(), chain.tip_hash());
-        assert_eq!(loaded.block_count(), chain.block_count());
-        assert_eq!(loaded.ledger.utxo_root(), chain.ledger.utxo_root());
-        loaded.verify_supply().unwrap();
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    /// After converting, the node keeps mining into the file it now has.
-    /// Appending to the abandoned .jsonl would silently split the chain in
-    /// two, with the newer half in the file nothing reads.
-    #[test]
-    fn blocks_mined_after_migration_land_in_the_binary_file() {
-        use nightfall_crypto::WalletKeys;
-        let dir = std::env::temp_dir().join(format!("nf-mig-app-{}", now_unix()));
-        fs::create_dir_all(&dir).unwrap();
-        // A fresh datadir now defaults to binary, so lay down the historic
-        // file first: this test is about converting an old node.
-        fs::write(dir.join(codec::BLOCKS_JSONL), b"").unwrap();
-        let store = ChainStore::new(&dir);
-        let miner = WalletKeys::generate().address();
-        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
-        for i in 0..4u64 {
-            chain
-                .mine_block(&miner, vec![], now_unix() + i * 15)
-                .unwrap();
-        }
-        store.save(&chain).unwrap();
-        store.migrate_to_binary().unwrap();
-
-        let mut chain = store.load_or_new(NetworkId::Devnet).unwrap();
-        for i in 4..9u64 {
-            chain
-                .mine_block(&miner, vec![], now_unix() + i * 15)
-                .unwrap();
-            // save() appends only what is not on disk yet, so this exercises
-            // the incremental write path, not a rewrite.
-            store.save(&chain).unwrap();
-        }
-        let tip = chain.tip_hash();
-
-        let reloaded = store.load_or_new(NetworkId::Devnet).unwrap();
-        assert_eq!(reloaded.block_count(), chain.block_count());
-        assert_eq!(reloaded.tip_hash(), tip);
-        reloaded.verify_supply().unwrap();
-        // The stale file must not have grown a single byte.
-        let stale = fs::read_to_string(dir.join("blocks.jsonl.pre-binary")).unwrap();
-        assert_eq!(
-            stale.lines().count(),
-            4,
-            "the abandoned file was written to after the swap"
-        );
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn migrating_an_already_binary_datadir_is_refused() {
-        use nightfall_crypto::WalletKeys;
-        let dir = std::env::temp_dir().join(format!("nf-mig-twice-{}", now_unix()));
-        fs::create_dir_all(&dir).unwrap();
-        // A fresh datadir now defaults to binary, so lay down the historic
-        // file first: this test is about converting an old node.
-        fs::write(dir.join(codec::BLOCKS_JSONL), b"").unwrap();
-        let store = ChainStore::new(&dir);
-        let miner = WalletKeys::generate().address();
-        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
-        chain.mine_block(&miner, vec![], now_unix()).unwrap();
-        store.save(&chain).unwrap();
-        store.migrate_to_binary().unwrap();
-
-        let err = store.migrate_to_binary().unwrap_err().to_string();
-        assert!(err.contains("already binary"), "got: {err}");
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    /// Snapshots written before the binary format exist in the wild, and a
-    /// datadir created today reads bincode. Importing one into the other must
-    /// convert, not copy: a straight copy puts JSON in a file the node is
-    /// about to parse as bincode, and the node then refuses to start.
-    #[test]
-    fn a_json_snapshot_imports_into_a_binary_datadir() {
-        use nightfall_crypto::WalletKeys;
-        let src = std::env::temp_dir().join(format!("nf-xsnap-src-{}", now_unix()));
-        let out = std::env::temp_dir().join(format!("nf-xsnap-out-{}", now_unix()));
-        let dest = std::env::temp_dir().join(format!("nf-xsnap-dst-{}", now_unix()));
-        fs::create_dir_all(&src).unwrap();
-        // An old node: JSON on disk.
-        fs::write(src.join(codec::BLOCKS_JSONL), b"").unwrap();
-        let store = ChainStore::new(&src);
-        assert_eq!(store.format(), Format::Json);
-        let miner = WalletKeys::generate().address();
-        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
-        for i in 0..3u64 {
-            chain
-                .mine_block(&miner, vec![], now_unix() + i * 15)
-                .unwrap();
-        }
-        store.save(&chain).unwrap();
-        let snap = store.export_snapshot(&out).unwrap();
-        assert_eq!(snap.format, "json");
-
-        // A new node: binary by default.
-        let dest_store = ChainStore::new(&dest);
-        let imported = dest_store.import_snapshot(&out, NetworkId::Devnet).unwrap();
-        assert_eq!(imported.tip_hash(), chain.tip_hash());
-        assert_eq!(dest_store.format(), Format::Binary);
-        imported.verify_supply().unwrap();
-
-        // And it survives a restart, which is where a mis-copied file shows up.
-        let reloaded = dest_store.load_or_new(NetworkId::Devnet).unwrap();
-        assert_eq!(reloaded.tip_hash(), chain.tip_hash());
-
-        fs::remove_dir_all(&src).ok();
-        fs::remove_dir_all(&out).ok();
-        fs::remove_dir_all(&dest).ok();
-    }
-
-    /// The bug this test exists for: `rewrite_all` and `rewrite_bodies` wrote
-    /// raw JSON regardless of the datadir's format. A reorg that shortens the
-    /// chain takes that path, so a converted node would have quietly written a
-    /// JSON file named blocks.bin and refused to start on the next restart.
-    #[test]
-    fn a_rewrite_keeps_the_format_the_datadir_is_in() {
-        use nightfall_crypto::WalletKeys;
-        let dir = std::env::temp_dir().join(format!("nf-rewrite-{}", now_unix()));
-        fs::create_dir_all(&dir).unwrap();
-        let store = ChainStore::new(&dir);
-        let miner = WalletKeys::generate().address();
-        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
-        for i in 0..6u64 {
-            chain
-                .mine_block(&miner, vec![], now_unix() + i * 15)
-                .unwrap();
-        }
-        store.save(&chain).unwrap();
-        assert_eq!(store.format(), Format::Binary);
-
-        // Shorter chain than what is on disk: this is the reorg path, and it
-        // rewrites the whole file instead of appending.
-        let mut shorter = Chain::new_fair(NetworkId::Devnet).unwrap();
-        for i in 0..3u64 {
-            shorter
-                .mine_block(&miner, vec![], now_unix() + 1000 + i * 15)
-                .unwrap();
-        }
-        store.save(&shorter).unwrap();
-
-        assert!(!dir.join(format!("{}.tmp", codec::BLOCKS_BIN)).exists());
-        let reloaded = store.load_or_new(NetworkId::Devnet).unwrap();
-        assert_eq!(reloaded.block_count(), shorter.block_count());
-        assert_eq!(reloaded.tip_hash(), shorter.tip_hash());
-        reloaded.verify_supply().unwrap();
         fs::remove_dir_all(&dir).ok();
     }
 }
