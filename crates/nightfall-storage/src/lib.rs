@@ -253,10 +253,20 @@ impl ChainStore {
     /// `validated_bytes` reproduces the exact locally-authenticated chain
     /// named by the old metadata. This prevents a complete rewrite/reorg
     /// beside stale metadata from being mistaken for an append tail.
-    fn recover_uncommitted_archive_tail(&self) -> anyhow::Result<()> {
+    fn recover_uncommitted_archive_tail(&self, network: NetworkId) -> anyhow::Result<()> {
         let Some(meta) = self.read_meta() else {
             return Ok(());
         };
+
+        // Never repair a datadir that belongs to another network: the caller
+        // refuses it, and a refusal must leave the files exactly as they were.
+        if meta.network != network
+            || Chain::new_fair(network)
+                .map(|c| c.genesis_hash.to_hex() != meta.genesis_hash)
+                .unwrap_or(true)
+        {
+            return Ok(());
+        }
 
         if meta.pruned
             || meta.first_height != 0
@@ -813,13 +823,9 @@ impl ChainStore {
             return Ok(Chain::new_fair(network)?);
         }
 
-        self.recover_uncommitted_archive_tail()?;
-
-        let meta: Option<ChainMeta> = fs::read_to_string(self.meta_path())
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok());
-
-        if let Some(m) = &meta {
+        // Identity first, repair second: a datadir for another network is
+        // refused before anything in it is touched.
+        if let Some(m) = self.read_meta() {
             if m.network != network {
                 anyhow::bail!(
                     "datadir holds a {:?} chain but {:?} was requested",
@@ -828,6 +834,12 @@ impl ChainStore {
                 );
             }
         }
+
+        self.recover_uncommitted_archive_tail(network)?;
+
+        let meta: Option<ChainMeta> = fs::read_to_string(self.meta_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok());
 
         // Trust our own past validation only if the blocks file is byte-for-byte
         // what it was when we recorded it. Any edit, truncation or corruption
@@ -1492,6 +1504,56 @@ mod tests {
     }
 
     #[test]
+    fn wrong_network_open_leaves_an_uncommitted_tail_untouched() {
+        use nightfall_crypto::WalletKeys;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("nf-wrong-net-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+        for i in 0..3u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+        store.save(&chain).unwrap();
+
+        // A durable but uncommitted fourth block: the interrupted-append window.
+        chain.mine_block(&miner, vec![], now_unix() + 1000).unwrap();
+        {
+            let mut file = BufWriter::new(
+                OpenOptions::new()
+                    .append(true)
+                    .open(store.blocks_path())
+                    .unwrap(),
+            );
+            codec::write_block(&mut file, chain.blocks.last().unwrap(), store.format()).unwrap();
+            file.flush().unwrap();
+            file.get_ref().sync_all().unwrap();
+        }
+        let before = fs::read(store.blocks_path()).unwrap();
+        let meta_before = fs::read(store.meta_path()).unwrap();
+
+        let err = store
+            .load_or_new(NetworkId::Mainnet)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("was requested"), "{err}");
+
+        assert_eq!(fs::read(store.blocks_path()).unwrap(), before);
+        assert_eq!(fs::read(store.meta_path()).unwrap(), meta_before);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn archive_uncommitted_append_is_rolled_back_on_restart() {
         use nightfall_crypto::WalletKeys;
 
@@ -1605,7 +1667,9 @@ mod tests {
             assert!(original_corrupt_len > committed_len);
             fs::write(store.blocks_path(), &bytes).unwrap();
 
-            store.recover_uncommitted_archive_tail().unwrap();
+            store
+                .recover_uncommitted_archive_tail(NetworkId::Devnet)
+                .unwrap();
 
             assert_eq!(
                 fs::metadata(store.blocks_path()).unwrap().len(),
