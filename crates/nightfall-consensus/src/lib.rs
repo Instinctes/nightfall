@@ -7,14 +7,14 @@ use nightfall_crypto::{
     block_work, default_threads, domain, genesis_commitment, hash_multi, meets_difficulty,
     mine_parallel, nighthash, Address, Commitment,
 };
-use nightfall_ledger::{build_coinbase, BlockBody, LedgerState, Transaction};
+use nightfall_ledger::{build_coinbase, BlockBody, LedgerState, StateUndo, Transaction};
 use nightfall_types::{
     Amount, GenesisConfig, Hash256, Height, NetworkId, PowParams, DARKS_PER_NIGHT,
     HALVING_INTERVAL_BLOCKS, INITIAL_BLOCK_REWARD_NIGHT, MAX_FUTURE_DRIFT_SECS, MAX_SUPPLY_DARKS,
     MAX_SUPPLY_NIGHT, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 /// Reorgs deeper than this are refused outright. Depth is how many of *our*
 /// blocks we would abandon — the rewind to the common ancestor — not how much
@@ -262,6 +262,40 @@ pub struct Chain {
     pub horizon_work: u128,
     /// Exact cumulative proof of work. This, not block count, decides forks.
     pub total_work: u128,
+    /// Undo of the most recent blocks, oldest at the front, tip at the back.
+    ///
+    /// Capped at [`MAX_REORG_DEPTH`]. A fork rewinds these instead of cloning
+    /// every historical body into a second chain.
+    pub undos: VecDeque<TipUndo>,
+}
+
+/// Work and pre-state of one applied block. Not written to disk: a restart
+/// rebuilds the window while it replays its own file.
+#[derive(Clone, Debug)]
+pub struct TipUndo {
+    pub work: u128,
+    pub state: StateUndo,
+}
+
+/// Chain positioned at a fork ancestor. Holds headers and a rewound ledger,
+/// not the historical block bodies.
+pub struct SuffixTrial {
+    trial: Chain,
+    based_on: Hash256,
+    rewind: usize,
+    our_work: u128,
+}
+
+/// A verified heavier suffix, ready to splice onto the chain it was prepared
+/// from. `suffix` is only the blocks after the ancestor.
+pub struct SuffixReorg {
+    ledger: LedgerState,
+    headers: Vec<CompactHeader>,
+    suffix: Vec<Block>,
+    undos: VecDeque<TipUndo>,
+    total_work: u128,
+    rewind: usize,
+    based_on: Hash256,
 }
 
 impl Chain {
@@ -284,11 +318,17 @@ impl Chain {
             horizon: None,
             horizon_work: 0,
             total_work: 0,
+            undos: VecDeque::new(),
         })
     }
 
     pub fn proof_ctx(&self) -> &'static [u8] {
         self.network.proof_context()
+    }
+
+    /// Are the binding rules in force for a block at `height`?
+    pub fn binding_active_at(&self, height: Height) -> bool {
+        height.0 >= self.network.binding_fork_height()
     }
 
     pub fn pow_params(&self) -> PowParams {
@@ -411,36 +451,6 @@ impl Chain {
         Some(self.blocks[..=last].to_vec())
     }
 
-    /// Whether [`Self::bodies_through`] would return `Some` for `height` —
-    /// answered without copying a single block.
-    ///
-    /// On an archive node `bodies_through` copies the whole history (hundreds
-    /// of thousands of blocks, gigabytes). The fork path asks this first so it
-    /// only pays that price for a reorg it is actually going to evaluate.
-    pub fn can_rebuild_through(&self, height: u64) -> bool {
-        if self.first_height == 0 {
-            return true;
-        }
-        let before_first = self.first_height - 1;
-        if height < before_first {
-            return false;
-        }
-        height == before_first || ((height - self.first_height) as usize) < self.blocks.len()
-    }
-
-    /// Declared work of our blocks above `height`: what a reorg whose common
-    /// ancestor is `height` would replace. A candidate is only worth
-    /// rebuilding if its suffix declares more than this — the same comparison
-    /// [`Self::evaluate_reorg_at`] makes first, without the copy.
-    pub fn work_above(&self, height: u64) -> u128 {
-        let skip = height.saturating_add(1).saturating_sub(self.first_height);
-        self.blocks
-            .iter()
-            .skip(usize::try_from(skip).unwrap_or(usize::MAX))
-            .map(|b| b.work())
-            .sum()
-    }
-
     fn difficulty_history(&self) -> Vec<(u64, u64)> {
         if !self.headers.is_empty() {
             self.headers
@@ -545,13 +555,32 @@ impl Chain {
             .reward_at(height, self.ledger.supply.total_minted_darks)
             .darks();
         extra_txs.truncate(MAX_TXS_PER_BLOCK - 1);
-        let fees: u64 = extra_txs.iter().map(|t| t.total_fee()).sum();
+        let binding = self.binding_active_at(height);
+        if !binding {
+            // Below the fork a block has the 1.0.x shape, byte for byte.
+            for tx in &mut extra_txs {
+                tx.strip_binding();
+            }
+        }
+        let fees: u64 = if binding {
+            extra_txs
+                .iter()
+                .try_fold(0u64, |acc, t| acc.checked_add(t.checked_total_fee()?))
+                .ok_or_else(|| ConsensusError::Tx("fee out of range".into()))?
+        } else {
+            extra_txs
+                .iter()
+                .fold(0u64, |acc, t| acc.wrapping_add(t.total_fee()))
+        };
         // After the last subsidy the miner is paid in fees. Those coins are
         // already circulating; they are not minted and they are not burned.
         let coinbase_darks = if subsidy > 0 { subsidy } else { fees };
 
-        let coinbase = build_coinbase(miner, coinbase_darks, height.0, self.proof_ctx())
+        let mut coinbase = build_coinbase(miner, coinbase_darks, height.0, self.proof_ctx())
             .map_err(|e| ConsensusError::Tx(e.to_string()))?;
+        if !binding {
+            coinbase.strip_binding();
+        }
 
         let mut txs = vec![coinbase];
         txs.extend(extra_txs);
@@ -643,7 +672,10 @@ impl Chain {
     /// Linkage only (height, parent). Proofs, signatures and the supply
     /// equation already ran when we accepted the block. Used on restart so
     /// a miner is not stuck for minutes on their own file.
-    pub fn apply_block_from_own_disk(&mut self, block: Block) -> Result<(), ConsensusError> {
+    pub fn apply_block_from_own_disk(&mut self, mut block: Block) -> Result<(), ConsensusError> {
+        if !self.binding_active_at(block.header.height) {
+            block.body.strip_binding();
+        }
         if block.header.version != PROTOCOL_VERSION {
             return Err(ConsensusError::BadVersion {
                 got: block.header.version,
@@ -677,11 +709,17 @@ impl Chain {
             .emission
             .reward_at(block.header.height, self.ledger.supply.total_minted_darks)
             .darks();
+        let undo = self
+            .ledger
+            .capture_undo(&block.body)
+            .map_err(|e| ConsensusError::Ledger(e.to_string()))?;
+        let work = block.work();
         self.ledger
             .apply_block_state_only(&block.body, block.header.height, subsidy)
             .map_err(|e| ConsensusError::Ledger(e.to_string()))?;
-        self.total_work = self.total_work.saturating_add(block.work());
+        self.total_work = self.total_work.saturating_add(work);
         self.push_block(block);
+        self.remember_undo(undo, work);
         Ok(())
     }
 
@@ -692,10 +730,17 @@ impl Chain {
 
     fn apply_block_inner(
         &mut self,
-        block: Block,
+        mut block: Block,
         now_unix: u64,
         verify_pow: bool,
     ) -> Result<(), ConsensusError> {
+        // A 1.0.x node cannot see binding fields, so below the fork they must
+        // not exist for us either: not in the body hash, not in validation,
+        // not on disk. Stripping is what makes the two versions agree on
+        // every pre-fork block whatever a peer chose to attach.
+        if !self.binding_active_at(block.header.height) {
+            block.body.strip_binding();
+        }
         // --- cheap structural checks first (cheapest rejection wins) ---
         if block.header.version != PROTOCOL_VERSION {
             return Err(ConsensusError::BadVersion {
@@ -705,6 +750,11 @@ impl Chain {
         }
         if block.body.outputs.is_empty() || block.body.kernels.is_empty() {
             return Err(ConsensusError::BadTxCount);
+        }
+        if block.body.exceeds_size_limits() {
+            return Err(ConsensusError::Ledger(
+                nightfall_ledger::LedgerError::BlockTooLarge.to_string(),
+            ));
         }
         if block.header.height != self.next_height() {
             return Err(ConsensusError::BadHeight);
@@ -772,24 +822,46 @@ impl Chain {
             return Err(ConsensusError::BadTxRoot);
         }
 
-        // --- full ledger validation on a scratch copy ---
-        let mut trial = self.ledger.clone();
-        trial
+        // Validate in place. `LedgerState::apply_block` does every fallible
+        // check before it mutates, so a rejection leaves this ledger alone
+        // and we no longer clone the whole UTXO set to find that out.
+        let undo = self
+            .ledger
+            .capture_undo(&block.body)
+            .map_err(|e| ConsensusError::Ledger(e.to_string()))?;
+        let work = block.work();
+        self.ledger
             .apply_block(&block.body, block.header.height, subsidy, self.proof_ctx())
             .map_err(|e| ConsensusError::Ledger(e.to_string()))?;
-
-        if trial.utxo_root() != block.header.utxo_root {
+        if self.ledger.utxo_root() != block.header.utxo_root {
+            self.ledger.rewind(&undo);
             return Err(ConsensusError::BadUtxoRoot);
         }
-        if trial.kernel_sum() != block.header.kernel_sum {
+        if self.ledger.kernel_sum() != block.header.kernel_sum {
+            self.ledger.rewind(&undo);
             return Err(ConsensusError::BadKernelSum);
         }
 
-        // --- commit ---
-        self.total_work = self.total_work.saturating_add(block.work());
-        self.ledger = trial;
+        self.total_work = self.total_work.saturating_add(work);
         self.push_block(block);
+        self.remember_undo(undo, work);
         Ok(())
+    }
+
+    fn remember_undo(&mut self, state: StateUndo, work: u128) {
+        self.undos.push_back(TipUndo { work, state });
+        while self.undos.len() > MAX_REORG_DEPTH {
+            self.undos.pop_front();
+        }
+    }
+
+    /// Sum of the work we would abandon by rewinding `rewind` blocks.
+    /// `None` when the undo window does not cover that far.
+    pub fn rewound_work(&self, rewind: usize) -> Option<u128> {
+        if rewind > self.undos.len() {
+            return None;
+        }
+        Some(self.undos.iter().rev().take(rewind).map(|u| u.work).sum())
     }
 
     /// Drop bodies older than `keep`, leaving headers and the UTXO set.
@@ -945,6 +1017,120 @@ impl Chain {
         Ok(applied)
     }
 
+    /// Snapshot this chain at `ancestor_height` without copying block bodies.
+    ///
+    /// The trial carries headers through the ancestor, the ledger rewound
+    /// with [`Self::undos`], and no historical bodies. Verifying a suffix
+    /// against it costs one ledger and the new blocks, not a second archive.
+    pub fn prepare_suffix_trial(
+        &self,
+        ancestor_height: u64,
+    ) -> Result<SuffixTrial, ConsensusError> {
+        let our_tip = self.tip_height().map(|h| h.0).unwrap_or(0);
+        if ancestor_height > our_tip {
+            return Err(ConsensusError::BadHeight);
+        }
+        let rewind = (our_tip - ancestor_height) as usize;
+        if rewind > MAX_REORG_DEPTH || rewind > self.undos.len() {
+            return Err(ConsensusError::ReorgTooDeep);
+        }
+        let ancestor_idx = ancestor_height as usize;
+        if ancestor_idx >= self.headers.len() {
+            return Err(ConsensusError::BadHeight);
+        }
+        let rewind_work = self
+            .rewound_work(rewind)
+            .ok_or(ConsensusError::ReorgTooDeep)?;
+        let ancestor_work = self
+            .total_work
+            .checked_sub(rewind_work)
+            .ok_or(ConsensusError::ReorgTooDeep)?;
+
+        let mut ledger = self.ledger.clone();
+        for undo in self.undos.iter().rev().take(rewind) {
+            ledger.rewind(&undo.state);
+        }
+
+        let mut trial = Self::new_fair(self.network)?;
+        trial.ledger = ledger;
+        trial.total_work = ancestor_work;
+        trial.headers = self.headers[..=ancestor_idx].to_vec();
+        trial.blocks.clear();
+        trial.undos.clear();
+        trial.first_height = 0;
+        trial.horizon = None;
+        trial.horizon_work = 0;
+
+        Ok(SuffixTrial {
+            trial,
+            based_on: self.tip_hash(),
+            rewind,
+            our_work: self.total_work,
+        })
+    }
+
+    /// Apply `suffix` to a trial from [`Self::prepare_suffix_trial`].
+    ///
+    /// Returns `Ok(None)` when the declared work would not win, before any
+    /// proof of work. A heavier but invalid suffix is `Err`. The live chain
+    /// is not touched; [`Self::splice_suffix`] commits a `Some`.
+    pub fn finish_suffix(
+        mut trial: SuffixTrial,
+        suffix: Vec<Block>,
+        now_unix: u64,
+    ) -> Result<Option<SuffixReorg>, ConsensusError> {
+        if suffix.is_empty() {
+            return Ok(None);
+        }
+        let declared: u128 = suffix.iter().map(|block| block.work()).sum();
+        if trial.trial.total_work.saturating_add(declared) <= trial.our_work {
+            return Ok(None);
+        }
+        for block in suffix {
+            trial.trial.apply_block(block, now_unix)?;
+        }
+        if trial.trial.total_work <= trial.our_work {
+            return Ok(None);
+        }
+        let rewind = trial.rewind;
+        let based_on = trial.based_on;
+        let chain = trial.trial;
+        Ok(Some(SuffixReorg {
+            ledger: chain.ledger,
+            headers: chain.headers,
+            suffix: chain.blocks,
+            undos: chain.undos,
+            total_work: chain.total_work,
+            rewind,
+            based_on,
+        }))
+    }
+
+    /// Commit a suffix reorg if we are still on the tip it was built against
+    /// and it is still heavier. Historical bodies before the fork stay put.
+    pub fn splice_suffix(&mut self, reorg: SuffixReorg) -> bool {
+        if self.tip_hash() != reorg.based_on || reorg.total_work <= self.total_work {
+            return false;
+        }
+        if reorg.rewind > self.blocks.len() || reorg.rewind > self.undos.len() {
+            return false;
+        }
+        let keep = self.blocks.len() - reorg.rewind;
+        self.blocks.truncate(keep);
+        self.blocks.extend(reorg.suffix);
+        self.headers = reorg.headers;
+        self.ledger = reorg.ledger;
+        self.total_work = reorg.total_work;
+        for _ in 0..reorg.rewind {
+            self.undos.pop_back();
+        }
+        self.undos.extend(reorg.undos);
+        while self.undos.len() > MAX_REORG_DEPTH {
+            self.undos.pop_front();
+        }
+        true
+    }
+
     /// Adopt `blocks` if and only if it is a fully valid chain carrying **more
     /// cumulative work**.
     ///
@@ -1084,8 +1270,11 @@ impl Chain {
         now_unix: u64,
     ) -> Result<Self, ConsensusError> {
         let mut chain = Self::new_fair(network)?;
-        chain.ledger = base.horizon.clone();
-        chain.horizon = Some(base.horizon);
+        let horizon = base
+            .horizon
+            .with_binding_height(network.binding_fork_height());
+        chain.ledger = horizon.clone();
+        chain.horizon = Some(horizon);
         chain.horizon_work = base.horizon_work;
         chain.first_height = base.first_height;
         chain.headers = base.headers;
@@ -1126,9 +1315,14 @@ impl Chain {
 
     /// Mempool admission.
     pub fn precheck_tx(&self, tx: &Transaction) -> Result<(), ConsensusError> {
+        self.precheck_tx_typed(tx)
+            .map_err(|e| ConsensusError::Ledger(e.to_string()))
+    }
+
+    /// Same admission rules, preserving the failure type for local wallet policy.
+    pub fn precheck_tx_typed(&self, tx: &Transaction) -> Result<(), nightfall_ledger::LedgerError> {
         self.ledger
             .check_tx_acceptable(tx, self.next_height(), self.proof_ctx())
-            .map_err(|e| ConsensusError::Ledger(e.to_string()))
     }
 
     /// Re-verify the global supply invariant.
@@ -1140,6 +1334,18 @@ impl Chain {
 }
 
 // ----------------------------------------------------------------- mempool --
+
+/// What [`Mempool::insert_checked`] did with a transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InsertOutcome {
+    Added,
+    /// Already held under this txid.
+    Known,
+    /// Spends an input a held transaction already spends.
+    Conflict,
+    /// The pool is full of live entries.
+    Full,
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Mempool {
@@ -1165,19 +1371,58 @@ impl Mempool {
     /// `now_unix` is passed in rather than read from the clock because this
     /// crate also compiles to wasm32, where `SystemTime::now()` aborts.
     pub fn insert(&mut self, tx: Transaction, now_unix: u64) -> bool {
+        self.insert_checked(tx, now_unix) == InsertOutcome::Added
+    }
+
+    /// [`Self::insert`], saying why a transaction was not taken.
+    ///
+    /// **First seen wins.** A transaction spending an input that a held
+    /// transaction already spends is refused, whatever its fee. The one
+    /// replacement allowed is the same spend arriving again *with* its
+    /// binding fields after an older relay dropped them: same legacy txid,
+    /// strictly more complete.
+    pub fn insert_checked(&mut self, tx: Transaction, now_unix: u64) -> InsertOutcome {
         if self.txs.len() >= Self::MAX_ENTRIES {
             // Full is usually not "too much traffic", it is "too many corpses".
             // Sweep before refusing, so a long-running node heals itself
             // instead of quietly going deaf.
             self.expire(now_unix);
             if self.txs.len() >= Self::MAX_ENTRIES {
-                return false;
+                return InsertOutcome::Full;
             }
         }
         let id = tx.txid().to_hex();
-        let fresh = self.txs.insert(id.clone(), tx).is_none();
+        if self.txs.contains_key(&id) {
+            return InsertOutcome::Known;
+        }
+        let wanted: std::collections::BTreeSet<[u8; 32]> =
+            tx.inputs.iter().map(|i| i.commit.0).collect();
+        let conflicts: Vec<String> = self
+            .txs
+            .iter()
+            .filter(|(_, held)| held.inputs.iter().any(|i| wanted.contains(&i.commit.0)))
+            .map(|(k, _)| k.clone())
+            .collect();
+        if !conflicts.is_empty() {
+            let upgrade = conflicts.len() == 1 && {
+                let held = &self.txs[&conflicts[0]];
+                !held.has_full_binding()
+                    && tx.has_full_binding()
+                    && held.legacy_txid() == tx.legacy_txid()
+            };
+            if !upgrade {
+                return InsertOutcome::Conflict;
+            }
+            let first = self.seen.get(&conflicts[0]).copied().unwrap_or(now_unix);
+            self.txs.remove(&conflicts[0]);
+            self.seen.remove(&conflicts[0]);
+            self.txs.insert(id.clone(), tx);
+            self.seen.insert(id, first);
+            return InsertOutcome::Added;
+        }
+        self.txs.insert(id.clone(), tx);
         self.seen.entry(id).or_insert(now_unix);
-        fresh
+        InsertOutcome::Added
     }
 
     /// Forget transactions no block ever took.
@@ -1276,9 +1521,10 @@ impl Mempool {
     /// to assemble, and mining stalled — a free denial of service.
     pub fn select_for_block(&self, max: usize) -> Vec<Transaction> {
         let mut candidates: Vec<&Transaction> = self.txs.values().collect();
+        let fee = |t: &Transaction| t.checked_total_fee().unwrap_or(0);
         candidates.sort_by(|a, b| {
-            b.total_fee()
-                .cmp(&a.total_fee())
+            fee(b)
+                .cmp(&fee(a))
                 .then_with(|| a.txid().0.cmp(&b.txid().0))
         });
 

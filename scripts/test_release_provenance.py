@@ -34,6 +34,15 @@ class ReleaseProvenanceTests(unittest.TestCase):
             self.assertIn("refs/tags/v1.0.7", args[0])
             self.assertIn("--signer-workflow", args[0])
 
+    def test_roadmap_tools_are_required_starting_at_110(self):
+        for platform in ("linux", "windows"):
+            self.assertEqual(len(expected_assets("v1.0.9", platform)[0]), 3)
+            files, _ = expected_assets("v1.1.0", platform)
+            self.assertEqual(len(files), 6)
+            self.assertTrue(any("nightfall-nodekit-" in f for f in files))
+            self.assertTrue(any("nightfall-till-" in f for f in files))
+            self.assertTrue(any("nightfall-receipt-evidence-" in f for f in files))
+
     def test_signature_failure_rejects(self):
         f = Mock(return_value=Mock(returncode=1, stderr="no attestation"))
         with self.assertRaisesRegex(ValueError, "signed provenance"):
