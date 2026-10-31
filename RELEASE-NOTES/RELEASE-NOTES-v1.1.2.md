@@ -27,7 +27,9 @@ Nodes on 1.1.1 stay fully compatible. Nodes still on 1.0.x must upgrade to
   disk before `chain-meta.json` is written, and the metadata is replaced
   atomically. If the computer stops in the middle of an append, the node
   rolls back to the last confirmed state on the next start, but only when the
-  data up to that point still matches its own validation record.
+  data up to that point still matches its own validation record. A data
+  folder that belongs to another network is refused before anything in it is
+  changed.
 - **Stricter public light API — #86.** The read-only `GET` and `OPTIONS`
   requests must not carry a body or ambiguous framing, and the rate limiter
   no longer scans its whole table on every request.
