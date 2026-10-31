@@ -1077,6 +1077,96 @@ fn prune_reorg_inside_the_window_still_works() {
     ours.verify_supply().unwrap();
 }
 
+#[test]
+fn suffix_reorg_keeps_history_and_matches_the_heavier_tip() {
+    // The seed case: one competing tip, then the network pulls ahead. The
+    // adopt must not need a second copy of the shared history.
+    let miner = WalletKeys::generate().address();
+    let mut shared = devnet();
+    for i in 0..4u64 {
+        shared
+            .mine_block(&miner, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+    let ancestor = shared.tip_height().unwrap().0;
+    let genesis = shared.block_by_height(0).unwrap().hash();
+
+    let mut ours = Chain::new_fair(NetworkId::Devnet).unwrap();
+    ours.try_ingest_blocks(shared.blocks.clone(), NOW + 1_000)
+        .unwrap();
+    ours.mine_block(&miner, vec![], NOW + 4 * TARGET_BLOCK_TIME_SECS)
+        .unwrap();
+    let stale_root = ours.ledger.utxo_root();
+
+    let mut theirs = Chain::new_fair(NetworkId::Devnet).unwrap();
+    theirs
+        .try_ingest_blocks(shared.blocks.clone(), NOW + 1_000)
+        .unwrap();
+    for i in 0..3u64 {
+        theirs
+            .mine_block(&miner, vec![], NOW + (4 + i) * TARGET_BLOCK_TIME_SECS)
+            .unwrap();
+    }
+
+    let suffix: Vec<Block> = theirs
+        .blocks
+        .iter()
+        .filter(|block| block.header.height.0 > ancestor)
+        .cloned()
+        .collect();
+    assert_eq!(suffix.len(), 3);
+    let trial = ours.prepare_suffix_trial(ancestor).unwrap();
+    let reorg = Chain::finish_suffix(trial, suffix, NOW + 10_000)
+        .unwrap()
+        .expect("heavier suffix");
+    assert!(ours.splice_suffix(reorg));
+    assert_eq!(ours.tip_hash(), theirs.tip_hash());
+    assert_eq!(ours.block_by_height(0).unwrap().hash(), genesis);
+    assert_ne!(ours.ledger.utxo_root(), stale_root);
+    ours.verify_supply().unwrap();
+    assert_eq!(ours.undos.len(), theirs.block_count() as usize);
+}
+
+#[test]
+fn a_rejected_block_does_not_move_the_ledger() {
+    let mut chain = devnet();
+    let miner = WalletKeys::generate().address();
+    chain.mine_block(&miner, vec![], NOW).unwrap();
+    let root = chain.ledger.utxo_root();
+    let work = chain.total_work;
+    let mut block = chain
+        .build_template(&miner, vec![], NOW + TARGET_BLOCK_TIME_SECS)
+        .unwrap()
+        .seal(0);
+    block.header.nonce = 0;
+    while block.pow_is_valid(chain.pow_params()) {
+        block.header.nonce = block.header.nonce.wrapping_add(1);
+    }
+    assert!(chain
+        .apply_block(block, NOW + TARGET_BLOCK_TIME_SECS)
+        .is_err());
+    assert_eq!(chain.ledger.utxo_root(), root);
+    assert_eq!(chain.total_work, work);
+    assert_eq!(chain.block_count(), 1);
+}
+
+#[test]
+fn undo_rewind_matches_the_chain_before_the_last_block() {
+    let miner = WalletKeys::generate().address();
+    let mut chain = devnet();
+    chain.mine_block(&miner, vec![], NOW).unwrap();
+    let root = chain.ledger.utxo_root();
+    let work = chain.total_work;
+    chain
+        .mine_block(&miner, vec![], NOW + TARGET_BLOCK_TIME_SECS)
+        .unwrap();
+    let undo = chain.undos.back().unwrap();
+    let mut ledger = chain.ledger.clone();
+    ledger.rewind(&undo.state);
+    assert_eq!(ledger.utxo_root(), root);
+    assert_eq!(chain.total_work - undo.work, work);
+}
+
 /// Seal a template with real work and apply it. The devnet difficulty is low
 /// enough that this is a handful of hashes, not a wait.
 fn mine_template(chain: &mut Chain, template: BlockTemplate) -> Hash256 {
@@ -1195,55 +1285,29 @@ fn bodies_through_handles_max_height_after_pruning() {
     assert!(chain.bodies_through(0).is_none());
 }
 
-/// `can_rebuild_through` and `work_above` answer what `bodies_through` and
-/// the reorg work check would, without copying. The 1.0.7 fork path relies on
-/// that to turn away a lighter or too-deep branch before it copies our history.
 #[test]
-fn cheap_reorg_checks_agree_with_the_copying_ones() {
-    let miner = WalletKeys::from_seed([7; 32]).address();
-    let mut archive = devnet();
-    for i in 0..40u64 {
-        archive
-            .mine_block(&miner, vec![], NOW + i * TARGET_BLOCK_TIME_SECS)
-            .unwrap();
-    }
-    let mut pruned = archive.clone();
-    pruned.prune_keep(10).unwrap();
-    assert!(pruned.first_height > 0, "test needs a pruned chain");
+fn oversized_block_is_rejected_before_pow() {
+    let mut chain = devnet();
+    let miner = WalletKeys::generate().address();
 
-    for chain in [&archive, &pruned] {
-        let tip = chain.tip_height().unwrap().0;
-        for h in 0..=tip + 3 {
-            assert_eq!(
-                chain.can_rebuild_through(h),
-                chain.bodies_through(h).is_some(),
-                "height {h}, first_height {}",
-                chain.first_height
-            );
-        }
-        for h in chain.first_height.saturating_sub(1)..=tip {
-            let expected: u128 = chain
-                .blocks
-                .iter()
-                .filter(|b| b.header.height.0 > h)
-                .map(|b| b.work())
-                .sum();
-            assert_eq!(chain.work_above(h), expected, "height {h}");
-        }
-        assert_eq!(chain.work_above(tip), 0);
-        assert_eq!(chain.work_above(u64::MAX), 0);
-    }
-    // The comparison it stands in for: horizon + prefix + suffix vs total.
-    let tip = archive.tip_height().unwrap().0;
-    let ancestor = tip - 5;
-    let prefix: u128 = archive
-        .bodies_through(ancestor)
-        .unwrap()
-        .iter()
-        .map(|b| b.work())
-        .sum();
-    assert_eq!(
-        archive.horizon_work + prefix + archive.work_above(ancestor),
-        archive.total_work
+    // Start from a structurally normal template, but deliberately do not mine it.
+    let mut block = chain.build_template(&miner, vec![], NOW).unwrap().seal(0);
+
+    // Exceed an existing consensus aggregate limit. The duplicated outputs do
+    // not need to be otherwise valid: size must win before PoW or ledger crypto.
+    let output = block.body.outputs[0].clone();
+    block
+        .body
+        .outputs
+        .resize(nightfall_ledger::MAX_BLOCK_OUTPUTS + 1, output);
+
+    let res = chain.apply_block(block, NOW);
+    assert!(
+        matches!(
+            res,
+            Err(ConsensusError::Ledger(ref msg))
+                if msg == &nightfall_ledger::LedgerError::BlockTooLarge.to_string()
+        ),
+        "oversized body must be rejected before proof of work, got {res:?}"
     );
 }

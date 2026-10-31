@@ -32,7 +32,11 @@ def expected_assets(tag, platform):
                          for arch in ("arm64", "intel"))
         return binaries, f"SHA256SUMS-{version}.txt"
     ending = "linux-x64" if platform == "linux" else "windows-x64.exe"
-    binaries = tuple(f"{name}-{version}-{ending}" for name in PRODUCTS)
+    # Preserve verification of immutable historical releases.
+    numeric = tuple(map(int, version.split("-", 1)[0].split(".")))
+    products = PRODUCTS + (("nightfall-nodekit", "nightfall-till", "nightfall-receipt-evidence")
+                           if numeric >= (1, 1, 0) else ())
+    binaries = tuple(f"{name}-{version}-{ending}" for name in products)
     sums = f"SHA256SUMS-{version}-{platform}.txt"
     return binaries, sums
 

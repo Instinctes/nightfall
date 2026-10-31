@@ -405,7 +405,7 @@ pub(crate) fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
                     // 0.8.4 "mining: true, hashrate: 0" had three different
                     // causes and looked the same from outside.
                     "mining_idle": match g.mining_idle_reason.load(Ordering::Relaxed) {
-                        1 => "behind a peer",
+                        1 => "waiting for network synchronization",
                         2 => "no template",
                         _ => "",
                     },

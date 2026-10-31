@@ -92,16 +92,14 @@ pub(crate) fn settled(status: &nightfall_node::StatusSnap, devnet: bool) -> bool
     }
 }
 
-/// Is a mempool refusal one that no later block can change?
-///
-/// Spending an immature coinbase or a time-locked kernel becomes valid as the
-/// chain grows, so those wait. Everything else the precheck can say about a
-/// transaction whose inputs all exist — too many inputs, a bad proof or
-/// signature, an output that already exists — is a property of the
-/// transaction and the current chain, and stays true.
-pub(crate) fn permanent_rejection(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    !(error.contains("immature") || error.contains("locked until"))
+/// Only explicit transaction-invalid failures justify releasing existing inputs.
+/// Chain-dependent and unknown errors remain pending by default.
+pub(crate) fn permanent_rejection(error: &nightfall_ledger::LedgerError) -> bool {
+    use nightfall_ledger::LedgerError;
+    matches!(
+        error,
+        LedgerError::Tx { .. } | LedgerError::CoinbaseInMempool | LedgerError::BadInputSignature
+    )
 }
 
 /// Minimum age before a pending send may be judged impossible.
@@ -1037,47 +1035,43 @@ impl WalletState {
         node: &NodeHandle,
         now: u64,
     ) -> anyhow::Result<usize> {
-        if !chain_settled(node) {
+        let shared = node.shared();
+        let guard = shared
+            .lock()
+            .map_err(|_| anyhow::anyhow!("node state lock poisoned"))?;
+        let wallet = self.require_wallet()?;
+        if !guard.wallet_chain_settled() || require_canonical_scan(wallet, &guard).is_err() {
             return Ok(0);
         }
-        let (txids, unspend) = {
-            let wallet = self.require_wallet()?;
-            let shared = node.shared();
-            let guard = shared
-                .lock()
-                .map_err(|_| anyhow::anyhow!("node state lock poisoned"))?;
-            if require_canonical_scan(wallet, &guard).is_err() {
-                return Ok(0);
-            }
-            impossible_sends(
-                wallet.history(),
-                now,
-                |commit| {
-                    guard
-                        .chain
-                        .ledger
-                        .utxos
-                        .contains(&nightfall_crypto::Commitment(*commit))
-                },
-                |entry| {
-                    let Some(tx) = entry
-                        .raw
-                        .as_deref()
-                        .and_then(|raw| serde_json::from_str::<Transaction>(raw).ok())
-                    else {
-                        return false;
-                    };
-                    match guard.chain.precheck_tx(&tx) {
-                        Ok(()) => false,
-                        Err(error) => permanent_rejection(&error.to_string()),
-                    }
-                },
-            )
-        };
+        let (txids, unspend) = impossible_sends(
+            wallet.history(),
+            now,
+            |commit| {
+                guard
+                    .chain
+                    .ledger
+                    .utxos
+                    .contains(&nightfall_crypto::Commitment(*commit))
+            },
+            |entry| {
+                let Some(tx) = entry
+                    .raw
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<Transaction>(raw).ok())
+                else {
+                    return false;
+                };
+                match guard.chain.precheck_tx_typed(&tx) {
+                    Ok(()) => false,
+                    Err(error) => permanent_rejection(&error),
+                }
+            },
+        );
         if txids.is_empty() {
             return Ok(0);
         }
         let released = self.update(|wallet| wallet.release_sends(&txids, &unspend))?;
+        drop(guard);
         if released > 0 {
             tracing::warn!(
                 "released {released} pending payment(s) that the current chain can never confirm"
@@ -1189,6 +1183,7 @@ mod release_tests {
             spent_commits: inputs.iter().map(|b| [*b; 32]).collect(),
             raw: None,
             quarantined: false,
+            failed: false,
         }
     }
 
@@ -1219,14 +1214,29 @@ mod release_tests {
     #[test]
     fn waiting_for_maturity_or_a_lock_is_not_a_permanent_refusal() {
         use super::permanent_rejection;
-        assert!(!permanent_rejection(
-            "immature coinbase: created at 5, spend attempted at 9"
-        ));
-        assert!(!permanent_rejection("kernel locked until height 99"));
-        assert!(permanent_rejection(
-            "ledger: transaction 0: too many inputs"
-        ));
-        assert!(permanent_rejection("invalid range proof"));
+        use nightfall_ledger::{LedgerError, TxError};
+        assert!(!permanent_rejection(&LedgerError::ImmatureCoinbaseSpend {
+            created: 5,
+            now: 9
+        }));
+        assert!(!permanent_rejection(&LedgerError::KernelLocked {
+            until: 99
+        }));
+        assert!(!permanent_rejection(&LedgerError::DuplicateCommitment {
+            commit: "fixture".into()
+        }));
+        assert!(!permanent_rejection(&LedgerError::UnknownInput {
+            commit: "fixture".into()
+        }));
+        assert!(!permanent_rejection(&LedgerError::ArithmeticOverflow));
+        assert!(permanent_rejection(&LedgerError::Tx {
+            index: 0,
+            source: TxError::TooManyInputs
+        }));
+        assert!(permanent_rejection(&LedgerError::Tx {
+            index: 0,
+            source: TxError::BadRangeProof
+        }));
     }
 
     #[test]

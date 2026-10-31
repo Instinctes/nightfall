@@ -76,7 +76,7 @@ build_target() {
     # different floors, and a stale value from the previous build would silently
     # bake the wrong minimum into the binary.
     (cd "$ROOT" && MACOSX_DEPLOYMENT_TARGET="$MIN" cargo build --offline --locked --release --target "$TRIPLE" \
-        -p nightfall-core -p nightfall-node -p nightfall-wallet)
+        --bins -p nightfall-core -p nightfall-node -p nightfall-wallet -p nightfall-nodekit)
 
     # Confirm what the binary actually declares, rather than what we asked for.
     # A dependency that hardcodes its own target would otherwise go unnoticed
@@ -106,24 +106,13 @@ make_app() {
     cp "$BIN/nightfall-core" "$APP/Contents/MacOS/nightfall-core.bin"
     cp "$BIN/nightfalld" "$APP/Contents/MacOS/nightfalld"
     cp "$BIN/nightfall-wallet" "$APP/Contents/MacOS/nightfall-wallet"
+    for tool in nightfall-nodekit nightfall-till nightfall-receipt-evidence; do
+        cp "$BIN/$tool" "$APP/Contents/MacOS/$tool"
+    done
     chmod +x "$APP/Contents/MacOS/"*
 
-    # Launcher: Finder starts an app with no arguments, so default to mainnet
-    # (Devnet for a pre-release pipeline test) while still allowing
-    # `--network devnet` from a terminal.
-    cat > "$APP/Contents/MacOS/nightfall-core" <<'LAUNCH'
-#!/bin/bash
-DIR="$(cd "$(dirname "$0")" && pwd)"
-if [[ $# -eq 0 ]]; then
-    exec "$DIR/nightfall-core.bin" --network "${NF_NETWORK:-__DEFAULT_NETWORK__}"
-else
-    exec "$DIR/nightfall-core.bin" "$@"
-fi
-LAUNCH
-    sed -i '' "s/__DEFAULT_NETWORK__/$DEFAULT_NETWORK/" "$APP/Contents/MacOS/nightfall-core"
-    grep -q -- "--network \"\${NF_NETWORK:-$DEFAULT_NETWORK}\"" "$APP/Contents/MacOS/nightfall-core"
-    chmod +x "$APP/Contents/MacOS/nightfall-core"
-
+    # The native binary chooses mainnet for stable versions and Devnet for
+    # prereleases. A shell bundle entry prevents native window association.
     cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
 
     cat > "$APP/Contents/Info.plist" <<PLIST
@@ -133,7 +122,7 @@ LAUNCH
 <dict>
     <key>CFBundleName</key><string>$APP_NAME</string>
     <key>CFBundleDisplayName</key><string>$APP_NAME</string>
-    <key>CFBundleExecutable</key><string>nightfall-core</string>
+    <key>CFBundleExecutable</key><string>nightfall-core.bin</string>
     <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
     <key>CFBundleVersion</key><string>$VERSION</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>

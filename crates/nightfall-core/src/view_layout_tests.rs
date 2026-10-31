@@ -42,6 +42,7 @@ fn the_withheld_payment_notice_fits_supported_content_widths() {
         spent_commits: Vec::new(),
         raw: None,
         quarantined,
+        failed: false,
     };
     // One withheld and one ordinary pending send: the notice must count only
     // the first, or an owner would be told to check a payment they just made.
@@ -188,8 +189,10 @@ fn the_payment_request_card_fits_supported_content_widths() {
     .to_uri();
     // A request for another network, so the refusal text is measured too — it
     // is the longest sentence this card can show.
+    let share = PaymentRequest::parse(&full).unwrap().to_share_link();
     let cases = [
         full.as_str(),
+        share.as_str(),
         "nightfall:not-an-address?network=devnet",
         "nightfall:",
     ];
@@ -292,6 +295,7 @@ fn rows_fixture() -> Vec<nightfall_wallet::HistoryEntry> {
         spent_commits: Vec::new(),
         raw: None,
         quarantined: false,
+        failed: false,
     };
     vec![
         row(Direction::Received, 0, "A-17", Some(1_280)),
@@ -542,7 +546,7 @@ fn the_air_card_fits_supported_content_widths_in_every_state() {
 /// merchant and treating an unidentified payment as settlement.
 #[test]
 fn the_till_rows_fit_supported_content_widths() {
-    use crate::views::invoice_row;
+    use crate::views::{invoice_row, settlement_line};
     use nightfall_wallet::counter::{status, Incoming, Invoice, InvoiceState};
 
     let ctx = egui::Context::default();
@@ -615,6 +619,9 @@ fn the_till_rows_fit_supported_content_widths() {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let right = ui.max_rect().right();
                     invoice_row(ui, invoice, &state);
+                    // Heights in the cases are single digits: tip 8 leaves a
+                    // payment at 7 confirming, the longest line this can say.
+                    settlement_line(ui, &state, 8);
                     assert!(
                         ui.min_rect().right() <= right + 1.0,
                         "invoice row overflow at {width}px for {:?}",

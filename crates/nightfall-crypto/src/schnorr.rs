@@ -151,3 +151,129 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod schnorr_properties {
+    use super::*;
+    use crate::commit::generator_g;
+    use curve25519_dalek::traits::Identity;
+    use rand::RngCore;
+
+    fn random_scalar() -> Scalar {
+        Scalar::random(&mut OsRng)
+    }
+
+    fn random_32() -> [u8; 32] {
+        let mut b = [0u8; 32];
+        let mut rng = OsRng;
+        rng.fill_bytes(&mut b);
+        b
+    }
+
+    #[test]
+    fn every_bit_flip_in_s_invalidates_signature() {
+        let sk = random_scalar();
+        let pk = generator_g() * sk;
+        let sig = sign(&sk, &generator_g(), b"m");
+        assert!(verify(&pk, &generator_g(), b"m", &sig));
+        for byte_idx in 0..32 {
+            for bit in 0..8u8 {
+                let mut tampered = sig;
+                tampered.s[byte_idx] ^= 1u8 << bit;
+                assert!(!verify(&pk, &generator_g(), b"m", &tampered));
+            }
+        }
+    }
+
+    #[test]
+    fn every_bit_flip_in_r_invalidates_signature() {
+        let sk = random_scalar();
+        let pk = generator_g() * sk;
+        let sig = sign(&sk, &generator_g(), b"m");
+        assert!(verify(&pk, &generator_g(), b"m", &sig));
+        for byte_idx in 0..32 {
+            for bit in 0..8u8 {
+                let mut tampered = sig;
+                tampered.r[byte_idx] ^= 1u8 << bit;
+                assert!(!verify(&pk, &generator_g(), b"m", &tampered));
+            }
+        }
+    }
+
+    #[test]
+    fn non_canonical_s_is_rejected() {
+        let sk = random_scalar();
+        let pk = generator_g() * sk;
+        let mut sig = sign(&sk, &generator_g(), b"m");
+        let l_bytes: [u8; 32] = [
+            0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9,
+            0xde, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x10,
+        ];
+        sig.s = l_bytes;
+        assert!(!verify(&pk, &generator_g(), b"m", &sig));
+        let mut l_plus_one = l_bytes;
+        l_plus_one[0] = l_plus_one[0].wrapping_add(1);
+        sig.s = l_plus_one;
+        assert!(!verify(&pk, &generator_g(), b"m", &sig));
+    }
+
+    #[test]
+    fn zero_s_is_rejected() {
+        let sk = random_scalar();
+        let pk = generator_g() * sk;
+        let mut sig = sign(&sk, &generator_g(), b"m");
+        sig.s = [0u8; 32];
+        assert!(!verify(&pk, &generator_g(), b"m", &sig));
+    }
+
+    #[test]
+    fn identity_r_is_rejected() {
+        let sk = random_scalar();
+        let pk = generator_g() * sk;
+        let mut sig = sign(&sk, &generator_g(), b"m");
+        sig.r = RistrettoPoint::identity().compress().to_bytes();
+        assert!(!verify(&pk, &generator_g(), b"m", &sig));
+    }
+
+    #[test]
+    fn arbitrary_bytes_never_panic() {
+        let sk = random_scalar();
+        let pk = generator_g() * sk;
+        for _ in 0..128 {
+            let sig = SchnorrSig {
+                r: random_32(),
+                s: random_32(),
+            };
+            let _ = verify(&pk, &generator_g(), b"m", &sig);
+        }
+    }
+
+    #[test]
+    fn empty_message_roundtrips() {
+        let sk = random_scalar();
+        let pk = generator_g() * sk;
+        let sig = sign(&sk, &generator_g(), b"");
+        assert!(verify(&pk, &generator_g(), b"", &sig));
+    }
+
+    #[test]
+    fn long_message_roundtrips() {
+        let sk = random_scalar();
+        let pk = generator_g() * sk;
+        let msg = vec![0xa5u8; 65_536];
+        let sig = sign(&sk, &generator_g(), &msg);
+        assert!(verify(&pk, &generator_g(), &msg, &sig));
+    }
+
+    #[test]
+    fn many_random_roundtrips() {
+        for _ in 0..64 {
+            let sk = random_scalar();
+            let pk = generator_g() * sk;
+            let msg = random_32();
+            let sig = sign(&sk, &generator_g(), &msg);
+            assert!(verify(&pk, &generator_g(), &msg, &sig));
+        }
+    }
+}

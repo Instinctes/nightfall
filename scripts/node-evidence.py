@@ -15,6 +15,7 @@ from pathlib import Path
 GENESIS = "061a052d49607ff8f4b306c75d622ebd230cff4ec3a45a6dffc2f7738d4b20de"
 MAX_DARKS = 90_000_000 * 100_000_000
 MAX_BYTES = 65536
+MAX_RECEIPT_BYTES = 16384
 ALLOWED = ("network", "genesis", "protocol_version", "wire_version", "tip", "tip_height",
            "blocks", "total_work", "minted", "burned_fees", "circulating", "loading",
            "supply_invariant_ok", "live_peers", "best_peer_height", "stalled_on_fork",
@@ -38,13 +39,16 @@ def parse_json(data):
     try:
         return json.loads(data, object_pairs_hook=unique_pairs,
                           parse_constant=lambda _: (_ for _ in ()).throw(EvidenceError("nonfinite JSON")))
-    except (ValueError, UnicodeError, TypeError) as ex:
-        raise EvidenceError("invalid RPC JSON") from ex
+    except (ValueError, UnicodeError, TypeError, RecursionError) as ex:
+        raise EvidenceError("invalid JSON input") from ex
 
 
 def canonical(value):
-    return json.dumps(value, sort_keys=True, ensure_ascii=True,
-                      separators=(",", ":"), allow_nan=False).encode("ascii")
+    try:
+        return json.dumps(value, sort_keys=True, ensure_ascii=True,
+                          separators=(",", ":"), allow_nan=False).encode("ascii")
+    except (TypeError, ValueError, RecursionError, OverflowError) as ex:
+        raise EvidenceError("cannot encode canonical JSON") from ex
 
 
 def rpc(port, method, req_id):
@@ -152,8 +156,36 @@ def verify_receipt(obj):
         raise EvidenceError("invalid receipt assessment")
     if set(body) != {"schema", "scope", "samples", "checks", "assessment", "warnings"}:
         raise EvidenceError("unexpected receipt fields")
-    if not isinstance(body["warnings"], list) or any(x not in WARNINGS for x in body["warnings"]):
+    warnings = body["warnings"]
+
+    if not isinstance(warnings, list) or any(
+        type(x) is not str or x not in WARNINGS
+        for x in warnings
+    ):
         raise EvidenceError("invalid receipt warnings")
+
+    # A checksum does not make a claim true.
+    # Recalculate the assessment from the actual
+    # status samples rather than trusting labels.
+
+    expected = assess(
+        body["samples"][0],
+        body["samples"][1],
+    )
+
+    assessment = (
+        "CAUTION" if expected else "OBSERVED"
+    )
+
+    if (
+        warnings != expected
+        or body["assessment"] != assessment
+    ):
+        raise EvidenceError(
+            "receipt warnings or assessment "
+            "disagree with samples"
+        )
+
     return body
 
 
@@ -215,9 +247,33 @@ def capture(port, pause):
     return seal(body)
 
 
+def read_receipt(path):
+    # Limit untrusted input before parsing.
+    # A legitimate two-sample receipt is small.
+
+    with Path(path).open("rb") as file:
+        data = file.read(MAX_RECEIPT_BYTES + 1)
+
+    if len(data) > MAX_RECEIPT_BYTES:
+        raise EvidenceError(
+            "receipt exceeds 16 KiB input limit"
+        )
+
+    try:
+        value = parse_json(
+            data.decode("utf-8", "strict")
+        )
+    except UnicodeError as ex:
+        raise EvidenceError(
+            "receipt must be UTF-8"
+        ) from ex
+
+    return verify_receipt(value)
+
+
 def compare(file_a, file_b):
-    a = verify_receipt(parse_json(Path(file_a).read_text(encoding="utf8")))["samples"][-1]
-    b = verify_receipt(parse_json(Path(file_b).read_text(encoding="utf8")))["samples"][-1]
+    a = read_receipt(file_a)["samples"][-1]
+    b = read_receipt(file_b)["samples"][-1]
     if a["genesis"] != b["genesis"] or a["network"] != b["network"]:
         raise EvidenceError("network identities disagree")
     if a["tip_height"] == b["tip_height"]:
