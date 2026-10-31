@@ -324,8 +324,21 @@ mod tests {
         let dir = tmpdir();
         let victim = dir.join("unrelated.txt");
         std::fs::write(&victim, b"must remain unchanged").unwrap();
-        std::fs::hard_link(&victim, dir.join(LOCK_FILE)).unwrap();
-        assert!(acquire(&dir).is_err());
+        match std::fs::hard_link(&victim, dir.join(LOCK_FILE)) {
+            Ok(()) => {
+                // Platforms that permit hard links must reject aliased locks.
+                assert!(acquire(&dir).is_err());
+            }
+            Err(e)
+                if cfg!(target_os = "android")
+                    && e.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                // Android SELinux may prohibit hard links altogether.
+                // No lock alias was created; the victim must remain intact.
+                assert!(!dir.join(LOCK_FILE).exists());
+            }
+            Err(e) => panic!("cannot set up hard-link test: {e}"),
+        }
         assert_eq!(std::fs::read(&victim).unwrap(), b"must remain unchanged");
         std::fs::remove_dir_all(dir).unwrap();
     }

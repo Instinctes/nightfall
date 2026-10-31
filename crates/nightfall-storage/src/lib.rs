@@ -675,8 +675,7 @@ impl ChainStore {
 
         // Metadata is the archive commit record. Durable block bytes must
         // therefore precede metadata publication.
-        file.flush()?;
-        file.get_ref().sync_all()?;
+        flush_and_sync(&mut file)?;
         drop(file);
 
         self.write_meta(chain)?;
