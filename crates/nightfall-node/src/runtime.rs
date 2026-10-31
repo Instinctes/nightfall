@@ -2526,87 +2526,179 @@ impl Drop for ReorgFlight {
     }
 }
 
+/// Search window for a reorg ancestor.
+///
+/// Reorg depth is the number of OUR blocks abandoned, not the peer's
+/// distance from its own tip.  Therefore an ahead peer is searched
+/// starting at our tip, while a shorter peer starts at its tip.
+///
+/// Returns `(highest_possible_common_height, how_far_back_to_search)`.
+fn ancestor_search_window(our_height: u64, peer_height: u64) -> Option<(u64, u64)> {
+    let start = our_height.min(peer_height);
+    let already_rewound = our_height.saturating_sub(start);
+    let max_rewind = nightfall_consensus::MAX_REORG_DEPTH as u64;
+
+    if already_rewound > max_rewind {
+        return None;
+    }
+
+    let remaining = max_rewind.saturating_sub(already_rewound);
+    Some((start, remaining.min(start)))
+}
+
+/// Find the highest matching height in `[start - max_back, start]`.
+///
+/// `same_at(h)` returns whether both chains contain the same block at `h`.
+/// Exponential probing finds a matching bracket quickly; binary refinement
+/// then returns the actual highest common height rather than merely one
+/// sampled height.
+fn highest_common_within<F>(start: u64, max_back: u64, mut same_at: F) -> Option<u64>
+where
+    F: FnMut(u64) -> Option<bool>,
+{
+    if same_at(start)? {
+        return Some(start);
+    }
+
+    let max_back = max_back.min(start);
+    if max_back == 0 {
+        return None;
+    }
+
+    // `upper_mismatch` is known to be on the divergent suffix.
+    let mut upper_mismatch = start;
+    let mut back = 1u64;
+
+    loop {
+        // Always probe the actual boundary, even when it is not a power of 2.
+        let distance = back.min(max_back);
+        let probe = start - distance;
+
+        if same_at(probe)? {
+            // We now have:
+            //
+            //     probe = known shared
+            //     upper_mismatch = known divergent
+            //
+            // Refine to the highest shared block.
+            let mut lo = probe;
+            let mut hi = upper_mismatch;
+
+            while lo.saturating_add(1) < hi {
+                let mid = lo + (hi - lo) / 2;
+                if same_at(mid)? {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+
+            return Some(lo);
+        }
+
+        upper_mismatch = probe;
+
+        if distance == max_back {
+            return None;
+        }
+
+        back = back.saturating_mul(2);
+    }
+}
+
 /// Highest height at which we and this peer hold the same block.
 ///
-/// Returns their tip height when we already agree there — the ordinary case of
-/// a peer that is merely behind. Otherwise walks backwards in doubling steps,
-/// asking for one block at each probe, until a hash matches. That is a handful
-/// of round trips rather than a linear scan, and it is bounded by
-/// `MAX_REORG_DEPTH` because a fork deeper than that cannot be resolved anyway.
-///
-/// On any failure it falls back to just below the peer's tip: no worse than the
-/// behaviour this replaced.
+/// The search is bounded by the number of OUR blocks a reorg may abandon.
+/// This matters for an ahead peer: it may be hundreds of blocks ahead while
+/// differing from us only one block back.
 fn common_ancestor(
     state: &SharedState,
     stream: &mut TcpStream,
     peer_h: u64,
     peer_tip: &str,
-) -> u64 {
-    let our_hash_at = |h: u64| -> Option<String> {
+) -> Option<u64> {
+    let (our_h, peer_tip_is_ours) = {
         let g = state.lock().ok()?;
-        g.chain.hash_at(h).map(|h| h.to_hex())
+        let our_h = g.chain.tip_height().map(|h| h.0)?;
+        let peer_tip_is_ours = g
+            .chain
+            .hash_at(peer_h)
+            .map(|hash| hash.to_hex() == peer_tip)
+            .unwrap_or(false);
+        (our_h, peer_tip_is_ours)
     };
 
-    // Fast path: we agree at their tip, so they are simply behind.
-    if our_hash_at(peer_h).as_deref() == Some(peer_tip) {
-        return peer_h;
+    // Same-chain lag is not a reorg and is therefore not bounded by
+    // MAX_REORG_DEPTH. This check must happen before the reorg window.
+    if peer_tip_is_ours {
+        return Some(peer_h);
     }
 
-    // Search back from the lower tip. Probing back from a peer who is
-    // thousands of blocks ahead never looks at our chain, falls through to
-    // `peer_tip - 1`, and the caller then copies our whole archive trying to
-    // attach one block up there.
-    let our_h = state
-        .lock()
-        .ok()
-        .and_then(|g| g.chain.tip_height().map(|h| h.0))
-        .unwrap_or(0);
-    let ceiling = our_h.min(peer_h);
-    if let Some(ours) = our_hash_at(ceiling) {
-        if let Ok(batch) = nightfall_p2p::request_blocks(stream, ceiling, 1) {
-            if let Some(theirs) = batch.first() {
-                if theirs.hash().to_hex() == ours {
-                    return ceiling;
-                }
-            }
-        }
-    }
+    let (start, max_back) = ancestor_search_window(our_h, peer_h)?;
 
-    let mut step = 1u64;
-    let mut lower = None;
-    while step <= nightfall_consensus::MAX_REORG_DEPTH as u64 {
-        let Some(probe) = ceiling.checked_sub(step) else {
-            break;
+    highest_common_within(start, max_back, |height| {
+        let ours = {
+            let g = state.lock().ok()?;
+            g.chain.hash_at(height)?.to_hex()
         };
-        let Ok(batch) = nightfall_p2p::request_blocks(stream, probe, 1) else {
-            break;
-        };
-        let Some(theirs) = batch.first() else { break };
-        if our_hash_at(probe) == Some(theirs.hash().to_hex()) {
-            lower = Some(probe);
-            break;
-        }
-        step = step.saturating_mul(2);
-    }
-    let Some(mut lo) = lower else {
-        return ceiling.saturating_sub(nightfall_consensus::MAX_REORG_DEPTH as u64 + 1);
-    };
-    let mut hi = ceiling;
-    while lo < hi {
-        let mid = lo + (hi - lo).div_ceil(2);
-        let Ok(batch) = nightfall_p2p::request_blocks(stream, mid, 1) else {
-            break;
-        };
-        let Some(theirs) = batch.first() else { break };
-        if our_hash_at(mid) == Some(theirs.hash().to_hex()) {
-            lo = mid;
-        } else if mid == 0 {
-            break;
+
+        let theirs = if height == peer_h {
+            peer_tip.to_owned()
         } else {
-            hi = mid - 1;
-        }
+            let batch = nightfall_p2p::request_blocks(stream, height, 1).ok()?;
+            let block = batch.first()?;
+
+            // Do not let a malformed peer answer a probe with another height.
+            if block.header.height.0 != height {
+                return None;
+            }
+
+            block.hash().to_hex()
+        };
+
+        Some(ours == theirs)
+    })
+}
+
+#[cfg(test)]
+mod common_ancestor_search_tests {
+    use super::{ancestor_search_window, highest_common_within};
+
+    #[test]
+    fn finds_an_ancestor_that_is_not_an_exponential_probe() {
+        let actual = 23;
+        assert_eq!(
+            highest_common_within(100, 100, |h| Some(h <= actual)),
+            Some(actual)
+        );
     }
-    lo
+
+    #[test]
+    fn returns_the_highest_common_height() {
+        let actual = 95;
+        assert_eq!(
+            highest_common_within(100, 100, |h| Some(h <= actual)),
+            Some(actual)
+        );
+    }
+
+    #[test]
+    fn ahead_peer_is_searched_from_our_tip() {
+        // Peer is 699 blocks ahead, but a one-block fork is still a
+        // one-block rewind from our point of view.
+        assert_eq!(ancestor_search_window(2_000, 2_699), Some((2_000, 500)));
+    }
+
+    #[test]
+    fn shorter_divergent_peer_beyond_reorg_depth_has_no_window() {
+        // Even its tip is already 600 of our blocks behind.
+        assert_eq!(ancestor_search_window(1_000, 400), None);
+    }
+
+    #[test]
+    fn ancestor_below_the_reorg_window_is_not_returned() {
+        assert_eq!(highest_common_within(1_000, 500, |h| Some(h <= 499)), None);
+    }
 }
 
 /// How many blocks to push to a lagging peer in one sync round.
@@ -2695,6 +2787,50 @@ fn push_blocks_via_session(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShorterPeerAction {
+    /// The peer's tip is one of our blocks. It is genuinely behind.
+    PushFrom(u64),
+    /// The peer diverges before its tip. Fetch and evaluate its suffix.
+    EvaluateFrom(u64),
+}
+
+/// Height alone is not fork choice.
+///
+/// A lower-height peer is only known to be behind when its advertised
+/// tip is also our block at that height. Otherwise it is a competing
+/// branch and must be judged by validated cumulative work.
+fn shorter_peer_action(peer_height: u64, common_ancestor: u64) -> ShorterPeerAction {
+    debug_assert!(common_ancestor <= peer_height);
+
+    if common_ancestor == peer_height {
+        ShorterPeerAction::PushFrom(common_ancestor)
+    } else {
+        ShorterPeerAction::EvaluateFrom(common_ancestor.saturating_add(1))
+    }
+}
+
+#[cfg(test)]
+mod shorter_peer_fork_tests {
+    use super::{shorter_peer_action, ShorterPeerAction};
+
+    #[test]
+    fn lower_peer_on_our_chain_is_really_behind() {
+        assert_eq!(
+            shorter_peer_action(100, 100),
+            ShorterPeerAction::PushFrom(100)
+        );
+    }
+
+    #[test]
+    fn lower_peer_on_another_branch_is_evaluated() {
+        assert_eq!(
+            shorter_peer_action(100, 95),
+            ShorterPeerAction::EvaluateFrom(96)
+        );
+    }
+}
+
 fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
     let proxy = state.lock().ok().and_then(|g| g.proxy.clone());
     let (mut stream, used_tor) = connect_peer_via(addr, 15_000, proxy.as_ref())?;
@@ -2773,36 +2909,40 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // They are behind us. Feed them over the connection we already have, and
-    // do not bother asking for anything back — there is nothing there to want.
+    // A lower-height peer is not necessarily the losing branch.
+    // First distinguish ordinary lag from a divergent fork.
+    // Height alone is not fork choice. A shorter branch can carry more
+    // cumulative work after difficulty retargeting.
     //
-    // Without this, a node can only catch up by dialling, and a peer behind NAT
-    // can dial out but cannot be dialled. A fresh seed node whose only contact
-    // is a miner behind a router therefore sits at height 0 indefinitely: it
-    // has a peer, it reports healthy, it learns a dial-back address it can
-    // never reach, and it retries that address forever while the miner keeps
-    // mining. Nothing in either log says anything is wrong. Found by standing
-    // up the first real seed node and watching it stay empty while connected.
-    //
-    // This has to happen before the pull loop below: that loop asks the peer
-    // for blocks, gets an empty answer from a peer that has none, and breaks
-    // immediately — so anything placed inside it never runs in exactly the
-    // case that matters.
-    if peer_h < our_h {
-        // Where to start pushing from is the whole question.
-        //
-        // Starting just below their tip is right when they are simply behind on
-        // our chain. It is useless when they are on a *branch*: every block we
-        // send then has a parent they have never seen, so nothing connects and
-        // nothing can be evaluated. That is not theoretical — a two-block fork
-        // survived indefinitely this way, with the heavier side pushing into a
-        // void every eight seconds.
-        //
-        // So: find where we last agreed, and push from there.
-        let from = common_ancestor(state, &mut stream, peer_h, &peer_tip);
-        push_blocks_to(state, &mut stream, from, addr);
-        return Ok(());
-    }
+    // If the peer's advertised tip is one of our blocks, it is genuinely behind
+    // and we keep the push path needed by peers behind NAT. Otherwise it is a
+    // competing branch: fall through to the normal pull/reorg path so consensus
+    // can compare cumulative work.
+    let shorter_fork_from = if peer_h < our_h {
+        let Some(ancestor) = common_ancestor(state, &mut stream, peer_h, &peer_tip) else {
+            tracing::debug!(
+                "peer {addr} has no discoverable common ancestor inside the reorg window"
+            );
+            return Ok(());
+        };
+
+        match shorter_peer_action(peer_h, ancestor) {
+            ShorterPeerAction::PushFrom(from) => {
+                // Same-chain lag: preserve the NAT-friendly push path.
+                push_blocks_to(state, &mut stream, from, addr);
+                return Ok(());
+            }
+            ShorterPeerAction::EvaluateFrom(from) => {
+                tracing::info!(
+                    "peer {addr} has shorter competing tip at height {peer_h}; \
+                     evaluating from common ancestor {ancestor}"
+                );
+                Some(from)
+            }
+        }
+    } else {
+        None
+    };
 
     // Fetch forward from the next height we can attach, not from tip − 1.
     // Starting at tip − 1 includes a block we already hold; apply_block
@@ -2812,9 +2952,12 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
     //
     // `our_h + 1` is wrong on an empty node: tip_height is then 0 by
     // default, and we would skip genesis.
-    let mut from = {
-        let g = state.lock().unwrap();
-        next_needed_height(&g)
+    let mut from = match shorter_fork_from {
+        Some(from) => from,
+        None => {
+            let g = state.lock().unwrap();
+            next_needed_height(&g)
+        }
     };
     let mut total_applied = 0usize;
 
@@ -2853,7 +2996,10 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
             break;
         }
 
-        let ancestor = common_ancestor(state, &mut stream, peer_h, &peer_tip);
+        let Some(ancestor) = common_ancestor(state, &mut stream, peer_h, &peer_tip) else {
+            tracing::debug!("peer {addr}: no common ancestor inside MAX_REORG_DEPTH");
+            break;
+        };
         let (trial, guard) = {
             let g = state.lock().unwrap();
             let our_tip = g.chain.tip_height().map(|h| h.0).unwrap_or(0);
