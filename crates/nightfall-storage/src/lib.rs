@@ -587,6 +587,8 @@ impl ChainStore {
             horizon_work: String::new(),
             validated_horizon_bytes: 0,
             validated_headers_bytes: 0,
+            validated_horizon_fingerprint: String::new(),
+            validated_headers_fingerprint: String::new(),
         };
         fs::write(self.meta_path(), serde_json::to_vec_pretty(&meta)?)?;
         let chain = self.load_or_new(network)?;
