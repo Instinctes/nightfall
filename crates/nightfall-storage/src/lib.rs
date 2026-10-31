@@ -2034,4 +2034,158 @@ mod tests {
 
         fs::remove_dir_all(&dir).ok();
     }
+
+    /// Missing or partial pruned integrity seals must never be regenerated
+    /// from their own unverified contents, even after a failed restart.
+    #[test]
+    fn pruned_partial_seals_refuse_without_resealing() {
+        use nightfall_crypto::WalletKeys;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let dir =
+            std::env::temp_dir().join(format!("nf-partial-seal-{}-{unique}", std::process::id()));
+
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+        for i in 0..12u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+
+        chain.prune_keep(4).unwrap();
+        store.save(&chain).unwrap();
+
+        assert!(store.is_own_file_trusted());
+
+        let original_meta = fs::read(store.meta_path()).unwrap();
+
+        let original_horizon = fs::read(store.horizon_path()).unwrap();
+
+        let original_headers = fs::read(store.headers_path()).unwrap();
+
+        let original_blocks = fs::read(store.blocks_path()).unwrap();
+
+        for key in [
+            "validated_horizon_fingerprint",
+            "validated_headers_fingerprint",
+        ] {
+            for missing in [true, false] {
+                let mut value: serde_json::Value = serde_json::from_slice(&original_meta).unwrap();
+
+                if missing {
+                    value.as_object_mut().unwrap().remove(key);
+                } else {
+                    value[key] = serde_json::Value::String(String::new());
+                }
+
+                let damaged_meta = serde_json::to_vec_pretty(&value).unwrap();
+
+                fs::write(store.meta_path(), &damaged_meta).unwrap();
+
+                assert!(!store.is_own_file_trusted(), "{key}, missing={missing}");
+
+                let err = store
+                    .load_or_new(NetworkId::Devnet)
+                    .unwrap_err()
+                    .to_string();
+
+                assert!(
+                    err.contains("pruned datadir failed the validation record"),
+                    "{key}, missing={missing}: {err}"
+                );
+
+                assert_eq!(fs::read(store.meta_path()).unwrap(), damaged_meta);
+
+                assert_eq!(fs::read(store.horizon_path()).unwrap(), original_horizon);
+
+                assert_eq!(fs::read(store.headers_path()).unwrap(), original_headers);
+
+                assert_eq!(fs::read(store.blocks_path()).unwrap(), original_blocks);
+            }
+        }
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An interrupted operation must not change a valid pruned datadir;
+    /// removing the deliberate test journal restores an ordinary restart.
+    #[test]
+    fn pruned_interrupted_restart_is_refused_and_resumable() {
+        use nightfall_crypto::WalletKeys;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let dir =
+            std::env::temp_dir().join(format!("nf-pruned-restart-{}-{unique}", std::process::id()));
+
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+        for i in 0..12u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+
+        chain.prune_keep(4).unwrap();
+
+        let tip = chain.tip_hash();
+        let root = chain.ledger.utxo_root();
+
+        store.save(&chain).unwrap();
+
+        let original_meta = fs::read(store.meta_path()).unwrap();
+
+        let original_horizon = fs::read(store.horizon_path()).unwrap();
+
+        let original_headers = fs::read(store.headers_path()).unwrap();
+
+        let original_blocks = fs::read(store.blocks_path()).unwrap();
+
+        fs::write(dir.join(RECOVERY_JOURNAL), b"{\"backup\":\"crash\"}").unwrap();
+
+        let err = store
+            .load_or_new(NetworkId::Devnet)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("interrupted"), "{err}");
+
+        assert_eq!(fs::read(store.meta_path()).unwrap(), original_meta);
+
+        assert_eq!(fs::read(store.horizon_path()).unwrap(), original_horizon);
+
+        assert_eq!(fs::read(store.headers_path()).unwrap(), original_headers);
+
+        assert_eq!(fs::read(store.blocks_path()).unwrap(), original_blocks);
+
+        fs::remove_file(dir.join(RECOVERY_JOURNAL)).unwrap();
+
+        let loaded = store.load_or_new(NetworkId::Devnet).unwrap();
+
+        assert_eq!(loaded.tip_hash(), tip);
+
+        assert_eq!(loaded.ledger.utxo_root(), root);
+
+        loaded.verify_supply().unwrap();
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
