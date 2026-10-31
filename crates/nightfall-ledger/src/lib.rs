@@ -6,6 +6,9 @@
 //! never rolled back, so one malformed transaction from any peer permanently
 //! corrupted the node (audit finding N-01).
 
+mod state_fingerprint;
+pub use state_fingerprint::state_fingerprint;
+
 mod aggregate;
 mod builder;
 mod tx;
