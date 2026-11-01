@@ -335,10 +335,16 @@ pub fn status(network: NetworkId, addr: &str, timeout: Duration) -> Result<NodeS
     })?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
-    writeln!(stream, r#"{{"method":"status","params":{{}},"id":1}}"#)?;
+    writeln!(stream, r#"{{"method":"status","params":{{}},"id":1}}"#)
+        .with_context(|| format!("no node answering at {addr}: RPC write failed"))?;
 
     let mut line = Vec::new();
-    BufReader::new(stream.take(1 << 20)).read_until(b'\n', &mut line)?;
+    let received = BufReader::new(stream.take(1 << 20))
+        .read_until(b'\n', &mut line)
+        .with_context(|| format!("no node answering at {addr}: RPC read failed"))?;
+    if received == 0 {
+        bail!("no node answering at {addr}: RPC connection closed without a reply");
+    }
     let reply: serde_json::Value =
         serde_json::from_slice(&line).context("the node's reply was not JSON")?;
     if let Some(e) = reply.get("error").filter(|e| !e.is_null()) {

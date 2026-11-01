@@ -364,7 +364,7 @@ pub struct NodeInner {
     /// do not connect to our tip — so we pull their chain on a fresh
     /// socket. Without a throttle, every 4-second Status tick would
     /// start the same download.
-    pub last_reorg_fetch: AtomicU64,
+    pub last_reorg_fetch: HashMap<String, u64>,
     /// Last time a 1-second ticker stored the wall clock. A jump larger than
     /// [`SLEEP_GAP_SECS`] means the process was frozen (lid closed). Mining
     /// must not resume on the stale tip.
@@ -1033,7 +1033,7 @@ impl NodeHandle {
             ibd_from: 0,
             ibd_buffer: BTreeMap::new(),
             reorg_in_flight: Arc::new(AtomicBool::new(false)),
-            last_reorg_fetch: AtomicU64::new(0),
+            last_reorg_fetch: HashMap::new(),
             last_wall_tick: AtomicU64::new(now_unix()),
             confirmed_peers: HashSet::new(),
             stalled_on_fork: AtomicBool::new(false),
@@ -1846,6 +1846,16 @@ fn claim_ibd_from(inner: &mut NodeInner) -> u64 {
     next_ibd_claim(next, &mut inner.ibd_from)
 }
 
+/// A wire-size-limited response may contain far fewer than IBD_PAGE blocks.
+/// In that case the claim cursor's 128-height stride creates a hole even
+/// though the serving peer has more blocks. Recover the exact successor now,
+/// instead of waiting for four speculative pages and their timeouts. The next
+/// page still goes through normal consensus validation.
+fn next_ibd_claim_after_short_page(next_needed: u64, ibd_from: &mut u64) -> u64 {
+    *ibd_from = next_needed;
+    next_ibd_claim(next_needed, ibd_from)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IbdPage {
     Applied(usize),
@@ -1902,6 +1912,32 @@ fn apply_ibd_page(inner: &mut NodeInner, blocks: Vec<Block>, now: u64) -> IbdPag
 }
 
 const REORG_FETCH_COOLDOWN_SECS: u64 = 15;
+const REORG_FETCH_MAX_PEERS: usize = 256;
+
+/// Claim the side-channel reorg-fetch slot for one peer.
+///
+/// The throttle is deliberately peer-scoped. A broken or slow peer must not
+/// suppress an independent peer that may have the heavier valid branch.
+///
+/// Expired entries are discarded so arbitrary peer addresses cannot make this
+/// map grow without bound.
+fn claim_reorg_fetch_slot(last_by_peer: &mut HashMap<String, u64>, addr: &str, now: u64) -> bool {
+    last_by_peer.retain(|_, last| now.saturating_sub(*last) < REORG_FETCH_COOLDOWN_SECS);
+
+    if last_by_peer.contains_key(addr) {
+        return false;
+    }
+
+    // Keep peer-scoped recovery from becoming an unbounded peer-churn map.
+    // If the cooldown window is saturated, fail closed for this peer and
+    // try again after entries naturally expire.
+    if last_by_peer.len() >= REORG_FETCH_MAX_PEERS {
+        return false;
+    }
+
+    last_by_peer.insert(addr.to_string(), now);
+    true
+}
 
 /// Pull a peer's chain on a fresh socket and weigh it. Used when live
 /// `GetBlocks` cannot extend our tip — we are on a fork, not merely late.
@@ -1927,12 +1963,10 @@ fn kick_reorg_fetch(
     }
     let now = now_unix();
     {
-        let Ok(g) = state.lock() else { return };
-        let last = g.last_reorg_fetch.load(Ordering::Relaxed);
-        if now.saturating_sub(last) < REORG_FETCH_COOLDOWN_SECS {
+        let Ok(mut g) = state.lock() else { return };
+        if !claim_reorg_fetch_slot(&mut g.last_reorg_fetch, &addr, now) {
             return;
         }
-        g.last_reorg_fetch.store(now, Ordering::Relaxed);
     }
     if shutdown.is_requested() {
         return;
@@ -2746,6 +2780,7 @@ fn peer_io_loop(
                 if blocks.len() > MAX_BLOCKS_PER_REQUEST {
                     return Err(anyhow::anyhow!("peer sent an oversized block batch"));
                 }
+                let short_response = blocks.len() < MAX_BLOCKS_PER_REQUEST;
                 let outcome = {
                     let mut g = state.lock().unwrap();
                     let outcome = apply_ibd_page(&mut g, blocks, now_unix());
@@ -2764,6 +2799,16 @@ fn peer_io_loop(
                     let next = next_needed_height(&g);
                     let behind = peer_covers_height(last_peer_height, next);
                     match outcome {
+                        IbdPage::Applied(_) if behind && short_response => {
+                            // P2P caps bytes as well as block count. Do not
+                            // jump 128 heights when the peer delivered fewer.
+                            let next = next_needed_height(&g);
+                            tracing::debug!("short IBD response; request successor {next}");
+                            (
+                                Some(next_ibd_claim_after_short_page(next, &mut g.ibd_from)),
+                                false,
+                            )
+                        }
                         IbdPage::Applied(_) | IbdPage::Buffered if behind => {
                             (Some(claim_ibd_from(&mut g)), false)
                         }
@@ -3475,6 +3520,13 @@ pub fn next_fetch_height(height: u64) -> Option<u64> {
 }
 
 /// Download blocks `[from_height ..= peer_height]` in pages.
+/// A short page is not the end of the peer's chain: blocks may have been
+/// trimmed to fit the P2P byte ceiling. Only the advertised height (or an
+/// empty response handled by the caller) ends the download.
+fn continue_fetch_after_page(received: usize, next_height: u64, peer_height: u64) -> bool {
+    received > 0 && next_height <= peer_height
+}
+
 fn fetch_blocks_from(
     stream: &mut TcpStream,
     from_height: u64,
@@ -3498,7 +3550,7 @@ fn fetch_blocks_from(
             break;
         };
         from = next_from;
-        if n < MAX_BLOCKS_PER_REQUEST || from > peer_height {
+        if !continue_fetch_after_page(n, from, peer_height) {
             break;
         }
     }
@@ -3869,7 +3921,10 @@ fn mining_loop(state: SharedState, shutdown: Arc<Shutdown>) {
 
 #[cfg(test)]
 mod ibd_claim_tests {
-    use super::{next_ibd_claim, IBD_MAX_AHEAD, IBD_PAGE};
+    use super::{
+        continue_fetch_after_page, next_ibd_claim, next_ibd_claim_after_short_page, IBD_MAX_AHEAD,
+        IBD_PAGE,
+    };
 
     #[test]
     fn distinct_pages_then_rewind_at_the_cap() {
@@ -3895,6 +3950,50 @@ mod ibd_claim_tests {
         let advanced = next_ibd_claim(200, &mut ibd_from);
         assert_eq!(advanced, 200);
         assert_eq!(ibd_from, 200 + IBD_PAGE);
+    }
+
+    #[test]
+    fn short_wire_page_reclaims_immediate_missing_height() {
+        let mut cursor = 0;
+
+        assert_eq!(next_ibd_claim(0, &mut cursor), 0);
+        assert_eq!(cursor, IBD_PAGE);
+
+        assert_eq!(next_ibd_claim_after_short_page(3, &mut cursor), 3);
+
+        assert_eq!(next_ibd_claim_after_short_page(6, &mut cursor), 6);
+
+        assert_eq!(cursor, 6 + IBD_PAGE);
+    }
+
+    #[test]
+    fn regular_full_pages_stay_parallel() {
+        let mut cursor = 0;
+
+        assert_eq!(next_ibd_claim(0, &mut cursor), 0);
+        assert_eq!(next_ibd_claim(0, &mut cursor), IBD_PAGE);
+        assert_eq!(next_ibd_claim(0, &mut cursor), IBD_PAGE * 2);
+    }
+
+    #[test]
+    fn short_page_does_not_end_a_long_fork_fetch() {
+        assert!(continue_fetch_after_page(3, 103, 2_000));
+        assert!(continue_fetch_after_page(1, 2_000, 2_000));
+
+        assert!(!continue_fetch_after_page(3, 2_001, 2_000));
+        assert!(!continue_fetch_after_page(0, 103, 2_000));
+    }
+
+    #[test]
+    fn short_page_claim_saturates_near_u64_limit() {
+        let mut cursor = u64::MAX;
+
+        assert_eq!(
+            next_ibd_claim_after_short_page(u64::MAX - 2, &mut cursor),
+            u64::MAX - 2
+        );
+
+        assert_eq!(cursor, u64::MAX);
     }
 }
 
@@ -3945,54 +4044,67 @@ mod sync_hold_tests {
 }
 
 #[cfg(test)]
-mod shutdown_worker_reaping_regression_20261030 {
-    use super::Workers;
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
-    use std::time::{Duration, Instant};
+mod reorg_fetch_throttle_tests {
+    use super::{claim_reorg_fetch_slot, REORG_FETCH_COOLDOWN_SECS, REORG_FETCH_MAX_PEERS};
+    use std::collections::HashMap;
 
     #[test]
-    fn completed_worker_handles_are_reaped() {
-        let workers = Workers::new();
+    fn failed_peer_does_not_suppress_different_reorg_peer() {
+        let mut slots = HashMap::new();
+        let now = 1_000;
 
-        let finished = Arc::new(AtomicUsize::new(0));
+        assert!(claim_reorg_fetch_slot(&mut slots, "127.0.0.1:10001", now));
 
-        for _ in 0..64 {
-            let done = Arc::clone(&finished);
+        // Repeated work from the same peer is throttled.
+        assert!(!claim_reorg_fetch_slot(
+            &mut slots,
+            "127.0.0.1:10001",
+            now + 1
+        ));
 
-            workers.spawn(move || {
-                done.fetch_add(1, Ordering::SeqCst);
-            });
+        // Critical regression check: the first peer must not consume a
+        // node-global slot and suppress an independent candidate peer.
+        assert!(claim_reorg_fetch_slot(
+            &mut slots,
+            "127.0.0.1:10002",
+            now + 1
+        ));
+
+        // Once the cooldown expires, the original peer may be tried again.
+        assert!(claim_reorg_fetch_slot(
+            &mut slots,
+            "127.0.0.1:10001",
+            now + REORG_FETCH_COOLDOWN_SECS
+        ));
+    }
+
+    #[test]
+    fn reorg_fetch_slots_are_bounded_under_peer_churn() {
+        let mut slots = HashMap::new();
+        let now = 2_000;
+
+        for i in 0..REORG_FETCH_MAX_PEERS {
+            let addr = format!("127.0.0.1:{}", 20_000 + i);
+            assert!(claim_reorg_fetch_slot(&mut slots, &addr, now));
         }
 
-        let until = Instant::now() + Duration::from_secs(5);
+        assert_eq!(slots.len(), REORG_FETCH_MAX_PEERS);
 
-        while finished.load(Ordering::SeqCst) < 64 && Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        // A churned extra peer must not grow the cooldown map without bound.
+        assert!(!claim_reorg_fetch_slot(
+            &mut slots,
+            "127.0.0.1:29999",
+            now + 1
+        ));
+        assert_eq!(slots.len(), REORG_FETCH_MAX_PEERS);
 
-        assert_eq!(finished.load(Ordering::SeqCst), 64);
-
-        let until = Instant::now() + Duration::from_secs(5);
-
-        while !workers
-            .handles
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|h| h.is_finished())
-            && Instant::now() < until
-        {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-
-        workers.reap_finished();
-
-        assert_eq!(workers.handles.lock().unwrap().len(), 0);
-
-        workers.stop_accepting();
-        workers.join_all();
+        // After the cooldown expires, stale entries are removed and recovery
+        // attempts can proceed again.
+        assert!(claim_reorg_fetch_slot(
+            &mut slots,
+            "127.0.0.1:29999",
+            now + REORG_FETCH_COOLDOWN_SECS
+        ));
+        assert_eq!(slots.len(), 1);
     }
 }

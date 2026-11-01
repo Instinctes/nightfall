@@ -34,14 +34,12 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      - name: Reorg shutdown and restart
+      - name: Reorg shutdown and restart (3 runs)
         run: |
-          cargo test --locked \
-            -p nightfall-node \
-            --test restart_recovery \
-            -j 2 \
-            -- --test-threads=1
-
+          for run in 1 2 3; do
+            echo "Restart/reorg regression run ${run}/3"
+            cargo test --locked -p nightfall-node --test restart_recovery -j 2 -- --test-threads=1
+          done
       - name: Node unit tests
         run: |
           cargo test --locked \

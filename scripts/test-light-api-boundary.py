@@ -52,6 +52,12 @@ with tempfile.TemporaryDirectory(prefix='nightfall-light-boundary-') as tmp:
                     pass
                 assert time.monotonic() < deadline and node.poll() is None, 'node did not start'
                 time.sleep(.1)
+            for bad in (
+                b'GET /status HTTP/1.1\r\nContent-Length: 1\r\n\r\nx',
+                b'OPTIONS / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n',
+                b'GET /status HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n',
+            ):
+                assert b'400 Bad Request' in request(light, bad), 'read-only HTTP framing accepted'
             body = b'{"method":"status","params":{},"id":1}'
             with socket.create_connection(('127.0.0.1', light), timeout=5) as s:
                 s.sendall(b'POST / HTTP/1.1\r\nContent-Len')
