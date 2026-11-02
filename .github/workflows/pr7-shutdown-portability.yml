@@ -25,6 +25,7 @@ jobs:
         os:
           - ubuntu-latest
           - macos-latest
+          - windows-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -35,12 +36,14 @@ jobs:
           rustup default stable
 
       - name: Reorg shutdown and restart (3 runs)
+        shell: bash
         run: |
           for run in 1 2 3; do
             echo "Restart/reorg regression run ${run}/3"
             cargo test --locked -p nightfall-node --test restart_recovery -j 2 -- --test-threads=1
           done
       - name: Node unit tests
+        shell: bash
         run: |
           cargo test --locked \
             -p nightfall-node \

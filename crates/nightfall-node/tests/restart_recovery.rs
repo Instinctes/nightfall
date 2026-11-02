@@ -17,7 +17,7 @@ use nightfall_storage::ChainStore;
 use nightfall_types::{NetworkId, TARGET_BLOCK_TIME_SECS};
 
 use std::collections::HashSet;
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -57,21 +57,55 @@ impl Drop for TempDir {
 }
 
 fn free_port() -> u16 {
-    // Avoid returning the same recently released ephemeral port for different
-    // P2P and RPC listeners or for later nodes in the same test process.
-    // Otherwise the RPC listener can bind first while the P2P worker silently
-    // fails to bind that port, and a bind-based readiness probe becomes false.
+    // The default Windows dynamic client range starts at 49152.
+    // Using a lower range reduces races with outbound connections.
+    // Binding is still checked because ports may be reserved.
     static USED: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+
     let used = USED.get_or_init(|| Mutex::new(HashSet::new()));
 
-    for _ in 0..128 {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        let port = listener.local_addr().expect("read ephemeral port").port();
-        if used.lock().expect("test port mutex poisoned").insert(port) {
+    const FIRST: u32 = 20_000;
+    const SPAN: u32 = 12_000;
+
+    let offset = std::process::id().wrapping_mul(131) % SPAN;
+
+    for i in 0..SPAN {
+        let port = (FIRST + (offset + i) % SPAN) as u16;
+
+        let mut assigned = used.lock().expect("test port mutex poisoned");
+
+        if assigned.contains(&port) {
+            continue;
+        }
+
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
+            assigned.insert(port);
+            drop(listener);
             return port;
         }
     }
-    panic!("unable to allocate unique ephemeral ports for test nodes");
+
+    panic!("no free test port in 20000..32000");
+}
+
+fn p2p_listening(port: u16) -> bool {
+    // Check whether a real TCP listener accepts connections.
+    // Binding another socket is not a portable readiness proof.
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+    TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+}
+
+#[test]
+fn p2p_readiness_probes_a_real_listener() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind probe listener");
+
+    let port = listener.local_addr().expect("probe local port").port();
+
+    assert!(
+        p2p_listening(port),
+        "TCP readiness did not detect a live listener"
+    );
 }
 
 struct TestNode {
@@ -131,7 +165,7 @@ impl TestNode {
         let deadline = Instant::now() + LISTEN_TIMEOUT;
 
         loop {
-            if TcpListener::bind(("127.0.0.1", self.p2p_port)).is_err() {
+            if p2p_listening(self.p2p_port) {
                 return;
             }
 
