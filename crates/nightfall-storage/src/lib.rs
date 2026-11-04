@@ -1877,6 +1877,13 @@ mod tests {
 
         fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
 
+        // Upgrading an old pruned installation must never reseal remaining
+        // data it cannot independently authenticate.
+        let original_meta = fs::read(&meta_path).unwrap();
+        let original_horizon = fs::read(store.horizon_path()).unwrap();
+        let original_headers = fs::read(store.headers_path()).unwrap();
+        let original_bodies = fs::read(store.blocks_path()).unwrap();
+
         assert!(
             !store.is_own_file_trusted(),
             "pruned metadata without semantic seals must fail closed"
@@ -1891,6 +1898,11 @@ mod tests {
             err.contains("pruned datadir failed the validation record"),
             "got: {err}"
         );
+
+        assert_eq!(fs::read(&meta_path).unwrap(), original_meta);
+        assert_eq!(fs::read(store.horizon_path()).unwrap(), original_horizon);
+        assert_eq!(fs::read(store.headers_path()).unwrap(), original_headers);
+        assert_eq!(fs::read(store.blocks_path()).unwrap(), original_bodies);
 
         fs::remove_dir_all(&dir).ok();
     }

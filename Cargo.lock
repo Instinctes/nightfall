@@ -3049,6 +3049,7 @@ dependencies = [
  "clap",
  "hex",
  "nightfall-consensus",
+ "nightfall-node",
  "nightfall-storage",
  "nightfall-types",
  "serde",
