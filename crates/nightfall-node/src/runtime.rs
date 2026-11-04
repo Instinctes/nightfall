@@ -2695,6 +2695,26 @@ mod common_ancestor_search_tests {
         assert_eq!(ancestor_search_window(1_000, 400), None);
     }
 
+    // The boundary itself is valid; one block beyond it must be refused.
+    #[test]
+    fn exactly_at_reorg_depth_boundary_is_accepted() {
+        let depth = nightfall_consensus::MAX_REORG_DEPTH as u64;
+        let ours = depth + 100;
+        let (start, max_back) = ancestor_search_window(ours, ours).unwrap();
+
+        assert_eq!(start, ours);
+        assert_eq!(max_back, depth);
+        assert_eq!(
+            highest_common_within(start, max_back, |h| Some(h <= ours - depth)),
+            Some(ours - depth)
+        );
+        assert_eq!(
+            highest_common_within(start, max_back, |h| Some(h < ours - depth)),
+            None
+        );
+        assert_eq!(ancestor_search_window(ours, ours - depth - 1), None);
+    }
+
     #[test]
     fn ancestor_below_the_reorg_window_is_not_returned() {
         assert_eq!(highest_common_within(1_000, 500, |h| Some(h <= 499)), None);
