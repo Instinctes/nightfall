@@ -2644,3 +2644,15 @@ mod tests {
         }
     }
 }
+
+impl Drop for App {
+    fn drop(&mut self) {
+        // The desktop window may close while the node still owns the datadir.
+        // Persist and close workers before releasing the shared directory lock.
+        if let Some(node) = self.node.take() {
+            if let Err(error) = node.shutdown() {
+                tracing::error!("Core node shutdown failed: {error:#}");
+            }
+        }
+    }
+}

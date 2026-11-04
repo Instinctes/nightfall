@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub type SharedState = Arc<Mutex<NodeInner>>;
 
@@ -87,19 +87,39 @@ impl Workers {
         self.accepting.store(false, Ordering::Release);
     }
 
-    fn join_all(&self) {
+    /// Wait for every worker only up to a global deadline. Report unfinished
+    /// workers instead of hanging indefinitely. Workers are never joined
+    /// while the registry mutex is held.
+    fn join_all_bounded(&self, timeout: Duration) -> anyhow::Result<()> {
+        let deadline = Instant::now() + timeout;
         loop {
-            let handles = {
-                let mut guard = self.handles.lock().unwrap();
-                if guard.is_empty() {
-                    break;
+            let (finished, outstanding) = {
+                let mut handles = self.handles.lock().unwrap();
+                let mut finished = Vec::new();
+                let mut i = 0;
+                while i < handles.len() {
+                    if handles[i].is_finished() {
+                        finished.push(handles.swap_remove(i));
+                    } else {
+                        i += 1;
+                    }
                 }
-                std::mem::take(&mut *guard)
+                (finished, handles.len())
             };
 
-            for handle in handles {
-                let _ = handle.join();
+            for handle in finished {
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("node worker panicked during shutdown"))?;
             }
+            if outstanding == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                tracing::error!(outstanding, "node shutdown deadline exceeded");
+                anyhow::bail!("node shutdown timed out with {outstanding} workers running");
+            }
+            thread::sleep(Duration::from_millis(25));
         }
     }
 }
@@ -895,12 +915,12 @@ impl NodeHandle {
         }
     }
 
-    pub fn shutdown(self) -> anyhow::Result<()> {
+    pub fn shutdown(&self) -> anyhow::Result<()> {
         self.request_shutdown();
 
         // No new registered worker may appear after this barrier.
         self.workers.stop_accepting();
-        self.workers.join_all();
+        self.workers.join_all_bounded(Duration::from_secs(15))?;
 
         // Persist only a fully loaded chain. During slow replay `state.chain`
         // is only a temporary preview/genesis chain and must never overwrite
@@ -4106,5 +4126,25 @@ mod reorg_fetch_throttle_tests {
             now + REORG_FETCH_COOLDOWN_SECS
         ));
         assert_eq!(slots.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod bounded_shutdown_wip_tests {
+    use super::Workers;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn shutdown_returns_at_deadline_then_joins_when_worker_exits() {
+        let workers = Workers::new();
+        let (tx, rx) = mpsc::channel::<()>();
+        workers.spawn(move || {
+            let _ = rx.recv_timeout(Duration::from_secs(3));
+        });
+        workers.stop_accepting();
+        assert!(workers.join_all_bounded(Duration::from_millis(10)).is_err());
+        tx.send(()).expect("release pending worker");
+        assert!(workers.join_all_bounded(Duration::from_secs(2)).is_ok());
     }
 }
