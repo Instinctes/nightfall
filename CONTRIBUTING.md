@@ -82,7 +82,7 @@ touching P2P, persistence or chain selection, run two nodes.
 |------|----------------|
 | **Cut-through** | The single biggest privacy gap. Needs a spend-authorisation scheme that does not publish a per-input signature. |
 | **Dandelion++** | No network-layer privacy today. |
-| **UTXO snapshots / headers-first sync** | Initial sync replays and re-verifies every block; memory-hard PoW makes that expensive. |
+| **Headers-first sync / checkpoint distribution** | Checkpoint-state bootstrap avoids historical body replay up to a compiled mainnet pin. Ordinary P2P catch-up above the pin remains block-by-block; distribution and headers-first sync still need work. |
 | **Merkle Mountain Range** | The UTXO root is recomputed per block, O(n log n). An MMR would make it incremental. |
 | **Independent review of the cryptography** | The most valuable contribution anyone could make right now. |
 
