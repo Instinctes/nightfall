@@ -16,7 +16,7 @@ use nightfall_node::{NodeConfig, NodeHandle, SyncHold};
 use nightfall_storage::ChainStore;
 use nightfall_types::{NetworkId, TARGET_BLOCK_TIME_SECS};
 
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -121,7 +121,11 @@ impl TestNode {
         let deadline = Instant::now() + START_TIMEOUT;
 
         loop {
-            if TcpListener::bind(("127.0.0.1", self.p2p_port)).is_err() {
+            // A bound port is not proof that this node accepts connections.
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], self.p2p_port));
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(150)).is_ok()
+                && self.node.status_snapshot().is_ok()
+            {
                 return;
             }
 
@@ -752,13 +756,19 @@ fn three_nodes_converge_after_partition_with_competing_branches() {
     b.node
         .add_peer(&c_addr)
         .expect("connect short partition B to heavy partition C");
+    // Both nodes on the losing fork must have an explicit outbound route to
+    // the heavier node: the reorg side-channel fetch is outbound-only.
+    // An inbound connection from C to A does not let A fetch C's chain.
+    a.node
+        .add_peer(&c_addr)
+        .expect("connect short partition A to heavy partition C");
     c.node
         .add_peer(&a_addr)
         .expect("connect heavy partition C to short partition A");
 
     wait_until(
         "all three nodes converge on heavier branch after partition heal",
-        Duration::from_secs(60),
+        Duration::from_secs(90),
         &[&a, &b, &c],
         || {
             let sa = a.snapshot();

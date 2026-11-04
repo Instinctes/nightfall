@@ -434,15 +434,33 @@ pub fn request_blocks(
     limit: usize,
 ) -> std::io::Result<Vec<Block>> {
     write_msg(stream, &PeerMsg::GetBlocks { from_height, limit })?;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    match read_msg(&mut reader)? {
-        PeerMsg::Blocks { blocks } => Ok(blocks),
-        PeerMsg::Error { message } => Err(std::io::Error::other(message)),
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "expected blocks",
-        )),
+
+    // The live peer sends an unsolicited Peers announcement after HelloOk,
+    // then may answer a separate GetPeers before answering GetBlocks.
+    // These frames must not be mistaken for a block response. Use a one-byte
+    // BufReader: a temporary reader otherwise reads ahead into the *next*
+    // message and silently discards it when dropped between requests.
+    let mut reader = BufReader::with_capacity(1, stream.try_clone()?);
+    for _ in 0..8 {
+        match read_msg(&mut reader)? {
+            PeerMsg::Blocks { blocks } => return Ok(blocks),
+            PeerMsg::Peers { .. } | PeerMsg::Pong { .. } | PeerMsg::Status { .. } => {}
+            PeerMsg::Ping { nonce } => {
+                write_msg(stream, &PeerMsg::Pong { nonce })?;
+            }
+            PeerMsg::Error { message } => return Err(std::io::Error::other(message)),
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("expected blocks, got {other:?}"),
+                ));
+            }
+        }
     }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "too many non-block messages before blocks response",
+    ))
 }
 
 pub fn broadcast_block(stream: &mut TcpStream, block: &Block) -> std::io::Result<()> {
@@ -485,5 +503,63 @@ mod directory_tests {
         assert!(!is_directory_addr("abcd.onion:17891"));
         assert!(!is_directory_addr("no-port"));
         assert!(!is_directory_addr(""));
+    }
+}
+
+#[cfg(test)]
+mod request_blocks_framing_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn unsolicited_peers_do_not_hide_requested_blocks() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let responder = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::with_capacity(1, socket.try_clone().unwrap());
+            match read_msg(&mut reader).unwrap() {
+                PeerMsg::GetBlocks { from_height, limit } => {
+                    assert_eq!(from_height, 42);
+                    assert_eq!(limit, 3);
+                }
+                other => panic!("expected request, got {other:?}"),
+            }
+            write_msg(&mut socket, &PeerMsg::Peers { addrs: vec![] }).unwrap();
+            write_msg(&mut socket, &PeerMsg::Peers { addrs: vec![] }).unwrap();
+            write_msg(&mut socket, &PeerMsg::Blocks { blocks: vec![] }).unwrap();
+        });
+        let mut socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert!(request_blocks(&mut socket, 42, 3).unwrap().is_empty());
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn excessive_unsolicited_control_frames_are_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let responder = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut reader = BufReader::with_capacity(1, socket.try_clone().unwrap());
+            let _ = read_msg(&mut reader).unwrap();
+            for _ in 0..9 {
+                if write_msg(&mut socket, &PeerMsg::Peers { addrs: vec![] }).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let err = request_blocks(&mut socket, 0, 2).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        responder.join().unwrap();
     }
 }
