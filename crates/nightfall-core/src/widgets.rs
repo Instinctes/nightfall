@@ -1796,11 +1796,12 @@ impl Toasts {
             let y_off = (1.0 - appear) * 18.0;
 
             let id = egui::Id::new(("toast", toast.created.to_bits()));
-            egui::Area::new(id)
+            let shown = egui::Area::new(id)
                 .fixed_pos(egui::pos2(screen.max.x - 24.0, y + y_off))
                 .pivot(egui::Align2::RIGHT_BOTTOM)
                 .interactable(false)
                 .show(ctx, |ui| {
+                    ui.set_max_width((screen.width() - 48.0).clamp(120.0, 420.0));
                     ui.set_opacity(alpha);
                     egui::Frame::none()
                         // Toasts overlap page text: use opaque frost so the
@@ -1823,11 +1824,16 @@ impl Toasts {
                                     toast.color,
                                 );
                                 ui.add_space(12.0);
-                                ui.label(RichText::new(&toast.text).color(TEXT));
+                                ui.add(
+                                    egui::Label::new(RichText::new(&toast.text).color(TEXT)).wrap(),
+                                );
                             });
                         });
                 });
-            y -= 52.0;
+            y -= shown.response.rect.height() + 10.0;
+            if y < screen.top() + 24.0 {
+                break;
+            }
         }
     }
 }

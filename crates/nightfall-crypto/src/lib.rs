@@ -17,6 +17,7 @@
 //! | [`keys`] | Scan / spend key split, addresses, view keys |
 //! | [`pow`] | Nighthash proof of work |
 
+mod binding;
 mod commit;
 mod kernel;
 mod keys;
@@ -26,6 +27,7 @@ mod rangeproof;
 mod schnorr;
 mod stealth;
 
+pub use binding::*;
 pub use commit::*;
 pub use kernel::*;
 pub use keys::*;
@@ -49,7 +51,9 @@ pub mod domain {
     pub const GENESIS: &[u8] = b"nightfall:genesis:v2";
     pub const BLOCK: &[u8] = b"nightfall:block:v2";
     pub const TX: &[u8] = b"nightfall:tx:v2";
+    pub const TX_BOUND: &[u8] = b"nightfall:tx:bound:v1";
     pub const TXBODY: &[u8] = b"nightfall:txbody:v2";
+    pub const TXBODY_BOUND: &[u8] = b"nightfall:txbody:bound:v1";
     pub const MERKLE: &[u8] = b"nightfall:merkle:v2";
     pub const MERKLE_LEAF: &[u8] = b"nightfall:merkle:leaf:v2";
     pub const KERNEL: &[u8] = b"nightfall:kernel:v2";

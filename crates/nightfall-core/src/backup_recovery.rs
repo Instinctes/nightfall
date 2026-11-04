@@ -439,6 +439,8 @@ mod tests {
             inputs: vec![],
             outputs: vec![],
             kernels: vec![],
+            stealth_offset: None,
+            kernel_offset: None,
         };
         wallet
             .record_send(&tx, 1_000, "public fixture".into())

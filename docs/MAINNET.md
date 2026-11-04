@@ -4,26 +4,19 @@
 **Coin:** NIGHTFALLCOIN (`NIGHT`)  
 **Max supply:** 90,000,000 (hard cap, no tail)  
 **Premine:** 0  
-**Fee:** 100% burn  
+**Fee:** burned during subsidy eras; paid to miners after subsidy ends
 **P2P default:** `0.0.0.0:17891`  
 **RPC default:** `127.0.0.1:17881` (local wallet only)  
-**Protocol:** v7 (Nightproof) · **Wire:** v4
-**Genesis:** `c8614333c0f86a4824df212474632f4b9feecf9bf0593841199d894127f2f9a6`
+**Protocol:** v8 (Nightproof) · **Wire:** v6
+**Genesis:** `061a052d49607ff8f4b306c75d622ebd230cff4ec3a45a6dffc2f7738d4b20de`
 
-> ⚠ **Every chain before v7 is dead.** v4 was consensus-broken — anyone could
-> mint unlimited NIGHT, see [`AUDIT-2026-08-12.md`](./AUDIT-2026-08-12.md). v5
-> was sound; v6 added view tags to the output format.
+> ⚠ **Mainnet v8 is a different chain from the abandoned v7 and earlier chains.**
+> V4 had a broken monetary proof. V7 was abandoned; its balances do not
+> migrate to v8. See [`RESET.md`](./RESET.md), [`HISTORY.md`](./HISTORY.md)
+> and [`FAIR_LAUNCH.md`](../FAIR_LAUNCH.md).
 >
-> v7 changes no format. The v6 chain was abandoned because two networking
-> faults made it untrustworthy rather than invalid: nodes stopped mining while
-> waiting for each other across a fork, and wallets never un-did what a reorg
-> had undone, so a confirmed payment could disappear with nothing reporting it.
-> The result was a chain with a transaction on one branch and not the other and
-> no way to say which was true. The genesis differs, so nothing can mix. Delete
-> any pre-v7 datadir.
->
-> Coins mined on a pre-v7 chain do not carry over. There is no migration and
-> there was never a claim there would be — see [`FAIR_LAUNCH.md`](../FAIR_LAUNCH.md).
+> **Preserve historical data.** V8 uses `nightfall/mainnet/n8/`. Do not
+> delete or overwrite an older data directory to install this release.
 
 Peers with a different genesis_hash are incompatible — always use matching release builds.
 
@@ -43,9 +36,9 @@ Binaries:
 
 ---
 
-## 2. First node (genesis miner)
+## 2. Join the existing mainnet
 
-You are **Node Zero**. Fair launch: empty chain, first block height 0 is mined by whoever starts first.
+Mainnet v8 already exists. Start as a validating, non-mining node; let it find independent peers and synchronize. Do not mine without peers or while your local chain is behind.
 
 ```bash
 # optional dedicated datadir
@@ -53,19 +46,17 @@ export NF_DATA="$HOME/nightfall-mainnet"
 
 ./target/release/nightfalld --network mainnet --datadir "$NF_DATA" init
 
-# Start P2P + mine continuously
+# Start a validating node without mining
 ./target/release/nightfalld --network mainnet --datadir "$NF_DATA" run \
   --listen 0.0.0.0:17891 \
-  --rpc-listen 127.0.0.1:17881 \
-  --mine \
-  --miner-seed miner.seed
+  --rpc-listen 127.0.0.1:17881
 ```
 
 **Open firewall TCP 17891** so others can connect.
 
 Note `genesis_hash` from logs/`init` — all peers must match.
 
-Miner address is derived from `miner.seed` in the datadir. Back it up offline.
+If you later opt into mining, first confirm peer connectivity and synchronization. Back up your `miner.seed` offline. A solo fork may lose its rewards when reconnected.
 
 ---
 
@@ -209,19 +200,17 @@ export SEED_NODE="YOUR.IP.OR.HOST:17891"
 ./target/release/nightfalld --network mainnet --datadir "$NF_DATA" run \
   --listen 0.0.0.0:17891 \
   --rpc-listen 127.0.0.1:17881 \
-  --connect "$SEED_NODE" \
-  --mine \
-  --miner-seed miner.seed
+  --connect "$SEED_NODE"
 ```
 
-Multiple `--connect host:port` allowed.
+Multiple `--connect host:port` are allowed. Both examples deliberately start without `--mine`; enable mining only after verifying peer connectivity, synchronization and the correct v8 genesis.
 
 Node will:
 
 1. Handshake (network + genesis check)  
-2. Pull chain / reorg to **longest valid chain**  
-3. Mine on the shared tip  
-4. Broadcast new blocks  
+2. Download and validate blocks; select the **heaviest valid chain by cumulative work**
+3. Confirm peers and tip before optionally enabling mining
+4. Relay blocks according to node policy
 
 ---
 
@@ -288,7 +277,7 @@ Or:
 | Coinbase maturity | 1,440 blocks |
 | Premine | 0 |
 | Tail emission | none |
-| Fee | 100% burn |
+| Fee | Burned during subsidy eras; paid to miners after subsidy ends |
 
 ---
 
@@ -302,8 +291,8 @@ Or:
   makes non-interactive payments safe; the two are mutually exclusive.
 - **Network-layer privacy is stem/fluff.** A locally submitted transaction
   is sent to one random peer first. Relays stay in the stem with 90 %
-  probability and fluff after 12–28 s. The wire message is still `Tx`, so
-  0.6.3 peers accept it — they just broadcast immediately. Optional Tor:
+  probability and fluff after 12–28 s. Old pre-v8 nodes cannot handshake with protocol v8 / wire v6 nodes;
+  do not assume legacy transaction-relay compatibility. Optional Tor:
   `--proxy 127.0.0.1:9050` or `NIGHTFALL_PROXY`. See [PRIVACY.md](PRIVACY.md).
 - **PoW is Argon2id** (Nighthash-v2) at 32 MiB per hash on mainnet. Verification
   costs the same as one mining attempt — that is the price of ASIC resistance.
@@ -339,4 +328,4 @@ Devnet is easier PoW and 1s mine pacing for testing.
 
 ---
 
-**NIGHTFALLCOIN** — first node starts the night. Everyone else joins with the same genesis rules.
+**NIGHTFALLCOIN** — independent operators verify the same v8 rules and genesis.

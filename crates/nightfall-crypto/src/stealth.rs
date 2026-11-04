@@ -26,8 +26,8 @@
 //!   to the same address.
 //! * **The sender cannot spend what they sent.** Spending requires the secret
 //!   for `Ko`, which is `b_spend + o`. The sender knows `o` but not `b_spend`.
-//!   This is what makes non-interactive MW safe; without it the sender keeps
-//!   the blinding factor and can sweep the funds back.
+//!   Since 1.1.0 inputs and outputs are also bound to their transaction; see
+//!   [`crate::binding`].
 //! * **Scanning needs only the scan key**, so a view key is a real, useful,
 //!   non-spending credential.
 
@@ -230,6 +230,10 @@ impl Output {
 pub struct SenderSecrets {
     pub blind: Scalar,
     pub value: u64,
+    /// The ephemeral secret `r` behind `Ke`. The binding rules balance every
+    /// output's `Ke` against the transaction's input keys, so the builder
+    /// needs it to compute the stealth excess.
+    pub ephemeral: Scalar,
 }
 
 /// What the receiver recovers when an output is theirs.
@@ -318,7 +322,14 @@ pub fn create_output_with_features(
     };
     output.sender_sig = schnorr::sign(&r, &generator_g(), &output.sig_message());
 
-    Ok((output, SenderSecrets { blind, value }))
+    Ok((
+        output,
+        SenderSecrets {
+            blind,
+            value,
+            ephemeral: r,
+        },
+    ))
 }
 
 /// The parts of an [`Output`] a scanner actually reads.

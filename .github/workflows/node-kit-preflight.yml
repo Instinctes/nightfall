@@ -1,0 +1,20 @@
+name: Node Kit preflight (offline)
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'scripts/node_kit_preflight.py'
+      - 'scripts/test_node_kit_preflight.py'
+      - '.github/workflows/node-kit-preflight.yml'
+      - 'docs/NODE-KIT-PREFLIGHT.md'
+  workflow_dispatch:
+jobs:
+  python-fixtures:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Offline preflight regression cases
+        run: python3 -m unittest discover -s scripts -p 'test_node_kit_preflight.py' -v

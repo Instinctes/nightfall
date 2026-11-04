@@ -48,7 +48,12 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        // NodeHandle in current main has no joining shutdown API yet.
+        // Dropping the handle does not guarantee its P2P/storage workers
+        // stopped: deleting the directory here races their file writes.
+        // Preserve these unique test directories until the test process
+        // exits. CI runners discard their ephemeral filesystem afterward.
+        // After PR #7 lands, join node workers before restoring cleanup.
     }
 }
 

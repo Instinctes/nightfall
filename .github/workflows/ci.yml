@@ -35,10 +35,25 @@ jobs:
       # Clippy must be clean, not "mostly clean". Dead code and unused
       # constants are how unreadable UI and stale helpers slipped through.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Signed release provenance policy tests (no external keys)
+        run: python3 -m unittest discover -s scripts -p 'test_release_provenance.py' -v
+
+      - name: Locked release dependency policy
+        run: python3 -m unittest discover -s scripts -p 'test_release_lock_policy.py' -v
+
+      - name: Installer temporary swap lifecycle (mocked; no root or real swap)
+        run: python3 -m unittest discover -s scripts -p 'test_installer_swap_safety.py' -v
+
+      - name: Installer source identity and lock policy
+        run: python3 -m unittest discover -s scripts -p 'test_node_kit_source_policy.py' -v
+
+      - name: Node evidence receipt hardening
+        run: python3 scripts/test-node-evidence.py
 
       - name: Tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       # The website checks used to sit here — browser wallet, chain page,
       # download links, cache busters, button colours — and the archive
@@ -109,3 +124,10 @@ jobs:
       # skipped here by the compiler rather than silently at runtime.
       - name: Wallet storage tests
         run: cargo test -p nightfall-wallet --lib
+
+      # The Release workflow runs the whole workspace suite on Windows before
+      # it builds anything, so a Windows-only failure used to surface only
+      # after the tag. Run the same suite here, before the merge.
+      - name: Workspace tests (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test --workspace --locked --no-fail-fast

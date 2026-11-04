@@ -5,7 +5,9 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { WalletSession, checkedPage, checkedStatus, syncWallet } from '../website/public/wallet-origin/session.js';
-import init, { BrowserVault } from '../website/public/wallet-origin/pkg/nightfall_web.js';
+import { browserBindings, browserApp } from './browser-channel.mjs';
+const bindings = browserBindings();
+const { default: init, BrowserVault } = await import(new URL('nightfall_web.js', bindings));
 
 let count = 0;
 async function test(label, run) { await run(); count++; console.log(`  ok ${label}`); }
@@ -17,7 +19,7 @@ if (!existsSync(fixturePath)) {
   }));
 }
 const fixture = JSON.parse(readFileSync(fixturePath));
-const wasm = readFileSync(new URL('../website/public/wallet-origin/pkg/nightfall_web_bg.wasm', import.meta.url));
+const wasm = readFileSync(new URL('nightfall_web_bg.wasm', bindings));
 await init({ module_or_path: wasm });
 const PASSWORD = 'PUBLIC disposable test password';
 const anchor = 'a'.repeat(64);
@@ -154,7 +156,7 @@ await test('repeated branch changes stop after one repair and retry on the next 
   await assert.rejects(syncWallet({ session: s, rpc: replacementNode({ moving: true }), genesis: fixture.genesis, assertCurrent() {} }), /next background pass/);
   assert.equal(store.writes.length, 2); assert.equal(JSON.parse(s.vault.info()).scan_anchor, 'b'.repeat(64)); s.close();
 });
-const app = readFileSync(new URL('../website/public/wallet-origin/app.js', import.meta.url), 'utf8');
+const app = readFileSync(browserApp(), 'utf8');
 const html = readFileSync(new URL('../website/public/wallet-origin/index.html', import.meta.url), 'utf8');
 await test('host IDs exist and private state never goes to localStorage or remote origins', () => {
   for (const match of app.matchAll(/\$\("([\w-]+)"\)/g)) assert.ok(html.includes(`id="${match[1]}"`), `missing ${match[1]}`);
@@ -162,4 +164,8 @@ await test('host IDs exist and private state never goes to localStorage or remot
   assert.match(app, /BrowserVault\.fromBackup/); assert.match(app, /candidate\.prepareSend/);
   assert.equal([...app.matchAll(/fetch\(/g)].length, 1); assert.match(app, /fetch\("\/wallet-api"/);
 });
-console.log(`Web wallet 1.0.5: ${count} checks passed with real WASM and public synthetic keys; no network.`);
+const release = JSON.parse(readFileSync(new URL('../website/public/releases.json', import.meta.url))).web_wallet;
+assert.ok(html.includes(`WEB WALLET · ${release}`));
+assert.ok(html.includes(`<dd>${release}</dd>`));
+assert.ok(html.includes(`NIGHTFALL Web Wallet ${release}`));
+console.log(`Web wallet ${release}: ${count} checks passed with real WASM and public synthetic keys; no network.`);

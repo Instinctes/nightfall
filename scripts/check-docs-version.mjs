@@ -26,15 +26,15 @@
  * type or download — have to name the current version.
  */
 import { readFileSync } from "node:fs";
-import { releaseChannels, RELEASE_VERSION } from "./release-channels.mjs";
+import { releaseChannels, publishedVersion, RELEASE_VERSION } from "./release-channels.mjs";
 
 const ROOT = new URL("../", import.meta.url).pathname;
 
-const version = (readFileSync(ROOT + "Cargo.toml", "utf8").match(
-    /^version\s*=\s*"([^"]+)"/m,
-) || [])[1];
+// The published version (github/Cargo.toml when the mirror is present), not
+// whatever the workspace is developing next. See release-channels.mjs.
+const version = publishedVersion(ROOT);
 if (!version) {
-    console.error("no workspace version in Cargo.toml");
+    console.error("no version in github/Cargo.toml or Cargo.toml");
     process.exit(1);
 }
 

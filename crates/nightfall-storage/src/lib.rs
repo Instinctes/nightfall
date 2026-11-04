@@ -13,7 +13,7 @@ use nightfall_ledger::{LedgerState, UtxoEntry, UtxoSet};
 use nightfall_types::{Hash256, Height, NetworkId};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -185,8 +185,14 @@ impl ChainStore {
             validated_headers_bytes,
         };
         let tmp = self.dir.join("chain-meta.json.tmp");
-        fs::write(&tmp, serde_json::to_vec_pretty(&meta)?)?;
-        fs::rename(tmp, self.meta_path())?;
+        {
+            let mut file = File::create(&tmp)?;
+            serde_json::to_writer_pretty(&mut file, &meta)?;
+            file.flush()?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp, self.meta_path())?;
+        sync_dir(&self.dir)?;
         Ok(())
     }
 
@@ -240,6 +246,87 @@ impl ChainStore {
             .and_then(|s| serde_json::from_str(&s).ok())
     }
 
+    /// Roll back an archive append that reached durable storage but whose
+    /// metadata commit did not.
+    ///
+    /// Truncation is permitted only when the prefix through
+    /// `validated_bytes` reproduces the exact locally-authenticated chain
+    /// named by the old metadata. This prevents a complete rewrite/reorg
+    /// beside stale metadata from being mistaken for an append tail.
+    fn recover_uncommitted_archive_tail(&self, network: NetworkId) -> anyhow::Result<()> {
+        let Some(meta) = self.read_meta() else {
+            return Ok(());
+        };
+
+        // Never repair a datadir that belongs to another network: the caller
+        // refuses it, and a refusal must leave the files exactly as they were.
+        if meta.network != network
+            || Chain::new_fair(network)
+                .map(|c| c.genesis_hash.to_hex() != meta.genesis_hash)
+                .unwrap_or(true)
+        {
+            return Ok(());
+        }
+
+        if meta.pruned
+            || meta.first_height != 0
+            || meta.validated_bytes == 0
+            || meta.validated_tip.is_empty()
+            || meta.validated_by.is_empty()
+            || meta.validated_by != self.install_id()
+        {
+            return Ok(());
+        }
+
+        let path = self.blocks_path();
+        let actual = match fs::metadata(&path) {
+            Ok(m) => m.len(),
+            Err(_) => return Ok(()),
+        };
+
+        if actual <= meta.validated_bytes {
+            return Ok(());
+        }
+
+        let prefix = File::open(&path)?.take(meta.validated_bytes);
+        let blocks = match codec::read_blocks(prefix, self.format()) {
+            Ok(blocks) => blocks,
+            Err(_) => return Ok(()),
+        };
+
+        // A matching tip does not authenticate an earlier block body.
+        // Full validation is limited to the exceptional crash-recovery path.
+        let prefix_matches = if let Ok(mut verified) = Chain::new_fair(meta.network) {
+            let now = now_unix();
+            let valid = blocks
+                .into_iter()
+                .all(|block| verified.apply_block(block, now).is_ok());
+
+            valid
+                && verified.verify_supply().is_ok()
+                && verified.block_count() == meta.block_count
+                && verified.tip_hash().to_hex() == meta.validated_tip
+                && verified.genesis_hash.to_hex() == meta.genesis_hash
+        } else {
+            false
+        };
+
+        if !prefix_matches {
+            return Ok(());
+        }
+
+        let file = OpenOptions::new().write(true).open(&path)?;
+        file.set_len(meta.validated_bytes)?;
+        file.sync_all()?;
+
+        tracing::warn!(
+            discarded_bytes = actual - meta.validated_bytes,
+            "discarded uncommitted archive tail left by interrupted save"
+        );
+
+        Ok(())
+    }
+
     /// Rewrite the chain file in the binary encoding.
     ///
     /// Opt-in and reversible. The old `blocks.jsonl` is kept as
@@ -253,6 +340,7 @@ impl ChainStore {
     ///
     /// Returns the old and new sizes in bytes.
     pub fn migrate_to_binary(&self) -> anyhow::Result<(u64, u64)> {
+        self.refuse_if_interrupted_recovery()?;
         if self.format() == Format::Binary {
             anyhow::bail!("this datadir is already binary");
         }
@@ -315,6 +403,7 @@ impl ChainStore {
     /// Copy `blocks.jsonl` plus a small manifest. The importer still verifies
     /// every block — this is a faster start, not a trust shortcut.
     pub fn export_snapshot(&self, out: &Path) -> anyhow::Result<SnapshotManifest> {
+        self.refuse_if_interrupted_recovery()?;
         if self
             .read_meta()
             .map(|m| m.pruned || m.first_height > 0)
@@ -357,6 +446,7 @@ impl ChainStore {
     /// checks. `validated_bytes` is forced to 0 so a copied file is never
     /// trusted as if this node had already verified it.
     pub fn import_snapshot(&self, from: &Path, network: NetworkId) -> anyhow::Result<Chain> {
+        self.refuse_if_interrupted_recovery()?;
         // A snapshot may be either format, and the two are not
         // interchangeable by filename. Pick the file that is there, and
         // remember what it is.
@@ -504,7 +594,13 @@ impl ChainStore {
         for block in &chain.blocks[on_disk as usize..] {
             codec::write_block(&mut file, block, fmt)?;
         }
+
+        // Metadata is the archive commit record. Durable block bytes must
+        // therefore precede metadata publication.
         file.flush()?;
+        file.get_ref().sync_all()?;
+        drop(file);
+
         self.write_meta(chain)?;
         Ok(())
     }
@@ -606,8 +702,15 @@ impl ChainStore {
                 codec::write_block(&mut file, block, fmt)?;
             }
             file.flush()?;
+            file.get_ref().sync_all()?;
         }
-        fs::rename(tmp, self.blocks_path())?;
+
+        fs::rename(&tmp, self.blocks_path())?;
+        sync_dir(&self.dir)?;
+
+        // A crash before metadata publication leaves a complete replacement
+        // beside stale metadata. Startup will revalidate it rather than
+        // treating it as an authenticated append tail.
         self.write_meta(chain)?;
         Ok(())
     }
@@ -624,6 +727,51 @@ impl ChainStore {
     /// Throttled by time rather than by block count: block rate depends on the
     /// machine, and a line every N blocks is a flood on a fast one and silence
     /// on a slow one.
+    /// Refuse to operate on a datadir whose recovery was interrupted.
+    ///
+    /// `recover-stalled-fork` leaves [`RECOVERY_JOURNAL`] behind if it is
+    /// interrupted mid-reset, so the datadir may be only half-reset. Every
+    /// entry point that reads or rewrites the chain calls this, so a normal
+    /// start, a storage migration or a snapshot export/import can never
+    /// silently proceed over an unfinished recovery.
+    pub fn refuse_if_interrupted_recovery(&self) -> anyhow::Result<()> {
+        let journal = self.dir.join(RECOVERY_JOURNAL);
+        // symlink_metadata, not exists(): a dangling symlink at the journal path
+        // must be caught too (exists() follows it and reports "not found"), and
+        // the entry must never be followed.
+        let md = match fs::symlink_metadata(&journal) {
+            Ok(md) => md,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(anyhow::anyhow!("checking {}: {e}", journal.display())),
+        };
+        let detail = if md.file_type().is_file() {
+            fs::read_to_string(&journal)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| v.get("backup").and_then(|b| b.as_str()).map(String::from))
+                .map(|b| format!("The original chain is backed up at {b}."))
+                .unwrap_or_else(|| {
+                    "The original chain is in the recovery-backup-* directory.".to_string()
+                })
+        } else if md.file_type().is_symlink() {
+            format!(
+                "{RECOVERY_JOURNAL} is a symlink, which is suspicious; it will not be followed."
+            )
+        } else {
+            format!("{RECOVERY_JOURNAL} is not a regular file, which is suspicious.")
+        };
+        anyhow::bail!(
+            "an interrupted recover-stalled-fork was found in {} ({} is present),\n\
+             so the datadir may be only half-reset and cannot be trusted.\n\
+             {}\n\
+             Restore the backup into the datadir and delete {}, then try again.",
+            self.dir.display(),
+            RECOVERY_JOURNAL,
+            detail,
+            RECOVERY_JOURNAL,
+        )
+    }
+
     pub fn load_or_new(&self, network: NetworkId) -> anyhow::Result<Chain> {
         let started = std::time::Instant::now();
         let mut last = started;
@@ -657,6 +805,7 @@ impl ChainStore {
         mut on_progress: impl FnMut(u64, u64),
     ) -> anyhow::Result<Chain> {
         self.ensure_dir()?;
+        self.refuse_if_interrupted_recovery()?;
 
         if self.legacy_path().exists() && !self.blocks_path().exists() {
             anyhow::bail!(
@@ -674,11 +823,9 @@ impl ChainStore {
             return Ok(Chain::new_fair(network)?);
         }
 
-        let meta: Option<ChainMeta> = fs::read_to_string(self.meta_path())
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok());
-
-        if let Some(m) = &meta {
+        // Identity first, repair second: a datadir for another network is
+        // refused before anything in it is touched.
+        if let Some(m) = self.read_meta() {
             if m.network != network {
                 anyhow::bail!(
                     "datadir holds a {:?} chain but {:?} was requested",
@@ -687,6 +834,12 @@ impl ChainStore {
                 );
             }
         }
+
+        self.recover_uncommitted_archive_tail(network)?;
+
+        let meta: Option<ChainMeta> = fs::read_to_string(self.meta_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok());
 
         // Trust our own past validation only if the blocks file is byte-for-byte
         // what it was when we recorded it. Any edit, truncation or corruption
@@ -722,7 +875,8 @@ impl ChainStore {
             let m = meta.as_ref().expect("pruned load has meta");
             chain.first_height = m.first_height;
             chain.horizon_work = m.horizon_work.parse().unwrap_or(0);
-            let horizon = load_horizon_file(&self.horizon_path())?;
+            let horizon = load_horizon_file(&self.horizon_path())?
+                .with_binding_height(network.binding_fork_height());
             chain.ledger = horizon.clone();
             chain.horizon = Some(horizon);
             chain.total_work = chain.horizon_work;
@@ -868,6 +1022,9 @@ fn load_horizon_file(path: &Path) -> anyhow::Result<LedgerState> {
         },
         tx_count: file.tx_count,
         coinbase_maturity: file.coinbase_maturity,
+        // The file does not say which network it belongs to; the loader
+        // re-applies the right height for the chain it is building.
+        binding_height: nightfall_types::NetworkId::Mainnet.binding_fork_height(),
     })
 }
 
@@ -890,6 +1047,12 @@ fn load_jsonl_headers(path: &Path) -> anyhow::Result<Vec<CompactHeader>> {
 /// This chain uses a sibling folder so an old wallet cannot mine the corpse.
 pub const DATADIR_EPOCH: &str = "n8";
 
+/// Written by `recover-stalled-fork` while it resets a datadir, and removed
+/// only when the reset has completed and been verified. Its presence means a
+/// recovery was interrupted and the datadir may be half-reset, so every load
+/// path refuses to start until the operator restores the named backup.
+pub const RECOVERY_JOURNAL: &str = ".recovery-journal.json";
+
 pub fn default_data_dir(network: NetworkId) -> PathBuf {
     let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
     base.join("nightfall")
@@ -899,6 +1062,59 @@ pub fn default_data_dir(network: NetworkId) -> PathBuf {
 
 pub fn wallet_dir(datadir: &Path) -> PathBuf {
     datadir.join("wallet")
+}
+
+/// fsync a directory so a rename or a newly created file in it is durable.
+///
+/// This is what keeps the recovery journal and the backup from disagreeing
+/// after a crash: the journal must reach disk before the originals are moved.
+///
+/// On Unix an open directory handle can be synced directly, and the error is
+/// propagated. Windows has no user-space directory fsync: `FlushFileBuffers`
+/// on a directory handle fails with `ERROR_ACCESS_DENIED` (5) or
+/// `ERROR_INVALID_FUNCTION` (1), and NTFS instead orders directory-entry
+/// (rename/create) metadata through its own journal. So on Windows the file
+/// contents are what carry durability — each file is `sync_all`'d when written
+/// (the journal included) — and this call recognises the expected
+/// directory-flush-unsupported result as the no-op it is, while still surfacing
+/// a genuine failure such as being unable to open the directory at all. The
+/// rename-ordering guarantee is therefore weaker on Windows than on Unix; that
+/// is a platform limitation, not something this function can close.
+pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const ERROR_INVALID_FUNCTION: i32 = 1;
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        let handle = OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)?;
+        match handle.sync_all() {
+            Ok(()) => Ok(()),
+            // Flushing a directory handle is not supported on Windows; NTFS
+            // journals the metadata itself, so this is a no-op, not a failure.
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(ERROR_ACCESS_DENIED) | Some(ERROR_INVALID_FUNCTION)
+                ) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 pub fn now_unix() -> u64 {
@@ -968,6 +1184,42 @@ fn getrandom_bytes(out: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An interrupted recovery marks the datadir unsafe for every entry
+    /// point that reads or rewrites the chain, not only a normal start.
+    #[test]
+    fn an_interrupted_recovery_is_refused_everywhere() {
+        use nightfall_crypto::WalletKeys;
+        let dir =
+            std::env::temp_dir().join(format!("nf-journal-{}-{}", std::process::id(), now_unix()));
+        fs::create_dir_all(&dir).unwrap();
+        // A JSON chain, so migrate_to_binary would otherwise have work to do.
+        fs::write(dir.join(codec::BLOCKS_JSONL), b"").unwrap();
+        let store = ChainStore::new(&dir);
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+        let miner = WalletKeys::generate().address();
+        chain.mine_block(&miner, vec![], now_unix() - 60).unwrap();
+        store.save(&chain).unwrap();
+
+        fs::write(dir.join(RECOVERY_JOURNAL), b"{\"backup\":\"bk\"}").unwrap();
+
+        let load = store
+            .load_or_new(NetworkId::Devnet)
+            .unwrap_err()
+            .to_string();
+        assert!(load.contains("interrupted"), "load: {load}");
+        let mig = store.migrate_to_binary().unwrap_err().to_string();
+        assert!(mig.contains("interrupted"), "migrate: {mig}");
+        let out = std::env::temp_dir().join(format!(
+            "nf-journal-out-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let exp = store.export_snapshot(&out).unwrap_err().to_string();
+        assert!(exp.contains("interrupted"), "export: {exp}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn secret_files_are_owner_only() {
@@ -1249,5 +1501,184 @@ mod tests {
         assert_eq!(reloaded.tip_hash(), shorter.tip_hash());
         reloaded.verify_supply().unwrap();
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wrong_network_open_leaves_an_uncommitted_tail_untouched() {
+        use nightfall_crypto::WalletKeys;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("nf-wrong-net-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+        for i in 0..3u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+        store.save(&chain).unwrap();
+
+        // A durable but uncommitted fourth block: the interrupted-append window.
+        chain.mine_block(&miner, vec![], now_unix() + 1000).unwrap();
+        {
+            let mut file = BufWriter::new(
+                OpenOptions::new()
+                    .append(true)
+                    .open(store.blocks_path())
+                    .unwrap(),
+            );
+            codec::write_block(&mut file, chain.blocks.last().unwrap(), store.format()).unwrap();
+            file.flush().unwrap();
+            file.get_ref().sync_all().unwrap();
+        }
+        let before = fs::read(store.blocks_path()).unwrap();
+        let meta_before = fs::read(store.meta_path()).unwrap();
+
+        let err = store
+            .load_or_new(NetworkId::Mainnet)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("was requested"), "{err}");
+
+        assert_eq!(fs::read(store.blocks_path()).unwrap(), before);
+        assert_eq!(fs::read(store.meta_path()).unwrap(), meta_before);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_uncommitted_append_is_rolled_back_on_restart() {
+        use nightfall_crypto::WalletKeys;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let dir =
+            std::env::temp_dir().join(format!("nf-crash-append-{}-{unique}", std::process::id()));
+
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+        for i in 0..3u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+
+        store.save(&chain).unwrap();
+
+        let committed_count = chain.block_count();
+        let committed_tip = chain.tip_hash();
+        let committed_bytes = fs::metadata(store.blocks_path()).unwrap().len();
+
+        chain.mine_block(&miner, vec![], now_unix() + 1000).unwrap();
+
+        // Simulate interruption after the appended block reached stable
+        // storage but before chain-meta.json was committed.
+        let fmt = store.format();
+        {
+            let mut file = BufWriter::new(
+                OpenOptions::new()
+                    .append(true)
+                    .open(store.blocks_path())
+                    .unwrap(),
+            );
+
+            codec::write_block(&mut file, chain.blocks.last().unwrap(), fmt).unwrap();
+            file.flush().unwrap();
+            file.get_ref().sync_all().unwrap();
+        }
+
+        assert!(fs::metadata(store.blocks_path()).unwrap().len() > committed_bytes);
+
+        let loaded = store.load_or_new(NetworkId::Devnet).unwrap();
+
+        assert_eq!(loaded.block_count(), committed_count);
+        assert_eq!(loaded.tip_hash(), committed_tip);
+        assert_eq!(
+            fs::metadata(store.blocks_path()).unwrap().len(),
+            committed_bytes
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn crash_recovery_preserves_corrupted_committed_prefix() {
+        use nightfall_crypto::WalletKeys;
+
+        for corrupt_body in [false, true] {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "nf-crash-corrupt-{}-{unique}-{corrupt_body}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+
+            let store = ChainStore::new(&dir);
+            let miner = WalletKeys::generate().address();
+            let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+            for i in 0..3u64 {
+                chain
+                    .mine_block(&miner, vec![], now_unix() + i * 15)
+                    .unwrap();
+            }
+            store.save(&chain).unwrap();
+
+            let committed_len = fs::metadata(store.blocks_path()).unwrap().len();
+            let mut altered = chain.blocks.clone();
+
+            if corrupt_body {
+                altered[0].body.kernels[0].reward_darks ^= 1;
+                assert_eq!(altered[0].hash(), chain.blocks[0].hash());
+                assert_ne!(altered[0].body.hash(), altered[0].header.body_root);
+            } else {
+                altered[0].header.nonce ^= 1;
+                assert_ne!(altered[0].hash(), chain.blocks[0].hash());
+            }
+
+            let fmt = store.format();
+            let mut bytes = Vec::new();
+            for block in &altered {
+                codec::write_block(&mut bytes, block, fmt).unwrap();
+            }
+            assert_eq!(bytes.len() as u64, committed_len);
+
+            chain.mine_block(&miner, vec![], now_unix() + 1000).unwrap();
+            codec::write_block(&mut bytes, chain.blocks.last().unwrap(), fmt).unwrap();
+
+            let original_corrupt_len = bytes.len() as u64;
+            assert!(original_corrupt_len > committed_len);
+            fs::write(store.blocks_path(), &bytes).unwrap();
+
+            store
+                .recover_uncommitted_archive_tail(NetworkId::Devnet)
+                .unwrap();
+
+            assert_eq!(
+                fs::metadata(store.blocks_path()).unwrap().len(),
+                original_corrupt_len,
+                "recovery must not truncate a corrupt committed prefix"
+            );
+            assert!(store.load_or_new(NetworkId::Devnet).is_err());
+
+            fs::remove_dir_all(&dir).ok();
+        }
     }
 }

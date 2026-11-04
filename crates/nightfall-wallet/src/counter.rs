@@ -312,6 +312,19 @@ fn looks_like_another_reference(memo: &str) -> bool {
 /// Underpayments are excluded on purpose. A day's takings that counted a half
 /// payment as a sale is a day's takings that will not reconcile, and the
 /// merchant finds out at the end of the day rather than at the counter.
+/// On-chain takings meeting the selected depth, recomputed from the current
+/// branch. Pending, manually closed and reorg-removed payments are excluded.
+pub fn confirmed_takings_darks<'a>(
+    statuses: impl IntoIterator<Item = &'a InvoiceStatus>,
+    tip: u64,
+    need: u64,
+) -> u64 {
+    statuses
+        .into_iter()
+        .filter(|s| matches!(settlement(s, tip, need), Settlement::Confirmed))
+        .fold(0, |sum, s| sum.saturating_add(s.received_darks))
+}
+
 pub fn takings_darks(statuses: &[InvoiceStatus]) -> u64 {
     statuses
         .iter()
@@ -323,6 +336,92 @@ pub fn takings_darks(statuses: &[InvoiceStatus]) -> u64 {
         })
         .map(|s| s.received_darks)
         .fold(0, u64::saturating_add)
+}
+
+/// Confirmations a checkout asks for before it calls a payment final, unless
+/// the merchant chooses otherwise. A merchant policy, not a consensus rule:
+/// the protocol allows reorganisations up to `MAX_REORG_DEPTH` blocks, and no
+/// number below that is a guarantee — only a cost to the attacker.
+pub const DEFAULT_CONFIRMATIONS: u64 = 10;
+
+/// Whether a merchant should hand over the goods yet.
+///
+/// [`status`] answers "did the right payment arrive?". This answers the
+/// question that follows: "how sure are we that it stays arrived?" The two are
+/// kept apart on purpose — a payment in a block one deep has *arrived*, and a
+/// till that hid it would confuse the customer standing at the counter, but it
+/// is not yet something to ship against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Settlement {
+    /// Nothing that settles the invoice has been seen: open, expired, or
+    /// underpaid. Candidates do not count; they are questions.
+    NotPaid,
+    /// Settled only by payments still in the mempool (no block yet). Shown so
+    /// the merchant knows something is coming; never final.
+    Unconfirmed,
+    /// Settled by payments in blocks, the shallowest of which has `have`
+    /// confirmations of the `need` the merchant asked for.
+    Confirming { have: u64, need: u64 },
+    /// Every payment is at least `need` deep by the current wallet view.
+    /// This is a merchant policy threshold, never irreversible finality.
+    Confirmed,
+    /// The merchant closed it by hand ("paid in cash"). Nothing on chain is
+    /// claimed.
+    ClosedByHand,
+}
+
+impl Settlement {
+    pub fn headline(&self) -> String {
+        match self {
+            Settlement::NotPaid => "Not paid".into(),
+            Settlement::Unconfirmed => "Seen, not in a block yet — do not hand over".into(),
+            Settlement::Confirming { have, need } => {
+                format!("Confirming {have}/{need} — do not hand over yet")
+            }
+            Settlement::Confirmed => "Confirmed — threshold met; reorg risk remains".into(),
+            Settlement::ClosedByHand => "Closed by hand".into(),
+        }
+    }
+}
+
+/// How settled an invoice is, measured against the chain tip right now.
+///
+/// Confirmations of a payment at height `h` with tip `t` are `t - h + 1`.
+/// The **shallowest** settling payment decides: an invoice paid in two parts
+/// is only as final as its most recent part, because a reorganisation that
+/// removes that part turns the invoice back into an underpayment.
+///
+/// This is a pure function of the payments the wallet can see *now*. After a
+/// reorganisation the wallet's view changes (a payment moves to another
+/// height, returns to the mempool, or disappears) and calling this again
+/// gives the new answer. Nothing is remembered from an earlier call, so
+/// nothing stale can be reported as final.
+pub fn settlement(status: &InvoiceStatus, tip_height: u64, need: u64) -> Settlement {
+    let need = need.max(1);
+    match status.state {
+        InvoiceState::Closed => return Settlement::ClosedByHand,
+        InvoiceState::Paid { .. } | InvoiceState::Overpaid { .. } => {}
+        _ => return Settlement::NotPaid,
+    }
+    let mut shallowest: Option<u64> = None;
+    for p in &status.matched {
+        let Some(h) = p.height else {
+            return Settlement::Unconfirmed;
+        };
+        // A payment "above" the tip means the wallet's view and the tip we
+        // were given disagree — a reorg in progress. Treat it as not in a
+        // block rather than inventing a confirmation count.
+        if h > tip_height {
+            return Settlement::Unconfirmed;
+        }
+        let confs = tip_height - h + 1;
+        shallowest = Some(shallowest.map_or(confs, |s: u64| s.min(confs)));
+    }
+    match shallowest {
+        Some(have) if have >= need => Settlement::Confirmed,
+        Some(have) => Settlement::Confirming { have, need },
+        None => Settlement::Unconfirmed,
+    }
 }
 
 /// A payment request for an invoice, so the two cannot drift apart.
@@ -626,5 +725,118 @@ mod tests {
             status(&inv, &[arrival], 1_600).state,
             InvoiceState::Paid { late: false },
         );
+    }
+
+    fn at(amount: u64, memo: &str, height: Option<u64>) -> Incoming {
+        Incoming {
+            height,
+            ..paid(amount, memo, 1_500)
+        }
+    }
+
+    #[test]
+    fn a_payment_meets_the_confirmation_policy_only_once_deep_enough() {
+        let inv = invoice("A-1", Some(500));
+        let s = status(&inv, &[at(500, "A-1", Some(100))], 1_600);
+        assert!(s.is_settled());
+        assert_eq!(
+            settlement(&s, 100, 3),
+            Settlement::Confirming { have: 1, need: 3 }
+        );
+        assert_eq!(
+            settlement(&s, 101, 3),
+            Settlement::Confirming { have: 2, need: 3 }
+        );
+        assert_eq!(settlement(&s, 102, 3), Settlement::Confirmed);
+        // Zero is not a policy; one confirmation is the least there is.
+        assert_eq!(settlement(&s, 100, 0), Settlement::Confirmed);
+    }
+
+    #[test]
+    fn a_mempool_payment_never_meets_the_confirmation_policy() {
+        let inv = invoice("A-1", Some(500));
+        let s = status(&inv, &[at(500, "A-1", None)], 1_600);
+        assert_eq!(settlement(&s, 1_000_000, 1), Settlement::Unconfirmed);
+    }
+
+    #[test]
+    fn a_reorg_that_removes_the_payment_reopens_the_invoice() {
+        let inv = invoice("A-1", Some(500));
+        let before = status(&inv, &[at(500, "A-1", Some(100))], 1_600);
+        assert_eq!(
+            settlement(&before, 101, 3),
+            Settlement::Confirming { have: 2, need: 3 }
+        );
+        // Even crossing the merchant's threshold does not establish finality.
+        assert_eq!(settlement(&before, 102, 3), Settlement::Confirmed);
+        // The block is orphaned; the wallet's rescan no longer holds the output.
+        let after = status(&inv, &[], 1_600);
+        assert_eq!(after.state, InvoiceState::Open);
+        assert_eq!(settlement(&after, 104, 3), Settlement::NotPaid);
+        // Or the transaction is re-mined later: confirmations restart from there.
+        let remined = status(&inv, &[at(500, "A-1", Some(104))], 1_600);
+        assert_eq!(
+            settlement(&remined, 104, 3),
+            Settlement::Confirming { have: 1, need: 3 }
+        );
+    }
+
+    #[test]
+    fn a_split_payment_is_only_as_deep_as_its_newest_part() {
+        let inv = invoice("A-1", Some(500));
+        let s = status(
+            &inv,
+            &[at(200, "A-1", Some(50)), at(300, "A-1", Some(99))],
+            1_600,
+        );
+        assert_eq!(s.state, InvoiceState::Paid { late: false });
+        assert_eq!(
+            settlement(&s, 100, 3),
+            Settlement::Confirming { have: 2, need: 3 }
+        );
+        // Losing the newer part leaves an underpayment, which is not paid.
+        let s = status(&inv, &[at(200, "A-1", Some(50))], 1_600);
+        assert_eq!(settlement(&s, 100, 3), Settlement::NotPaid);
+    }
+
+    #[test]
+    fn candidates_underpayments_and_hand_closing_are_never_chain_final() {
+        let inv = invoice("A-1", Some(500));
+        let s = status(&inv, &[at(500, "", Some(10))], 1_600);
+        assert_eq!(s.candidates.len(), 1);
+        assert_eq!(
+            settlement(&s, 1_000, 1),
+            Settlement::NotPaid,
+            "a candidate is a question"
+        );
+        let s = status(&inv, &[at(400, "A-1", Some(10))], 1_600);
+        assert_eq!(settlement(&s, 1_000, 1), Settlement::NotPaid);
+        let mut closed = invoice("A-1", Some(500));
+        closed.closed_note = Some("cash".into());
+        assert_eq!(
+            settlement(&status(&closed, &[], 1_600), 1_000, 1),
+            Settlement::ClosedByHand
+        );
+    }
+
+    #[test]
+    fn a_payment_above_the_tip_is_not_counted_as_confirmed() {
+        let inv = invoice("A-1", Some(500));
+        let s = status(&inv, &[at(500, "A-1", Some(120))], 1_600);
+        assert_eq!(settlement(&s, 110, 1), Settlement::Unconfirmed);
+    }
+    #[test]
+    fn confirmed_takings_follow_threshold_and_reorg_instead_of_arrival() {
+        let invoice = invoice("A-17", Some(500));
+        let received = status(&invoice, &[paid(500, "A-17", 1500)], 1600);
+        assert_eq!(confirmed_takings_darks([&received], 7, 3), 0);
+        assert_eq!(confirmed_takings_darks([&received], 9, 3), 500);
+        let removed = status(&invoice, &[], 1600);
+        assert_eq!(confirmed_takings_darks([&removed], 10, 3), 0);
+        let mut unconfirmed = received.clone();
+        for payment in &mut unconfirmed.matched {
+            payment.height = None;
+        }
+        assert_eq!(confirmed_takings_darks([&unconfirmed], 9, 3), 0);
     }
 }

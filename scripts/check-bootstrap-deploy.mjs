@@ -23,7 +23,14 @@ assert.match(source,/scripts\/deploy-website\.sh" --check/,'weekly run must pre-
 assert.match(source,/scripts\/deploy-website\.sh"\s*\\?\s*\n?\s*\|\| die/,'weekly run must publish the site through deploy-website.sh');
 
 // --- and that gate is the one doing the work --------------------------------
-assert.match(deploy,/cd "\$SITE" && npx wrangler deploy/,'deploy script must actually deploy');
+assert.match(deploy,/cd "\$SITE" && npx --yes wrangler deploy/,'deploy script must actually deploy');
+// wrangler is fetched by npx. Without --yes npx asks "Ok to proceed? (y)", and
+// with output silenced that question is invisible: on 11 October 2026 the weekly
+// run hung in its preflight waiting for a keypress. No npx call may prompt.
+for (const line of deploy.split('\n').filter(l => /^[^#]*\bnpx\b/.test(l) && !/die "/.test(l))) {
+  assert.match(line,/npx --yes /,`npx must never prompt: ${line.trim()}`);
+  assert.match(line,/<\/dev\/null/,`npx must not read the terminal: ${line.trim()}`);
+}
 assert.match(deploy,/stamp-cache-busters\.mjs" --check/,'cache busters must be checked, not rewritten, before publishing');
 assert.match(deploy,/CHECKS=\(\s*"check-published-channel"/,'published wallet fingerprint must gate every website/weekly deploy');
 assert.match(deploy,/cmp -s "\$tmp" "\$SITE\/public\/index\.html"/,'deploy must read the published home page back');

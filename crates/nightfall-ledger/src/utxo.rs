@@ -154,6 +154,25 @@ impl UtxoSet {
         gone
     }
 
+    /// Running sum after removing `remove` and adding `add`, without mutating.
+    ///
+    /// `None` when the current sum cannot be stated or a commitment is not a
+    /// point. Callers use it to reject a block before any entry changes.
+    pub fn sum_after(
+        &self,
+        remove: impl IntoIterator<Item = Commitment>,
+        add: impl IntoIterator<Item = Commitment>,
+    ) -> Option<RistrettoPoint> {
+        let mut sum = self.commitment_sum()?;
+        for commit in remove {
+            sum -= commit.point()?;
+        }
+        for commit in add {
+            sum += commit.point()?;
+        }
+        Some(sum)
+    }
+
     /// Σ of all unspent commitments.
     ///
     /// O(1) whenever the running sum covers the whole map, which is every
@@ -262,6 +281,17 @@ impl KernelAccumulator {
         Some(())
     }
 
+    /// Fold a block's `k·H` kernel offset into the sum without counting it
+    /// as a kernel. The identity (no offset) leaves the sum unchanged.
+    pub fn add_offset(&mut self, offset: RistrettoPoint) -> Option<()> {
+        if offset == RistrettoPoint::identity() {
+            return Some(());
+        }
+        let acc = self.sum.point()?;
+        self.sum = Commitment::from_point(acc + offset);
+        Some(())
+    }
+
     pub fn point(&self) -> Option<RistrettoPoint> {
         self.sum.point()
     }
@@ -290,16 +320,16 @@ impl SupplyState {
     }
 }
 
-/// Verify `Σ UTXO − Σ kernel_excess == circulating·G`.
-pub fn verify_supply_invariant(
-    utxos: &UtxoSet,
+/// Verify `Σ UTXO − Σ kernel_excess == circulating·G` for a sum that may not
+/// be the set's current one. Applying a block projects the sum, checks this,
+/// and only then mutates — so a rejected block never clones the UTXO map.
+pub fn supply_equation_holds(
+    utxo_sum: RistrettoPoint,
     kernels: &KernelAccumulator,
     supply: &SupplyState,
 ) -> Result<(), SupplyError> {
-    let utxo_sum = utxos.commitment_sum().ok_or(SupplyError::MalformedUtxo)?;
     let kernel_sum = kernels.point().ok_or(SupplyError::MalformedKernelSum)?;
     let expected = commit_public_value(supply.circulating());
-
     if utxo_sum - kernel_sum != expected {
         return Err(SupplyError::InvariantViolated);
     }
@@ -307,6 +337,16 @@ pub fn verify_supply_invariant(
         return Err(SupplyError::CapExceeded);
     }
     Ok(())
+}
+
+/// Verify `Σ UTXO − Σ kernel_excess == circulating·G`.
+pub fn verify_supply_invariant(
+    utxos: &UtxoSet,
+    kernels: &KernelAccumulator,
+    supply: &SupplyState,
+) -> Result<(), SupplyError> {
+    let utxo_sum = utxos.commitment_sum().ok_or(SupplyError::MalformedUtxo)?;
+    supply_equation_holds(utxo_sum, kernels, supply)
 }
 
 /// Is a coinbase output old enough to spend?

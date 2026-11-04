@@ -1,0 +1,21 @@
+[package]
+name = "nightfall-nodekit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nightfall Node Kit — read-only diagnostics, download verification and service files for operators"
+
+[[bin]]
+name = "nightfall-nodekit"
+path = "src/main.rs"
+
+[dependencies]
+nightfall-types = { workspace = true }
+nightfall-consensus = { workspace = true }
+nightfall-storage = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }

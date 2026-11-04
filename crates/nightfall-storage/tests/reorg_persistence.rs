@@ -55,13 +55,33 @@ fn reorg_to_a_longer_chain_is_stored_correctly() {
 
     store.save(&adopted).unwrap();
 
-    // The decisive check: reload from disk.
-    let reloaded = store
+    let expected_tip = adopted.tip_hash();
+    let expected_height = adopted.tip_height();
+    let expected_count = adopted.block_count();
+    let expected_work = adopted.total_work;
+    let expected_utxo_root = adopted.ledger.utxo_root();
+    let expected_kernel_sum = adopted.ledger.kernel_sum();
+    let expected_utxos = adopted.ledger.utxos.len();
+    let expected_minted = adopted.total_minted();
+
+    // Reconstruct from the persisted store rather than relying on the
+    // in-memory Chain that performed the save.
+    drop(store);
+    drop(adopted);
+    drop(ours);
+
+    let reloaded = ChainStore::new(&dir)
         .load_or_new(NetworkId::Devnet)
         .expect("a chain saved after a reorg must reload");
 
-    assert_eq!(reloaded.tip_hash(), adopted.tip_hash());
-    assert_eq!(reloaded.block_count(), adopted.block_count());
+    assert_eq!(reloaded.tip_hash(), expected_tip);
+    assert_eq!(reloaded.tip_height(), expected_height);
+    assert_eq!(reloaded.block_count(), expected_count);
+    assert_eq!(reloaded.total_work, expected_work);
+    assert_eq!(reloaded.ledger.utxo_root(), expected_utxo_root);
+    assert_eq!(reloaded.ledger.kernel_sum(), expected_kernel_sum);
+    assert_eq!(reloaded.ledger.utxos.len(), expected_utxos);
+    assert_eq!(reloaded.total_minted(), expected_minted);
     reloaded.verify_supply().unwrap();
 
     std::fs::remove_dir_all(&dir).ok();

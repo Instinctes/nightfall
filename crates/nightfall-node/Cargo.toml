@@ -29,3 +29,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rand.workspace = true
 ureq.workspace = true
+
+[dev-dependencies]
+nightfall-storage = { workspace = true }

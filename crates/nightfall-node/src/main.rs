@@ -2,7 +2,7 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use nightfall_crypto::WalletKeys;
-use nightfall_node::{NodeConfig, NodeHandle};
+use nightfall_node::{recovery::RecoverOpts, NodeConfig, NodeHandle};
 use nightfall_p2p::network_magic;
 use nightfall_storage::{default_data_dir, now_unix, ChainStore};
 use nightfall_types::{
@@ -99,6 +99,13 @@ enum Commands {
         #[arg(long)]
         from: PathBuf,
     },
+    /// Offline escape hatch: back up a stalled-fork chain and reset the
+    /// datadir to a fresh genesis, keeping the wallet. The node must be
+    /// stopped; requires an explicit --network and --datadir, and --force.
+    RecoverStalledFork {
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -126,7 +133,26 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let network: NetworkId = cli.network.into();
+    let datadir_explicit = cli.datadir.is_some();
+    let network_explicit = std::env::args()
+        .skip(1)
+        .any(|a| a == "--network" || a.starts_with("--network="));
     let datadir = cli.datadir.unwrap_or_else(|| default_data_dir(network));
+
+    // A destructive reset validates its inputs before the lock is taken, so a
+    // bad --datadir is not created and a symlinked lock file is not written
+    // through by lock acquisition.
+    if let Commands::RecoverStalledFork { force } = &cli.command {
+        nightfall_node::recovery::precheck(
+            &RecoverOpts {
+                datadir: datadir.clone(),
+                network,
+                force: *force,
+            },
+            network_explicit,
+            datadir_explicit,
+        )?;
+    }
 
     // One writer per data directory. The wallet takes the same lock, so a
     // node and a Core wallet cannot both open the same folder — which they
@@ -322,6 +348,30 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
             }
+        }
+        Commands::RecoverStalledFork { force } => {
+            let report = nightfall_node::recovery::recover_stalled_fork(&RecoverOpts {
+                datadir: datadir.clone(),
+                network,
+                force,
+            })?;
+            println!("datadir........ {}", datadir.display());
+            println!("network........ {network}");
+            println!("format......... {:?}", report.format);
+            if let Some(tip) = &report.previous_tip {
+                println!("previous_tip... {tip} (height {})", report.previous_height);
+            }
+            println!("backup......... {}", report.backup_dir.display());
+            println!("backed_up...... {}", report.files_backed_up.join(", "));
+            println!("genesis........ {}", report.genesis_hash);
+            println!("wallet......... untouched");
+            println!("status......... reset to a fresh genesis");
+            println!("next........... resync WITHOUT mining first — start the node,");
+            println!("                let it reach the network tip, then start mining:");
+            println!(
+                "                  nightfalld --datadir {} --network {network} run --connect <peer>",
+                datadir.display()
+            );
         }
     }
     Ok(())

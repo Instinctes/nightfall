@@ -52,7 +52,7 @@ assert.match(nav, /min-width: 1001px/);
 assert.match(nav, /aria-current/);
 assert.match(nav, /drawer\.inert = !open/);
 for (const page of ['index.html', 'chain/index.html', 'emission/index.html',
-    'audit/index.html', 'audit/2026-08-16/index.html', 'build/index.html', 'view-key/index.html', 'whitepaper/index.html', 'compare/index.html', '404.html']) {
+    'audit/index.html', 'audit/2026-08-16/index.html', 'build/index.html', 'view-key/index.html', 'whitepaper/index.html', 'compare/index.html', 'roadmap/index.html', '404.html']) {
     const html = read(`website/public/${page}`);
     assert.match(html, /name="theme-color" content="#423858"/, page);
     assert.doesNotMatch(html, /<script(?![^>]*\bsrc=)[^>]*>/, `${page}: CSP`);
@@ -61,4 +61,4 @@ for (const page of ['index.html', 'chain/index.html', 'emission/index.html',
         assert.match(html, /tabindex="-1"/, page);
     }
 }
-console.log('site design ok — wallet palette, text/gradient contrast, 10 pages, navigation');
+console.log('site design ok — wallet palette, text/gradient contrast, 11 pages, navigation');

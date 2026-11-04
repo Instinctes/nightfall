@@ -161,6 +161,11 @@ pub struct App {
     pub startup_complete: bool,
     startup_ready_since: Option<Instant>,
     startup_connection_view: bool,
+    /// When the node was first seen stuck on a fork it will not follow.
+    /// Drives the explanation on the startup screen.
+    fork_stall_since: Option<Instant>,
+    /// How many released payments the owner has already been told about.
+    observed_released: u64,
     pending_status: Option<StatusReply>,
     pub last_sync_at: Option<u64>,
     /// A detected scan failure remains visible until a successful canonical
@@ -206,6 +211,8 @@ pub struct App {
     pub till_reference: String,
     pub till_amount: String,
     pub till_description: String,
+    pub till_confirmations: u64,
+    pub till_expiry_hours: u64,
 
     // Air. `air_pending` is the request this online side wrote and is waiting
     // for an answer to; `air_frames` is whatever this side is currently showing
@@ -349,6 +356,8 @@ impl App {
             startup_complete: false,
             startup_ready_since: None,
             startup_connection_view: false,
+            fork_stall_since: None,
+            observed_released: 0,
             pending_status: None,
             last_sync_at: None,
             wallet_sync_error: None,
@@ -377,6 +386,12 @@ impl App {
             till_reference: String::new(),
             till_amount: String::new(),
             till_description: String::new(),
+            till_confirmations: std::fs::read_to_string(datadir.join("till-confirmations"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .filter(|n| (1..=10000).contains(n))
+                .unwrap_or(10),
+            till_expiry_hours: 0,
             air_input: String::new(),
             air_pending: None,
             air_incoming: None,
@@ -582,39 +597,46 @@ impl App {
             self.toasts.error(ctx, "Node is not running");
             return;
         };
-        let wallet = self.wallet.clone();
+        // The chain file only. The wallet is not reset and nothing is
+        // re-sent: once the node has the network's chain again, the
+        // background scan reconciles the wallet against it automatically —
+        // the same path an ordinary reorg takes, which keeps pending payments,
+        // invoices and reservations.
+        //
+        // 1.0.5 rescanned the wallet here as well, and a rescan is refused
+        // while any payment is pending. A node stuck on a dead branch with a
+        // pending payment — the usual pair, because the payment spent coins
+        // from that branch — therefore could not be resynced from the app at
+        // all, and the startup screen gave no hint why it never finished.
         let access = self.wallet_scan_access.clone();
-        let paused = self.wallet_paused.clone();
-        let syncing = self.syncing.clone();
         let signal = self.sync_signal.clone();
         self.resync_confirm = false;
         self.startup_complete = false;
         self.startup_connection_view = false;
+        self.startup_ready_since = None;
         self.last_sync_at = None;
+        self.fork_stall_since = None;
         std::thread::spawn(move || {
+            // Not while a scan is copying the chain.
             let Ok(_access) = access.lock() else {
                 return;
             };
-            syncing.store(true, Ordering::SeqCst);
-            let result = (|| -> anyhow::Result<u32> {
-                let mut wallet = wallet
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("wallet lock poisoned"))?;
-                anyhow::ensure!(
-                    !paused.load(Ordering::SeqCst) && wallet.can_scan(),
-                    "Resync cancelled: wallet is being secured."
-                );
-                wallet.check_rescan_allowed()?;
-                node.resync_chain()?;
-                wallet.rescan(&node)
-            })()
-            .map_err(|e| e.to_string());
-            syncing.store(false, Ordering::SeqCst);
-            if let Ok(mut slot) = signal.lock() {
-                *slot = Some(result);
+            let result = node.resync_chain().map(|backup| {
+                tracing::info!("chain resync: old chain kept at {}", backup.display());
+                0u32
+            });
+            if let Err(error) = &result {
+                if let Ok(mut slot) = signal.lock() {
+                    *slot = Some(Err(format!("Chain resync failed: {error}")));
+                }
             }
         });
-        self.toasts.info(ctx, "Chain resync queued. The existing chain file is preserved by the node; scan errors will be reported.");
+        self.toasts.info(
+            ctx,
+            "Chain resync started. The old chain file is kept as a backup in the data folder. \
+             Your wallet and keys stay; its history is checked again automatically once the \
+             network's chain is downloaded.",
+        );
     }
 
     pub fn start_chain_check(&mut self) {
@@ -720,6 +742,10 @@ impl App {
     }
 }
 
+/// Pending payments the background scan released because the current chain
+/// can never confirm them. Read by the UI to tell the owner once.
+pub(crate) static RELEASED_SENDS: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) fn run_wallet_scan(
     wallet: &Arc<Mutex<WalletState>>,
     node: &NodeHandle,
@@ -758,7 +784,12 @@ pub(crate) fn run_wallet_scan(
                 !status.reorg_in_flight,
                 "Waiting for the node to finish changing branches…"
             );
-            let changed = candidate.chain_moved_under_scan(node);
+            // A chain that ends below the wallet's scan only counts as changed
+            // once the node has caught up with its peers: during an ordinary
+            // download it is simply not there yet. After a resync off a dead
+            // branch it is the expected state, and waiting would be for ever.
+            let changed = candidate.chain_moved_under_scan(node)
+                || (crate::wallet_state::chain_settled(node) && candidate.scanned_past_tip(node));
             let (count, more) = if changed {
                 anyhow::ensure!(
                     status.blocks_behind == 0,
@@ -790,6 +821,15 @@ pub(crate) fn run_wallet_scan(
                 if more {
                     None
                 } else {
+                    // Only on the live wallet, only once the scan is complete:
+                    // the rule depends on the wallet matching the node's tip.
+                    match w.release_impossible_sends(node) {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            RELEASED_SENDS.fetch_add(n as u64, Ordering::SeqCst);
+                        }
+                        Err(error) => tracing::warn!("pending-payment check skipped: {error}"),
+                    }
                     Some(w.scan_candidate()?.1)
                 }
             };
@@ -1097,7 +1137,7 @@ impl App {
                 // it cannot be traced back to this node. With almost no peers
                 // that one hop is also the only hop, and nothing re-sends it.
                 // Say so now, while the sender is still looking at the screen.
-                let peers = self.status.as_ref().map(|s| s.peers).unwrap_or(0);
+                let peers = self.status.as_ref().map(|s| s.live_peers).unwrap_or(0);
                 if peers < 3 {
                     self.toasts.error(
                         ctx,
@@ -1580,6 +1620,27 @@ impl eframe::App for App {
         }
         self.poll_status();
         self.drain_sync_signal(ctx);
+        let released = RELEASED_SENDS.load(Ordering::SeqCst);
+        if released != self.observed_released {
+            let n = released.saturating_sub(self.observed_released);
+            self.observed_released = released;
+            if n > 0 {
+                self.toasts.info(
+                    ctx,
+                    &if n == 1 {
+                        "A pending payment can never confirm on the current chain (its coins \
+                         were spent elsewhere or no longer exist). It was removed and its \
+                         remaining coins are spendable again."
+                            .to_string()
+                    } else {
+                        format!(
+                            "{n} pending payments can never confirm on the current chain. \
+                             They were removed and their remaining coins are spendable again."
+                        )
+                    },
+                );
+            }
+        }
         if self
             .shots
             .as_ref()
@@ -1751,7 +1812,12 @@ impl eframe::App for App {
         {
             self.rewards.preview(ctx.input(|input| input.time));
         }
-        self.rewards.show(ctx, self.reward_sound);
+        self.rewards.show(
+            ctx,
+            self.reward_sound,
+            self.send_confirm || self.retry_payment.is_some(),
+            94.0 + Self::title_clearance(),
+        );
         self.toasts.show(ctx);
         crate::ui_shots::step(self, ctx);
     }
@@ -1785,6 +1851,24 @@ impl App {
             .ok()
             .map(|wallet| wallet.scanned_to());
         let can_view_connection = self.wallet_scan_access.try_lock().is_ok();
+        // A node held on a fork it will not follow never satisfies the gate
+        // below. Say so, and offer the fix, instead of spinning for ever.
+        let stalled_for = match &status {
+            Some(s) if s.stalled_on_fork && !s.reorg_in_flight => Some(
+                self.fork_stall_since
+                    .get_or_insert_with(Instant::now)
+                    .elapsed(),
+            ),
+            _ => {
+                self.fork_stall_since = None;
+                None
+            }
+        };
+        let dead_branch: Option<Option<u64>> = match status.as_ref().map(|s| s.sync_hold) {
+            Some(nightfall_node::SyncHold::DeadBranch { gap }) => Some(Some(gap)),
+            _ if stalled_for.is_some_and(|d| d >= Duration::from_secs(180)) => Some(None),
+            _ => None,
+        };
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(Color32::TRANSPARENT).inner_margin(egui::Margin::same(24.0)))
             .show(ctx, |ui| {
@@ -1803,6 +1887,7 @@ impl App {
                         });
                         let (phase, current, total) = match &status {
                             Some(s) if s.loading => ("Verifying saved blocks", s.blocks, s.loading_total),
+                            Some(s) if dead_branch.is_some() => ("This node cannot follow the network's chain", s.tip_height, 0),
                             Some(s) if s.reorg_in_flight || s.stalled_on_fork => ("Checking the current chain", s.tip_height, s.best_peer_height),
                             Some(s) if s.live_peers == 0 && self.network != NetworkId::Devnet => ("Connecting to the network", s.tip_height, 0),
                             Some(s) if s.blocks_behind > 0 => ("Downloading missing blocks", s.tip_height, s.best_peer_height),
@@ -1810,7 +1895,10 @@ impl App {
                             None => ("Starting the node", 0, 0),
                         };
                         ui.label(RichText::new(phase).size(16.0).color(TEXT));
-                        if total > 0 {
+                        if let Some(gap) = dead_branch {
+                            ui.add_space(10.0);
+                            crate::views::dead_branch_notice(self, ui, gap);
+                        } else if total > 0 {
                             let progress = (current as f64 / total as f64).clamp(0.0, 1.0) as f32;
                             ui.add(egui::ProgressBar::new(progress).fill(ACCENT).desired_width(ui.available_width())
                                 .text(format!("{} / {} blocks", format_int(current), format_int(total))));
@@ -1960,7 +2048,7 @@ impl App {
                 )
                 .show(ctx, |ui| {
                     let tip = self.tip_height();
-                    let peers = self.status.as_ref().map(|s| s.peers).unwrap_or(0);
+                    let peers = self.status.as_ref().map(|s| s.live_peers).unwrap_or(0);
                     screen_header(
                         ui,
                         &self.network.to_string(),
@@ -2138,6 +2226,13 @@ fn save_mining_threads(datadir: &std::path::Path, n: usize) {
 }
 
 fn fetch_public_tip() -> Result<(String, u64, String), String> {
+    // A direct HTTPS request would show this machine's address to the site,
+    // which is exactly what the lockdown promises not to do.
+    if nightfall_p2p::privacy_lockdown_enabled() {
+        return Err(
+            "privacy lockdown is on: Core does not contact nightfallcoin.org directly".into(),
+        );
+    }
     let body: serde_json::Value = ureq::get("https://nightfallcoin.org/network.json")
         .timeout(Duration::from_secs(8))
         .call()

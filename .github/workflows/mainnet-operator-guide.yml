@@ -1,0 +1,41 @@
+name: Mainnet Operator Integrity
+
+on:
+  pull_request:
+    paths:
+      - 'crates/nightfall-types/src/lib.rs'
+      - 'docs/MAINNET.md'
+      - 'docs/RESET.md'
+      - 'README.md'
+      - 'scripts/check-mainnet-operator-guide.py'
+      - '.github/workflows/mainnet-operator-guide.yml'
+
+  push:
+    branches: [main]
+    paths:
+      - 'crates/nightfall-types/src/lib.rs'
+      - 'docs/MAINNET.md'
+      - 'docs/RESET.md'
+      - 'README.md'
+      - 'scripts/check-mainnet-operator-guide.py'
+      - '.github/workflows/mainnet-operator-guide.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify operator documentation
+        run: |
+          python3 scripts/check-mainnet-operator-guide.py --test
+          python3 scripts/check-mainnet-operator-guide.py

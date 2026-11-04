@@ -2,14 +2,16 @@
 //!
 //! # Signature binding
 //!
-//! Two signatures guard every spend, and both cover the whole transaction:
-//!
-//! * **Input signature** under the output's one-time key `Ko`, proving the
-//!   spender is the party the funds were sent to. Without it, whoever created
-//!   the output (the *sender*) could spend it back — the classic hole in naive
-//!   non-interactive Mimblewimble.
+//! * **Input signature** under the output's one-time key `Ko`, over the
+//!   commitment alone, proving the spender is the party the funds were sent
+//!   to.
 //! * **Kernel excess signature** under generator `H`, proving no value was
 //!   created.
+//!
+//! From protocol 1.1.0 every input also carries a fresh input key with a
+//! signature under `Ki + h·Ko`, every kernel a stealth excess, and one
+//! block-wide key balance ties them to the outputs' ephemeral keys. See
+//! [`nightfall_crypto::binding`](nightfall_crypto).
 //!
 //! A third signature sits on each output, made by the sender's ephemeral key,
 //! sealing the commitment, range proof, one-time key and encrypted payload.
@@ -25,6 +27,9 @@
 //! malleable, and a single flipped ciphertext byte destroyed the recipient's
 //! money (audit findings C-03 to C-05).
 
+use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
+use curve25519_dalek::scalar::Scalar;
+use curve25519_dalek::traits::Identity;
 use nightfall_crypto::{
     domain, expected_excess, hash_multi, sig, Commitment, KernelFeature, Output, SchnorrSig,
     TxKernel,
@@ -42,6 +47,34 @@ pub struct Input {
     pub commit: Commitment,
     /// Schnorr signature under the referenced output's `Ko`, over `input_message`.
     pub sig: SchnorrSig,
+    /// Fresh input key `Ki`. Required from the binding fork on, stripped
+    /// below it. See [`nightfall_crypto::binding`](nightfall_crypto).
+    #[serde(default)]
+    pub input_key: Option<[u8; 32]>,
+    /// Signature under `Ki + h·Ko` over `H(commit ‖ Ki)`.
+    #[serde(default)]
+    pub key_sig: Option<SchnorrSig>,
+}
+
+impl Input {
+    /// The 1.0.x shape: commitment and signature only.
+    pub fn legacy(commit: Commitment, sig: SchnorrSig) -> Self {
+        Self {
+            commit,
+            sig,
+            input_key: None,
+            key_sig: None,
+        }
+    }
+
+    pub fn strip_binding(&mut self) {
+        self.input_key = None;
+        self.key_sig = None;
+    }
+
+    pub fn has_binding(&self) -> bool {
+        self.input_key.is_some() || self.key_sig.is_some()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +83,13 @@ pub struct Transaction {
     pub inputs: Vec<Input>,
     pub outputs: Vec<Output>,
     pub kernels: Vec<TxKernel>,
+    /// Public scalar `s` of the key balance. Summed when aggregated.
+    #[serde(default)]
+    pub stealth_offset: Option<[u8; 32]>,
+    /// Public scalar `k` with `Σout − Σin + fee·G − reward·G = Σ E + k·H`.
+    /// Only valid from the binding fork on.
+    #[serde(default)]
+    pub kernel_offset: Option<[u8; 32]>,
 }
 
 /// Consensus limits. Unbounded transactions are a remote OOM vector: the v4 P2P
@@ -65,8 +105,13 @@ impl Transaction {
             .any(|k| k.feature == KernelFeature::Coinbase)
     }
 
+    /// Wrapping sum, exactly as 1.0.x release builds computed it. Consensus
+    /// below the binding fork depends on this; use [`Self::checked_total_fee`]
+    /// anywhere else.
     pub fn total_fee(&self) -> u64 {
-        self.kernels.iter().map(|k| k.fee_darks).sum()
+        self.kernels
+            .iter()
+            .fold(0u64, |acc, k| acc.wrapping_add(k.fee_darks))
     }
 
     pub fn total_reward(&self) -> u64 {
@@ -79,10 +124,8 @@ impl Transaction {
     /// no per-transaction body to bind to, and binding to one would make
     /// inputs unaggregatable.
     ///
-    /// Replaying a captured input signature is useless: the output is removed
-    /// from the UTXO set the moment it is spent. Re-routing the value is
-    /// prevented by the kernel, which requires knowledge of the input's
-    /// blinding factor that no third party has.
+    /// The input key signature ([`Transaction::verify_input_key`]) binds the
+    /// input to its transaction.
     pub fn input_message(commit: &Commitment) -> Vec<u8> {
         hash_multi(domain::INPUT, &[&commit.0]).0.to_vec()
     }
@@ -96,6 +139,37 @@ impl Transaction {
     /// aggregation. The wallet tracks a pending send by this id and marks it
     /// confirmed when its inputs are observed spent.
     pub fn txid(&self) -> Hash256 {
+        if !self.has_any_binding() {
+            return self.legacy_txid();
+        }
+        let mut parts: Vec<Vec<u8>> = Vec::new();
+        let mut ins: Vec<&Input> = self.inputs.iter().collect();
+        ins.sort_unstable_by_key(|i| i.commit.0);
+        for i in &ins {
+            let mut v = i.commit.0.to_vec();
+            v.extend_from_slice(&i.input_key.unwrap_or_default());
+            parts.push(v);
+        }
+        for o in &self.outputs {
+            parts.push(o.commitment_bytes());
+        }
+        for k in &self.kernels {
+            let mut v = k.signing_message();
+            v.extend_from_slice(&k.stealth_excess.unwrap_or_default());
+            parts.push(v);
+        }
+        parts.push(self.stealth_offset.unwrap_or_default().to_vec());
+        parts.push(self.kernel_offset.unwrap_or_default().to_vec());
+        let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
+        hash_multi(domain::TX_BOUND, &refs)
+    }
+
+    /// The 1.0.x transaction id, which ignores every binding field.
+    ///
+    /// An old relay re-serialises a transaction without the fields it does
+    /// not know, so the same spend can arrive in two shapes; this id is what
+    /// they have in common.
+    pub fn legacy_txid(&self) -> Hash256 {
         let mut parts: Vec<Vec<u8>> = Vec::new();
         let mut ins: Vec<[u8; 32]> = self.inputs.iter().map(|i| i.commit.0).collect();
         ins.sort_unstable();
@@ -110,6 +184,46 @@ impl Transaction {
         }
         let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
         hash_multi(domain::TX, &refs)
+    }
+
+    /// Does any field of the binding rules appear?
+    pub fn has_any_binding(&self) -> bool {
+        self.stealth_offset.is_some()
+            || self.kernel_offset.is_some()
+            || self.inputs.iter().any(Input::has_binding)
+            || self
+                .kernels
+                .iter()
+                .any(|k| k.stealth_excess.is_some() || k.stealth_sig.is_some())
+    }
+
+    /// Does every object carry its binding fields?
+    pub fn has_full_binding(&self) -> bool {
+        self.inputs
+            .iter()
+            .all(|i| i.input_key.is_some() && i.key_sig.is_some())
+            && self
+                .kernels
+                .iter()
+                .all(|k| k.stealth_excess.is_some() && k.stealth_sig.is_some())
+    }
+
+    /// Restore the 1.0.x shape.
+    pub fn strip_binding(&mut self) {
+        for i in &mut self.inputs {
+            i.strip_binding();
+        }
+        for k in &mut self.kernels {
+            k.strip_binding();
+        }
+        self.stealth_offset = None;
+        self.kernel_offset = None;
+    }
+
+    /// Total fee, or `None` if any kernel fee is out of range or the sum
+    /// overflows.
+    pub fn checked_total_fee(&self) -> Option<u64> {
+        checked_fee_sum(&self.kernels)
     }
 
     /// Checks that need no chain context.
@@ -161,6 +275,10 @@ impl Transaction {
         if coinbase_kernels == 1 && !self.inputs.is_empty() {
             return Err(TxError::CoinbaseWithInputs);
         }
+        // The Coinbase flag is reserved for the coinbase output.
+        if coinbase_kernels == 0 && self.outputs.iter().any(|o| o.features.is_coinbase()) {
+            return Err(TxError::CoinbaseOutputInTransaction);
+        }
 
         for k in &self.kernels {
             k.check_shape().map_err(|_| TxError::BadKernel)?;
@@ -173,8 +291,45 @@ impl Transaction {
     /// Input signatures cannot be checked here because they need the UTXO set
     /// to resolve each input's one-time key — the ledger does that.
     pub fn verify_stateless(&self, ctx: &[u8]) -> Result<(), TxError> {
-        self.check_shape()?;
+        self.verify_stateless_rules(ctx, false)
+    }
 
+    /// [`Self::verify_stateless`] under the rules of a given height.
+    ///
+    /// `binding` is whether the binding fork is active for the block this
+    /// transaction would go into. Below it the binding fields are optional
+    /// and a kernel offset is refused; at or above it every field is required
+    /// and both balance equations must hold.
+    pub fn verify_stateless_rules(&self, ctx: &[u8], binding: bool) -> Result<(), TxError> {
+        self.check_shape()?;
+        if self.checked_total_fee().is_none() {
+            return Err(TxError::FeeOutOfRange);
+        }
+        if !binding && self.kernel_offset.is_some() {
+            return Err(TxError::KernelOffsetBeforeFork);
+        }
+        if binding && !self.has_full_binding() {
+            return Err(TxError::MissingBinding);
+        }
+        // Present binding fields must be valid even before the fork, so a node
+        // never relays a transaction that will turn invalid at activation.
+        if binding || self.has_full_binding() {
+            for k in &self.kernels {
+                if k.verified_stealth_excess().is_none() {
+                    return Err(TxError::BadStealthExcess);
+                }
+            }
+            key_balance(
+                &self.inputs,
+                &self.outputs,
+                &self.kernels,
+                self.stealth_offset,
+            )?;
+        }
+        self.verify_value_balance(ctx)
+    }
+
+    fn verify_value_balance(&self, ctx: &[u8]) -> Result<(), TxError> {
         // Every output must carry a valid range proof. Skipping this is what
         // allowed a commitment to −1 to pass as a legitimate amount.
         for o in &self.outputs {
@@ -207,12 +362,23 @@ impl Transaction {
 
         let kernel_sum =
             Commitment::sum(&self.kernels.iter().map(|k| k.excess).collect::<Vec<_>>())
-                .ok_or(TxError::MalformedCommitment)?;
+                .ok_or(TxError::MalformedCommitment)?
+                + offset_point_h(self.kernel_offset)?;
 
         if expected != kernel_sum {
             return Err(TxError::UnbalancedTransaction);
         }
         Ok(())
+    }
+
+    /// Verify one input's binding signature against the `Ko` in the UTXO set.
+    pub fn verify_input_key(input: &Input, output_pk: &[u8; 32]) -> bool {
+        match (input.input_key, input.key_sig) {
+            (Some(ki), Some(sig)) => {
+                nightfall_crypto::verify_input_key(&input.commit, &ki, output_pk, &sig)
+            }
+            _ => false,
+        }
     }
 
     /// Verify one input's signature against the one-time key recorded in the
@@ -230,8 +396,102 @@ impl Transaction {
     }
 }
 
+/// Largest fee a single kernel may declare: the whole supply.
+pub const MAX_KERNEL_FEE_DARKS: u64 = nightfall_types::MAX_SUPPLY_DARKS;
+
+/// Σ fees with every fee bounded and the sum checked.
+pub fn checked_fee_sum(kernels: &[TxKernel]) -> Option<u64> {
+    kernels.iter().try_fold(0u64, |acc, k| {
+        if k.fee_darks > MAX_KERNEL_FEE_DARKS {
+            return None;
+        }
+        acc.checked_add(k.fee_darks)
+    })
+}
+
+fn decode_offset(offset: Option<[u8; 32]>) -> Result<Scalar, TxError> {
+    match offset {
+        None => Ok(Scalar::ZERO),
+        Some(bytes) => nightfall_crypto::scalar_from_bytes(&bytes).ok_or(TxError::BadOffset),
+    }
+}
+
+/// `k·H` for a kernel offset (identity when absent).
+pub fn offset_point_h(offset: Option<[u8; 32]>) -> Result<RistrettoPoint, TxError> {
+    Ok(nightfall_crypto::generator_h() * decode_offset(offset)?)
+}
+
+/// Add two optional offsets. `None` + `None` stays `None`.
+pub fn add_offsets(a: Option<[u8; 32]>, b: Option<[u8; 32]>) -> Option<[u8; 32]> {
+    match (a, b) {
+        (None, None) => None,
+        _ => {
+            let sa = a
+                .and_then(|x| nightfall_crypto::scalar_from_bytes(&x))
+                .unwrap_or(Scalar::ZERO);
+            let sb = b
+                .and_then(|x| nightfall_crypto::scalar_from_bytes(&x))
+                .unwrap_or(Scalar::ZERO);
+            Some((sa + sb).to_bytes())
+        }
+    }
+}
+
+/// The key balance: `Σ Ki − Σ Ke = Σ X + s·G`.
+///
+/// Every input must carry an input key and every kernel a verified stealth
+/// excess; input key *signatures* need the UTXO set and are checked by the
+/// ledger.
+pub fn key_balance(
+    inputs: &[Input],
+    outputs: &[Output],
+    kernels: &[TxKernel],
+    stealth_offset: Option<[u8; 32]>,
+) -> Result<(), TxError> {
+    let mut lhs = RistrettoPoint::identity();
+    for i in inputs {
+        let ki = i.input_key.ok_or(TxError::MissingBinding)?;
+        lhs += CompressedRistretto(ki)
+            .decompress()
+            .ok_or(TxError::BadInputKey)?;
+    }
+    for o in outputs {
+        lhs -= CompressedRistretto(o.ephemeral_pk)
+            .decompress()
+            .ok_or(TxError::MalformedOutputKey)?;
+    }
+    let mut rhs = nightfall_crypto::generator_g() * decode_offset(stealth_offset)?;
+    for k in kernels {
+        rhs += k
+            .verified_stealth_excess()
+            .ok_or(TxError::BadStealthExcess)?;
+    }
+    if lhs != rhs {
+        return Err(TxError::KeyImbalance);
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TxError {
+    #[error("binding fields missing")]
+    MissingBinding,
+    #[error("malformed input key")]
+    BadInputKey,
+    #[error("invalid input key signature")]
+    BadInputKeySignature,
+    #[error("missing or invalid stealth excess")]
+    BadStealthExcess,
+    #[error("key balance does not hold")]
+    KeyImbalance,
+    #[error("malformed offset")]
+    BadOffset,
+    #[error("kernel fee out of range")]
+    FeeOutOfRange,
+    #[error("kernel offset before the binding fork")]
+    KernelOffsetBeforeFork,
+    #[error("coinbase-flagged output outside a coinbase")]
+    CoinbaseOutputInTransaction,
     #[error("too many inputs")]
     TooManyInputs,
     #[error("too many outputs")]

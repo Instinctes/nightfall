@@ -48,6 +48,12 @@ if [ "$DEST" != "dev" ]; then
   [ "$EXPLICIT_OUT" -eq 0 ] || { echo "--$DEST und --out sind nicht kombinierbar" >&2; exit 2; }
   [ "$DEST" = "publish" ] && OUT_DIR="$LIVE_DIR" || OUT_DIR="$ORIGIN_DIR"
 fi
+# The flat origin bindings are now frozen for old tabs. Official browser
+# releases are built/attested on GitHub and installed in their versioned folder.
+if [ "$DEST" = "origin" ] && [ -f "$ROOT/scripts/retired-browser-assets.sha256" ]; then
+  echo "The flat browser origin is retired. Install verified GitHub-built bindings in a new versioned folder." >&2
+  exit 2
+fi
 # Resolve existing symlinks AND missing parents before any build or write. The
 # returned physical path is also the one used for installation, not the input.
 OUT_DIR="$(node scripts/web-wallet-output.mjs resolve "$ROOT" "$OUT_DIR" "$DEST")"
