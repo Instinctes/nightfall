@@ -38,10 +38,10 @@ mod platform {
         // SAFETY: on_signal is an extern C function with the expected
         // signature and only executes a lock-free atomic store.
         unsafe {
-            if signal(SIGINT, on_signal as usize) == SIG_ERR {
+            if signal(SIGINT, on_signal as *const () as usize) == SIG_ERR {
                 anyhow::bail!("failed to register SIGINT handler");
             }
-            if signal(SIGTERM, on_signal as usize) == SIG_ERR {
+            if signal(SIGTERM, on_signal as *const () as usize) == SIG_ERR {
                 anyhow::bail!("failed to register SIGTERM handler");
             }
         }
