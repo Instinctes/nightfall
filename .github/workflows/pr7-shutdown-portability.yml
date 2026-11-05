@@ -10,6 +10,10 @@ on:
       - crates/nightfall-node/src/rpc.rs
       - crates/nightfall-node/src/mobile.rs
       - crates/nightfall-node/tests/restart_recovery.rs
+      - crates/nightfall-node/src/main.rs
+      - crates/nightfall-node/src/stop_signals.rs
+      - crates/nightfall-core/src/app.rs
+      - crates/nightfall-node/tests/daemon_stop.rs
       - .github/workflows/pr7-shutdown-portability.yml
 
 permissions:
@@ -42,6 +46,11 @@ jobs:
             echo "Restart/reorg regression run ${run}/3"
             cargo test --locked -p nightfall-node --test restart_recovery -j 2 -- --test-threads=1
           done
+      - name: Real daemon SIGTERM and restart (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cargo test --locked -p nightfall-node --test daemon_stop -j 2 -- --test-threads=1
       - name: Node unit tests
         shell: bash
         run: |
