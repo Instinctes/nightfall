@@ -1,5 +1,7 @@
 //! `nightfalld` — full node: P2P, RPC, optional mining.
 
+mod stop_signals;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use nightfall_crypto::WalletKeys;
 use nightfall_node::{recovery::RecoverOpts, NodeConfig, NodeHandle};
@@ -12,7 +14,7 @@ use nightfall_types::{
 use std::fs;
 use std::path::PathBuf;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -330,24 +332,34 @@ fn main() -> anyhow::Result<()> {
                 }
             );
 
+            // Install OS handlers before opening the datadir. Both Unix
+            // SIGINT/SIGTERM and Windows console events request an orderly exit.
+            stop_signals::install()?;
             let handle = NodeHandle::start(cfg)?;
             println!("genesis........ {}", handle.genesis_hex());
             println!("node online — Ctrl+C to stop");
 
-            // Stay alive; periodic status
-            loop {
-                thread::sleep(Duration::from_secs(30));
-                if let Ok(s) = handle.status_snapshot() {
-                    tracing::info!(
-                        blocks = s.blocks,
-                        tip = %s.tip,
-                        peers = s.peers,
-                        mempool = s.mempool,
-                        mining = s.mining,
-                        "heartbeat"
-                    );
+            let mut last_heartbeat = Instant::now();
+            while !stop_signals::requested() {
+                thread::sleep(Duration::from_millis(100));
+                if last_heartbeat.elapsed() >= Duration::from_secs(30) {
+                    last_heartbeat = Instant::now();
+                    if let Ok(s) = handle.status_snapshot() {
+                        tracing::info!(
+                            blocks = s.blocks,
+                            tip = %s.tip,
+                            peers = s.peers,
+                            mempool = s.mempool,
+                            mining = s.mining,
+                            "heartbeat"
+                        );
+                    }
                 }
             }
+
+            tracing::info!("received stop signal; closing node");
+            handle.shutdown()?;
+            tracing::info!("node shutdown completed");
         }
         Commands::RecoverStalledFork { force } => {
             let report = nightfall_node::recovery::recover_stalled_fork(&RecoverOpts {
