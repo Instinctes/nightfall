@@ -13,6 +13,7 @@ path = "src/main.rs"
 nightfall-types = { workspace = true }
 nightfall-consensus = { workspace = true }
 nightfall-storage = { workspace = true }
+nightfall-node = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
