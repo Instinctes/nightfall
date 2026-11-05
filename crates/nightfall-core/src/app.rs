@@ -2299,6 +2299,18 @@ pub fn parse_amount(s: &str) -> Result<u64, String> {
     nightfall_wallet::amount_input::parse_night(s).map_err(|e| e.to_string())
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        // The desktop window may close while the node still owns the datadir.
+        // Persist and close workers before releasing the shared directory lock.
+        if let Some(node) = self.node.take() {
+            if let Err(error) = node.shutdown() {
+                tracing::error!("Core node shutdown failed: {error:#}");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{parse_amount, App};
@@ -2641,18 +2653,6 @@ mod tests {
                     assert!(ui.min_rect().right() <= right + 1.0, "overflow at {width}");
                 });
             });
-        }
-    }
-}
-
-impl Drop for App {
-    fn drop(&mut self) {
-        // The desktop window may close while the node still owns the datadir.
-        // Persist and close workers before releasing the shared directory lock.
-        if let Some(node) = self.node.take() {
-            if let Err(error) = node.shutdown() {
-                tracing::error!("Core node shutdown failed: {error:#}");
-            }
         }
     }
 }
