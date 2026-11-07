@@ -174,6 +174,55 @@ fn real_two_nodes_adopt_shorter_heavier_branch_only_one_way() {
     assert_eq!(sa.minted, sb.minted);
     assert_eq!(sa.burned_fees, sb.burned_fees);
 
+    // Regression: a pruned node must refuse a valid heavier fork below its horizon.
+    // Reuse the already mined, validated branches: no extra mining is needed.
+    // This checks the real P2P/reorg path, not just a helper function.
+    let mut pruned_light = a_long_light.clone();
+    let dropped = pruned_light.prune_keep(48).expect("prune fork fixture");
+    assert!(dropped > 0, "fixture must actually discard historical bodies");
+    let horizon = pruned_light.first_height;
+    let ancestor = prefix.tip_height().unwrap().0;
+    assert!(horizon > ancestor, "shared ancestor must be below prune horizon");
+    assert!(
+        a_long_light.tip_height().unwrap().0 - ancestor
+            <= nightfall_consensus::MAX_REORG_DEPTH as u64,
+        "fixture must be inside the normal reorg window"
+    );
+    pruned_light.verify_supply().expect("valid pruned supply");
+
+    let pruned_dir = root.join("pruned-a");
+    ChainStore::new(&pruned_dir).save(&pruned_light).unwrap();
+    let (pruned, _pruned_port) = boot(&pruned_dir);
+    wait_until("pruned fork loaded", Duration::from_secs(45), || {
+        let s = pruned.status_snapshot().unwrap();
+        !s.loading && s.pruned && s.prune_height == horizon && s.tip == a_tip
+    });
+    let before = pruned.status_snapshot().unwrap();
+    assert!(before.supply_ok);
+    pruned.add_peer(&format!("127.0.0.1:{b_port}")).unwrap();
+
+    // This flag is set by the horizon refusal in the actual node sync path.
+    // It prevents a disconnected or unattempted sync from passing the test.
+    wait_until("pruned node explicitly refuses deep rewind", Duration::from_secs(60), || {
+        let s = pruned.status_snapshot().unwrap();
+        s.stalled_on_fork && !s.reorg_in_flight
+    });
+    let after = pruned.status_snapshot().unwrap();
+    assert!(after.pruned && after.supply_ok);
+    assert_eq!(after.prune_height, horizon);
+    assert_eq!(after.tip, before.tip, "refusal must preserve original tip");
+    assert_eq!(after.tip_height, before.tip_height);
+    assert_eq!(after.total_work, before.total_work);
+    assert_eq!(after.utxo_root, before.utxo_root);
+    assert_eq!(after.kernels, before.kernels);
+    assert_eq!(after.minted, before.minted);
+    assert_eq!(after.burned_fees, before.burned_fees);
+
+    // Peer B stays on the valid heavier chain too.
+    let b_after = b.status_snapshot().unwrap();
+    assert_eq!(b_after.tip, b_tip);
+    assert_eq!(b_after.total_work, b_work);
+
     // Existing NodeHandle on this PR has no worker join lifecycle yet.
     // The ephemeral test-runner workspace is deliberately not removed
     // while either live node may have background writers.
