@@ -179,10 +179,16 @@ fn real_two_nodes_adopt_shorter_heavier_branch_only_one_way() {
     // This checks the real P2P/reorg path, not just a helper function.
     let mut pruned_light = a_long_light.clone();
     let dropped = pruned_light.prune_keep(48).expect("prune fork fixture");
-    assert!(dropped > 0, "fixture must actually discard historical bodies");
+    assert!(
+        dropped > 0,
+        "fixture must actually discard historical bodies"
+    );
     let horizon = pruned_light.first_height;
     let ancestor = prefix.tip_height().unwrap().0;
-    assert!(horizon > ancestor, "shared ancestor must be below prune horizon");
+    assert!(
+        horizon > ancestor,
+        "shared ancestor must be below prune horizon"
+    );
     assert!(
         a_long_light.tip_height().unwrap().0 - ancestor
             <= nightfall_consensus::MAX_REORG_DEPTH as u64,
@@ -203,10 +209,14 @@ fn real_two_nodes_adopt_shorter_heavier_branch_only_one_way() {
 
     // This flag is set by the horizon refusal in the actual node sync path.
     // It prevents a disconnected or unattempted sync from passing the test.
-    wait_until("pruned node explicitly refuses deep rewind", Duration::from_secs(60), || {
-        let s = pruned.status_snapshot().unwrap();
-        s.stalled_on_fork && !s.reorg_in_flight
-    });
+    wait_until(
+        "pruned node explicitly refuses deep rewind",
+        Duration::from_secs(60),
+        || {
+            let s = pruned.status_snapshot().unwrap();
+            s.stalled_on_fork && !s.reorg_in_flight
+        },
+    );
     let after = pruned.status_snapshot().unwrap();
     assert!(after.pruned && after.supply_ok);
     assert_eq!(after.prune_height, horizon);
