@@ -1,0 +1,38 @@
+name: Network readiness evidence offline
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  public-evidence-tests:
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 5
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Adversarial monetary and network tests
+        run: |
+          python3 -m unittest discover \
+            -s scripts \
+            -p 'test_network_readiness.py' \
+            -v
+
+      - name: Python syntax verification
+        run: |
+          python3 -m py_compile \
+            scripts/network_readiness.py
