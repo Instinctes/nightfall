@@ -3708,3 +3708,139 @@ mod reorg_fetch_throttle_tests {
         assert_eq!(slots.len(), 1);
     }
 }
+
+// Additional adversarial post-activation tests for PR #10.
+// No production consensus changes.
+#[cfg(test)]
+mod post_activation_fork_choice_property_tests {
+    use super::{
+        ancestor_search_window, highest_common_within, shorter_peer_action, ShorterPeerAction,
+    };
+
+    #[test]
+    fn rewind_window_remains_correct_across_activation_and_overflow() {
+        let depth = nightfall_consensus::MAX_REORG_DEPTH as u64;
+
+        for ours in [499_999_u64, 500_000, 500_001, 500_500, 2_000_000, u64::MAX] {
+            for gap in [0, 1, 2, depth.saturating_sub(1), depth, depth + 1, 1_000] {
+                let peer = ours.saturating_sub(gap);
+                let rewind = ours - peer;
+
+                let expected = if rewind > depth {
+                    None
+                } else {
+                    Some((peer, (depth - rewind).min(peer)))
+                };
+
+                assert_eq!(
+                    ancestor_search_window(ours, peer),
+                    expected,
+                    "ours={ours}, peer={peer}"
+                );
+            }
+
+            let ahead = ours.saturating_add(10_000);
+
+            assert_eq!(
+                ancestor_search_window(ours, ahead),
+                Some((ours, depth.min(ours)))
+            );
+        }
+    }
+
+    #[test]
+    fn highest_common_is_exhaustive_on_small_synthetic_chains() {
+        for start in 0..=160_u64 {
+            for window in [0, 1, 2, 3, 7, 13, 31, 65, 500] {
+                // start+1 means no shared block exists.
+                for common in 0..=start + 1 {
+                    let exists = common <= start;
+
+                    let expected = if exists && start - common <= window.min(start) {
+                        Some(common)
+                    } else {
+                        None
+                    };
+
+                    let mut probes = 0_u32;
+
+                    let observed = highest_common_within(start, window, |height| {
+                        probes += 1;
+                        Some(exists && height <= common)
+                    });
+
+                    assert_eq!(
+                        observed, expected,
+                        "start={start}, window={window}, common={common}"
+                    );
+
+                    assert!(probes <= 32, "probe budget exceeded: {probes}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn postfork_boundary_and_probe_budget_are_bounded() {
+        for start in [500_000_u64, 500_001, 500_500, 1_000_000, u64::MAX] {
+            for back in [0, 1, 2, 3, 127, 255, 499, 500, 501] {
+                let shared = start - back;
+                let mut probes = 0_u32;
+
+                let answer = highest_common_within(start, 500, |height| {
+                    probes += 1;
+                    Some(height <= shared)
+                });
+
+                assert_eq!(answer, if back <= 500 { Some(shared) } else { None });
+
+                assert!(probes <= 24, "unbounded probing at {start}: {probes}");
+            }
+        }
+    }
+
+    #[test]
+    fn missing_peer_answers_always_fail_closed() {
+        let mut normal_probes = 0;
+
+        let expected = highest_common_within(500_500, 500, |height| {
+            normal_probes += 1;
+            Some(height <= 500_123)
+        });
+
+        assert_eq!(expected, Some(500_123));
+
+        for missing_at in 1..=normal_probes {
+            let mut index = 0;
+
+            let actual = highest_common_within(500_500, 500, |height| {
+                index += 1;
+
+                if index == missing_at {
+                    None
+                } else {
+                    Some(height <= 500_123)
+                }
+            });
+
+            assert_eq!(actual, None, "failed probe #{missing_at} was accepted");
+        }
+    }
+
+    #[test]
+    fn shorter_divergent_branch_is_never_classified_as_lag() {
+        for peer in [0_u64, 1, 2, 499_999, 500_000, 500_001, 600_000] {
+            for back in [0, 1, 2, 100, 500, 1_000] {
+                let ancestor = peer.saturating_sub(back);
+
+                let expected = if ancestor == peer {
+                    ShorterPeerAction::PushFrom(peer)
+                } else {
+                    ShorterPeerAction::EvaluateFrom(ancestor + 1)
+                };
+
+                assert_eq!(shorter_peer_action(peer, ancestor), expected);
+            }
+        }
+    }
+}
