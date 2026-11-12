@@ -95,18 +95,17 @@ pub(crate) fn open_read_no_links(path: &Path) -> std::io::Result<File> {
 /// not a plain file either, and a wallet inside one is a wallet whose contents
 /// another program decides to materialise or evict.
 pub(crate) fn is_link_like(meta: &Metadata) -> bool {
-    if meta.file_type().is_symlink() {
-        return true;
-    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return true;
-        }
+        let is_reparse_point = meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        meta.file_type().is_symlink() || is_reparse_point
     }
-    false
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
 }
 
 /// How many names this open file has. More than one means someone else can
