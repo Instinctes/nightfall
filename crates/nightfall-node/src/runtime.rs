@@ -4,7 +4,9 @@ use crate::rpc;
 use crate::session::{
     fanout_block, fluff_tx, inbound_key, outbound_key, stem_tx, SessionHandle, SessionPool,
 };
-use nightfall_consensus::{Block, BlockTemplate, Chain, Mempool, PRUNE_KEEP_BLOCKS};
+use nightfall_consensus::{
+    precheck_pow, Block, BlockTemplate, Chain, Mempool, PowVerdict, PRUNE_KEEP_BLOCKS,
+};
 use nightfall_crypto::{default_threads, mine_parallel, Address};
 use nightfall_ledger::Transaction;
 use nightfall_p2p::{
@@ -369,7 +371,7 @@ pub struct NodeInner {
     /// Next height a catch-up page should request, so two peers do not
     /// fetch the same 128-block slice.
     ibd_from: u64,
-    ibd_buffer: BTreeMap<u64, Vec<Block>>,
+    ibd_buffer: BTreeMap<u64, IbdBatch>,
     /// Set while a reorg candidate is being rebuilt and verified.
     ///
     /// Rebuilding is measured in tens of seconds on a chain of any size, and
@@ -1341,6 +1343,100 @@ impl NodeHandle {
         Ok(backup)
     }
 
+    /// Whether this node may fetch the chain archive over plain HTTPS: not
+    /// under privacy lockdown, and not when it dials its peers through a
+    /// proxy. See [`crate::bootstrap`].
+    pub fn direct_downloads_allowed(&self) -> bool {
+        crate::bootstrap::allowed()
+            && self
+                .state
+                .lock()
+                .map(|g| g.proxy.is_none())
+                .unwrap_or(false)
+    }
+
+    /// Validate the chain file in `import_dir` and, if it is ahead of what
+    /// this node has, continue from it.
+    ///
+    /// `import_dir` is a directory holding one `blocks.bin`, as
+    /// [`crate::bootstrap::download`] leaves it. The file is loaded exactly
+    /// as a chain file found in the datadir with no validation record would
+    /// be: nothing in it is taken on trust (see
+    /// `Chain::replay_foreign_blocks`). That runs with the node's lock
+    /// released, so the node keeps serving and syncing meanwhile.
+    ///
+    /// The switch itself is refused unless the archive carries more work than
+    /// the chain already here, so this can never move a node backwards or
+    /// replace a longer history with a shorter one. On success the new chain
+    /// is written to the datadir with this installation's validation record,
+    /// and the peers are asked for whatever comes after it.
+    ///
+    /// Returns the number of blocks now held. `on_progress` receives
+    /// `(blocks checked, blocks in the archive)`.
+    pub fn adopt_chain_archive(
+        &self,
+        import_dir: &std::path::Path,
+        on_progress: impl FnMut(u64, u64),
+    ) -> anyhow::Result<u64> {
+        let network = {
+            let g = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("node state lock poisoned"))?;
+            if g.loading {
+                anyhow::bail!("chain is still loading from disk");
+            }
+            g.network
+        };
+
+        let candidate =
+            ChainStore::new(import_dir).load_or_new_with_progress(network, on_progress)?;
+        if candidate.block_count() == 0 {
+            anyhow::bail!("the archive holds no blocks");
+        }
+        if self.shutdown.is_requested() {
+            anyhow::bail!("the node is shutting down");
+        }
+
+        let (sessions, blocks, next) = {
+            let mut g = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("node state lock poisoned"))?;
+            if g.loading {
+                anyhow::bail!("chain is still loading from disk");
+            }
+            if candidate.total_work <= g.chain.total_work {
+                anyhow::bail!(
+                    "the archive is not ahead of the chain this node already has \
+                     ({} blocks here, {} in the archive)",
+                    g.chain.block_count(),
+                    candidate.block_count()
+                );
+            }
+            g.chain = candidate;
+            g.branch.clear();
+            g.ibd_buffer.clear();
+            g.ibd_from = next_needed_height(&g);
+            g.stalled_on_fork.store(false, Ordering::SeqCst);
+            g.fork_rewind.store(0, Ordering::SeqCst);
+            g.behind_since = now_unix();
+            // Whatever was waiting was checked against the old tip.
+            g.mempool = Mempool::default();
+            g.bump_tip();
+            g.persist()?;
+            (g.sessions.all(), g.chain.block_count(), next_needed_height(&g))
+        };
+        for sess in sessions {
+            let _ = sess.send(&nightfall_p2p::PeerMsg::GetBlocks {
+                from_height: next,
+                limit: nightfall_p2p::MAX_BLOCKS_PER_REQUEST,
+            });
+        }
+        tracing::info!("continuing from a chain archive: {blocks} blocks, next height {next}");
+        Ok(blocks)
+    }
+
     pub fn shared(&self) -> SharedState {
         Arc::clone(&self.state)
     }
@@ -1979,13 +2075,53 @@ enum IbdPage {
     Rejected,
 }
 
-fn apply_ibd_page(inner: &mut NodeInner, blocks: Vec<Block>, now: u64) -> IbdPage {
+/// One page of blocks from a peer, with whatever proof of work was already
+/// hashed for it. A page waiting in the buffer keeps its verdicts, so the
+/// hashing done when it arrived is not repeated when the hole fills.
+struct IbdBatch {
+    blocks: Vec<Block>,
+    verdicts: Vec<Option<PowVerdict>>,
+}
+
+/// Hash a page's proof of work on all cores, before taking the state lock.
+///
+/// Applying a page used to hash each block under the lock, one after the
+/// other: about 11 ms a block, 1.4 s a page, on a single core while the rest
+/// sat idle. The hash depends only on the header, so it is done here first.
+/// Every other rule still runs in order under the lock.
+///
+/// One page at a time: with several peers delivering at once, each starting
+/// its own set of workers would only make them fight over the same cores and
+/// hold 32 MiB per worker per peer.
+fn precheck_ibd_page(state: &SharedState, blocks: Vec<Block>) -> IbdBatch {
+    static ONE_PAGE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+    let wanted = state.lock().ok().and_then(|g| {
+        let next = next_needed_height(&g);
+        let last = blocks.last().map(|b| b.header.height.0)?;
+        // A page entirely behind our tip is a duplicate. Do not hash it.
+        (last >= next).then(|| g.chain.pow_params())
+    });
+    let verdicts = match wanted {
+        Some(params) => {
+            let _lane = ONE_PAGE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+            precheck_pow(&blocks, params, default_threads())
+        }
+        None => Vec::new(),
+    };
+    IbdBatch { blocks, verdicts }
+}
+
+fn apply_ibd_page(inner: &mut NodeInner, page: IbdBatch, now: u64) -> IbdPage {
+    let IbdBatch { blocks, verdicts } = page;
     let Some(start) = blocks.first().map(|b| b.header.height.0) else {
         return IbdPage::Duplicate;
     };
     let next = next_needed_height(inner);
     if start > next {
-        inner.ibd_buffer.insert(start, blocks);
+        inner
+            .ibd_buffer
+            .insert(start, IbdBatch { blocks, verdicts });
         while inner.ibd_buffer.len() > 8 {
             if let Some(k) = inner.ibd_buffer.keys().next_back().copied() {
                 inner.ibd_buffer.remove(&k);
@@ -1997,16 +2133,22 @@ fn apply_ibd_page(inner: &mut NodeInner, blocks: Vec<Block>, now: u64) -> IbdPag
     if last_h < next {
         return IbdPage::Duplicate;
     }
+    // A page that overlaps our tip starts with blocks we already hold. The
+    // chain rejects those on height, as before; the verdicts stay aligned
+    // with `blocks` by index either way.
     let mut applied = inner
         .chain
-        .try_ingest_blocks(blocks, now)
+        .try_ingest_blocks_prechecked(blocks, &verdicts, now)
         .unwrap_or_default();
     loop {
         let n = next_needed_height(inner);
         let Some(page) = inner.ibd_buffer.remove(&n) else {
             break;
         };
-        match inner.chain.try_ingest_blocks(page, now) {
+        match inner
+            .chain
+            .try_ingest_blocks_prechecked(page.blocks, &page.verdicts, now)
+        {
             Ok(k) if k > 0 => applied += k,
             _ => break,
         }
@@ -2937,9 +3079,10 @@ fn peer_io_loop(
                     return Err(anyhow::anyhow!("peer sent an oversized block batch"));
                 }
                 let short_response = blocks.len() < MAX_BLOCKS_PER_REQUEST;
+                let page = precheck_ibd_page(state, blocks);
                 let outcome = {
                     let mut g = state.lock().unwrap();
-                    let outcome = apply_ibd_page(&mut g, blocks, now_unix());
+                    let outcome = apply_ibd_page(&mut g, page, now_unix());
                     if let IbdPage::Applied(n) = outcome {
                         g.stalled_on_fork.store(false, Ordering::SeqCst);
                         g.bump_tip();
