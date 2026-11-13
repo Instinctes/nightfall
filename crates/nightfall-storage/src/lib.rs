@@ -17,6 +17,7 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod checkpoint;
 pub mod codec;
 pub mod dirlock;
 pub use codec::Format;
@@ -269,10 +270,17 @@ impl ChainStore {
         if m.validated_by.is_empty() || m.validated_by != self.install_id() {
             return false;
         }
+        if !self.blocks_path().exists() {
+            return false;
+        }
         let bytes = fs::metadata(self.blocks_path())
             .map(|x| x.len())
             .unwrap_or(0);
-        if m.validated_bytes != bytes || bytes == 0 {
+        if m.validated_bytes != bytes {
+            return false;
+        }
+        let bodyless_pruned = m.pruned && m.first_height > 0 && m.block_count == m.first_height;
+        if bytes == 0 && !bodyless_pruned {
             return false;
         }
         if !m.pruned && m.first_height == 0 {
@@ -613,6 +621,143 @@ impl ChainStore {
         Ok(chain)
     }
 
+    pub fn export_checkpoint_snapshot(
+        &self,
+        out: &Path,
+        network: NetworkId,
+    ) -> anyhow::Result<checkpoint::CheckpointSnapshot> {
+        if out.exists() {
+            anyhow::bail!("refusing to overwrite {}", out.display());
+        }
+
+        let chain = self.load_or_new(network)?;
+        let snapshot = checkpoint::checkpoint_snapshot_from_chain(&chain)?;
+
+        if let Some(parent) = out.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        let tmp = out.with_extension("tmp");
+        let write_result = (|| -> anyhow::Result<()> {
+            let mut writer = BufWriter::new(File::create(&tmp)?);
+            serde_json::to_writer(&mut writer, &snapshot)?;
+            writer.flush()?;
+            fs::rename(&tmp, out)?;
+            Ok(())
+        })();
+
+        if let Err(err) = write_result {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
+
+        Ok(snapshot)
+    }
+
+    /// Install authenticated checkpoint state into a fresh chain datadir.
+    ///
+    /// Acceptance is anchored to the checkpoint compiled into this binary.
+    /// Blocks after that checkpoint are subsequently downloaded and validated
+    /// through the ordinary consensus path.
+    pub fn import_checkpoint_snapshot(
+        &self,
+        from: &Path,
+        network: NetworkId,
+    ) -> anyhow::Result<Chain> {
+        const MAX_CHECKPOINT_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
+
+        self.refuse_if_interrupted_recovery()?;
+
+        if !from.is_file() {
+            anyhow::bail!("checkpoint snapshot is not a file: {}", from.display());
+        }
+
+        let bytes = fs::metadata(from)?.len();
+        if bytes == 0 {
+            anyhow::bail!("checkpoint snapshot is empty");
+        }
+        if bytes > MAX_CHECKPOINT_SNAPSHOT_BYTES {
+            anyhow::bail!(
+                "checkpoint snapshot is {} bytes; maximum accepted size is {}",
+                bytes,
+                MAX_CHECKPOINT_SNAPSHOT_BYTES
+            );
+        }
+
+        if self.blocks_path().exists()
+            || self.meta_path().exists()
+            || self.horizon_path().exists()
+            || self.headers_path().exists()
+        {
+            anyhow::bail!(
+                "checkpoint state import requires fresh chain state; refusing to replace existing chain files"
+            );
+        }
+
+        let reader = BufReader::new(File::open(from)?);
+        let snapshot: checkpoint::CheckpointSnapshot = serde_json::from_reader(reader)
+            .map_err(|e| anyhow::anyhow!("invalid checkpoint snapshot: {e}"))?;
+
+        let chain = checkpoint::chain_from_checkpoint_snapshot(snapshot, network)?;
+
+        self.ensure_dir()?;
+        // A durable marker must precede the first chain-file modification.
+        // If power is lost in any later multi-file write, restart refuses.
+        let marker = self.dir.join(CHECKPOINT_IMPORT_JOURNAL);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)?;
+        file.write_all(b"checkpoint import in progress\n")?;
+        file.sync_all()?;
+        sync_dir(&self.dir)?;
+
+        self.save(&chain)?;
+
+        // Force all chain components to stable storage before clearing
+        // the marker. Metadata from save() is written last.
+        for path in [
+            self.blocks_path(),
+            self.headers_path(),
+            self.horizon_path(),
+            self.meta_path(),
+            self.dir.join("install-id"),
+        ] {
+            if path.exists() {
+                File::open(&path)?.sync_all()?;
+            }
+        }
+        sync_dir(&self.dir)?;
+        if !self.is_own_file_trusted() {
+            anyhow::bail!("checkpoint import did not produce a trusted local validation record");
+        }
+
+        fs::remove_file(&marker)?;
+        sync_dir(&self.dir)?;
+
+        /*
+         * Exercise the exact normal restart path immediately. This proves that
+         * the authenticated in-memory state can be represented safely by the
+         * existing bodyless-pruned persistence format.
+         */
+        let loaded = self.load_or_new(network)?;
+
+        if loaded.tip_hash() != chain.tip_hash()
+            || loaded.ledger.utxo_root() != chain.ledger.utxo_root()
+            || loaded.ledger.kernel_sum() != chain.ledger.kernel_sum()
+            || loaded.ledger.supply.total_minted_darks != chain.ledger.supply.total_minted_darks
+            || loaded.ledger.supply.total_burned_darks != chain.ledger.supply.total_burned_darks
+            || loaded.total_work != chain.total_work
+            || loaded.first_height != chain.first_height
+        {
+            anyhow::bail!("checkpoint state changed after persistence round-trip");
+        }
+
+        Ok(loaded)
+    }
+
     /// Tip hash recorded alongside the stored blocks, if any.
     fn stored_tip(&self) -> Option<String> {
         fs::read_to_string(self.meta_path())
@@ -812,6 +957,15 @@ impl ChainStore {
     /// start, a storage migration or a snapshot export/import can never
     /// silently proceed over an unfinished recovery.
     pub fn refuse_if_interrupted_recovery(&self) -> anyhow::Result<()> {
+        let checkpoint_marker = self.dir.join(CHECKPOINT_IMPORT_JOURNAL);
+        match fs::symlink_metadata(&checkpoint_marker) {
+            Ok(_) => anyhow::bail!(
+                "interrupted checkpoint import in {}; do not start from partial chain files; restore a clean datadir",
+                self.dir.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         let journal = self.dir.join(RECOVERY_JOURNAL);
         // symlink_metadata, not exists(): a dangling symlink at the journal path
         // must be caught too (exists() follows it and reports "not found"), and
@@ -1169,6 +1323,8 @@ pub const DATADIR_EPOCH: &str = "n8";
 /// recovery was interrupted and the datadir may be half-reset, so every load
 /// path refuses to start until the operator restores the named backup.
 pub const RECOVERY_JOURNAL: &str = ".recovery-journal.json";
+/// Fail-closed marker while checkpoint files are being installed.
+pub const CHECKPOINT_IMPORT_JOURNAL: &str = ".checkpoint-import-in-progress";
 
 pub fn default_data_dir(network: NetworkId) -> PathBuf {
     let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -1301,6 +1457,61 @@ fn getrandom_bytes(out: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Crash-injection analogue: an import persisted only the first chain
+    /// file and its journal before the process disappeared. The remaining
+    /// state is deliberately inconsistent and must not be accepted.
+    #[test]
+    fn interrupted_checkpoint_import_with_partial_chain_files_fails_closed() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nf-checkpoint-half-import-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let blocks = dir.join(codec::BLOCKS_BIN);
+        let meta = dir.join("chain-meta.json");
+        let journal = dir.join(CHECKPOINT_IMPORT_JOURNAL);
+        fs::write(&blocks, b"truncated-before-metadata").unwrap();
+        fs::write(&meta, b"{").unwrap();
+        fs::write(&journal, b"in-progress").unwrap();
+
+        let err = ChainStore::new(&dir)
+            .load_or_new(NetworkId::Devnet)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("interrupted checkpoint import"), "{err}");
+        assert_eq!(fs::read(&blocks).unwrap(), b"truncated-before-metadata");
+        assert_eq!(fs::read(&meta).unwrap(), b"{");
+        assert_eq!(fs::read(&journal).unwrap(), b"in-progress");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn interrupted_checkpoint_import_is_never_loaded() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nf-checkpoint-interrupt-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join(CHECKPOINT_IMPORT_JOURNAL);
+        fs::write(&marker, b"interrupted").unwrap();
+
+        let error = ChainStore::new(&dir)
+            .load_or_new(NetworkId::Devnet)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("interrupted checkpoint import"), "{error}");
+        assert_eq!(fs::read(&marker).unwrap(), b"interrupted");
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     /// An interrupted recovery marks the datadir unsafe for every entry
     /// point that reads or rewrites the chain, not only a normal start.
