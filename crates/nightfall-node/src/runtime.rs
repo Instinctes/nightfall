@@ -21,10 +21,211 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 pub type SharedState = Arc<Mutex<NodeInner>>;
+
+#[derive(Default)]
+pub(crate) struct Workers {
+    handles: Mutex<Vec<JoinHandle<()>>>,
+    accepting: AtomicBool,
+}
+
+impl Workers {
+    pub(crate) fn new() -> Self {
+        Self {
+            handles: Mutex::new(Vec::new()),
+            accepting: AtomicBool::new(true),
+        }
+    }
+
+    /// Retire completed handles before adding more.
+    /// Joining happens outside the registry lock.
+    fn reap_finished(&self) -> usize {
+        let mut finished = Vec::new();
+
+        {
+            let mut handles = self.handles.lock().unwrap();
+            let mut i = 0;
+
+            while i < handles.len() {
+                if handles[i].is_finished() {
+                    finished.push(handles.swap_remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        let n = finished.len();
+
+        for handle in finished {
+            let _ = handle.join();
+        }
+
+        n
+    }
+
+    pub(crate) fn spawn<F>(&self, work: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.reap_finished();
+
+        let mut handles = self.handles.lock().unwrap();
+
+        if !self.accepting.load(Ordering::Acquire) {
+            return;
+        }
+
+        handles.push(thread::spawn(work));
+    }
+
+    fn stop_accepting(&self) {
+        let _handles = self.handles.lock().unwrap();
+        self.accepting.store(false, Ordering::Release);
+    }
+
+    /// Wait for every worker only up to a global deadline. Report unfinished
+    /// workers instead of hanging indefinitely. Workers are never joined
+    /// while the registry mutex is held.
+    fn join_all_bounded(&self, timeout: Duration) -> anyhow::Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let (finished, outstanding) = {
+                let mut handles = self.handles.lock().unwrap();
+                let mut finished = Vec::new();
+                let mut i = 0;
+                while i < handles.len() {
+                    if handles[i].is_finished() {
+                        finished.push(handles.swap_remove(i));
+                    } else {
+                        i += 1;
+                    }
+                }
+                (finished, handles.len())
+            };
+
+            for handle in finished {
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("node worker panicked during shutdown"))?;
+            }
+            if outstanding == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                tracing::error!(outstanding, "node shutdown deadline exceeded");
+                anyhow::bail!("node shutdown timed out with {outstanding} workers running");
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Shutdown {
+    requested: AtomicBool,
+    wake: Condvar,
+    lock: Mutex<()>,
+    next_socket_id: AtomicU64,
+    pending_sockets: Mutex<HashMap<u64, TcpStream>>,
+}
+
+pub(crate) struct PendingSocket {
+    shutdown: Arc<Shutdown>,
+    id: u64,
+}
+
+impl Drop for PendingSocket {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.shutdown.pending_sockets.lock() {
+            pending.remove(&self.id);
+        }
+    }
+}
+
+impl Shutdown {
+    fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+        self.wake.notify_all();
+
+        let sockets = self
+            .pending_sockets
+            .lock()
+            .map(|mut pending| {
+                pending
+                    .drain()
+                    .map(|(_, stream)| stream)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        for stream in sockets {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    pub(crate) fn track_socket(
+        self: &Arc<Self>,
+        stream: &TcpStream,
+    ) -> std::io::Result<PendingSocket> {
+        if self.is_requested() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "node shutdown requested",
+            ));
+        }
+
+        let tracked = stream.try_clone()?;
+        let id = self.next_socket_id.fetch_add(1, Ordering::Relaxed);
+
+        let mut pending = self
+            .pending_sockets
+            .lock()
+            .map_err(|_| std::io::Error::other("pending socket registry lock poisoned"))?;
+
+        if self.is_requested() {
+            drop(pending);
+            let _ = tracked.shutdown(std::net::Shutdown::Both);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "node shutdown requested",
+            ));
+        }
+
+        pending.insert(id, tracked);
+
+        Ok(PendingSocket {
+            shutdown: Arc::clone(self),
+            id,
+        })
+    }
+
+    pub(crate) fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn wait_timeout(&self, duration: Duration) -> bool {
+        if self.is_requested() {
+            return true;
+        }
+
+        let Ok(guard) = self.lock.lock() else {
+            return self.is_requested();
+        };
+
+        if self.is_requested() {
+            return true;
+        }
+
+        let _ = self.wake.wait_timeout(guard, duration);
+        self.is_requested()
+    }
+}
 
 /// Soft cap on live sessions. A seed that sits at this number and then
 /// refuses Hello is how new wallets freeze on genesis: they never learn
@@ -192,6 +393,9 @@ pub struct NodeInner {
     /// NAT stays in real time because its outbound to a seed lives in this
     /// pool, not because anyone can dial it back.
     pub sessions: Arc<SessionPool>,
+    /// Registry for every node-owned background thread. Relay sends use the
+    /// same registry so shutdown can wait until no node worker remains.
+    pub(crate) workers: Arc<Workers>,
     /// Generation counter + condvar. Bumped with the tip so a wallet scan
     /// thread can sleep until there is something new to look at, instead of
     /// polling the whole chain every few seconds.
@@ -210,6 +414,16 @@ pub struct NodeInner {
     /// Tor exits and produced 51 hung SYN_SENT while the seed sat one
     /// socket away.
     pub confirmed_peers: HashSet<String>,
+    /// Peers explicitly disabled for this process lifetime.
+    ///
+    /// Supervisors, handshakes, gossip, and directory discovery must not
+    /// silently re-enable one. `add_peer` is the explicit re-enable path.
+    suppressed_peers: HashSet<String>,
+    /// Advertised dial address belonging to each live inbound session.
+    ///
+    /// Inbound session keys contain the observed ephemeral source port,
+    /// so this mapping is required to disconnect a logically removed peer.
+    inbound_peer_addrs: HashMap<String, String>,
     /// Set when a peer is ahead and their blocks do not connect to our tip.
     /// Mining on that tip deepens a fork; this does not expire with the
     /// catch-up window.
@@ -375,6 +589,7 @@ impl NodeInner {
             .map(|s| s.to_string())
             .chain(self.bootstrap.iter().cloned())
             .chain(self.peer_addrs.iter().cloned())
+            .filter(|addr| !self.suppressed_peers.contains(addr))
             .collect();
 
         // Archives first when we are behind.
@@ -431,6 +646,9 @@ impl NodeInner {
     }
 
     fn mark_confirmed(&mut self, addr: String) {
+        if self.suppressed_peers.contains(&addr) {
+            return;
+        }
         self.confirmed_peers.insert(addr.clone());
         self.peer_addrs.insert(addr);
     }
@@ -447,7 +665,8 @@ impl NodeInner {
             fallback_dial_block(&self.dialable_peers(), &block, self);
             return;
         }
-        fanout_block(&live, &block);
+        let workers = Arc::clone(&self.workers);
+        fanout_block(&live, &block, move |work| workers.spawn(work));
     }
 }
 
@@ -478,7 +697,8 @@ fn fallback_dial_block(peers: &[String], block: &Block, inner: &NodeInner) {
         let block = block.clone();
         let addr = addr.clone();
         let proxy = inner.proxy.clone();
-        thread::spawn(move || {
+        let workers = Arc::clone(&inner.workers);
+        workers.spawn(move || {
             if let Ok((mut s, _tor)) = connect_peer_via(&addr, 3000, proxy.as_ref()) {
                 if handshake(&mut s, network, genesis, height, tip, port, pruned, first_h).is_ok() {
                     let _ = broadcast_block(&mut s, &block);
@@ -501,7 +721,8 @@ fn fallback_stem_tx(peers: &[String], tx: &Transaction, inner: &NodeInner) {
     let first_h = inner.chain.first_height;
     let proxy = inner.proxy.clone();
     let tx = tx.clone();
-    thread::spawn(move || {
+    let workers = Arc::clone(&inner.workers);
+    workers.spawn(move || {
         if let Ok((mut s, _tor)) = connect_peer_via(&addr, 3000, proxy.as_ref()) {
             if handshake(&mut s, network, genesis, height, tip, port, pruned, first_h).is_ok() {
                 let _ = nightfall_p2p::broadcast_tx(&mut s, &tx);
@@ -528,7 +749,8 @@ fn propagate_from_inner(
 ) {
     let stem = origin || rand::random::<f64>() < DANDELION_STEM_P;
     let live = inner.sessions.all();
-    if stem && stem_tx(&live, tx, from_key) {
+    let workers = Arc::clone(&inner.workers);
+    if stem && stem_tx(&live, tx, from_key, |work| workers.spawn(work)) {
         inner
             .stem_embargo
             .insert(tx.txid().to_hex(), embargo_deadline());
@@ -538,7 +760,8 @@ fn propagate_from_inner(
         fallback_stem_tx(&inner.dialable_peers(), tx, inner);
         return;
     }
-    fluff_tx(&live, tx, from_key);
+    let workers = Arc::clone(&inner.workers);
+    fluff_tx(&live, tx, from_key, move |work| workers.spawn(work));
     inner.stem_embargo.remove(&tx.txid().to_hex());
 }
 
@@ -548,9 +771,11 @@ fn propagate_tx(state: &SharedState, tx: &Transaction, from_key: Option<&str>, o
     }
 }
 
-fn spawn_dandelion_fluff(state: SharedState) {
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(2));
+fn spawn_dandelion_fluff(state: SharedState, shutdown: Arc<Shutdown>, workers: Arc<Workers>) {
+    workers.spawn(move || loop {
+        if shutdown.wait_timeout(Duration::from_secs(2)) {
+            break;
+        }
         let now = now_unix();
         let due: Vec<Transaction> = {
             let Ok(mut g) = state.lock() else {
@@ -573,7 +798,10 @@ fn spawn_dandelion_fluff(state: SharedState) {
         };
         for tx in due {
             if let Ok(g) = state.lock() {
-                fluff_tx(&g.sessions.all(), &tx, None);
+                let workers = Arc::clone(&g.workers);
+                fluff_tx(&g.sessions.all(), &tx, None, move |work| {
+                    workers.spawn(work)
+                });
             }
         }
     });
@@ -680,9 +908,50 @@ pub struct NodeHandle {
     state: SharedState,
     mining_enabled: Arc<AtomicBool>,
     tip_notify: Arc<(Mutex<u64>, Condvar)>,
+    shutdown: Arc<Shutdown>,
+    workers: Arc<Workers>,
+    datadir: PathBuf,
 }
 
 impl NodeHandle {
+    pub fn request_shutdown(&self) {
+        self.mining_enabled.store(false, Ordering::Release);
+        self.shutdown.request();
+        self.tip_notify.1.notify_all();
+
+        let sessions = self
+            .state
+            .lock()
+            .map(|g| g.sessions.all())
+            .unwrap_or_default();
+        for session in sessions {
+            session.disconnect();
+        }
+    }
+
+    pub fn shutdown(&self) -> anyhow::Result<()> {
+        self.request_shutdown();
+
+        // No new registered worker may appear after this barrier.
+        self.workers.stop_accepting();
+        self.workers.join_all_bounded(Duration::from_secs(15))?;
+
+        // Persist only a fully loaded chain. During slow replay `state.chain`
+        // is only a temporary preview/genesis chain and must never overwrite
+        // the authoritative on-disk chain during shutdown.
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("node state lock poisoned during shutdown"))?;
+
+        if !state.loading {
+            state.persist()?;
+        }
+        state.persist_peers(&self.datadir);
+
+        Ok(())
+    }
+
     pub fn start(cfg: NodeConfig) -> anyhow::Result<Self> {
         if cfg.prune
             && cfg
@@ -734,6 +1003,8 @@ impl NodeHandle {
             .unwrap_or_else(|| (chain.block_count(), chain.tip_hash().to_hex()));
 
         let mining_enabled = Arc::new(AtomicBool::new(cfg.mine));
+        let shutdown = Arc::new(Shutdown::default());
+        let workers = Arc::new(Workers::new());
         let tip_epoch = Arc::new(AtomicU64::new(0));
         let hashes_total = Arc::new(AtomicU64::new(0));
         let blocks_found = Arc::new(AtomicU64::new(0));
@@ -799,6 +1070,8 @@ impl NodeHandle {
             last_reorg_fetch: HashMap::new(),
             last_wall_tick: AtomicU64::new(now_unix()),
             confirmed_peers: HashSet::new(),
+            suppressed_peers: HashSet::new(),
+            inbound_peer_addrs: HashMap::new(),
             stalled_on_fork: AtomicBool::new(false),
             fork_rewind: AtomicU64::new(0),
             mining_threads: Arc::clone(&mining_threads),
@@ -806,6 +1079,7 @@ impl NodeHandle {
             hashrate_hps: AtomicU64::new(0),
             mining_idle_reason: AtomicU8::new(0),
             sessions: Arc::clone(&sessions),
+            workers: Arc::clone(&workers),
             tip_notify: Arc::clone(&tip_notify),
             proxy: parse_proxy_cfg(cfg.proxy.as_deref())?,
             last_tor_ok: Arc::new(AtomicBool::new(false)),
@@ -814,9 +1088,19 @@ impl NodeHandle {
         };
         let state: SharedState = Arc::new(Mutex::new(inner));
 
-        rpc::spawn_rpc(cfg.rpc_listen.clone(), Arc::clone(&state));
+        rpc::spawn_rpc(
+            cfg.rpc_listen.clone(),
+            Arc::clone(&state),
+            Arc::clone(&shutdown),
+            Arc::clone(&workers),
+        );
         if let Some(addr) = cfg.mobile_listen.clone().filter(|s| !s.is_empty()) {
-            crate::mobile::spawn_mobile(addr, Arc::clone(&state));
+            crate::mobile::spawn_mobile(
+                addr,
+                Arc::clone(&state),
+                Arc::clone(&shutdown),
+                Arc::clone(&workers),
+            );
         }
 
         // HTTP directory only — fills the address book. Must not open P2P
@@ -826,13 +1110,19 @@ impl NodeHandle {
             cfg.network,
             cfg.peers_url.clone(),
             genesis_hex,
+            Arc::clone(&shutdown),
+            Arc::clone(&workers),
         );
 
         {
             let st = Arc::clone(&state);
             let datadir = cfg.datadir.clone();
-            thread::spawn(move || loop {
-                thread::sleep(Duration::from_secs(30));
+            let stop = Arc::clone(&shutdown);
+            let workers = Arc::clone(&workers);
+            workers.spawn(move || loop {
+                if stop.wait_timeout(Duration::from_secs(30)) {
+                    break;
+                }
                 if let Ok(mut g) = st.lock() {
                     if !g.loading {
                         if let Err(e) = g.persist() {
@@ -849,8 +1139,12 @@ impl NodeHandle {
             // process during sleep; the first iteration after wake sees the
             // jump and clears the stale peer height before mining resumes.
             let st = Arc::clone(&state);
-            thread::spawn(move || loop {
-                thread::sleep(Duration::from_secs(1));
+            let stop = Arc::clone(&shutdown);
+            let workers = Arc::clone(&workers);
+            workers.spawn(move || loop {
+                if stop.wait_timeout(Duration::from_secs(1)) {
+                    break;
+                }
                 let now = now_unix();
                 if let Ok(mut g) = st.lock() {
                     let last = g.last_wall_tick.load(Ordering::Relaxed);
@@ -873,13 +1167,21 @@ impl NodeHandle {
             let mine = cfg.miner.is_some();
             let network = cfg.network;
             let datadir = cfg.datadir.clone();
-            thread::spawn(move || {
+            let stop = Arc::clone(&shutdown);
+            let workers = Arc::clone(&workers);
+            let child_workers = Arc::clone(&workers);
+            workers.spawn(move || {
                 tracing::info!("loading chain from disk — RPC and the light API are already up");
                 let progress = {
                     let st = Arc::clone(&st);
+                    let stop = Arc::clone(&stop);
                     move |done: u64, total: u64| {
+                        if stop.is_requested() {
+                            return;
+                        }
+
                         if let Ok(mut g) = st.lock() {
-                            if g.loading {
+                            if !stop.is_requested() && g.loading {
                                 g.preview_blocks = done.max(1);
                                 g.preview_total = total;
                             }
@@ -888,6 +1190,11 @@ impl NodeHandle {
                 };
                 match ChainStore::new(&datadir).load_or_new_with_progress(network, progress) {
                     Ok(loaded) => {
+                        if stop.is_requested() {
+                            tracing::debug!("shutdown requested during chain replay");
+                            return;
+                        }
+
                         let blocks = loaded.block_count();
                         let tip = loaded.tip_hash().to_hex();
                         if let Ok(mut g) = st.lock() {
@@ -899,13 +1206,25 @@ impl NodeHandle {
                             g.bump_tip();
                             let _ = g.persist();
                         }
+                        if stop.is_requested() {
+                            tracing::debug!("shutdown requested before opening P2P");
+                            return;
+                        }
+
                         tracing::info!("chain ready ({blocks} blocks, tip {tip}) — opening P2P");
-                        spawn_p2p_plane(st, listen, mine);
+                        spawn_p2p_plane(st, listen, mine, stop, child_workers);
                     }
                     Err(e) => {
+                        if stop.is_requested() {
+                            tracing::debug!("shutdown requested while chain replay was failing");
+                            return;
+                        }
+
                         tracing::error!("chain load failed: {e}");
                         if let Ok(mut g) = st.lock() {
-                            g.last_dial_error = Some(format!("chain load: {e}"));
+                            if !stop.is_requested() {
+                                g.last_dial_error = Some(format!("chain load: {e}"));
+                            }
                         }
                     }
                 }
@@ -915,6 +1234,8 @@ impl NodeHandle {
                 Arc::clone(&state),
                 cfg.p2p_listen.clone(),
                 cfg.miner.is_some(),
+                Arc::clone(&shutdown),
+                Arc::clone(&workers),
             );
         }
 
@@ -922,6 +1243,9 @@ impl NodeHandle {
             state,
             mining_enabled,
             tip_notify,
+            shutdown,
+            workers,
+            datadir: cfg.datadir,
         })
     }
 
@@ -1059,10 +1383,71 @@ impl NodeHandle {
         if g.peer_addrs.len() >= MAX_PEERS {
             anyhow::bail!("peer limit reached");
         }
+        g.suppressed_peers.remove(addr);
         g.peer_addrs.insert(addr.to_string());
-        g.bootstrap.push(addr.to_string());
+        if !g.bootstrap.iter().any(|a| a == addr) {
+            g.bootstrap.push(addr.to_string());
+        }
         tracing::info!("peer added: {addr}");
         Ok(())
+    }
+
+    /// Stop dialling a peer and close an existing outbound session to it.
+    ///
+    /// Removing the address from every dial source is important: closing the
+    /// socket alone would let the outbound supervisor reconnect immediately.
+    /// A later `add_peer` call can explicitly enable the peer again.
+    pub fn remove_peer(&self, addr: &str) -> anyhow::Result<bool> {
+        let addr = addr.trim();
+        if !looks_like_dial_target(addr) {
+            anyhow::bail!("enter an address as host:port");
+        }
+
+        let (removed, sessions) = {
+            let mut g = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("node state lock poisoned"))?;
+
+            let newly_suppressed = g.suppressed_peers.insert(addr.to_string());
+            let removed = g.peer_addrs.remove(addr) | g.confirmed_peers.remove(addr) | {
+                let before = g.bootstrap.len();
+                g.bootstrap.retain(|a| a != addr);
+                g.bootstrap.len() != before
+            };
+
+            let mut sessions = Vec::new();
+
+            if let Some(session) = g.sessions.get(&outbound_key(addr)) {
+                sessions.push(session);
+            }
+
+            let inbound_keys: Vec<String> = g
+                .inbound_peer_addrs
+                .iter()
+                .filter(|(_, peer_addr)| peer_addr.as_str() == addr)
+                .map(|(key, _)| key.clone())
+                .collect();
+
+            for key in inbound_keys {
+                if let Some(session) = g.sessions.get(&key) {
+                    sessions.push(session);
+                }
+            }
+
+            (removed || newly_suppressed, sessions)
+        };
+
+        let had_sessions = !sessions.is_empty();
+        for session in sessions {
+            session.disconnect();
+        }
+
+        if removed || had_sessions {
+            tracing::info!("peer removed: {addr}");
+        }
+
+        Ok(removed || had_sessions)
     }
 
     /// Addresses this node will dial.
@@ -1250,10 +1635,15 @@ impl NodeHandle {
 pub const MAX_OUTBOUND_EXTRA: usize = 6;
 const DIAL_GIVE_UP: u32 = 5;
 
-fn spawn_outbound_supervisor(state: SharedState) {
-    thread::spawn(move || {
+fn spawn_outbound_supervisor(state: SharedState, shutdown: Arc<Shutdown>, workers: Arc<Workers>) {
+    let child_workers = Arc::clone(&workers);
+    workers.spawn(move || {
         let launched: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         loop {
+            if shutdown.is_requested() {
+                break;
+            }
+
             let targets = outbound_targets(&state);
             for addr in targets {
                 {
@@ -1265,14 +1655,19 @@ fn spawn_outbound_supervisor(state: SharedState) {
                 }
                 let st = Arc::clone(&state);
                 let slot = Arc::clone(&launched);
-                thread::spawn(move || {
-                    stay_connected(st, addr.clone());
+                let stop = Arc::clone(&shutdown);
+                let child_workers = Arc::clone(&child_workers);
+                let connection_workers = Arc::clone(&child_workers);
+                child_workers.spawn(move || {
+                    stay_connected(st, addr.clone(), stop, connection_workers);
                     if let Ok(mut live) = slot.lock() {
                         live.remove(&addr);
                     }
                 });
             }
-            thread::sleep(Duration::from_secs(2));
+            if shutdown.wait_timeout(Duration::from_secs(2)) {
+                break;
+            }
         }
     });
 }
@@ -1338,7 +1733,12 @@ pub fn peers_to_remember(
         .collect()
 }
 
-fn stay_connected(state: SharedState, addr: String) {
+fn stay_connected(
+    state: SharedState,
+    addr: String,
+    shutdown: Arc<Shutdown>,
+    workers: Arc<Workers>,
+) {
     let mut backoff = Duration::from_millis(250);
     let mut fails = 0u32;
     let is_seed = {
@@ -1348,7 +1748,19 @@ fn stay_connected(state: SharedState, addr: String) {
         g.network.seed_nodes().iter().any(|s| *s == addr) || g.bootstrap.iter().any(|s| s == &addr)
     };
     loop {
-        match open_outbound_session(&state, &addr) {
+        if shutdown.is_requested() {
+            return;
+        }
+
+        if state
+            .lock()
+            .map(|g| g.suppressed_peers.contains(&addr))
+            .unwrap_or(true)
+        {
+            return;
+        }
+
+        match open_outbound_session(&state, &addr, &shutdown, &workers) {
             Ok(()) => {
                 backoff = Duration::from_millis(250);
                 fails = 0;
@@ -1358,6 +1770,13 @@ fn stay_connected(state: SharedState, addr: String) {
             }
             Err(e) => {
                 let msg = e.to_string();
+                if state
+                    .lock()
+                    .map(|g| g.suppressed_peers.contains(&addr))
+                    .unwrap_or(true)
+                {
+                    return;
+                }
                 if !msg.contains("self-dial") {
                     if let Ok(mut g) = state.lock() {
                         g.last_dial_error = Some(format!("{addr}: {msg}"));
@@ -1386,7 +1805,9 @@ fn stay_connected(state: SharedState, addr: String) {
                 tracing::debug!("outbound {addr}: {e}");
             }
         }
-        thread::sleep(backoff);
+        if shutdown.wait_timeout(backoff) {
+            return;
+        }
         backoff = (backoff * 2).min(Duration::from_secs(8));
     }
 }
@@ -1398,9 +1819,16 @@ fn is_self_connection(stream: &TcpStream, listen_port: u16) -> bool {
     }
 }
 
-fn open_outbound_session(state: &SharedState, addr: &str) -> anyhow::Result<()> {
+fn open_outbound_session(
+    state: &SharedState,
+    addr: &str,
+    shutdown: &Arc<Shutdown>,
+    workers: &Arc<Workers>,
+) -> anyhow::Result<()> {
     let proxy = state.lock().ok().and_then(|g| g.proxy.clone());
     let (mut stream, used_tor) = connect_peer_via(addr, 8_000, proxy.as_ref())?;
+    let pending_socket = shutdown.track_socket(&stream)?;
+
     if let Ok(g) = state.lock() {
         g.last_tor_ok.store(used_tor, Ordering::Relaxed);
     }
@@ -1457,10 +1885,16 @@ fn open_outbound_session(state: &SharedState, addr: &str) -> anyhow::Result<()> 
     let write_clone = stream.try_clone()?;
     let sess = {
         let mut g = state.lock().unwrap();
+        if g.suppressed_peers.contains(addr) {
+            anyhow::bail!("peer removed");
+        }
         let key = outbound_key(addr);
         g.session_height.insert(key.clone(), peer_h);
         g.sessions.insert(key, write_clone, true)
     };
+
+    drop(pending_socket);
+
     tracing::info!("outbound session {addr} height={peer_h}");
 
     // Catch up on this socket before we sit in the read loop. A NAT wallet
@@ -1485,7 +1919,7 @@ fn open_outbound_session(state: &SharedState, addr: &str) -> anyhow::Result<()> 
     }
 
     let mut reader = BufReader::new(stream);
-    let result = peer_io_loop(&mut reader, &sess, state, addr, peer_h);
+    let result = peer_io_loop(&mut reader, &sess, state, addr, peer_h, shutdown, workers);
     if let Ok(mut g) = state.lock() {
         let key = outbound_key(addr);
         g.sessions.remove(&key);
@@ -1622,7 +2056,15 @@ fn claim_reorg_fetch_slot(last_by_peer: &mut HashMap<String, u64>, addr: &str, n
 
 /// Pull a peer's chain on a fresh socket and weigh it. Used when live
 /// `GetBlocks` cannot extend our tip — we are on a fork, not merely late.
-fn kick_reorg_fetch(state: &SharedState, sess: &SessionHandle) {
+fn kick_reorg_fetch(
+    state: &SharedState,
+    sess: &SessionHandle,
+    shutdown: &Arc<Shutdown>,
+    workers: &Arc<Workers>,
+) {
+    if shutdown.is_requested() {
+        return;
+    }
     if !sess.outbound {
         return;
     }
@@ -1641,22 +2083,43 @@ fn kick_reorg_fetch(state: &SharedState, sess: &SessionHandle) {
             return;
         }
     }
+    if shutdown.is_requested() {
+        return;
+    }
+
     tracing::info!("peer {addr} is ahead on a fork — fetching their chain");
     let st = Arc::clone(state);
-    thread::spawn(move || {
-        if let Err(e) = sync_from_peer(&st, &addr) {
-            tracing::debug!("reorg fetch {addr}: {e}");
+    let stop = Arc::clone(shutdown);
+    let workers = Arc::clone(workers);
+
+    workers.spawn(move || {
+        if stop.is_requested() {
+            return;
+        }
+
+        if let Err(e) = sync_from_peer(&st, &addr, &stop) {
+            if !stop.is_requested() {
+                tracing::debug!("reorg fetch {addr}: {e}");
+            }
         }
     });
 }
 
-fn spawn_status_ticker(state: SharedState) {
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(400));
+fn spawn_status_ticker(state: SharedState, shutdown: Arc<Shutdown>, workers: Arc<Workers>) {
+    workers.spawn(move || {
+        if shutdown.wait_timeout(Duration::from_millis(400)) {
+            return;
+        }
+
         loop {
+            if shutdown.is_requested() {
+                break;
+            }
             let sessions = {
                 let Ok(g) = state.lock() else {
-                    thread::sleep(STATUS_TICK);
+                    if shutdown.wait_timeout(STATUS_TICK) {
+                        break;
+                    }
                     continue;
                 };
                 g.sessions.all()
@@ -1666,7 +2129,9 @@ fn spawn_status_ticker(state: SharedState) {
                     tracing::debug!("status tick {}: {e}", s.key);
                 }
             }
-            thread::sleep(STATUS_TICK);
+            if shutdown.wait_timeout(STATUS_TICK) {
+                break;
+            }
         }
     });
 }
@@ -1694,17 +2159,40 @@ pub fn merge_directory_peers(
     out
 }
 
-fn spawn_p2p_plane(state: SharedState, listen: String, mine: bool) {
+fn spawn_p2p_plane(
+    state: SharedState,
+    listen: String,
+    mine: bool,
+    shutdown: Arc<Shutdown>,
+    workers: Arc<Workers>,
+) {
     {
         let st = Arc::clone(&state);
-        thread::spawn(move || p2p_listen_loop(listen, st));
+        let stop = Arc::clone(&shutdown);
+        let workers = Arc::clone(&workers);
+        let child_workers = Arc::clone(&workers);
+        workers.spawn(move || p2p_listen_loop(listen, st, stop, child_workers));
     }
-    spawn_outbound_supervisor(Arc::clone(&state));
-    spawn_status_ticker(Arc::clone(&state));
-    spawn_dandelion_fluff(Arc::clone(&state));
+    spawn_outbound_supervisor(
+        Arc::clone(&state),
+        Arc::clone(&shutdown),
+        Arc::clone(&workers),
+    );
+    spawn_status_ticker(
+        Arc::clone(&state),
+        Arc::clone(&shutdown),
+        Arc::clone(&workers),
+    );
+    spawn_dandelion_fluff(
+        Arc::clone(&state),
+        Arc::clone(&shutdown),
+        Arc::clone(&workers),
+    );
     if mine {
         let st = Arc::clone(&state);
-        thread::spawn(move || mining_loop(st));
+        let stop = Arc::clone(&shutdown);
+        let workers = Arc::clone(&workers);
+        workers.spawn(move || mining_loop(st, stop));
     }
 }
 
@@ -1713,6 +2201,8 @@ fn spawn_directory_bootstrap(
     network: NetworkId,
     configured: Option<String>,
     genesis_hex: String,
+    shutdown: Arc<Shutdown>,
+    workers: Arc<Workers>,
 ) {
     // The directory uses direct HTTPS, not P2P SOCKS5.
     // Lockdown must never contact it directly.
@@ -1727,26 +2217,48 @@ fn spawn_directory_bootstrap(
         _ if network == NetworkId::Mainnet => DEFAULT_PEERS_DIRECTORY.to_string(),
         _ => return,
     };
-    thread::spawn(move || match fetch_directory_peers(&url, &genesis_hex) {
-        Ok(peers) if !peers.is_empty() => {
-            if let Ok(mut g) = state.lock() {
-                let mut added = 0usize;
-                for addr in peers {
-                    if !looks_like_dial_target(&addr) || !is_directory_addr(&addr) {
-                        continue;
+    workers.spawn(move || {
+        if shutdown.is_requested() {
+            return;
+        }
+
+        match fetch_directory_peers(&url, &genesis_hex) {
+            Ok(peers) if !peers.is_empty() => {
+                if shutdown.is_requested() {
+                    return;
+                }
+
+                if let Ok(mut g) = state.lock() {
+                    if shutdown.is_requested() {
+                        return;
                     }
-                    if g.peer_addrs.insert(addr.clone()) {
-                        g.bootstrap.push(addr);
-                        added += 1;
+
+                    let mut added = 0usize;
+                    for addr in peers {
+                        if !looks_like_dial_target(&addr) || !is_directory_addr(&addr) {
+                            continue;
+                        }
+                        if g.suppressed_peers.contains(&addr) {
+                            continue;
+                        }
+                        if g.peer_addrs.insert(addr.clone()) {
+                            g.bootstrap.push(addr);
+                            added += 1;
+                        }
+                    }
+
+                    if added > 0 {
+                        tracing::info!("directory {url}: {added} listening node(s) to dial");
                     }
                 }
-                if added > 0 {
-                    tracing::info!("directory {url}: {added} listening node(s) to dial");
+            }
+            Ok(_) => tracing::debug!("directory {url}: empty"),
+            Err(e) => {
+                if !shutdown.is_requested() {
+                    tracing::info!("directory {url}: {e}");
                 }
             }
         }
-        Ok(_) => tracing::debug!("directory {url}: empty"),
-        Err(e) => tracing::info!("directory {url}: {e}"),
     });
 }
 
@@ -1887,7 +2399,12 @@ fn evict_synced_inbound(state: &SharedState, protect: &str) -> bool {
 
 // -------------------------------------------------------------------- p2p ---
 
-fn p2p_listen_loop(addr: String, state: SharedState) {
+fn p2p_listen_loop(
+    addr: String,
+    state: SharedState,
+    shutdown: Arc<Shutdown>,
+    workers: Arc<Workers>,
+) {
     let listener = match TcpListener::bind(&addr) {
         Ok(l) => l,
         Err(e) => {
@@ -1895,35 +2412,102 @@ fn p2p_listen_loop(addr: String, state: SharedState) {
             return;
         }
     };
+    if let Err(e) = listener.set_nonblocking(true) {
+        tracing::error!("p2p listener nonblocking {addr}: {e}");
+        return;
+    }
     tracing::info!("p2p listening on {addr}");
 
-    for conn in listener.incoming() {
-        match conn {
-            Ok(stream) => {
+    let pending = Arc::new(AtomicUsize::new(0));
+
+    while !shutdown.is_requested() {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if shutdown.is_requested() {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    break;
+                }
+
                 let live = state.lock().map(|g| g.sessions.len()).unwrap_or(MAX_PEERS);
+
                 // Hard cap only. Soft cap is MAX_PEERS; overflow seats exist
                 // so Hello can run and a synced miner can be asked to leave.
                 if live >= MAX_PEERS.saturating_add(IBD_ACCEPT_BURST) {
                     tracing::debug!("session burst full, dropping connection");
                     continue;
                 }
+
                 let st = Arc::clone(&state);
+                let stop = Arc::clone(&shutdown);
+                let child_workers = Arc::clone(&workers);
+                let peer_workers = Arc::clone(&child_workers);
                 let peer = stream
                     .peer_addr()
                     .map(|a| a.to_string())
                     .unwrap_or_default();
-                thread::spawn(move || {
-                    if let Err(e) = handle_peer(stream, st, peer.clone()) {
+
+                // Bound active handlers before peer Hello.
+                let limit = MAX_PEERS.saturating_add(IBD_ACCEPT_BURST);
+
+                let admitted = pending.try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    (n < limit).then_some(n + 1)
+                });
+
+                if admitted.is_err() {
+                    continue;
+                }
+
+                let seat = Arc::clone(&pending);
+
+                child_workers.spawn(move || {
+                    struct Release(Arc<AtomicUsize>);
+
+                    impl Drop for Release {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, Ordering::AcqRel);
+                        }
+                    }
+
+                    let _seat = Release(seat);
+
+                    if stop.is_requested() {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        return;
+                    }
+
+                    if let Err(e) = handle_peer(stream, st, peer.clone(), stop, peer_workers) {
                         tracing::debug!("peer {peer}: {e}");
                     }
                 });
             }
-            Err(e) => tracing::warn!("p2p accept: {e}"),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if shutdown.wait_timeout(Duration::from_millis(100)) {
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("p2p accept: {e}");
+                if shutdown.wait_timeout(Duration::from_millis(100)) {
+                    break;
+                }
+            }
         }
     }
 }
 
-fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> anyhow::Result<()> {
+fn handle_peer(
+    stream: TcpStream,
+    state: SharedState,
+    peer_label: String,
+    shutdown: Arc<Shutdown>,
+    workers: Arc<Workers>,
+) -> anyhow::Result<()> {
+    if shutdown.is_requested() {
+        return Ok(());
+    }
+
+    let pending_socket = shutdown.track_socket(&stream)?;
+
     prepare_live_socket(&stream)?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut hello_writer = stream.try_clone()?;
@@ -1933,7 +2517,7 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
         (g.network, g.chain.genesis_hash)
     };
 
-    let (session_key, peer_height) = match read_msg(&mut reader)? {
+    let (session_key, peer_height, peer_addr) = match read_msg(&mut reader)? {
         PeerMsg::Hello {
             wire,
             network: net,
@@ -1998,19 +2582,39 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
                 )?;
                 return Ok(());
             }
-            // Learn an address we can dial back. Without this the peer can
-            // reach us but we can never reach them, so our blocks never
-            // propagate outward and both nodes fork apart while mining.
-            if let Some(addr) = dialable_addr(&peer_label, listen_port) {
+            // Learn the dialable identity before accepting the session.
+            // The inbound socket itself is keyed by the observed ephemeral
+            // source port, so suppression must use the advertised listen
+            // address instead.
+            let peer_addr = dialable_addr(&peer_label, listen_port);
+
+            if let Some(addr) = peer_addr.as_ref() {
+                let suppressed = state
+                    .lock()
+                    .map(|g| g.suppressed_peers.contains(addr))
+                    .unwrap_or(true);
+
+                if suppressed {
+                    tracing::info!("refused removed peer {addr}");
+                    write_msg(
+                        &mut hello_writer,
+                        &PeerMsg::Error {
+                            message: "peer disabled".into(),
+                        },
+                    )?;
+                    return Ok(());
+                }
+
                 let mut g = state.lock().unwrap();
                 if g.peer_addrs.len() < MAX_PEERS {
                     g.mark_confirmed(addr.clone());
                     tracing::info!("learned peer address {addr} running {agent}");
                 }
                 if g.peer_agents.len() < MAX_PEERS * 2 {
-                    g.peer_agents.insert(addr, agent.clone());
+                    g.peer_agents.insert(addr.clone(), agent.clone());
                 }
             }
+
             // Always key inbound sockets by the observed connection, never
             // by the advertised listen address. See `outbound_key`.
             let session_key = inbound_key(&peer_label);
@@ -2042,7 +2646,7 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
                     first_height: our_first,
                 },
             )?;
-            (session_key, peer_height)
+            (session_key, peer_height, peer_addr)
         }
         other => {
             write_msg(
@@ -2072,6 +2676,10 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
         return Ok(());
     }
 
+    if shutdown.is_requested() {
+        return Ok(());
+    }
+
     if state
         .lock()
         .map(|g| g.sessions.len() >= MAX_PEERS)
@@ -2079,10 +2687,32 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
     {
         evict_synced_inbound(&state, &session_key);
     }
+
+    if shutdown.is_requested() {
+        return Ok(());
+    }
+
     let sess = {
-        let g = state.lock().unwrap();
+        let mut g = state.lock().unwrap();
+
+        // remove_peer may have raced with the handshake after HelloOk.
+        // Never install a session for a peer that became suppressed.
+        if let Some(addr) = peer_addr.as_ref() {
+            if g.suppressed_peers.contains(addr) {
+                tracing::info!("discarded inbound session from removed peer {addr}");
+                g.session_height.remove(&session_key);
+                return Ok(());
+            }
+
+            g.inbound_peer_addrs
+                .insert(session_key.clone(), addr.clone());
+        }
+
         g.sessions.insert(session_key.clone(), hello_writer, false)
     };
+
+    drop(pending_socket);
+
     // First gift: who else answers. A new install that only knows the
     // seed must leave this socket with somewhere else to dial.
     let intro = {
@@ -2090,15 +2720,26 @@ fn handle_peer(stream: TcpStream, state: SharedState, peer_label: String) -> any
         g.publishable_peers()
     };
     let _ = sess.send(&PeerMsg::Peers { addrs: intro });
-    let result = peer_io_loop(&mut reader, &sess, &state, &peer_label, peer_height);
+    let result = peer_io_loop(
+        &mut reader,
+        &sess,
+        &state,
+        &peer_label,
+        peer_height,
+        &shutdown,
+        &workers,
+    );
     if let Ok(mut g) = state.lock() {
         g.sessions.remove(&session_key);
         g.session_height.remove(&session_key);
+        g.inbound_peer_addrs.remove(&session_key);
     }
     result
 }
 
 fn prepare_live_socket(stream: &TcpStream) -> std::io::Result<()> {
+    // Normalize inherited socket mode on macOS.
+    stream.set_nonblocking(false)?;
     stream.set_nodelay(true)?;
     // Long read timeout: the peer may be quiet between 15-second blocks.
     // Writes are short so a stuck announce cannot pin a session forever.
@@ -2113,9 +2754,14 @@ fn peer_io_loop(
     state: &SharedState,
     peer_label: &str,
     mut last_peer_height: u64,
+    shutdown: &Arc<Shutdown>,
+    workers: &Arc<Workers>,
 ) -> anyhow::Result<()> {
     let introduced_at = std::time::Instant::now();
     loop {
+        if shutdown.is_requested() {
+            return Ok(());
+        }
         if !sess.outbound
             && finish_introduction(state, sess, last_peer_height, introduced_at, peer_label)
         {
@@ -2124,6 +2770,9 @@ fn peer_io_loop(
         let msg = match read_msg(reader) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                if shutdown.is_requested() {
+                    return Ok(());
+                }
                 sess.send(&PeerMsg::Ping { nonce: now_unix() })?;
                 continue;
             }
@@ -2149,7 +2798,10 @@ fn peer_io_loop(
                 for a in addrs.into_iter().take(MAX_PEERS_PER_MSG) {
                     // Only accept things that parse as a socket address, so a
                     // peer cannot feed us arbitrary strings to dial.
-                    if a.parse::<std::net::SocketAddr>().is_ok() && g.peer_addrs.len() < MAX_PEERS {
+                    if a.parse::<std::net::SocketAddr>().is_ok()
+                        && g.peer_addrs.len() < MAX_PEERS
+                        && !g.suppressed_peers.contains(&a)
+                    {
                         g.peer_addrs.insert(a);
                     }
                 }
@@ -2210,7 +2862,7 @@ fn peer_io_loop(
                         limit: MAX_BLOCKS_PER_REQUEST,
                     })?;
                 } else if tip != our_tip && sess.outbound {
-                    kick_reorg_fetch(state, sess);
+                    kick_reorg_fetch(state, sess, shutdown, workers);
                 }
             }
 
@@ -2329,7 +2981,7 @@ fn peer_io_loop(
                     if let Ok(g) = state.lock() {
                         g.stalled_on_fork.store(true, Ordering::SeqCst);
                     }
-                    kick_reorg_fetch(state, sess);
+                    kick_reorg_fetch(state, sess, shutdown, workers);
                 }
             }
 
@@ -2526,87 +3178,199 @@ impl Drop for ReorgFlight {
     }
 }
 
+/// Search window for a reorg ancestor.
+///
+/// Reorg depth is the number of OUR blocks abandoned, not the peer's
+/// distance from its own tip.  Therefore an ahead peer is searched
+/// starting at our tip, while a shorter peer starts at its tip.
+///
+/// Returns `(highest_possible_common_height, how_far_back_to_search)`.
+fn ancestor_search_window(our_height: u64, peer_height: u64) -> Option<(u64, u64)> {
+    let start = our_height.min(peer_height);
+    let already_rewound = our_height.saturating_sub(start);
+    let max_rewind = nightfall_consensus::MAX_REORG_DEPTH as u64;
+
+    if already_rewound > max_rewind {
+        return None;
+    }
+
+    let remaining = max_rewind.saturating_sub(already_rewound);
+    Some((start, remaining.min(start)))
+}
+
+/// Find the highest matching height in `[start - max_back, start]`.
+///
+/// `same_at(h)` returns whether both chains contain the same block at `h`.
+/// Exponential probing finds a matching bracket quickly; binary refinement
+/// then returns the actual highest common height rather than merely one
+/// sampled height.
+fn highest_common_within<F>(start: u64, max_back: u64, mut same_at: F) -> Option<u64>
+where
+    F: FnMut(u64) -> Option<bool>,
+{
+    if same_at(start)? {
+        return Some(start);
+    }
+
+    let max_back = max_back.min(start);
+    if max_back == 0 {
+        return None;
+    }
+
+    // `upper_mismatch` is known to be on the divergent suffix.
+    let mut upper_mismatch = start;
+    let mut back = 1u64;
+
+    loop {
+        // Always probe the actual boundary, even when it is not a power of 2.
+        let distance = back.min(max_back);
+        let probe = start - distance;
+
+        if same_at(probe)? {
+            // We now have:
+            //
+            //     probe = known shared
+            //     upper_mismatch = known divergent
+            //
+            // Refine to the highest shared block.
+            let mut lo = probe;
+            let mut hi = upper_mismatch;
+
+            while lo.saturating_add(1) < hi {
+                let mid = lo + (hi - lo) / 2;
+                if same_at(mid)? {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+
+            return Some(lo);
+        }
+
+        upper_mismatch = probe;
+
+        if distance == max_back {
+            return None;
+        }
+
+        back = back.saturating_mul(2);
+    }
+}
+
 /// Highest height at which we and this peer hold the same block.
 ///
-/// Returns their tip height when we already agree there — the ordinary case of
-/// a peer that is merely behind. Otherwise walks backwards in doubling steps,
-/// asking for one block at each probe, until a hash matches. That is a handful
-/// of round trips rather than a linear scan, and it is bounded by
-/// `MAX_REORG_DEPTH` because a fork deeper than that cannot be resolved anyway.
-///
-/// On any failure it falls back to just below the peer's tip: no worse than the
-/// behaviour this replaced.
+/// The search is bounded by the number of OUR blocks a reorg may abandon.
+/// This matters for an ahead peer: it may be hundreds of blocks ahead while
+/// differing from us only one block back.
 fn common_ancestor(
     state: &SharedState,
     stream: &mut TcpStream,
     peer_h: u64,
     peer_tip: &str,
-) -> u64 {
-    let our_hash_at = |h: u64| -> Option<String> {
+) -> Option<u64> {
+    let (our_h, peer_tip_is_ours) = {
         let g = state.lock().ok()?;
-        g.chain.hash_at(h).map(|h| h.to_hex())
+        let our_h = g.chain.tip_height().map(|h| h.0)?;
+        let peer_tip_is_ours = g
+            .chain
+            .hash_at(peer_h)
+            .map(|hash| hash.to_hex() == peer_tip)
+            .unwrap_or(false);
+        (our_h, peer_tip_is_ours)
     };
 
-    // Fast path: we agree at their tip, so they are simply behind.
-    if our_hash_at(peer_h).as_deref() == Some(peer_tip) {
-        return peer_h;
+    // Same-chain lag is not a reorg and is therefore not bounded by
+    // MAX_REORG_DEPTH. This check must happen before the reorg window.
+    if peer_tip_is_ours {
+        return Some(peer_h);
     }
 
-    // Search back from the lower tip. Probing back from a peer who is
-    // thousands of blocks ahead never looks at our chain, falls through to
-    // `peer_tip - 1`, and the caller then copies our whole archive trying to
-    // attach one block up there.
-    let our_h = state
-        .lock()
-        .ok()
-        .and_then(|g| g.chain.tip_height().map(|h| h.0))
-        .unwrap_or(0);
-    let ceiling = our_h.min(peer_h);
-    if let Some(ours) = our_hash_at(ceiling) {
-        if let Ok(batch) = nightfall_p2p::request_blocks(stream, ceiling, 1) {
-            if let Some(theirs) = batch.first() {
-                if theirs.hash().to_hex() == ours {
-                    return ceiling;
-                }
-            }
-        }
-    }
+    let (start, max_back) = ancestor_search_window(our_h, peer_h)?;
 
-    let mut step = 1u64;
-    let mut lower = None;
-    while step <= nightfall_consensus::MAX_REORG_DEPTH as u64 {
-        let Some(probe) = ceiling.checked_sub(step) else {
-            break;
+    highest_common_within(start, max_back, |height| {
+        let ours = {
+            let g = state.lock().ok()?;
+            g.chain.hash_at(height)?.to_hex()
         };
-        let Ok(batch) = nightfall_p2p::request_blocks(stream, probe, 1) else {
-            break;
-        };
-        let Some(theirs) = batch.first() else { break };
-        if our_hash_at(probe) == Some(theirs.hash().to_hex()) {
-            lower = Some(probe);
-            break;
-        }
-        step = step.saturating_mul(2);
-    }
-    let Some(mut lo) = lower else {
-        return ceiling.saturating_sub(nightfall_consensus::MAX_REORG_DEPTH as u64 + 1);
-    };
-    let mut hi = ceiling;
-    while lo < hi {
-        let mid = lo + (hi - lo).div_ceil(2);
-        let Ok(batch) = nightfall_p2p::request_blocks(stream, mid, 1) else {
-            break;
-        };
-        let Some(theirs) = batch.first() else { break };
-        if our_hash_at(mid) == Some(theirs.hash().to_hex()) {
-            lo = mid;
-        } else if mid == 0 {
-            break;
+
+        let theirs = if height == peer_h {
+            peer_tip.to_owned()
         } else {
-            hi = mid - 1;
-        }
+            let batch = nightfall_p2p::request_blocks(stream, height, 1).ok()?;
+            let block = batch.first()?;
+
+            // Do not let a malformed peer answer a probe with another height.
+            if block.header.height.0 != height {
+                return None;
+            }
+
+            block.hash().to_hex()
+        };
+
+        Some(ours == theirs)
+    })
+}
+
+#[cfg(test)]
+mod common_ancestor_search_tests {
+    use super::{ancestor_search_window, highest_common_within};
+
+    #[test]
+    fn finds_an_ancestor_that_is_not_an_exponential_probe() {
+        let actual = 23;
+        assert_eq!(
+            highest_common_within(100, 100, |h| Some(h <= actual)),
+            Some(actual)
+        );
     }
-    lo
+
+    #[test]
+    fn returns_the_highest_common_height() {
+        let actual = 95;
+        assert_eq!(
+            highest_common_within(100, 100, |h| Some(h <= actual)),
+            Some(actual)
+        );
+    }
+
+    #[test]
+    fn ahead_peer_is_searched_from_our_tip() {
+        // Peer is 699 blocks ahead, but a one-block fork is still a
+        // one-block rewind from our point of view.
+        assert_eq!(ancestor_search_window(2_000, 2_699), Some((2_000, 500)));
+    }
+
+    #[test]
+    fn shorter_divergent_peer_beyond_reorg_depth_has_no_window() {
+        // Even its tip is already 600 of our blocks behind.
+        assert_eq!(ancestor_search_window(1_000, 400), None);
+    }
+
+    // The boundary itself is valid; one block beyond it must be refused.
+    #[test]
+    fn exactly_at_reorg_depth_boundary_is_accepted() {
+        let depth = nightfall_consensus::MAX_REORG_DEPTH as u64;
+        let ours = depth + 100;
+        let (start, max_back) = ancestor_search_window(ours, ours).unwrap();
+
+        assert_eq!(start, ours);
+        assert_eq!(max_back, depth);
+        assert_eq!(
+            highest_common_within(start, max_back, |h| Some(h <= ours - depth)),
+            Some(ours - depth)
+        );
+        assert_eq!(
+            highest_common_within(start, max_back, |h| Some(h < ours - depth)),
+            None
+        );
+        assert_eq!(ancestor_search_window(ours, ours - depth - 1), None);
+    }
+
+    #[test]
+    fn ancestor_below_the_reorg_window_is_not_returned() {
+        assert_eq!(highest_common_within(1_000, 500, |h| Some(h <= 499)), None);
+    }
 }
 
 /// How many blocks to push to a lagging peer in one sync round.
@@ -2695,14 +3459,77 @@ fn push_blocks_via_session(
     }
 }
 
-fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShorterPeerAction {
+    /// The peer's tip is one of our blocks. It is genuinely behind.
+    PushFrom(u64),
+    /// The peer diverges before its tip. Fetch and evaluate its suffix.
+    EvaluateFrom(u64),
+}
+
+/// Height alone is not fork choice.
+///
+/// A lower-height peer is only known to be behind when its advertised
+/// tip is also our block at that height. Otherwise it is a competing
+/// branch and must be judged by validated cumulative work.
+fn shorter_peer_action(peer_height: u64, common_ancestor: u64) -> ShorterPeerAction {
+    debug_assert!(common_ancestor <= peer_height);
+
+    if common_ancestor == peer_height {
+        ShorterPeerAction::PushFrom(common_ancestor)
+    } else {
+        ShorterPeerAction::EvaluateFrom(common_ancestor.saturating_add(1))
+    }
+}
+
+#[cfg(test)]
+mod shorter_peer_fork_tests {
+    use super::{shorter_peer_action, ShorterPeerAction};
+
+    #[test]
+    fn lower_peer_on_our_chain_is_really_behind() {
+        assert_eq!(
+            shorter_peer_action(100, 100),
+            ShorterPeerAction::PushFrom(100)
+        );
+    }
+
+    #[test]
+    fn lower_peer_on_another_branch_is_evaluated() {
+        assert_eq!(
+            shorter_peer_action(100, 95),
+            ShorterPeerAction::EvaluateFrom(96)
+        );
+    }
+}
+
+fn sync_from_peer(state: &SharedState, addr: &str, shutdown: &Arc<Shutdown>) -> anyhow::Result<()> {
+    if shutdown.is_requested() {
+        return Ok(());
+    }
+
     let proxy = state.lock().ok().and_then(|g| g.proxy.clone());
     let (mut stream, used_tor) = connect_peer_via(addr, 15_000, proxy.as_ref())?;
+    let _pending_socket = shutdown.track_socket(&stream)?;
+
+    if shutdown.is_requested() {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return Ok(());
+    }
     // Connect is 15s. Pages of 128 blocks over Tor need the live-session
     // budget or a mid-chain fetch dies and looks like "sync is stuck".
     let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(120)));
+    if shutdown.is_requested() {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return Ok(());
+    }
+
     if let Ok(g) = state.lock() {
+        if shutdown.is_requested() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return Ok(());
+        }
         g.last_tor_ok.store(used_tor, Ordering::Relaxed);
     }
     let (network, genesis, our_h, tip, port, our_pruned, our_first) = {
@@ -2742,8 +3569,18 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
         }
     };
     let (peer_h, peer_tip) = (intro.height, intro.tip.clone());
+
+    if shutdown.is_requested() {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return Ok(());
+    }
+
     {
         let mut g = state.lock().unwrap();
+        if shutdown.is_requested() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return Ok(());
+        }
         g.mark_confirmed(addr.to_string());
         // Who can still answer for the whole chain, recorded the moment they
         // say so rather than discovered by an empty reply later.
@@ -2753,7 +3590,15 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
             g.archive_peers.remove(addr);
         }
     }
+    if shutdown.is_requested() {
+        return Ok(());
+    }
+
     note_peer_height(state, peer_h);
+
+    if shutdown.is_requested() {
+        return Ok(());
+    }
 
     // Learn about the rest of the network from this peer.
     if write_msg(&mut stream, &PeerMsg::GetPeers).is_ok() {
@@ -2761,11 +3606,18 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
         if let Ok(PeerMsg::Peers { addrs }) = read_msg(&mut reader) {
             let mut g = state.lock().unwrap();
             for a in addrs.into_iter().take(MAX_PEERS_PER_MSG) {
-                if a.parse::<std::net::SocketAddr>().is_ok() && g.peer_addrs.len() < MAX_PEERS {
+                if a.parse::<std::net::SocketAddr>().is_ok()
+                    && g.peer_addrs.len() < MAX_PEERS
+                    && !g.suppressed_peers.contains(&a)
+                {
                     g.peer_addrs.insert(a);
                 }
             }
         }
+    }
+
+    if shutdown.is_requested() {
+        return Ok(());
     }
 
     // Nothing to do if we agree.
@@ -2773,36 +3625,40 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // They are behind us. Feed them over the connection we already have, and
-    // do not bother asking for anything back — there is nothing there to want.
+    // A lower-height peer is not necessarily the losing branch.
+    // First distinguish ordinary lag from a divergent fork.
+    // Height alone is not fork choice. A shorter branch can carry more
+    // cumulative work after difficulty retargeting.
     //
-    // Without this, a node can only catch up by dialling, and a peer behind NAT
-    // can dial out but cannot be dialled. A fresh seed node whose only contact
-    // is a miner behind a router therefore sits at height 0 indefinitely: it
-    // has a peer, it reports healthy, it learns a dial-back address it can
-    // never reach, and it retries that address forever while the miner keeps
-    // mining. Nothing in either log says anything is wrong. Found by standing
-    // up the first real seed node and watching it stay empty while connected.
-    //
-    // This has to happen before the pull loop below: that loop asks the peer
-    // for blocks, gets an empty answer from a peer that has none, and breaks
-    // immediately — so anything placed inside it never runs in exactly the
-    // case that matters.
-    if peer_h < our_h {
-        // Where to start pushing from is the whole question.
-        //
-        // Starting just below their tip is right when they are simply behind on
-        // our chain. It is useless when they are on a *branch*: every block we
-        // send then has a parent they have never seen, so nothing connects and
-        // nothing can be evaluated. That is not theoretical — a two-block fork
-        // survived indefinitely this way, with the heavier side pushing into a
-        // void every eight seconds.
-        //
-        // So: find where we last agreed, and push from there.
-        let from = common_ancestor(state, &mut stream, peer_h, &peer_tip);
-        push_blocks_to(state, &mut stream, from, addr);
-        return Ok(());
-    }
+    // If the peer's advertised tip is one of our blocks, it is genuinely behind
+    // and we keep the push path needed by peers behind NAT. Otherwise it is a
+    // competing branch: fall through to the normal pull/reorg path so consensus
+    // can compare cumulative work.
+    let shorter_fork_from = if peer_h < our_h {
+        let Some(ancestor) = common_ancestor(state, &mut stream, peer_h, &peer_tip) else {
+            tracing::debug!(
+                "peer {addr} has no discoverable common ancestor inside the reorg window"
+            );
+            return Ok(());
+        };
+
+        match shorter_peer_action(peer_h, ancestor) {
+            ShorterPeerAction::PushFrom(from) => {
+                // Same-chain lag: preserve the NAT-friendly push path.
+                push_blocks_to(state, &mut stream, from, addr);
+                return Ok(());
+            }
+            ShorterPeerAction::EvaluateFrom(from) => {
+                tracing::info!(
+                    "peer {addr} has shorter competing tip at height {peer_h}; \
+                     evaluating from common ancestor {ancestor}"
+                );
+                Some(from)
+            }
+        }
+    } else {
+        None
+    };
 
     // Fetch forward from the next height we can attach, not from tip − 1.
     // Starting at tip − 1 includes a block we already hold; apply_block
@@ -2812,14 +3668,26 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
     //
     // `our_h + 1` is wrong on an empty node: tip_height is then 0 by
     // default, and we would skip genesis.
-    let mut from = {
-        let g = state.lock().unwrap();
-        next_needed_height(&g)
+    let mut from = match shorter_fork_from {
+        Some(from) => from,
+        None => {
+            let g = state.lock().unwrap();
+            next_needed_height(&g)
+        }
     };
     let mut total_applied = 0usize;
 
     for _ in 0..64 {
+        if shutdown.is_requested() {
+            return Ok(());
+        }
+
         let batch = nightfall_p2p::request_blocks(&mut stream, from, MAX_BLOCKS_PER_REQUEST)?;
+
+        if shutdown.is_requested() {
+            return Ok(());
+        }
+
         if batch.is_empty() {
             break;
         }
@@ -2853,7 +3721,10 @@ fn sync_from_peer(state: &SharedState, addr: &str) -> anyhow::Result<()> {
             break;
         }
 
-        let ancestor = common_ancestor(state, &mut stream, peer_h, &peer_tip);
+        let Some(ancestor) = common_ancestor(state, &mut stream, peer_h, &peer_tip) else {
+            tracing::debug!("peer {addr}: no common ancestor inside MAX_REORG_DEPTH");
+            break;
+        };
         let (trial, guard) = {
             let g = state.lock().unwrap();
             let our_tip = g.chain.tip_height().map(|h| h.0).unwrap_or(0);
@@ -3152,7 +4023,7 @@ fn initial_mining_threads() -> usize {
         .clamp(1, MAX_MINING_THREADS)
 }
 
-fn mining_loop(state: SharedState) {
+fn mining_loop(state: SharedState, shutdown: Arc<Shutdown>) {
     let threads = state
         .lock()
         .ok()
@@ -3172,6 +4043,10 @@ fn mining_loop(state: SharedState) {
     }
 
     loop {
+        if shutdown.is_requested() {
+            break;
+        }
+
         let (enabled, tip_epoch, epoch_now, last_tick) = {
             let mut g = state.lock().unwrap();
             let now = now_unix();
@@ -3188,7 +4063,9 @@ fn mining_loop(state: SharedState) {
         };
 
         if !enabled {
-            thread::sleep(Duration::from_millis(300));
+            if shutdown.wait_timeout(Duration::from_millis(300)) {
+                break;
+            }
             continue;
         }
 
@@ -3211,7 +4088,9 @@ fn mining_loop(state: SharedState) {
                 .unwrap()
                 .mining_idle_reason
                 .store(1, Ordering::Relaxed);
-            thread::sleep(Duration::from_secs(1));
+            if shutdown.wait_timeout(Duration::from_secs(1)) {
+                break;
+            }
             continue;
         }
 
@@ -3262,7 +4141,9 @@ fn mining_loop(state: SharedState) {
                 .unwrap()
                 .mining_idle_reason
                 .store(2, Ordering::Relaxed);
-            thread::sleep(Duration::from_secs(1));
+            if shutdown.wait_timeout(Duration::from_secs(1)) {
+                break;
+            }
             continue;
         };
         state
@@ -3291,7 +4172,9 @@ fn mining_loop(state: SharedState) {
             if now_unix().saturating_sub(last_tick) > SLEEP_GAP_SECS {
                 return true;
             }
-            tip_epoch.load(Ordering::SeqCst) != epoch_now || !mining_flag.load(Ordering::SeqCst)
+            shutdown.is_requested()
+                || tip_epoch.load(Ordering::SeqCst) != epoch_now
+                || !mining_flag.load(Ordering::SeqCst)
         };
 
         let threads = state
@@ -3314,10 +4197,18 @@ fn mining_loop(state: SharedState) {
             continue;
         };
 
+        if shutdown.is_requested() {
+            break;
+        }
+
         let block = template.clone().seal(nonce);
 
         // --- submit under the lock (cheap) ---
         let mut g = state.lock().unwrap();
+
+        if shutdown.is_requested() {
+            break;
+        }
         let now = now_unix();
         if now.saturating_sub(g.last_wall_tick.load(Ordering::Relaxed)) > SLEEP_GAP_SECS {
             apply_clock_jump(&mut g);
@@ -3540,5 +4431,161 @@ mod reorg_fetch_throttle_tests {
             now + REORG_FETCH_COOLDOWN_SECS
         ));
         assert_eq!(slots.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod bounded_shutdown_wip_tests {
+    use super::Workers;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn shutdown_returns_at_deadline_then_joins_when_worker_exits() {
+        let workers = Workers::new();
+        let (tx, rx) = mpsc::channel::<()>();
+        workers.spawn(move || {
+            let _ = rx.recv_timeout(Duration::from_secs(3));
+        });
+        workers.stop_accepting();
+        assert!(workers.join_all_bounded(Duration::from_millis(10)).is_err());
+        tx.send(()).expect("release pending worker");
+        assert!(workers.join_all_bounded(Duration::from_secs(2)).is_ok());
+    }
+}
+
+// Additional adversarial post-activation tests for PR #10.
+// No production consensus changes.
+#[cfg(test)]
+mod post_activation_fork_choice_property_tests {
+    use super::{
+        ancestor_search_window, highest_common_within, shorter_peer_action, ShorterPeerAction,
+    };
+
+    #[test]
+    fn rewind_window_remains_correct_across_activation_and_overflow() {
+        let depth = nightfall_consensus::MAX_REORG_DEPTH as u64;
+
+        for ours in [499_999_u64, 500_000, 500_001, 500_500, 2_000_000, u64::MAX] {
+            for gap in [0, 1, 2, depth.saturating_sub(1), depth, depth + 1, 1_000] {
+                let peer = ours.saturating_sub(gap);
+                let rewind = ours - peer;
+
+                let expected = if rewind > depth {
+                    None
+                } else {
+                    Some((peer, (depth - rewind).min(peer)))
+                };
+
+                assert_eq!(
+                    ancestor_search_window(ours, peer),
+                    expected,
+                    "ours={ours}, peer={peer}"
+                );
+            }
+
+            let ahead = ours.saturating_add(10_000);
+
+            assert_eq!(
+                ancestor_search_window(ours, ahead),
+                Some((ours, depth.min(ours)))
+            );
+        }
+    }
+
+    #[test]
+    fn highest_common_is_exhaustive_on_small_synthetic_chains() {
+        for start in 0..=160_u64 {
+            for window in [0, 1, 2, 3, 7, 13, 31, 65, 500] {
+                // start+1 means no shared block exists.
+                for common in 0..=start + 1 {
+                    let exists = common <= start;
+
+                    let expected = if exists && start - common <= window.min(start) {
+                        Some(common)
+                    } else {
+                        None
+                    };
+
+                    let mut probes = 0_u32;
+
+                    let observed = highest_common_within(start, window, |height| {
+                        probes += 1;
+                        Some(exists && height <= common)
+                    });
+
+                    assert_eq!(
+                        observed, expected,
+                        "start={start}, window={window}, common={common}"
+                    );
+
+                    assert!(probes <= 32, "probe budget exceeded: {probes}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn postfork_boundary_and_probe_budget_are_bounded() {
+        for start in [500_000_u64, 500_001, 500_500, 1_000_000, u64::MAX] {
+            for back in [0, 1, 2, 3, 127, 255, 499, 500, 501] {
+                let shared = start - back;
+                let mut probes = 0_u32;
+
+                let answer = highest_common_within(start, 500, |height| {
+                    probes += 1;
+                    Some(height <= shared)
+                });
+
+                assert_eq!(answer, if back <= 500 { Some(shared) } else { None });
+
+                assert!(probes <= 24, "unbounded probing at {start}: {probes}");
+            }
+        }
+    }
+
+    #[test]
+    fn missing_peer_answers_always_fail_closed() {
+        let mut normal_probes = 0;
+
+        let expected = highest_common_within(500_500, 500, |height| {
+            normal_probes += 1;
+            Some(height <= 500_123)
+        });
+
+        assert_eq!(expected, Some(500_123));
+
+        for missing_at in 1..=normal_probes {
+            let mut index = 0;
+
+            let actual = highest_common_within(500_500, 500, |height| {
+                index += 1;
+
+                if index == missing_at {
+                    None
+                } else {
+                    Some(height <= 500_123)
+                }
+            });
+
+            assert_eq!(actual, None, "failed probe #{missing_at} was accepted");
+        }
+    }
+
+    #[test]
+    fn shorter_divergent_branch_is_never_classified_as_lag() {
+        for peer in [0_u64, 1, 2, 499_999, 500_000, 500_001, 600_000] {
+            for back in [0, 1, 2, 100, 500, 1_000] {
+                let ancestor = peer.saturating_sub(back);
+
+                let expected = if ancestor == peer {
+                    ShorterPeerAction::PushFrom(peer)
+                } else {
+                    ShorterPeerAction::EvaluateFrom(ancestor + 1)
+                };
+
+                assert_eq!(shorter_peer_action(peer, ancestor), expected);
+            }
+        }
     }
 }
