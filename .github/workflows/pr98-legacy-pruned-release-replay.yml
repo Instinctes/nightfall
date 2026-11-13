@@ -1,0 +1,25 @@
+name: PR98 release pruned fixture replay
+
+on:
+  pull_request:
+    paths:
+      - "scripts/pr98_legacy_pruned_release_replay.py"
+      - "docs/PR98-LEGACY-PRUNED-REPLAY*"
+      - ".github/workflows/pr98-legacy-pruned-release-replay.yml"
+      - "crates/nightfall-nodekit/**"
+      - "crates/nightfall-node/src/recovery.rs"
+      - "crates/nightfall-storage/**"
+
+permissions:
+  contents: read
+
+jobs:
+  release-pruned-replay:
+    if: github.event.pull_request.number == 98
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Replay official 1.1.2 and 1.1.3 storage fixtures
+        run: python3 scripts/pr98_legacy_pruned_release_replay.py --workspace .

@@ -1,0 +1,55 @@
+{
+  "all_assertions_passed": true,
+  "current_reference": "v1.1.3",
+  "format": "nightfall-pr98-release-pruned-compat-v1",
+  "live_mainnet_data_modified": false,
+  "mainnet_scale_proven": false,
+  "real_operator_fixture_proven": false,
+  "releases": [
+    {
+      "backup_byte_identical": true,
+      "fresh_genesis_reloaded": true,
+      "interrupted_recovery_refused": true,
+      "no_force_refusal_unchanged": true,
+      "old_first_height": 10,
+      "old_height": 13,
+      "old_meta_sha256": "d337fd447c22e8edbd79c57e80f10a26ed23e74eb8e22f73349c15715336bb47",
+      "release": "v1.1.2",
+      "release_authored_chain_files": [
+        "blocks.bin",
+        "chain-meta.json",
+        "headers.jsonl",
+        "utxo-horizon.json"
+      ],
+      "resync_required": true,
+      "source_commit": "7d336540916b96ec7a6679d868106e628c0bee93",
+      "synthetic_devnet_only": true,
+      "unsealed_startup_refused": true,
+      "wallet_and_miner_preserved": true,
+      "wrong_network_refused": true
+    },
+    {
+      "backup_byte_identical": true,
+      "fresh_genesis_reloaded": true,
+      "interrupted_recovery_refused": true,
+      "no_force_refusal_unchanged": true,
+      "old_first_height": 10,
+      "old_height": 13,
+      "old_meta_sha256": "8219cac16b7c3ec3f1a4b0e7bfc31d6b1f14be6c85a8dbe7a5acdd99c93a9fb7",
+      "release": "v1.1.3",
+      "release_authored_chain_files": [
+        "blocks.bin",
+        "chain-meta.json",
+        "headers.jsonl",
+        "utxo-horizon.json"
+      ],
+      "resync_required": true,
+      "source_commit": "b0c83258ac83972b40a5b5dbba1c987ae027db98",
+      "synthetic_devnet_only": true,
+      "unsealed_startup_refused": true,
+      "wallet_and_miner_preserved": true,
+      "wrong_network_refused": true
+    }
+  ],
+  "synthetic_release_authored_fixtures": true
+}
