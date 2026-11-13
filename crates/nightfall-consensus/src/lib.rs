@@ -5,7 +5,7 @@ pub use difficulty::{median_time_past, next_difficulty};
 
 use nightfall_crypto::{
     block_work, default_threads, domain, genesis_commitment, hash_multi, meets_difficulty,
-    mine_parallel, nighthash, Address, Commitment,
+    mine_parallel, nighthash, Address, Commitment, PowHasher,
 };
 use nightfall_ledger::{build_coinbase, BlockBody, LedgerState, StateUndo, Transaction};
 use nightfall_types::{
@@ -181,6 +181,141 @@ impl Block {
         meets_difficulty(self.header.pow_hash(params), self.header.difficulty)
     }
 }
+
+/// The result of hashing one block's proof of work, bound to that block.
+///
+/// Nighthash-v2 costs ~11 ms per block and depends on nothing but the header,
+/// so many blocks can be hashed at once on different cores. Everything else
+/// about a block depends on the chain before it and stays sequential. A
+/// verdict carries the answer from the first step to the second.
+///
+/// It cannot be built from a bare `bool`: the only constructor hashes the
+/// block, and [`Chain::apply_block_prechecked`] ignores a verdict that was
+/// computed for a different block or different parameters and hashes again.
+/// A wrong or missing verdict therefore costs time, never correctness.
+#[derive(Clone, Copy, Debug)]
+pub struct PowVerdict {
+    block: Hash256,
+    params: PowParams,
+    valid: bool,
+}
+
+impl PowVerdict {
+    /// Hash `block` and record whether it meets its own stated difficulty.
+    pub fn compute(block: &Block, params: PowParams) -> Self {
+        Self::compute_with(&mut PowHasher::new(params), block)
+    }
+
+    /// As [`Self::compute`], reusing a worker's 32 MiB workspace.
+    fn compute_with(hasher: &mut PowHasher, block: &Block) -> Self {
+        let hash = hasher.hash(&block.header.pow_preimage(), block.header.nonce);
+        Self {
+            block: block.hash(),
+            params: hasher.params(),
+            valid: meets_difficulty(hash, block.header.difficulty),
+        }
+    }
+
+    /// The recorded answer, if this verdict is about exactly this block.
+    fn answer_for(&self, block: &Block, params: PowParams) -> Option<bool> {
+        (self.params == params && self.block == block.hash()).then_some(self.valid)
+    }
+}
+
+/// Hash the proof of work of many blocks across `threads` cores.
+///
+/// Returns one entry per block, in order. Hashing stops early at the first
+/// block whose proof of work is invalid: entries after it may be `None`,
+/// because the chain will reject that block and never look at the rest.
+/// Every block before the first invalid one always has an entry.
+pub fn verify_pow_parallel(
+    blocks: &[Block],
+    params: PowParams,
+    threads: usize,
+) -> Vec<Option<PowVerdict>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let threads = threads.max(1).min(blocks.len().max(1));
+    let next = AtomicUsize::new(0);
+    let first_bad = AtomicUsize::new(usize::MAX);
+
+    let mut out: Vec<Option<PowVerdict>> = vec![None; blocks.len()];
+    let done: Vec<Vec<(usize, PowVerdict)>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                let (next, first_bad) = (&next, &first_bad);
+                scope.spawn(move || {
+                    let mut hasher = PowHasher::new(params);
+                    let mut mine = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= blocks.len() || i > first_bad.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let verdict = PowVerdict::compute_with(&mut hasher, &blocks[i]);
+                        if !verdict.valid {
+                            first_bad.fetch_min(i, Ordering::Relaxed);
+                        }
+                        mine.push((i, verdict));
+                    }
+                    mine
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|w| w.join().expect("pow worker panicked"))
+            .collect()
+    });
+    for (i, verdict) in done.into_iter().flatten() {
+        out[i] = Some(verdict);
+    }
+    out
+}
+
+/// How many leading blocks form one unbroken run: consecutive heights, each
+/// naming the block before it as its parent.
+///
+/// Free to check, and worth checking before 11 ms of hashing per block: a
+/// batch that breaks its own chain at block `k` is rejected at `k` by the
+/// linkage rule, so nothing from `k` on is ever hashed.
+fn linked_run_len(blocks: &[Block]) -> usize {
+    let mut n = 0;
+    let mut prev: Option<&Block> = None;
+    for b in blocks {
+        if let Some(p) = prev {
+            if b.header.height.0 != p.header.height.0.wrapping_add(1)
+                || b.header.prev_hash != p.hash()
+            {
+                break;
+            }
+        }
+        prev = Some(b);
+        n += 1;
+    }
+    n
+}
+
+/// Proof-of-work verdicts for a batch that is about to be applied in order.
+///
+/// Only the leading linked run is hashed (see [`linked_run_len`]); the result
+/// is shorter than `blocks` when the batch breaks its own chain. Pass it to
+/// [`Chain::try_ingest_blocks_prechecked`] or
+/// [`Chain::apply_block_prechecked`].
+pub fn precheck_pow(
+    blocks: &[Block],
+    params: PowParams,
+    threads: usize,
+) -> Vec<Option<PowVerdict>> {
+    verify_pow_parallel(&blocks[..linked_run_len(blocks)], params, threads)
+}
+
+/// Blocks hashed per parallel batch while replaying a long run of blocks.
+///
+/// Large enough that thread start-up is noise next to 11 ms per hash, small
+/// enough that a bad block wastes at most this much work and that progress is
+/// reported several times a second.
+pub const POW_REPLAY_WINDOW: usize = 512;
 
 /// A block waiting for proof of work. Handed to the miner so hashing happens
 /// outside the node's state lock.
@@ -648,7 +783,147 @@ impl Chain {
     /// Every check runs before the ledger is touched; the ledger itself then
     /// applies atomically. A rejected block leaves the chain byte-identical.
     pub fn apply_block(&mut self, block: Block, now_unix: u64) -> Result<(), ConsensusError> {
-        self.apply_block_inner(block, now_unix, true)
+        self.apply_block_inner(block, now_unix, true, None)
+    }
+
+    /// [`Self::apply_block`] for a block whose proof of work was already
+    /// hashed, typically on another core by [`verify_pow_parallel`].
+    ///
+    /// Every rule is enforced exactly as in `apply_block` and in the same
+    /// order. The only difference is where the hash came from. A verdict that
+    /// is absent, or that belongs to another block, is ignored and the block
+    /// is hashed here.
+    pub fn apply_block_prechecked(
+        &mut self,
+        block: Block,
+        now_unix: u64,
+        verdict: Option<&PowVerdict>,
+    ) -> Result<(), ConsensusError> {
+        self.apply_block_inner(block, now_unix, true, verdict)
+    }
+
+    /// How many leading blocks of `blocks` this build can vouch for by
+    /// checkpoint alone. Zero unless every condition holds.
+    ///
+    /// The same conditions as the reorg path (see
+    /// `rebuild_from_blocks_trusted_prefix`), and one more that makes this
+    /// safe to decide *before* replaying anything: the block sitting at the
+    /// pinned height must already hash to the pin. A file that never arrives
+    /// at the pinned block is not anchored to it, and is validated in full.
+    fn checkpointed_prefix(&self, blocks: &[Block]) -> usize {
+        let pin_height = nightfall_types::highest_checkpoint_height();
+        if self.network != NetworkId::Mainnet
+            || pin_height == 0
+            || self.block_count() != 0
+            || std::env::var("NIGHTFALL_NO_ASSUME_VALID").is_ok()
+        {
+            return 0;
+        }
+        let Some(pinned) = nightfall_types::checkpoint_at(pin_height) else {
+            return 0;
+        };
+        match blocks.get(pin_height as usize) {
+            Some(b) if b.header.height.0 == pin_height && b.hash().to_hex() == pinned => {
+                pin_height as usize + 1
+            }
+            _ => 0,
+        }
+    }
+
+    /// Replay one block that lies at or below a checkpoint this chain file
+    /// has been shown to reach.
+    ///
+    /// The header is authenticated by the hash chain up to the pinned block,
+    /// and the body by the header's `body_root`, which is checked here. What
+    /// is skipped is re-deriving what the pinned chain already implies: proof
+    /// of work, range proofs and signatures.
+    fn apply_block_below_checkpoint(&mut self, mut block: Block) -> Result<(), ConsensusError> {
+        if !self.binding_active_at(block.header.height) {
+            block.body.strip_binding();
+        }
+        if block.body.hash() != block.header.body_root {
+            return Err(ConsensusError::BadTxRoot);
+        }
+        self.apply_block_from_own_disk(block)
+    }
+
+    /// Replay a chain file this installation did not validate itself: a
+    /// downloaded archive, a copied datadir, or our own file after its
+    /// validation record stopped matching.
+    ///
+    /// On mainnet, when the file reaches this build's newest checkpoint, the
+    /// blocks up to it are replayed by linkage and body hash, and the state
+    /// they produce is compared with the pinned block. Everything after the
+    /// checkpoint, and the whole file whenever the checkpoint does not apply,
+    /// is validated in full with proof of work hashed across `threads` cores.
+    ///
+    /// Must start from an empty chain. Returns the index of the first block
+    /// that failed, with the reason.
+    pub fn replay_foreign_blocks(
+        &mut self,
+        blocks: Vec<Block>,
+        now_unix: u64,
+        threads: usize,
+        mut on_progress: impl FnMut(&Self),
+    ) -> Result<(), (usize, ConsensusError)> {
+        let prefix = self.checkpointed_prefix(&blocks);
+        let mut blocks = blocks.into_iter();
+        for (i, block) in blocks.by_ref().take(prefix).enumerate() {
+            self.apply_block_below_checkpoint(block)
+                .map_err(|e| (i, e))?;
+            if i % 4096 == 0 {
+                on_progress(self);
+            }
+        }
+        if prefix > 0 {
+            self.check_tip_roots().map_err(|e| (prefix - 1, e))?;
+            on_progress(self);
+        }
+        self.apply_blocks_parallel_pow(blocks.collect(), now_unix, threads, on_progress)
+            .map_err(|(i, e)| (prefix + i, e))
+    }
+
+    /// Apply a long run of blocks with full validation, hashing proof of work
+    /// on `threads` cores one [`POW_REPLAY_WINDOW`] at a time.
+    ///
+    /// The result is the same as calling [`Self::apply_block`] on each block
+    /// in turn: same rules, same order, same first error. Stops at the first
+    /// block that fails and returns its index in `blocks` with the reason;
+    /// every block before it stays applied.
+    ///
+    /// `on_progress` runs after each window with the chain so far.
+    pub fn apply_blocks_parallel_pow(
+        &mut self,
+        blocks: Vec<Block>,
+        now_unix: u64,
+        threads: usize,
+        mut on_progress: impl FnMut(&Self),
+    ) -> Result<(), (usize, ConsensusError)> {
+        let params = self.pow_params();
+        let mut blocks = blocks.into_iter();
+        let mut index = 0usize;
+        loop {
+            let window: Vec<Block> = blocks.by_ref().take(POW_REPLAY_WINDOW).collect();
+            if window.is_empty() {
+                return Ok(());
+            }
+            // A window that does not start at our tip is rejected by the
+            // linkage rule on its first block. Do not hash any of it.
+            let extends_tip = window[0].header.height == self.next_height()
+                && window[0].header.prev_hash == self.tip_hash();
+            let verdicts = if extends_tip {
+                precheck_pow(&window, params, threads)
+            } else {
+                Vec::new()
+            };
+            for (i, block) in window.into_iter().enumerate() {
+                let verdict = verdicts.get(i).and_then(|v| v.as_ref());
+                self.apply_block_prechecked(block, now_unix, verdict)
+                    .map_err(|e| (index, e))?;
+                index += 1;
+            }
+            on_progress(self);
+        }
     }
 
     /// Apply a block **without** re-verifying its proof of work.
@@ -664,7 +939,7 @@ impl Chain {
         block: Block,
         now_unix: u64,
     ) -> Result<(), ConsensusError> {
-        self.apply_block_inner(block, now_unix, false)
+        self.apply_block_inner(block, now_unix, false, None)
     }
 
     /// Replay a block from this node's own `blocks.jsonl`.
@@ -733,6 +1008,7 @@ impl Chain {
         mut block: Block,
         now_unix: u64,
         verify_pow: bool,
+        verdict: Option<&PowVerdict>,
     ) -> Result<(), ConsensusError> {
         // A 1.0.x node cannot see binding fields, so below the fork they must
         // not exist for us either: not in the body hash, not in validation,
@@ -802,8 +1078,14 @@ impl Chain {
         // Deliberately checked after the cheap structural rules: a memory-hard
         // hash costs milliseconds, so we never pay for it on a block that was
         // going to be rejected anyway.
-        if verify_pow && !block.pow_is_valid(self.pow_params()) {
-            return Err(ConsensusError::BadPow);
+        if verify_pow {
+            let params = self.pow_params();
+            let valid = verdict
+                .and_then(|v| v.answer_for(&block, params))
+                .unwrap_or_else(|| block.pow_is_valid(params));
+            if !valid {
+                return Err(ConsensusError::BadPow);
+            }
         }
 
         // --- emission ---
@@ -964,20 +1246,27 @@ impl Chain {
         let trusted_prefix = trusted_prefix.max(assume_valid_to);
 
         let mut chain = Self::new_fair(network)?;
-        for (i, b) in blocks.into_iter().enumerate() {
-            if i < trusted_prefix {
-                chain.apply_block_from_own_disk(b)?;
-                continue;
-            }
-            if i == trusted_prefix && trusted_prefix > 0 {
-                chain.check_tip_roots()?;
-            }
-            chain.apply_block(b, now_unix)?;
-        }
-        if trusted_prefix > 0 && trusted_prefix >= chain.block_count() as usize {
-            chain.check_tip_roots()?;
-        }
+        chain.replay_trusted_prefix_then_validate(blocks, trusted_prefix, now_unix)?;
         Ok(chain)
+    }
+
+    /// Replay the first `trusted_prefix` blocks by linkage, confirm the state
+    /// they produce against the last of them, then validate the rest in full.
+    fn replay_trusted_prefix_then_validate(
+        &mut self,
+        blocks: Vec<Block>,
+        trusted_prefix: usize,
+        now_unix: u64,
+    ) -> Result<(), ConsensusError> {
+        let mut blocks = blocks.into_iter();
+        for b in blocks.by_ref().take(trusted_prefix) {
+            self.apply_block_from_own_disk(b)?;
+        }
+        if trusted_prefix > 0 {
+            self.check_tip_roots()?;
+        }
+        self.apply_blocks_parallel_pow(blocks.collect(), now_unix, default_threads(), |_| {})
+            .map_err(|(_, e)| e)
     }
 
     /// Last applied header must still describe the ledger we just rebuilt.
@@ -1001,9 +1290,22 @@ impl Chain {
         blocks: Vec<Block>,
         now_unix: u64,
     ) -> Result<usize, ConsensusError> {
+        self.try_ingest_blocks_prechecked(blocks, &[], now_unix)
+    }
+
+    /// [`Self::try_ingest_blocks`] with proof-of-work verdicts computed ahead
+    /// of time. `verdicts[i]` belongs to `blocks[i]`; a short or empty slice
+    /// is fine and those blocks are hashed here.
+    pub fn try_ingest_blocks_prechecked(
+        &mut self,
+        blocks: Vec<Block>,
+        verdicts: &[Option<PowVerdict>],
+        now_unix: u64,
+    ) -> Result<usize, ConsensusError> {
         let mut applied = 0usize;
-        for b in blocks {
-            match self.apply_block(b, now_unix) {
+        for (i, b) in blocks.into_iter().enumerate() {
+            let verdict = verdicts.get(i).and_then(|v| v.as_ref());
+            match self.apply_block_prechecked(b, now_unix, verdict) {
                 Ok(()) => applied += 1,
                 Err(ConsensusError::BadPrev) | Err(ConsensusError::BadHeight) => break,
                 Err(e) => {
@@ -1279,19 +1581,7 @@ impl Chain {
         chain.first_height = base.first_height;
         chain.headers = base.headers;
         chain.total_work = base.horizon_work;
-        for (i, b) in blocks.into_iter().enumerate() {
-            if i < trusted_prefix {
-                chain.apply_block_from_own_disk(b)?;
-                continue;
-            }
-            if i == trusted_prefix && trusted_prefix > 0 {
-                chain.check_tip_roots()?;
-            }
-            chain.apply_block(b, now_unix)?;
-        }
-        if trusted_prefix > 0 && trusted_prefix >= chain.blocks.len() {
-            chain.check_tip_roots()?;
-        }
+        chain.replay_trusted_prefix_then_validate(blocks, trusted_prefix, now_unix)?;
         Ok(chain)
     }
 

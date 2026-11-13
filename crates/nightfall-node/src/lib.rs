@@ -1,5 +1,6 @@
 //! Nightfall full node library — embeddable by Core Wallet and `nightfalld`.
 
+pub mod bootstrap;
 pub mod mobile;
 pub mod recovery;
 pub mod rpc;

@@ -229,30 +229,123 @@ impl UtxoSet {
     /// make this incremental; that is the next optimisation, not a correctness
     /// issue.
     pub fn root(&self) -> Hash256 {
-        if self.entries.is_empty() {
-            return Hash256::ZERO;
-        }
-        let mut level: Vec<Hash256> = self
-            .entries
-            .iter()
-            .map(|(commit, e)| {
+        let leaves: Vec<(&[u8; 32], &UtxoEntry)> = self.entries.iter().collect();
+        merkle_root(
+            &leaves,
+            |(commit, e)| {
                 hash_multi(
                     domain::MERKLE_LEAF,
-                    &[commit, &e.output_pk, &e.height.to_le_bytes()],
+                    &[*commit, &e.output_pk, &e.height.to_le_bytes()],
                 )
+            },
+            SUBTREE_LEVELS,
+            nightfall_crypto::default_threads(),
+        )
+    }
+}
+
+/// Leaves per independently hashed subtree: `2^SUBTREE_LEVELS`.
+const SUBTREE_LEVELS: u32 = 12;
+
+/// One level up: hash neighbours pairwise. A node without a neighbour is
+/// paired with itself.
+fn merkle_pair_up(level: &[Hash256]) -> Vec<Hash256> {
+    level
+        .chunks(2)
+        .map(|pair| {
+            let right = if pair.len() == 2 { pair[1] } else { pair[0] };
+            hash_multi(domain::MERKLE, &[&pair[0].0, &right.0])
+        })
+        .collect()
+}
+
+/// Reduce a level to the single root above it.
+fn merkle_fold(mut level: Vec<Hash256>) -> Hash256 {
+    if level.is_empty() {
+        return Hash256::ZERO;
+    }
+    while level.len() > 1 {
+        level = merkle_pair_up(&level);
+    }
+    level[0]
+}
+
+/// The Merkle root over `items` in order, hashed on up to `threads` cores.
+///
+/// The root is a consensus value: every block header carries it and a node
+/// that computes a different one rejects the block. This function changes how
+/// long it takes to compute and must never change the result. The definition
+/// is the plain one — hash each leaf, then pair neighbours level by level,
+/// pairing a lone last node with itself, until one node is left
+/// ([`merkle_fold`] over the leaf hashes).
+///
+/// Why it can be split: pairing is positional. With the leaves cut into runs
+/// of `2^subtree_levels`, no pair below that level ever straddles two runs, so
+/// each run can be reduced by exactly `subtree_levels` rounds on its own core
+/// and the results are precisely the nodes the plain algorithm has at that
+/// level. That holds for the short last run too: its lone nodes are paired
+/// with themselves in the plain algorithm as well, because every run before
+/// it contributes an even number of nodes at every level below the cut. The
+/// rest of the tree is then folded as before.
+///
+/// It only holds when the tree is taller than the cut, so anything that fits
+/// in one run — and anything too small to be worth starting threads for —
+/// takes the plain path.
+///
+/// It was worth doing: at 215,000 unspent outputs the plain path costs about
+/// 85 ms, it runs once per validated block, and a node catching up validates
+/// tens of thousands of blocks.
+fn merkle_root<T: Sync>(
+    items: &[T],
+    leaf: impl Fn(&T) -> Hash256 + Sync,
+    subtree_levels: u32,
+    threads: usize,
+) -> Hash256 {
+    let run = 1usize << subtree_levels;
+    if threads <= 1 || items.len() < 4 * run {
+        return merkle_fold(items.iter().map(&leaf).collect());
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let runs: Vec<&[T]> = items.chunks(run).collect();
+    let threads = threads.min(runs.len());
+    // Runs are claimed one at a time rather than dealt out up front: cores
+    // are not equally fast (efficiency cores, a busy machine), and a fixed
+    // share makes the whole root wait for the slowest one.
+    let next = AtomicUsize::new(0);
+    let (leaf, runs, next) = (&leaf, &runs, &next);
+    let done: Vec<Vec<(usize, Hash256)>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(move || {
+                    let mut mine = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(run) = runs.get(i) else {
+                            break;
+                        };
+                        let mut level: Vec<Hash256> = run.iter().map(leaf).collect();
+                        for _ in 0..subtree_levels {
+                            level = merkle_pair_up(&level);
+                        }
+                        debug_assert_eq!(level.len(), 1);
+                        mine.push((i, level[0]));
+                    }
+                    mine
+                })
             })
             .collect();
-
-        while level.len() > 1 {
-            let mut next = Vec::with_capacity(level.len().div_ceil(2));
-            for chunk in level.chunks(2) {
-                let right = if chunk.len() == 2 { chunk[1] } else { chunk[0] };
-                next.push(hash_multi(domain::MERKLE, &[&chunk[0].0, &right.0]));
-            }
-            level = next;
-        }
-        level[0]
+        workers
+            .into_iter()
+            .map(|w| w.join().expect("merkle worker panicked"))
+            .collect()
+    });
+    let mut tops = vec![Hash256::ZERO; runs.len()];
+    for (i, top) in done.into_iter().flatten() {
+        tops[i] = top;
     }
+    merkle_fold(tops)
 }
 
 /// Running total of every kernel excess ever accepted.
@@ -589,5 +682,110 @@ mod tests {
         assert_eq!(coinbase_maturity(NetworkId::Mainnet), COINBASE_MATURITY);
         assert!(coinbase_maturity(NetworkId::Devnet) < COINBASE_MATURITY);
         assert!(coinbase_maturity(NetworkId::Testnet) < COINBASE_MATURITY);
+    }
+
+    /// The root as it was defined before it was split across cores, written
+    /// out again here on purpose: the test must not share code with what it
+    /// tests.
+    fn plain_root(items: &[u64]) -> Hash256 {
+        if items.is_empty() {
+            return Hash256::ZERO;
+        }
+        let mut level: Vec<Hash256> = items.iter().map(test_leaf).collect();
+        while level.len() > 1 {
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+            for chunk in level.chunks(2) {
+                let right = if chunk.len() == 2 { chunk[1] } else { chunk[0] };
+                next.push(hash_multi(domain::MERKLE, &[&chunk[0].0, &right.0]));
+            }
+            level = next;
+        }
+        level[0]
+    }
+
+    fn test_leaf(n: &u64) -> Hash256 {
+        hash_multi(domain::MERKLE_LEAF, &[&n.to_le_bytes()])
+    }
+
+    #[test]
+    fn the_split_root_is_the_plain_root_for_every_size_and_cut() {
+        // Small cuts make every boundary case cheap to reach: a last run of
+        // one leaf, of exactly a full run, one short of it, and trees just
+        // over and just under the point where the split path starts.
+        let items: Vec<u64> = (0..300).collect();
+        for subtree_levels in 0..=5u32 {
+            for threads in [1usize, 2, 5] {
+                for n in 0..=items.len() {
+                    assert_eq!(
+                        merkle_root(&items[..n], test_leaf, subtree_levels, threads),
+                        plain_root(&items[..n]),
+                        "n={n} subtree_levels={subtree_levels} threads={threads}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_split_root_is_the_plain_root_at_the_real_cut() {
+        let run = 1usize << SUBTREE_LEVELS;
+        let items: Vec<u64> = (0..(run * 9 + 5) as u64).collect();
+        for n in [
+            run * 4 - 1,
+            run * 4,
+            run * 4 + 1,
+            run * 5,
+            run * 8 - 1,
+            run * 8,
+            run * 8 + 1,
+            run * 9 + 5,
+        ] {
+            for threads in [2usize, 7, 64] {
+                assert_eq!(
+                    merkle_root(&items[..n], test_leaf, SUBTREE_LEVELS, threads),
+                    plain_root(&items[..n]),
+                    "n={n} threads={threads}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_large_set_root_matches_the_plain_definition() {
+        // Through the real entry point, with real entries and enough of them
+        // to take the split path whatever this machine's core count.
+        let mut set = UtxoSet::default();
+        for i in 0..((4usize << SUBTREE_LEVELS) + 37) {
+            let mut commit = [0u8; 32];
+            commit[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            commit[8] = (i % 251) as u8;
+            set.insert(
+                Commitment(commit),
+                UtxoEntry {
+                    output_pk: [(i % 256) as u8; 32],
+                    height: i as u64,
+                    is_coinbase: i % 3 == 0,
+                },
+            );
+        }
+        let mut level: Vec<Hash256> = set
+            .entries
+            .iter()
+            .map(|(commit, e)| {
+                hash_multi(
+                    domain::MERKLE_LEAF,
+                    &[commit, &e.output_pk, &e.height.to_le_bytes()],
+                )
+            })
+            .collect();
+        while level.len() > 1 {
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+            for chunk in level.chunks(2) {
+                let right = if chunk.len() == 2 { chunk[1] } else { chunk[0] };
+                next.push(hash_multi(domain::MERKLE, &[&chunk[0].0, &right.0]));
+            }
+            level = next;
+        }
+        assert_eq!(set.root(), level[0]);
     }
 }

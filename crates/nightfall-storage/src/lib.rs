@@ -895,16 +895,30 @@ impl ChainStore {
 
         let stored_blocks = codec::read_blocks(File::open(self.blocks_path())?, self.format())?;
 
-        for (i, block) in stored_blocks.into_iter().enumerate() {
-            let outcome = if trusted {
-                chain.apply_block_from_own_disk(block)
-            } else {
-                chain.apply_block(block, now)
-            };
-            outcome.map_err(|e| anyhow::anyhow!("stored block {i} failed revalidation: {e}"))?;
-            if i == 0 || i % 128 == 0 {
-                on_progress(chain.block_count(), expected);
+        if trusted {
+            for (i, block) in stored_blocks.into_iter().enumerate() {
+                chain
+                    .apply_block_from_own_disk(block)
+                    .map_err(|e| anyhow::anyhow!("stored block {i} failed revalidation: {e}"))?;
+                if i == 0 || i % 128 == 0 {
+                    on_progress(chain.block_count(), expected);
+                }
             }
+        } else {
+            // Not our own validated file, so `meta.block_count` says nothing
+            // about it: the total is what the file actually holds. Reporting
+            // the stale figure is how a 459,000-block archive dropped into a
+            // fresh datadir showed "1,153 / 1 blocks".
+            let total = stored_blocks.len() as u64;
+            on_progress(0, total);
+            chain
+                .replay_foreign_blocks(
+                    stored_blocks,
+                    now,
+                    nightfall_crypto::default_threads(),
+                    |c| on_progress(c.block_count(), total),
+                )
+                .map_err(|(i, e)| anyhow::anyhow!("stored block {i} failed revalidation: {e}"))?;
         }
 
         // The validation record must describe the chain we actually rebuilt.

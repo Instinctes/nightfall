@@ -79,6 +79,15 @@ pub const CHECKPOINTS: &[(u64, &str)] = &[
         25_000,
         "71c8b97b1e8a20f9f29d9e873110e41223b0c96aa9ce773feaee78c97bdd247e",
     ),
+    // 5,000 blocks after the binding rules activated at 500,000, and more
+    // than `MAX_REORG_DEPTH` below the tip when it was taken. Computed
+    // 12 Nov 2026 from an operator laptop's chain file and cross-checked
+    // against the seed node that serves nightfallcoin.org/chain.json: hash,
+    // parent and UTXO root all agree.
+    (
+        505_000,
+        "3040e4304bec02a902124976d7ba76de0209a020086d7b9a896e2d00b2f9564f",
+    ),
 ];
 
 /// The pinned hash for `height`, if this build has an opinion about it.
