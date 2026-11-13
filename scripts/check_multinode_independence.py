@@ -401,9 +401,30 @@ def main():
             )
 
         if not passed:
+            # CI must show the captured Rust panic instead of hiding it.
+            # Preserve the same fail-closed result and all three scenarios.
+            print(
+                "DEVNET FAILURE OUTPUT (bounded, no test-gate bypass)",
+                file=sys.stderr,
+                flush=True,
+            )
+            print(
+                f"exit_code={code} timed_out={timed_out} "
+                f"output_truncated={truncated} "
+                f"successful_tests={sorted(successful_tests)}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if output:
+                print(
+                    output[-32768:],
+                    file=sys.stderr,
+                    flush=True,
+                )
             print(
                 "STOP: missing, failed or timed-out test.",
                 file=sys.stderr,
+                flush=True,
             )
             return 1
 
