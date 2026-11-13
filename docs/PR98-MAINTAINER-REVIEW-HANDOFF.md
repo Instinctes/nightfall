@@ -112,3 +112,10 @@ upstream merge or deployment occurs automatically.
 The maintainer retains full discretion over merging
 and may request the unrelated research or wallet scope
 to be split before acceptance.
+
+
+<!-- pr98-intel-runner-capacity-fix-v1 -->
+
+## CI macOS runner allocation
+
+GitHub Actions reported `The job was not acquired by Runner of type hosted` on the original `macos-latest` Apple Silicon (arm64) job. The CI matrix now explicitly chooses a standard **Intel macOS** runner (`macos-15-intel`; if runner acquisition fails, `macos-26-intel`). The macOS build and wallet tests remain enabled. **This replaces arm64 validation with x86_64 validation**: Apple Silicon CI coverage is an outstanding platform-specific check and is not claimed. A green Intel build cannot prove Apple Silicon compatibility. No consensus, wallet or mining code changed to address runner capacity.
