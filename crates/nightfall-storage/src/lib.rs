@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod checkpoint;
+const CHECKPOINT_SCAN_ARCHIVE: &str = "checkpoint-wallet-v2.json";
 pub mod codec;
 pub mod dirlock;
 pub use codec::Format;
@@ -656,6 +657,51 @@ impl ChainStore {
         Ok(snapshot)
     }
 
+    /// Re-verify the retained checkpoint artifact before any wallet can use it.
+    /// A missing, corrupted, replaced or unpinned archive always fails closed.
+    /// Must be called outside the node-state mutex (it replays all headers).
+    pub fn verified_checkpoint_wallet_outputs(
+        &self,
+        network: NetworkId,
+    ) -> anyhow::Result<(Chain, Vec<checkpoint::CheckpointWalletOutput>)> {
+        self.refuse_if_interrupted_recovery()?;
+        let path = self.dir.join(CHECKPOINT_SCAN_ARCHIVE);
+        let metadata = fs::symlink_metadata(&path)?;
+        anyhow::ensure!(
+            metadata.file_type().is_file(),
+            "checkpoint scan archive is not a regular file"
+        );
+        anyhow::ensure!(
+            metadata.len() > 0 && metadata.len() <= 512 * 1024 * 1024,
+            "checkpoint scan archive exceeds its bounded size"
+        );
+
+        let reader = BufReader::new(File::open(&path)?);
+        let snapshot: checkpoint::CheckpointSnapshot = serde_json::from_reader(reader)?;
+
+        let mut outputs = Vec::with_capacity(snapshot.utxos.len());
+
+        for item in &snapshot.utxos {
+            let idx = usize::try_from(item.height)?;
+            let header = snapshot
+                .headers
+                .get(idx)
+                .ok_or_else(|| anyhow::anyhow!("checkpoint scan output has no creation header"))?;
+
+            outputs.push(checkpoint::CheckpointWalletOutput {
+                height: item.height,
+                timestamp_unix: header.timestamp_unix,
+                output: item.output.clone(),
+            });
+        }
+
+        // Authenticate the complete snapshot, not merely the output list.
+        // The caller must also compare it to the live chain horizon.
+        let verified = checkpoint::chain_from_checkpoint_snapshot(snapshot, network)?;
+
+        Ok((verified, outputs))
+    }
+
     /// Install authenticated checkpoint state into a fresh chain datadir.
     ///
     /// Acceptance is anchored to the checkpoint compiled into this binary.
@@ -690,6 +736,7 @@ impl ChainStore {
             || self.meta_path().exists()
             || self.horizon_path().exists()
             || self.headers_path().exists()
+            || self.dir.join(CHECKPOINT_SCAN_ARCHIVE).exists()
         {
             anyhow::bail!(
                 "checkpoint state import requires fresh chain state; refusing to replace existing chain files"
@@ -716,6 +763,31 @@ impl ChainStore {
 
         self.save(&chain)?;
 
+        // Retain authenticated history under the crash journal.
+        // An interrupted import cannot silently finish without it.
+        let archive = self.dir.join(CHECKPOINT_SCAN_ARCHIVE);
+        let temp = self.dir.join("checkpoint-wallet-v2.json.tmp");
+
+        {
+            let mut source = File::open(from)?;
+            let mut target = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+
+            let copied = std::io::copy(&mut source, &mut target)?;
+
+            anyhow::ensure!(
+                copied == bytes,
+                "checkpoint scan source changed during import"
+            );
+
+            target.sync_all()?;
+        }
+
+        fs::rename(&temp, &archive)?;
+        sync_dir(&self.dir)?;
+
         // Force all chain components to stable storage before clearing
         // the marker. Metadata from save() is written last.
         for path in [
@@ -723,6 +795,7 @@ impl ChainStore {
             self.headers_path(),
             self.horizon_path(),
             self.meta_path(),
+            self.dir.join(CHECKPOINT_SCAN_ARCHIVE),
             self.dir.join("install-id"),
         ] {
             if path.exists() {

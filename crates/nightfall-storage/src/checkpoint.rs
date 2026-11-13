@@ -41,6 +41,15 @@ pub struct CheckpointUtxo {
     pub output: Output,
 }
 
+/// One historical, presently unspent Output from a checkpoint-verified archive.
+/// This is an input for wallet scanning, never independent proof of ownership.
+#[derive(Clone, Debug)]
+pub struct CheckpointWalletOutput {
+    pub height: u64,
+    pub timestamp_unix: u64,
+    pub output: Output,
+}
+
 /// Rebuild checkpoint state using the newest checkpoint compiled into this
 /// binary.
 ///
@@ -670,6 +679,27 @@ mod tests {
                 .unwrap_err();
 
         assert!(err.to_string().contains("authenticated body"), "{err}");
+    }
+
+    #[test]
+    fn checkpoint_snapshot_carries_authentic_unspent_outputs() {
+        let chain = make_checkpoint_test_chain();
+        let snapshot = snapshot_for(&chain);
+
+        assert_eq!(snapshot.utxos.len(), chain.ledger.utxos.entries.len());
+
+        for u in &snapshot.utxos {
+            assert_eq!(u.commit, Hash256(u.output.commit.0).to_hex());
+            assert_eq!(u.output_pk, Hash256(u.output.output_pk).to_hex());
+
+            let body = snapshot
+                .recent_bodies
+                .iter()
+                .find(|b| b.height == u.height)
+                .expect("creation body is retained");
+
+            assert!(body.body.outputs.contains(&u.output));
+        }
     }
 
     #[test]
