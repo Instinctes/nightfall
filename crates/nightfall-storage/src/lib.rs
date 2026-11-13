@@ -1564,6 +1564,86 @@ mod tests {
     }
 
     #[test]
+    fn pr100_interrupted_checkpoint_with_retained_scan_archive_refuses_restart() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let dir = std::env::temp_dir().join(format!(
+            "nf-pr100-partial-wallet-{}-{stamp}",
+            std::process::id()
+        ));
+
+        fs::create_dir_all(&dir).unwrap();
+
+        let marker = dir.join(CHECKPOINT_IMPORT_JOURNAL);
+        let archive = dir.join(CHECKPOINT_SCAN_ARCHIVE);
+
+        fs::write(&marker, b"partial import").unwrap();
+        fs::write(&archive, b"truncated snapshot").unwrap();
+
+        let store = ChainStore::new(&dir);
+
+        let error = store
+            .load_or_new(NetworkId::Devnet)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("interrupted checkpoint import"), "{error}");
+
+        let error = store
+            .verified_checkpoint_wallet_outputs(NetworkId::Devnet)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("interrupted checkpoint import"), "{error}");
+
+        assert_eq!(fs::read(&archive).unwrap(), b"truncated snapshot");
+
+        assert_eq!(fs::read(&marker).unwrap(), b"partial import");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pr100_invalid_checkpoint_scan_archive_fails_closed() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let dir = std::env::temp_dir().join(format!(
+            "nf-pr100-invalid-wallet-{}-{stamp}",
+            std::process::id()
+        ));
+
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = ChainStore::new(&dir);
+        let archive = dir.join(CHECKPOINT_SCAN_ARCHIVE);
+
+        assert!(store
+            .verified_checkpoint_wallet_outputs(NetworkId::Devnet)
+            .is_err());
+
+        fs::write(&archive, b"not a checkpoint JSON").unwrap();
+
+        assert!(store
+            .verified_checkpoint_wallet_outputs(NetworkId::Devnet)
+            .is_err());
+
+        fs::remove_file(&archive).unwrap();
+        fs::create_dir(&archive).unwrap();
+
+        assert!(store
+            .verified_checkpoint_wallet_outputs(NetworkId::Devnet)
+            .is_err());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn interrupted_checkpoint_import_is_never_loaded() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
