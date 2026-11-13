@@ -1425,7 +1425,11 @@ impl NodeHandle {
             g.mempool = Mempool::default();
             g.bump_tip();
             g.persist()?;
-            (g.sessions.all(), g.chain.block_count(), next_needed_height(&g))
+            (
+                g.sessions.all(),
+                g.chain.block_count(),
+                next_needed_height(&g),
+            )
         };
         for sess in sessions {
             let _ = sess.send(&nightfall_p2p::PeerMsg::GetBlocks {

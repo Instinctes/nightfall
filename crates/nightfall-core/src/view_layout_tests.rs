@@ -1014,3 +1014,76 @@ fn the_dead_branch_notice_fits_and_asks_before_resyncing() {
     assert!(app.resync_confirm);
     assert!(app.node.is_none());
 }
+
+/// Every state of the fast-start panel fits every supported width, and
+/// drawing it never starts or changes a fast start by itself.
+#[test]
+fn the_fast_start_panel_fits_in_every_state() {
+    use crate::app::FastStart;
+
+    let ctx = egui::Context::default();
+    crate::theme::apply(&ctx);
+    let dir = std::env::temp_dir().join(format!("nf-fast-start-{}", std::process::id()));
+    let mut app = App::new(nightfall_types::NetworkId::Devnet, dir);
+    let states = [
+        FastStart::Idle,
+        FastStart::Asking,
+        FastStart::Downloading {
+            done: 312_000_000,
+            total: 741_469_627,
+        },
+        FastStart::Checking {
+            done: 270_337,
+            total: 505_591,
+        },
+        FastStart::Done { blocks: 505_591 },
+        FastStart::Failed(
+            "the downloaded archive does not match its checksum (a long reason that must wrap \
+             rather than push the card wider than the window)"
+                .into(),
+        ),
+    ];
+    for state in states {
+        for offered in [true, false] {
+            *app.fast_start.lock().unwrap() = state.clone();
+            for width in [620.0, 884.0, 1180.0] {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(width, 900.0),
+                    )),
+                    ..Default::default()
+                };
+                let _ = ctx.run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let right = ui.max_rect().right();
+                        app.fast_start_panel(ui, ctx, offered);
+                        assert!(
+                            ui.min_rect().right() <= right + 1.0,
+                            "fast-start panel overflows at {width}px in {state:?}"
+                        );
+                    });
+                });
+            }
+            assert_eq!(*app.fast_start.lock().unwrap(), state);
+        }
+    }
+    assert!(app.node.is_none());
+}
+
+#[test]
+fn fast_start_is_offered_only_when_far_behind() {
+    use crate::app::{fast_start_worthwhile, FAST_START_MIN_GAP};
+    let pin = nightfall_types::highest_checkpoint_height();
+    // A fresh install knows no peer yet: the checkpoint stands in for one.
+    assert!(fast_start_worthwhile(0, 0));
+    // Close to the network, fetching from peers is quicker.
+    let peer = pin + 100_000;
+    assert!(!fast_start_worthwhile(peer - FAST_START_MIN_GAP, peer));
+    assert!(fast_start_worthwhile(peer - FAST_START_MIN_GAP - 1, peer));
+    // Past the checkpoint with no peer known, there is nothing to gain.
+    assert!(!fast_start_worthwhile(pin, 0));
+    // Never panics on hostile peer heights.
+    assert!(fast_start_worthwhile(0, u64::MAX));
+    assert!(!fast_start_worthwhile(u64::MAX, u64::MAX));
+}

@@ -56,6 +56,52 @@ pub const DEV_DATA_SUBDIR: &str = if IS_ISOLATED_DEV_PROFILE {
 pub const IS_DEV_MAINNET: bool =
     !IS_ISOLATED_DEV_PROFILE && option_env!("NIGHTFALL_DEV_MAINNET").is_some();
 
+/// Fast start is offered when the node is at least this far behind. Closer
+/// than that, fetching the rest from peers is quicker than a 700 MB download.
+pub const FAST_START_MIN_GAP: u64 = 20_000;
+
+/// Where a fast start is: fetching the published chain archive and handing
+/// it to the node, instead of pulling every block from peers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum FastStart {
+    #[default]
+    Idle,
+    /// Reading the description of the current archive.
+    Asking,
+    Downloading {
+        done: u64,
+        total: u64,
+    },
+    /// The node is checking the downloaded blocks.
+    Checking {
+        done: u64,
+        total: u64,
+    },
+    Done {
+        blocks: u64,
+    },
+    Failed(String),
+}
+
+impl FastStart {
+    pub fn is_running(&self) -> bool {
+        matches!(
+            self,
+            Self::Asking | Self::Downloading { .. } | Self::Checking { .. }
+        )
+    }
+}
+
+/// Whether a node at `tip` is far enough behind for a fast start to pay off.
+///
+/// `best_peer` is zero until a peer has reported its height, which on a fresh
+/// install is exactly when the offer matters most. The newest checkpoint in
+/// this build is a height the chain is known to have reached, so it stands in.
+pub fn fast_start_worthwhile(tip: u64, best_peer: u64) -> bool {
+    let known_height = best_peer.max(nightfall_types::highest_checkpoint_height());
+    tip.saturating_add(FAST_START_MIN_GAP) < known_height
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Dashboard,
@@ -188,6 +234,16 @@ pub struct App {
     pub backup_acked: bool,
     pub recovery_studio: crate::recovery_studio::RecoveryStudio,
     pub resync_confirm: bool,
+    /// Progress of a fast start, written by its worker thread.
+    pub fast_start: Arc<Mutex<FastStart>>,
+    fast_start_cancel: Arc<AtomicBool>,
+    /// Whether this node may make the direct download a fast start needs.
+    /// Decided once when the node starts: the waiting screen must not take
+    /// the node's lock to ask.
+    pub fast_start_allowed: bool,
+    /// The receive address, remembered for the waiting screen so it does not
+    /// disappear whenever the scanner holds the wallet.
+    startup_address: Option<String>,
     pub close_to_tray: bool,
     pub prune: bool,
     pub mining_threads: usize,
@@ -374,6 +430,10 @@ impl App {
             backup_acked: load_backup_acked(&datadir),
             recovery_studio: Default::default(),
             resync_confirm: false,
+            fast_start: Arc::new(Mutex::new(FastStart::Idle)),
+            fast_start_cancel: Arc::new(AtomicBool::new(false)),
+            fast_start_allowed: false,
+            startup_address: None,
             close_to_tray: load_close_to_tray(&datadir),
             prune: load_flag(&datadir, "prune", false),
             mining_threads,
@@ -491,6 +551,9 @@ impl App {
         match NodeHandle::start(cfg) {
             Ok(h) => {
                 h.set_mining_threads(self.mining_threads);
+                self.fast_start_allowed = self.network == NetworkId::Mainnet
+                    && !IS_DEV_BUILD
+                    && h.direct_downloads_allowed();
                 let handle = Arc::new(h);
                 self.node = Some(Arc::clone(&handle));
                 self.spawn_sync_worker(handle);
@@ -637,6 +700,83 @@ impl App {
              Your wallet and keys stay; its history is checked again automatically once the \
              network's chain is downloaded.",
         );
+    }
+
+    /// Fetch the published chain archive and continue from it.
+    ///
+    /// Runs on its own thread and reports through `self.fast_start`. The
+    /// node keeps syncing from peers meanwhile and decides for itself whether
+    /// the archive is valid and ahead; nothing here can make it accept a
+    /// chain it would not have accepted from the network.
+    pub fn start_fast_start(&mut self, ctx: &egui::Context) {
+        let Some(node) = self.node.clone() else {
+            self.toasts.error(ctx, "Node is not running");
+            return;
+        };
+        if !self.fast_start_allowed {
+            return;
+        }
+        {
+            let mut state = self.fast_start.lock().unwrap_or_else(|e| e.into_inner());
+            if state.is_running() {
+                return;
+            }
+            *state = FastStart::Asking;
+        }
+        self.fast_start_cancel.store(false, Ordering::SeqCst);
+
+        let state = self.fast_start.clone();
+        let cancel = self.fast_start_cancel.clone();
+        let access = self.wallet_scan_access.clone();
+        let dir = self.datadir.join("chain-archive");
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let set = |value: FastStart| {
+                if let Ok(mut slot) = state.lock() {
+                    *slot = value;
+                }
+                ctx.request_repaint();
+            };
+            let result = (|| -> anyhow::Result<u64> {
+                use nightfall_node::bootstrap;
+                let manifest = bootstrap::Manifest::fetch(&node.genesis_hex())?;
+                bootstrap::download(&manifest, &dir, &cancel, |done, total| {
+                    set(FastStart::Downloading { done, total })
+                })?;
+                set(FastStart::Checking {
+                    done: 0,
+                    total: manifest.height,
+                });
+                // Not while a scan is copying the chain.
+                let _access = access
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("the wallet scanner stopped unexpectedly"))?;
+                let adopted = node.adopt_chain_archive(&dir, |done, total| {
+                    set(FastStart::Checking { done, total })
+                });
+                // Adopted, the node has written its own copy. Refused, the
+                // file is of no use. Either way it is 700 MB to give back.
+                bootstrap::discard(&dir);
+                adopted
+            })();
+            match result {
+                Ok(blocks) => {
+                    tracing::info!("fast start: continuing from {blocks} blocks");
+                    set(FastStart::Done { blocks });
+                }
+                Err(_) if cancel.load(Ordering::SeqCst) => set(FastStart::Idle),
+                Err(error) => {
+                    tracing::warn!("fast start failed: {error}");
+                    set(FastStart::Failed(error.to_string()));
+                }
+            }
+        });
+    }
+
+    /// Stop a running download. The part already fetched is kept, so starting
+    /// again continues from there.
+    pub fn cancel_fast_start(&mut self) {
+        self.fast_start_cancel.store(true, Ordering::SeqCst);
     }
 
     pub fn start_chain_check(&mut self) {
@@ -1909,6 +2049,9 @@ impl App {
                         if let Some(s) = &status {
                             ui.label(RichText::new(format!("{} connected peers  ·  {}", s.live_peers, self.network)).size(12.0).color(TEXT_FAINT));
                         }
+                        let offered = self.fast_start_offered(status.as_ref());
+                        self.fast_start_panel(ui, ctx, offered);
+                        self.startup_address_row(ui, ctx);
                         ui.add_space(20.0);
                         ui.horizontal_wrapped(|ui| {
                             if self.vault_ui.custody == Custody::Unlocked && ghost_button(ui, "Lock wallet").clicked() {
@@ -1923,6 +2066,162 @@ impl App {
                 });
                 ui.min_rect()
             }).inner
+    }
+
+    /// Whether the waiting screen should offer a fast start right now.
+    pub fn fast_start_offered(&self, status: Option<&StatusSnap>) -> bool {
+        self.fast_start_allowed
+            && status.is_some_and(|s| {
+                !s.loading && fast_start_worthwhile(s.tip_height, s.best_peer_height)
+            })
+    }
+
+    /// The fast-start part of the waiting screen: the offer, or how far a
+    /// running one has got. Draws nothing when there is nothing to say.
+    ///
+    /// `offered` is [`Self::fast_start_offered`] for the current status. It
+    /// decides whether the offer and the retry button are shown; a fast start
+    /// that is already running is shown either way.
+    pub fn fast_start_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, offered: bool) {
+        let state = self
+            .fast_start
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default();
+        if state == FastStart::Idle && !offered {
+            return;
+        }
+        ui.add_space(16.0);
+        divider(ui);
+        match state {
+            FastStart::Idle => {
+                ui.label(RichText::new("Fast start").size(15.0).color(TEXT));
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Download the whole chain as one large file from GitHub instead of \
+                         fetching it block by block. This computer checks the file before using \
+                         it. Usually minutes instead of hours. GitHub sees your internet \
+                         address, as it did when you downloaded this app.",
+                    )
+                    .size(12.5)
+                    .color(TEXT_DIM),
+                );
+                ui.add_space(10.0);
+                if primary_button(ui, "  Fast start  ", true).clicked() {
+                    self.start_fast_start(ctx);
+                }
+            }
+            FastStart::Asking => {
+                ui.label(
+                    RichText::new("Fast start: looking up the current chain file…").color(TEXT),
+                );
+            }
+            FastStart::Downloading { done, total } => {
+                ui.label(RichText::new("Fast start: downloading the chain").color(TEXT));
+                ui.add_space(6.0);
+                let progress = if total > 0 {
+                    (done as f64 / total as f64).clamp(0.0, 1.0) as f32
+                } else {
+                    0.0
+                };
+                ui.add(
+                    egui::ProgressBar::new(progress)
+                        .fill(ACCENT)
+                        .desired_width(ui.available_width())
+                        .text(format!(
+                            "{} / {} MB",
+                            format_int(done / 1_000_000),
+                            format_int(total / 1_000_000)
+                        )),
+                );
+                ui.add_space(8.0);
+                if ghost_button(ui, "Stop download").clicked() {
+                    self.cancel_fast_start();
+                }
+            }
+            FastStart::Checking { done, total } => {
+                ui.label(RichText::new("Fast start: checking the downloaded blocks").color(TEXT));
+                ui.add_space(6.0);
+                let progress = if total > 0 {
+                    (done as f64 / total as f64).clamp(0.0, 1.0) as f32
+                } else {
+                    0.0
+                };
+                ui.add(
+                    egui::ProgressBar::new(progress)
+                        .fill(ACCENT)
+                        .desired_width(ui.available_width())
+                        .text(format!(
+                            "{} / {} blocks",
+                            format_int(done),
+                            format_int(total)
+                        )),
+                );
+            }
+            FastStart::Done { blocks } => {
+                ui.label(
+                    RichText::new(format!(
+                        "Fast start finished: {} blocks checked and loaded. The newest blocks \
+                         now come from the network.",
+                        format_int(blocks)
+                    ))
+                    .color(TEXT_DIM),
+                );
+            }
+            FastStart::Failed(error) => {
+                ui.colored_label(DANGER, format!("Fast start did not finish: {error}"));
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Nothing was changed. The wallet keeps syncing from the network.",
+                    )
+                    .size(12.5)
+                    .color(TEXT_DIM),
+                );
+                ui.add_space(8.0);
+                if offered && ghost_button(ui, "Try again").clicked() {
+                    self.start_fast_start(ctx);
+                }
+            }
+        }
+    }
+
+    /// The receive address on the waiting screen. A new wallet has no history
+    /// to wait for: its address can be given out while the chain catches up.
+    fn startup_address_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if !matches!(self.vault_ui.custody, Custody::Unlocked | Custody::Legacy) {
+            self.startup_address = None;
+            return;
+        }
+        if self.startup_address.is_none() {
+            // try_lock: the scanner may hold the wallet, and this screen must
+            // never wait for it.
+            self.startup_address = self
+                .wallet
+                .try_lock()
+                .ok()
+                .and_then(|wallet| wallet.address())
+                .map(|address| address.encode());
+        }
+        let Some(address) = self.startup_address.clone() else {
+            return;
+        };
+        ui.add_space(16.0);
+        divider(ui);
+        field_label(ui, "Your address", None);
+        if copyable(ui, &address, true) {
+            self.toasts.success(ctx, "Address copied");
+        }
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "You can give it out already. Payments sent to it show up here once the wallet \
+                 has caught up.",
+            )
+            .size(12.0)
+            .color(TEXT_FAINT),
+        );
     }
 
     pub fn request_vault(&mut self, action: crate::vault_ui::Action, ctx: &egui::Context) {
@@ -1948,6 +2247,7 @@ impl App {
         self.startup_complete = false;
         self.startup_ready_since = None;
         self.startup_connection_view = false;
+        self.startup_address = None;
         self.last_sync_at = None;
         self.reveal_seed = false;
         self.reveal_mnemonic = false;

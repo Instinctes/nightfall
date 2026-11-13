@@ -99,7 +99,10 @@ impl Manifest {
             anyhow::bail!("the archive has an unexpected file name");
         }
         if self.blocks_bin_sha256.len() != 64
-            || !self.blocks_bin_sha256.chars().all(|c| c.is_ascii_hexdigit())
+            || !self
+                .blocks_bin_sha256
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
         {
             anyhow::bail!("the archive description carries no usable checksum");
         }
@@ -123,9 +126,7 @@ fn is_archive_name(name: &str) -> bool {
     let Some(rest) = rest.strip_suffix(".bin") else {
         return false;
     };
-    !rest.is_empty()
-        && rest.len() <= 40
-        && rest.chars().all(|c| c.is_ascii_digit() || c == '-')
+    !rest.is_empty() && rest.len() <= 40 && rest.chars().all(|c| c.is_ascii_digit() || c == '-')
 }
 
 /// Download the archive named by `manifest` into `dir`, returning the path of
@@ -361,7 +362,11 @@ mod tests {
                     }
                 }
                 log.lock().unwrap().push(range);
-                let from = if honour_range { range.unwrap_or(0) as usize } else { 0 };
+                let from = if honour_range {
+                    range.unwrap_or(0) as usize
+                } else {
+                    0
+                };
                 let slice = &body[from.min(body.len())..];
                 let head = if honour_range && range.is_some() {
                     format!(
@@ -418,8 +423,8 @@ mod tests {
         manifest.blocks_bin_sha256 = "ab".repeat(32);
         let (url, _) = serve(data, None, true);
         let dir = temp_dir("sha");
-        let err = download_from(&url, &manifest, &dir, &AtomicBool::new(false), |_, _| {})
-            .unwrap_err();
+        let err =
+            download_from(&url, &manifest, &dir, &AtomicBool::new(false), |_, _| {}).unwrap_err();
         assert!(err.to_string().contains("checksum"), "{err}");
         assert!(!dir.join(ARCHIVE_FILE).exists());
         assert!(!dir.join(PART_FILE).exists());
@@ -467,8 +472,8 @@ mod tests {
         manifest.archive_bytes = 100_000;
         let (url, _) = serve(data, None, true);
         let dir = temp_dir("toolong");
-        let err = download_from(&url, &manifest, &dir, &AtomicBool::new(false), |_, _| {})
-            .unwrap_err();
+        let err =
+            download_from(&url, &manifest, &dir, &AtomicBool::new(false), |_, _| {}).unwrap_err();
         assert!(err.to_string().contains("more than"), "{err}");
         assert!(!dir.join(ARCHIVE_FILE).exists());
         discard(&dir);
@@ -515,8 +520,14 @@ mod tests {
         let other = body(300_001);
         let other_manifest = manifest_for(&other);
         let (url, _) = serve(other.clone(), None, true);
-        let path = download_from(&url, &other_manifest, &dir, &AtomicBool::new(false), |_, _| {})
-            .unwrap();
+        let path = download_from(
+            &url,
+            &other_manifest,
+            &dir,
+            &AtomicBool::new(false),
+            |_, _| {},
+        )
+        .unwrap();
         assert_eq!(fs::read(path).unwrap(), other);
         discard(&dir);
     }
