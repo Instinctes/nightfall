@@ -816,6 +816,158 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Synthetic checkpoint: disk serialization, restart,
+    /// normal catch-up and exact comparison with a full archive.
+    /// Not a real mainnet checkpoint validation.
+    #[test]
+    fn pr98_disk_serialized_synthetic_pin_restart_catchup_matches_archive() {
+        use nightfall_crypto::WalletKeys;
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let dir = std::env::temp_dir().join(format!(
+            "nightfall-pr98-checkpoint-e2e-{}-{stamp}",
+            std::process::id()
+        ));
+
+        fs::create_dir(&dir).unwrap();
+
+        let archive_dir = dir.join("archive");
+        let restored_dir = dir.join("restored");
+
+        fs::create_dir(&archive_dir).unwrap();
+        fs::create_dir(&restored_dir).unwrap();
+
+        let snapshot_file = dir.join("checkpoint.json");
+
+        let miner = WalletKeys::generate().address();
+        let start = now_unix();
+
+        let mut source = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+        for index in 0..22u64 {
+            source
+                .mine_block(&miner, vec![], start + index * 15)
+                .unwrap();
+        }
+
+        let archive_store = crate::ChainStore::new(&archive_dir);
+
+        archive_store.save(&source).unwrap();
+
+        let full = archive_store.load_or_new(NetworkId::Devnet).unwrap();
+
+        assert_eq!(full.block_count(), 22);
+
+        let checkpoint_blocks = 12usize;
+
+        let prefix = Chain::rebuild_from_blocks(
+            NetworkId::Devnet,
+            full.blocks[..checkpoint_blocks].to_vec(),
+            start + 15 * 32,
+        )
+        .unwrap();
+
+        let height = prefix.tip_height().unwrap().0;
+
+        assert_eq!(height, 11);
+
+        let pin = prefix.tip_hash().to_hex();
+
+        let snapshot = snapshot_for(&prefix);
+
+        fs::write(&snapshot_file, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+        let from_disk: CheckpointSnapshot =
+            serde_json::from_slice(&fs::read(&snapshot_file).unwrap()).unwrap();
+
+        let imported =
+            chain_from_checkpoint_snapshot_with_pin(from_disk, NetworkId::Devnet, height, &pin)
+                .unwrap();
+
+        assert_eq!(imported.first_height, height + 1);
+
+        assert_eq!(imported.tip_hash(), prefix.tip_hash(),);
+
+        assert_eq!(imported.ledger.utxo_root(), prefix.ledger.utxo_root(),);
+
+        assert_eq!(imported.ledger.kernel_sum(), prefix.ledger.kernel_sum(),);
+
+        assert_eq!(imported.total_work, prefix.total_work,);
+
+        let restored_store = crate::ChainStore::new(&restored_dir);
+
+        restored_store.save(&imported).unwrap();
+
+        assert_eq!(
+            fs::metadata(restored_store.blocks_path()).unwrap().len(),
+            0,
+            "checkpoint must not contain historical bodies",
+        );
+
+        let mut recovered = restored_store.load_or_new(NetworkId::Devnet).unwrap();
+
+        assert_eq!(recovered.tip_hash(), prefix.tip_hash(),);
+
+        assert_eq!(recovered.total_work, prefix.total_work,);
+
+        for block in full.blocks[checkpoint_blocks..].iter().cloned() {
+            let now = block.header.timestamp_unix;
+
+            recovered.apply_block(block, now).unwrap();
+
+            restored_store.save(&recovered).unwrap();
+
+            // Exercise normal restart after every block.
+            recovered = restored_store.load_or_new(NetworkId::Devnet).unwrap();
+        }
+
+        recovered.verify_supply().unwrap();
+
+        assert_eq!(recovered.tip_hash(), full.tip_hash(),);
+
+        assert_eq!(recovered.block_count(), full.block_count(),);
+
+        assert_eq!(recovered.ledger.utxo_root(), full.ledger.utxo_root(),);
+
+        assert_eq!(recovered.ledger.kernel_sum(), full.ledger.kernel_sum(),);
+
+        assert_eq!(
+            recovered.ledger.supply.total_minted_darks,
+            full.ledger.supply.total_minted_darks,
+        );
+
+        assert_eq!(
+            recovered.ledger.supply.total_burned_darks,
+            full.ledger.supply.total_burned_darks,
+        );
+
+        assert_eq!(recovered.total_work, full.total_work,);
+
+        assert_eq!(recovered.next_difficulty(), full.next_difficulty(),);
+
+        assert_eq!(recovered.median_time_past(), full.median_time_past(),);
+
+        // Reject a modified on-disk snapshot.
+        let mut tampered: CheckpointSnapshot =
+            serde_json::from_slice(&fs::read(&snapshot_file).unwrap()).unwrap();
+
+        tampered.headers[0].timestamp_unix ^= 1;
+
+        assert!(
+            chain_from_checkpoint_snapshot_with_pin(tampered, NetworkId::Devnet, height, &pin,)
+                .is_err(),
+            "tampered snapshot must not be accepted",
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn checkpoint_export_rejects_body_not_matching_header_root() {
         let chain = make_checkpoint_test_chain();

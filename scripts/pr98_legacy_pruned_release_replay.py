@@ -313,6 +313,12 @@ def check_release(
 
     local_env = env.copy()
 
+    # Never share Cargo artifacts between PR98 and historical releases.
+    # The packages can have identical names/versions but different APIs.
+    local_env["CARGO_TARGET_DIR"] = str(
+        home / ("release-target-" + tag)
+    )
+
     local_env["NIGHTFALL_FIXTURE_OUT"] = str(
         fixture
     )

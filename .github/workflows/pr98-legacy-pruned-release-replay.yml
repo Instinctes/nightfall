@@ -23,3 +23,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Replay official 1.1.2 and 1.1.3 storage fixtures
         run: python3 scripts/pr98_legacy_pruned_release_replay.py --workspace .
+      - name: PR98 disk snapshot restart and catch-up
+        run: cargo test --locked -p nightfall-storage checkpoint::tests::pr98_disk_serialized_synthetic_pin_restart_catchup_matches_archive -- --exact --test-threads=1
