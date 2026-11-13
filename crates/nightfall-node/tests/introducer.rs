@@ -181,13 +181,39 @@ fn a_normal_node_keeps_the_session() {
     });
     writeln!(w, "{hello}").expect("write");
     w.flush().ok();
-    std::thread::sleep(Duration::from_millis(600));
 
+    // CI handshake barrier v1: wait for admission before checking retention.
+    // HelloOk alone comes before session admission. The Peers message is
+    // emitted after insertion into the live session pool by handle_peer.
+    let mut reply = BufReader::new(stream.try_clone().expect("clone read socket"));
+    let mut first = String::new();
+    assert!(
+        reply.read_line(&mut first).expect("read hello_ok") > 0,
+        "normal node closed before hello_ok"
+    );
+    let hello_ok: serde_json::Value = serde_json::from_str(&first).expect("parse hello_ok");
+    assert_eq!(
+        hello_ok["type"], "hello_ok",
+        "unexpected response: {hello_ok}"
+    );
+
+    let mut second = String::new();
+    assert!(
+        reply.read_line(&mut second).expect("read peers") > 0,
+        "normal node closed before admission/peers"
+    );
+    let peers: serde_json::Value = serde_json::from_str(&second).expect("parse peers");
+    assert_eq!(peers["type"], "peers", "unexpected response: {peers}");
+
+    // Keep the original retention requirement and its observation interval.
+    std::thread::sleep(Duration::from_millis(600));
     assert_eq!(
         node.status_snapshot().expect("status").live_peers,
         1,
         "a normal node should hold the session open"
     );
+    drop(reply);
+    drop(w);
     drop(stream);
 }
 
