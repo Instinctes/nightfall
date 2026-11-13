@@ -8,8 +8,8 @@
 //! rewrite; the cost grows linearly with height forever (audit finding N-05).
 
 use nightfall_consensus::{Chain, CompactHeader};
-use nightfall_crypto::Commitment;
-use nightfall_ledger::{LedgerState, UtxoEntry, UtxoSet};
+use nightfall_crypto::{hash_multi, Commitment};
+use nightfall_ledger::{state_fingerprint, LedgerState, UtxoEntry, UtxoSet};
 use nightfall_types::{Hash256, Height, NetworkId};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -17,6 +17,7 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod checkpoint;
 pub mod codec;
 pub mod dirlock;
 pub use codec::Format;
@@ -59,6 +60,12 @@ struct ChainMeta {
     validated_horizon_bytes: u64,
     #[serde(default)]
     validated_headers_bytes: u64,
+
+    /// Non-consensus seals: old unverified pruned datadirs fail closed.
+    #[serde(default)]
+    validated_horizon_fingerprint: String,
+    #[serde(default)]
+    validated_headers_fingerprint: String,
 }
 
 /// Sidecar written next to an exported `blocks.jsonl`.
@@ -77,6 +84,31 @@ pub struct SnapshotManifest {
 
 fn json_format_name() -> String {
     "json".to_string()
+}
+
+fn compact_headers_fingerprint(headers: &[CompactHeader]) -> Hash256 {
+    let leaves: Vec<Hash256> = headers
+        .iter()
+        .map(|h| {
+            hash_multi(
+                b"nightfall:local-compact-header:v1",
+                &[
+                    &h.height.to_le_bytes(),
+                    &h.hash.0,
+                    &h.prev_hash.0,
+                    &h.timestamp_unix.to_le_bytes(),
+                    &h.difficulty.to_le_bytes(),
+                ],
+            )
+        })
+        .collect();
+
+    let count = (leaves.len() as u64).to_le_bytes();
+    let mut refs: Vec<&[u8]> = Vec::with_capacity(leaves.len() + 1);
+    refs.push(&count);
+    refs.extend(leaves.iter().map(|h| h.0.as_slice()));
+
+    hash_multi(b"nightfall:local-compact-headers:v1", &refs)
 }
 
 pub struct ChainStore {
@@ -170,6 +202,20 @@ impl ChainStore {
         let validated_headers_bytes = fs::metadata(self.headers_path())
             .map(|m| m.len())
             .unwrap_or(0);
+        let (validated_horizon_fingerprint, validated_headers_fingerprint) = if chain.is_pruned() {
+            let horizon = chain
+                .horizon
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("pruned chain is missing its UTXO horizon"))?;
+
+            (
+                state_fingerprint(horizon).to_hex(),
+                compact_headers_fingerprint(&chain.headers).to_hex(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+
         let meta = ChainMeta {
             network: chain.network,
             genesis_hash: chain.genesis_hash.to_hex(),
@@ -183,6 +229,8 @@ impl ChainStore {
             horizon_work: chain.horizon_work.to_string(),
             validated_horizon_bytes,
             validated_headers_bytes,
+            validated_horizon_fingerprint,
+            validated_headers_fingerprint,
         };
         let tmp = self.dir.join("chain-meta.json.tmp");
         {
@@ -222,10 +270,17 @@ impl ChainStore {
         if m.validated_by.is_empty() || m.validated_by != self.install_id() {
             return false;
         }
+        if !self.blocks_path().exists() {
+            return false;
+        }
         let bytes = fs::metadata(self.blocks_path())
             .map(|x| x.len())
             .unwrap_or(0);
-        if m.validated_bytes != bytes || bytes == 0 {
+        if m.validated_bytes != bytes {
+            return false;
+        }
+        let bodyless_pruned = m.pruned && m.first_height > 0 && m.block_count == m.first_height;
+        if bytes == 0 && !bodyless_pruned {
             return false;
         }
         if !m.pruned && m.first_height == 0 {
@@ -237,7 +292,35 @@ impl ChainStore {
         let hd = fs::metadata(self.headers_path())
             .map(|x| x.len())
             .unwrap_or(0);
-        m.validated_horizon_bytes == hz && hz > 0 && m.validated_headers_bytes == hd && hd > 0
+
+        if m.validated_horizon_bytes != hz || hz == 0 || m.validated_headers_bytes != hd || hd == 0
+        {
+            return false;
+        }
+
+        // A pruned datadir cannot safely bootstrap these seals from itself:
+        // the discarded bodies no longer exist to reconstruct and verify the
+        // horizon/header prefix independently. Missing or partial seals therefore
+        // fail closed and require a resync.
+        if m.validated_horizon_fingerprint.is_empty() || m.validated_headers_fingerprint.is_empty()
+        {
+            return false;
+        }
+
+        let horizon = match load_horizon_file(&self.horizon_path()) {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+        if state_fingerprint(&horizon).to_hex() != m.validated_horizon_fingerprint {
+            return false;
+        }
+
+        let headers = match load_jsonl_headers(&self.headers_path()) {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+
+        compact_headers_fingerprint(&headers).to_hex() == m.validated_headers_fingerprint
     }
 
     fn read_meta(&self) -> Option<ChainMeta> {
@@ -512,6 +595,8 @@ impl ChainStore {
             horizon_work: String::new(),
             validated_horizon_bytes: 0,
             validated_headers_bytes: 0,
+            validated_horizon_fingerprint: String::new(),
+            validated_headers_fingerprint: String::new(),
         };
         fs::write(self.meta_path(), serde_json::to_vec_pretty(&meta)?)?;
         let chain = self.load_or_new(network)?;
@@ -534,6 +619,143 @@ impl ChainStore {
         }
         self.save(&chain)?;
         Ok(chain)
+    }
+
+    pub fn export_checkpoint_snapshot(
+        &self,
+        out: &Path,
+        network: NetworkId,
+    ) -> anyhow::Result<checkpoint::CheckpointSnapshot> {
+        if out.exists() {
+            anyhow::bail!("refusing to overwrite {}", out.display());
+        }
+
+        let chain = self.load_or_new(network)?;
+        let snapshot = checkpoint::checkpoint_snapshot_from_chain(&chain)?;
+
+        if let Some(parent) = out.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        let tmp = out.with_extension("tmp");
+        let write_result = (|| -> anyhow::Result<()> {
+            let mut writer = BufWriter::new(File::create(&tmp)?);
+            serde_json::to_writer(&mut writer, &snapshot)?;
+            writer.flush()?;
+            fs::rename(&tmp, out)?;
+            Ok(())
+        })();
+
+        if let Err(err) = write_result {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
+
+        Ok(snapshot)
+    }
+
+    /// Install authenticated checkpoint state into a fresh chain datadir.
+    ///
+    /// Acceptance is anchored to the checkpoint compiled into this binary.
+    /// Blocks after that checkpoint are subsequently downloaded and validated
+    /// through the ordinary consensus path.
+    pub fn import_checkpoint_snapshot(
+        &self,
+        from: &Path,
+        network: NetworkId,
+    ) -> anyhow::Result<Chain> {
+        const MAX_CHECKPOINT_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
+
+        self.refuse_if_interrupted_recovery()?;
+
+        if !from.is_file() {
+            anyhow::bail!("checkpoint snapshot is not a file: {}", from.display());
+        }
+
+        let bytes = fs::metadata(from)?.len();
+        if bytes == 0 {
+            anyhow::bail!("checkpoint snapshot is empty");
+        }
+        if bytes > MAX_CHECKPOINT_SNAPSHOT_BYTES {
+            anyhow::bail!(
+                "checkpoint snapshot is {} bytes; maximum accepted size is {}",
+                bytes,
+                MAX_CHECKPOINT_SNAPSHOT_BYTES
+            );
+        }
+
+        if self.blocks_path().exists()
+            || self.meta_path().exists()
+            || self.horizon_path().exists()
+            || self.headers_path().exists()
+        {
+            anyhow::bail!(
+                "checkpoint state import requires fresh chain state; refusing to replace existing chain files"
+            );
+        }
+
+        let reader = BufReader::new(File::open(from)?);
+        let snapshot: checkpoint::CheckpointSnapshot = serde_json::from_reader(reader)
+            .map_err(|e| anyhow::anyhow!("invalid checkpoint snapshot: {e}"))?;
+
+        let chain = checkpoint::chain_from_checkpoint_snapshot(snapshot, network)?;
+
+        self.ensure_dir()?;
+        // A durable marker must precede the first chain-file modification.
+        // If power is lost in any later multi-file write, restart refuses.
+        let marker = self.dir.join(CHECKPOINT_IMPORT_JOURNAL);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)?;
+        file.write_all(b"checkpoint import in progress\n")?;
+        file.sync_all()?;
+        sync_dir(&self.dir)?;
+
+        self.save(&chain)?;
+
+        // Force all chain components to stable storage before clearing
+        // the marker. Metadata from save() is written last.
+        for path in [
+            self.blocks_path(),
+            self.headers_path(),
+            self.horizon_path(),
+            self.meta_path(),
+            self.dir.join("install-id"),
+        ] {
+            if path.exists() {
+                File::open(&path)?.sync_all()?;
+            }
+        }
+        sync_dir(&self.dir)?;
+        if !self.is_own_file_trusted() {
+            anyhow::bail!("checkpoint import did not produce a trusted local validation record");
+        }
+
+        fs::remove_file(&marker)?;
+        sync_dir(&self.dir)?;
+
+        /*
+         * Exercise the exact normal restart path immediately. This proves that
+         * the authenticated in-memory state can be represented safely by the
+         * existing bodyless-pruned persistence format.
+         */
+        let loaded = self.load_or_new(network)?;
+
+        if loaded.tip_hash() != chain.tip_hash()
+            || loaded.ledger.utxo_root() != chain.ledger.utxo_root()
+            || loaded.ledger.kernel_sum() != chain.ledger.kernel_sum()
+            || loaded.ledger.supply.total_minted_darks != chain.ledger.supply.total_minted_darks
+            || loaded.ledger.supply.total_burned_darks != chain.ledger.supply.total_burned_darks
+            || loaded.total_work != chain.total_work
+            || loaded.first_height != chain.first_height
+        {
+            anyhow::bail!("checkpoint state changed after persistence round-trip");
+        }
+
+        Ok(loaded)
     }
 
     /// Tip hash recorded alongside the stored blocks, if any.
@@ -735,6 +957,15 @@ impl ChainStore {
     /// start, a storage migration or a snapshot export/import can never
     /// silently proceed over an unfinished recovery.
     pub fn refuse_if_interrupted_recovery(&self) -> anyhow::Result<()> {
+        let checkpoint_marker = self.dir.join(CHECKPOINT_IMPORT_JOURNAL);
+        match fs::symlink_metadata(&checkpoint_marker) {
+            Ok(_) => anyhow::bail!(
+                "interrupted checkpoint import in {}; do not start from partial chain files; restore a clean datadir",
+                self.dir.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         let journal = self.dir.join(RECOVERY_JOURNAL);
         // symlink_metadata, not exists(): a dangling symlink at the journal path
         // must be caught too (exists() follows it and reports "not found"), and
@@ -873,24 +1104,50 @@ impl ChainStore {
 
         if pruned {
             let m = meta.as_ref().expect("pruned load has meta");
-            chain.first_height = m.first_height;
-            chain.horizon_work = m.horizon_work.parse().unwrap_or(0);
+
+            let expected_horizon_height = m
+                .first_height
+                .checked_sub(1)
+                .ok_or_else(|| anyhow::anyhow!("pruned datadir has first_height 0"))?;
+
             let horizon = load_horizon_file(&self.horizon_path())?
                 .with_binding_height(network.binding_fork_height());
-            chain.ledger = horizon.clone();
-            chain.horizon = Some(horizon);
-            chain.total_work = chain.horizon_work;
-            chain.headers = load_jsonl_headers(&self.headers_path())?
-                .into_iter()
-                .filter(|h| h.height < m.first_height)
-                .collect();
-            if chain.headers.len() as u64 != m.first_height {
+            if horizon.height.0 != expected_horizon_height {
                 anyhow::bail!(
-                    "headers.jsonl prefix is {} long, prune horizon is {}",
-                    chain.headers.len(),
+                    "UTXO horizon is at height {}, expected {} for first stored body {}",
+                    horizon.height.0,
+                    expected_horizon_height,
                     m.first_height
                 );
             }
+
+            let headers: Vec<CompactHeader> = load_jsonl_headers(&self.headers_path())?
+                .into_iter()
+                .filter(|h| h.height < m.first_height)
+                .collect();
+
+            if headers.len() as u64 != m.first_height {
+                anyhow::bail!(
+                    "headers.jsonl prefix is {} long, prune horizon is {}",
+                    headers.len(),
+                    m.first_height
+                );
+            }
+
+            // Never trust cached chain work from chain-meta.json. The compact
+            // headers are already authenticated by the local semantic seal, so
+            // derive the prefix work from them instead.
+            let horizon_work = headers.iter().try_fold(0u128, |sum, header| {
+                sum.checked_add(header.work())
+                    .ok_or_else(|| anyhow::anyhow!("horizon work overflow"))
+            })?;
+
+            chain.first_height = m.first_height;
+            chain.horizon_work = horizon_work;
+            chain.total_work = horizon_work;
+            chain.ledger = horizon.clone();
+            chain.horizon = Some(horizon);
+            chain.headers = headers;
         }
 
         let stored_blocks = codec::read_blocks(File::open(self.blocks_path())?, self.format())?;
@@ -1066,6 +1323,8 @@ pub const DATADIR_EPOCH: &str = "n8";
 /// recovery was interrupted and the datadir may be half-reset, so every load
 /// path refuses to start until the operator restores the named backup.
 pub const RECOVERY_JOURNAL: &str = ".recovery-journal.json";
+/// Fail-closed marker while checkpoint files are being installed.
+pub const CHECKPOINT_IMPORT_JOURNAL: &str = ".checkpoint-import-in-progress";
 
 pub fn default_data_dir(network: NetworkId) -> PathBuf {
     let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -1198,6 +1457,61 @@ fn getrandom_bytes(out: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Crash-injection analogue: an import persisted only the first chain
+    /// file and its journal before the process disappeared. The remaining
+    /// state is deliberately inconsistent and must not be accepted.
+    #[test]
+    fn interrupted_checkpoint_import_with_partial_chain_files_fails_closed() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nf-checkpoint-half-import-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let blocks = dir.join(codec::BLOCKS_BIN);
+        let meta = dir.join("chain-meta.json");
+        let journal = dir.join(CHECKPOINT_IMPORT_JOURNAL);
+        fs::write(&blocks, b"truncated-before-metadata").unwrap();
+        fs::write(&meta, b"{").unwrap();
+        fs::write(&journal, b"in-progress").unwrap();
+
+        let err = ChainStore::new(&dir)
+            .load_or_new(NetworkId::Devnet)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("interrupted checkpoint import"), "{err}");
+        assert_eq!(fs::read(&blocks).unwrap(), b"truncated-before-metadata");
+        assert_eq!(fs::read(&meta).unwrap(), b"{");
+        assert_eq!(fs::read(&journal).unwrap(), b"in-progress");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn interrupted_checkpoint_import_is_never_loaded() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nf-checkpoint-interrupt-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join(CHECKPOINT_IMPORT_JOURNAL);
+        fs::write(&marker, b"interrupted").unwrap();
+
+        let error = ChainStore::new(&dir)
+            .load_or_new(NetworkId::Devnet)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("interrupted checkpoint import"), "{error}");
+        assert_eq!(fs::read(&marker).unwrap(), b"interrupted");
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     /// An interrupted recovery marks the datadir unsafe for every entry
     /// point that reads or rewrites the chain, not only a normal start.
@@ -1694,5 +2008,421 @@ mod tests {
 
             fs::remove_dir_all(&dir).ok();
         }
+    }
+
+    #[test]
+    fn pruned_load_recomputes_horizon_work_from_authenticated_headers() {
+        use nightfall_crypto::WalletKeys;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("nf-prune-work-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+        for i in 0..12u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+
+        chain.prune_keep(4).unwrap();
+
+        let expected_horizon_work = chain.horizon_work;
+        let expected_total_work = chain.total_work;
+
+        assert!(expected_horizon_work > 1);
+
+        store.save(&chain).unwrap();
+        assert!(store.is_own_file_trusted());
+
+        // Corrupt only the cached metadata. Horizon and header seals remain
+        // untouched, so the loader must not use this value for fork choice.
+        let meta_path = store.meta_path();
+        let mut meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+
+        meta["horizon_work"] = serde_json::Value::String("1".to_string());
+        fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+
+        assert!(
+            store.is_own_file_trusted(),
+            "horizon_work is not itself part of the semantic file seals"
+        );
+
+        let loaded = store.load_or_new(NetworkId::Devnet).unwrap();
+
+        assert_eq!(loaded.horizon_work, expected_horizon_work);
+        assert_eq!(loaded.total_work, expected_total_work);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_pruned_validation_record_fails_closed_without_seals() {
+        use nightfall_crypto::WalletKeys;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nf-prune-seal-legacy-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+        for i in 0..12u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+
+        chain.prune_keep(4).unwrap();
+        store.save(&chain).unwrap();
+        assert!(store.is_own_file_trusted());
+
+        let meta_path = store.meta_path();
+        let mut meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+
+        let object = meta.as_object_mut().unwrap();
+        object.remove("validated_horizon_fingerprint");
+        object.remove("validated_headers_fingerprint");
+
+        fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+
+        // Upgrading an old pruned installation must never reseal remaining
+        // data it cannot independently authenticate.
+        let original_meta = fs::read(&meta_path).unwrap();
+        let original_horizon = fs::read(store.horizon_path()).unwrap();
+        let original_headers = fs::read(store.headers_path()).unwrap();
+        let original_bodies = fs::read(store.blocks_path()).unwrap();
+
+        assert!(
+            !store.is_own_file_trusted(),
+            "pruned metadata without semantic seals must fail closed"
+        );
+
+        let err = store
+            .load_or_new(NetworkId::Devnet)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("pruned datadir failed the validation record"),
+            "got: {err}"
+        );
+
+        assert_eq!(fs::read(&meta_path).unwrap(), original_meta);
+        assert_eq!(fs::read(store.horizon_path()).unwrap(), original_horizon);
+        assert_eq!(fs::read(store.headers_path()).unwrap(), original_headers);
+        assert_eq!(fs::read(store.blocks_path()).unwrap(), original_bodies);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pruned_validation_seal_rejects_horizon_content_change() {
+        use nightfall_crypto::WalletKeys;
+
+        let dir = std::env::temp_dir().join(format!("nf-prune-seal-hz-{}", now_unix()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+        for i in 0..12u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+
+        chain.prune_keep(4).unwrap();
+
+        let minted = chain.horizon.as_ref().unwrap().supply.total_minted_darks;
+        assert!(minted >= 10, "setup needs a multi-digit minted value");
+
+        store.save(&chain).unwrap();
+        assert!(store.is_own_file_trusted());
+
+        let path = store.horizon_path();
+        let before = fs::read_to_string(&path).unwrap();
+
+        assert!(
+            before.contains("\"is_coinbase\":true"),
+            "setup needs a coinbase UTXO in the horizon"
+        );
+
+        // `true` -> `false` adds one byte. Dividing a positive multi-digit
+        // integer by ten removes one decimal digit, keeping the file length
+        // exactly unchanged while changing semantic state.
+        let smaller_minted = minted / 10;
+        assert_eq!(
+            minted.to_string().len(),
+            smaller_minted.to_string().len() + 1
+        );
+
+        let after = before
+            .replacen("\"is_coinbase\":true", "\"is_coinbase\":false", 1)
+            .replacen(
+                &format!("\"minted\":{minted}"),
+                &format!("\"minted\":{smaller_minted}"),
+                1,
+            );
+
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "setup must bypass the old length-only check"
+        );
+
+        fs::write(&path, after).unwrap();
+
+        assert!(
+            !store.is_own_file_trusted(),
+            "same-length horizon mutation must invalidate the local seal"
+        );
+
+        let err = store
+            .load_or_new(NetworkId::Devnet)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("pruned datadir failed the validation record"),
+            "got: {err}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pruned_validation_seal_rejects_header_content_change() {
+        use nightfall_crypto::WalletKeys;
+
+        let dir = std::env::temp_dir().join(format!("nf-prune-seal-hd-{}", now_unix()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+        for i in 0..12u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+
+        chain.prune_keep(4).unwrap();
+        store.save(&chain).unwrap();
+        assert!(store.is_own_file_trusted());
+
+        let path = store.headers_path();
+        let before = fs::read_to_string(&path).unwrap();
+        let headers = load_jsonl_headers(&path).unwrap();
+
+        let old_ts = headers[0].timestamp_unix;
+        let new_ts = if old_ts % 10 == 9 {
+            old_ts - 1
+        } else {
+            old_ts + 1
+        };
+
+        assert_eq!(old_ts.to_string().len(), new_ts.to_string().len());
+
+        let needle = format!("\"timestamp_unix\":{old_ts}");
+        let replacement = format!("\"timestamp_unix\":{new_ts}");
+        assert!(before.contains(&needle));
+
+        let after = before.replacen(&needle, &replacement, 1);
+
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "setup must bypass the old length-only check"
+        );
+
+        fs::write(&path, after).unwrap();
+
+        assert!(
+            !store.is_own_file_trusted(),
+            "same-length compact-header mutation must invalidate the local seal"
+        );
+
+        let err = store
+            .load_or_new(NetworkId::Devnet)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("pruned datadir failed the validation record"),
+            "got: {err}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Missing or partial pruned integrity seals must never be regenerated
+    /// from their own unverified contents, even after a failed restart.
+    #[test]
+    fn pruned_partial_seals_refuse_without_resealing() {
+        use nightfall_crypto::WalletKeys;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let dir =
+            std::env::temp_dir().join(format!("nf-partial-seal-{}-{unique}", std::process::id()));
+
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+        for i in 0..12u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+
+        chain.prune_keep(4).unwrap();
+        store.save(&chain).unwrap();
+
+        assert!(store.is_own_file_trusted());
+
+        let original_meta = fs::read(store.meta_path()).unwrap();
+
+        let original_horizon = fs::read(store.horizon_path()).unwrap();
+
+        let original_headers = fs::read(store.headers_path()).unwrap();
+
+        let original_blocks = fs::read(store.blocks_path()).unwrap();
+
+        for key in [
+            "validated_horizon_fingerprint",
+            "validated_headers_fingerprint",
+        ] {
+            for missing in [true, false] {
+                let mut value: serde_json::Value = serde_json::from_slice(&original_meta).unwrap();
+
+                if missing {
+                    value.as_object_mut().unwrap().remove(key);
+                } else {
+                    value[key] = serde_json::Value::String(String::new());
+                }
+
+                let damaged_meta = serde_json::to_vec_pretty(&value).unwrap();
+
+                fs::write(store.meta_path(), &damaged_meta).unwrap();
+
+                assert!(!store.is_own_file_trusted(), "{key}, missing={missing}");
+
+                let err = store
+                    .load_or_new(NetworkId::Devnet)
+                    .unwrap_err()
+                    .to_string();
+
+                assert!(
+                    err.contains("pruned datadir failed the validation record"),
+                    "{key}, missing={missing}: {err}"
+                );
+
+                assert_eq!(fs::read(store.meta_path()).unwrap(), damaged_meta);
+
+                assert_eq!(fs::read(store.horizon_path()).unwrap(), original_horizon);
+
+                assert_eq!(fs::read(store.headers_path()).unwrap(), original_headers);
+
+                assert_eq!(fs::read(store.blocks_path()).unwrap(), original_blocks);
+            }
+        }
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An interrupted operation must not change a valid pruned datadir;
+    /// removing the deliberate test journal restores an ordinary restart.
+    #[test]
+    fn pruned_interrupted_restart_is_refused_and_resumable() {
+        use nightfall_crypto::WalletKeys;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let dir =
+            std::env::temp_dir().join(format!("nf-pruned-restart-{}-{unique}", std::process::id()));
+
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = ChainStore::new(&dir);
+        let miner = WalletKeys::generate().address();
+
+        let mut chain = Chain::new_fair(NetworkId::Devnet).unwrap();
+
+        for i in 0..12u64 {
+            chain
+                .mine_block(&miner, vec![], now_unix() + i * 15)
+                .unwrap();
+        }
+
+        chain.prune_keep(4).unwrap();
+
+        let tip = chain.tip_hash();
+        let root = chain.ledger.utxo_root();
+
+        store.save(&chain).unwrap();
+
+        let original_meta = fs::read(store.meta_path()).unwrap();
+
+        let original_horizon = fs::read(store.horizon_path()).unwrap();
+
+        let original_headers = fs::read(store.headers_path()).unwrap();
+
+        let original_blocks = fs::read(store.blocks_path()).unwrap();
+
+        fs::write(dir.join(RECOVERY_JOURNAL), b"{\"backup\":\"crash\"}").unwrap();
+
+        let err = store
+            .load_or_new(NetworkId::Devnet)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("interrupted"), "{err}");
+
+        assert_eq!(fs::read(store.meta_path()).unwrap(), original_meta);
+
+        assert_eq!(fs::read(store.horizon_path()).unwrap(), original_horizon);
+
+        assert_eq!(fs::read(store.headers_path()).unwrap(), original_headers);
+
+        assert_eq!(fs::read(store.blocks_path()).unwrap(), original_blocks);
+
+        fs::remove_file(dir.join(RECOVERY_JOURNAL)).unwrap();
+
+        let loaded = store.load_or_new(NetworkId::Devnet).unwrap();
+
+        assert_eq!(loaded.tip_hash(), tip);
+
+        assert_eq!(loaded.ledger.utxo_root(), root);
+
+        loaded.verify_supply().unwrap();
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
