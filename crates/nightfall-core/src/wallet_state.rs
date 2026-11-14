@@ -7,9 +7,10 @@ use nightfall_crypto::Address;
 use nightfall_ledger::Transaction;
 use nightfall_node::{NodeHandle, NodeInner};
 use nightfall_storage::dirlock::DirLock;
+use nightfall_storage::ChainStore;
 use nightfall_types::NetworkId;
 use nightfall_wallet::vault_store::VaultStore;
-use nightfall_wallet::{Balances, HistoryEntry, OwnedOutput, Wallet};
+use nightfall_wallet::{Balances, HistoryEntry, LightOutput, OwnedOutput, Wallet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -625,6 +626,98 @@ impl WalletState {
                 wallet.birth_height(),
                 wallet.scan_from(),
             );
+            // Only a completely new wallet may initialize from
+            // checkpoint UTXOs. Never discard historical observations.
+            // Authenticate outside the node mutex.
+            let (first_height, storage_dir, network) = {
+                let shared = node.shared();
+                let g = shared
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("node state lock poisoned"))?;
+
+                require_finished_replay(g.is_loading())?;
+
+                (g.chain.first_height, g.store.dir.clone(), g.network)
+            };
+
+            let bridge =
+                from.checked_add(1) == Some(first_height) && !wallet.scan_anchor().is_empty();
+
+            if from < first_height && !bridge {
+                anyhow::ensure!(
+                    !wallet.has_scanned_history()
+                        && wallet.scan_anchor().is_empty(),
+                    "existing wallet history cannot be reconstructed from pruned bodies; use an archive node"
+                );
+
+                let store = ChainStore::new(storage_dir);
+
+                let (verified, records) = store.verified_checkpoint_wallet_outputs(network)?;
+
+                let checkpoint_height = verified
+                    .first_height
+                    .checked_sub(1)
+                    .ok_or_else(|| anyhow::anyhow!("invalid checkpoint height"))?;
+
+                let checkpoint_hash = verified.tip_hash().to_hex();
+
+                anyhow::ensure!(
+                    first_height == verified.first_height && from <= checkpoint_height,
+                    "checkpoint does not cover the wallet's history"
+                );
+
+                {
+                    let shared = node.shared();
+                    let g = shared
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("node state lock poisoned"))?;
+
+                    require_finished_replay(g.is_loading())?;
+
+                    let horizon = g
+                        .chain
+                        .horizon
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("pruned horizon is missing"))?;
+
+                    anyhow::ensure!(
+                        g.chain.first_height == verified.first_height
+                            && g.chain.hash_at(checkpoint_height) == Some(verified.tip_hash())
+                            && horizon.utxo_root() == verified.ledger.utxo_root()
+                            && horizon.kernel_sum() == verified.ledger.kernel_sum()
+                            && g.chain.horizon_work == verified.total_work,
+                        "verified checkpoint no longer agrees with the live chain"
+                    );
+                }
+
+                let lights: Vec<LightOutput> = records
+                    .into_iter()
+                    .filter(|o| o.height >= wallet.birth_height())
+                    .map(|o| LightOutput {
+                        height: o.height,
+                        timestamp: o.timestamp_unix,
+                        commit: hex::encode(o.output.commit.0),
+                        ephemeral_pk: hex::encode(o.output.ephemeral_pk),
+                        output_pk: hex::encode(o.output.output_pk),
+                        view_tag: o.output.view_tag,
+                        payload: hex::encode(o.output.payload),
+                        coinbase: o.output.features.is_coinbase(),
+                    })
+                    .collect();
+
+                let n = self.update(|w| {
+                    w.ingest_authenticated_checkpoint_outputs(
+                        &lights,
+                        checkpoint_height,
+                        &checkpoint_hash,
+                    )
+                })?;
+
+                found = found.saturating_add(n);
+
+                continue;
+            }
+
             // Snapshot one page under the lock, then release it before
             // scanning: trial-decrypting every output is not something to do
             // while holding the node's state mutex.
@@ -639,14 +732,28 @@ impl WalletState {
                     from <= tip || !self.require_wallet()?.has_scanned_history(),
                     "The wallet already scanned height {from}, but the node's current chain ends at {tip}. This is not a completed scan. Wait for the node to catch up, or review the changed chain before rescanning."
                 );
-                if guard.chain.is_pruned() && from < guard.chain.first_height {
+                if guard.chain.is_pruned() && from < guard.chain.first_height && !bridge {
                     anyhow::bail!(
                         "this node is pruned; bodies start at height {}. \
                          Cannot rescan from {from}. Use an archive node or the light API",
                         guard.chain.first_height
                     );
                 }
-                (guard.chain.blocks_from(from, page_size), tip)
+                let requested = if bridge {
+                    guard.chain.first_height
+                } else {
+                    from
+                };
+
+                if bridge {
+                    anyhow::ensure!(
+                        guard.chain.hash_at(from).map(|h| h.to_hex()).as_deref()
+                            == Some(self.require_wallet()?.scan_anchor()),
+                        "checkpoint scan anchor changed"
+                    );
+                }
+
+                (guard.chain.blocks_from(requested, page_size), tip)
             };
 
             if page.is_empty() {
@@ -664,7 +771,15 @@ impl WalletState {
             }
 
             let was_full_page = page.len() == page_size;
-            found = found.saturating_add(self.update(|wallet| wallet.scan_blocks(&page))?);
+            let discovered = self.update(|w| {
+                if bridge {
+                    w.scan_blocks_after_checkpoint(&page)
+                } else {
+                    w.scan_blocks(&page)
+                }
+            })?;
+
+            found = found.saturating_add(discovered);
             pages += 1;
 
             if !was_full_page {
