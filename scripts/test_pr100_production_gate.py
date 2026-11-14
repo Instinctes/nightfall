@@ -109,5 +109,45 @@ class EvidencePolicy(unittest.TestCase):
             self.assertEqual(b["state"], "BLOCKED")
 
 
+class EvidenceConsistencyV2(unittest.TestCase):
+    # pr100-evidence-consistency-v2: no trusted claims from malformed logs.
+
+    @staticmethod
+    def receipt():
+        return (
+            'PR100_REAL_MAINNET_PASS checkpoint=505000 '
+            'source_tip=505005 catchup=5 snapshot_bytes=1000 '
+            'load_s=1.00 export_s=2.00 import_s=3.00 '
+            'catchup_s=4.00 peak_ram_kib=Some(1500)'
+        )
+
+    def test_consistent_receipt_accepted(self):
+        self.assertEqual(mod.parse_mainnet_pass(self.receipt())['catchup'], '5')
+
+    def test_contradictory_or_forged_receipts_rejected(self):
+        good = self.receipt()
+        changes = (
+            good.replace('catchup=5', 'catchup=6'),
+            good.replace('source_tip=505005', 'source_tip=505000'),
+            good.replace('checkpoint=505000', 'checkpoint=505000abc'),
+            good.replace('checkpoint=505000', 'checkpoint=25000'),
+            good.replace('snapshot_bytes=1000', 'snapshot_bytes=0'),
+            good.replace('snapshot_bytes=1000', 'snapshot_bytes=536870913'),
+            good.replace('load_s=1.00', 'load_s=-1.00'),
+            good.replace('load_s=1.00', 'load_s=1e999'),
+            good.replace('peak_ram_kib=Some(1500)', 'peak_ram_kib=Some(-1)'),
+            good + ' checkpoint=505000',
+            good + ' unrelated=1',
+            'log: ' + good,
+            good + '\n' + good,
+            good.replace('source_tip=505005', 'source_tip=505005.0'),
+            good.replace('export_s=2.00', 'export_s=inf'),
+            good.replace('catchup_s=4.00', 'catchup_s=NaN'),
+        )
+        for bad in changes:
+            with self.subTest(receipt=bad[:80]):
+                self.assertIsNone(mod.parse_mainnet_pass(bad))
+
+
 if __name__ == "__main__":
     unittest.main()

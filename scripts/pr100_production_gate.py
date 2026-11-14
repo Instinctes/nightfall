@@ -106,51 +106,63 @@ def fingerprint(folder):
 
 
 def parse_mainnet_pass(output):
-    """Extract measurements only from real Rust success."""
+    """Fail closed on malformed or contradictory real-data test receipts.
+
+    A consistent log is a local test receipt, never independent chain proof.
+    """
+    # pr100-evidence-consistency-v2
+    import math
 
     required = (
-        "checkpoint",
-        "source_tip",
-        "catchup",
-        "snapshot_bytes",
-        "load_s",
-        "export_s",
-        "import_s",
-        "catchup_s"
+        "checkpoint", "source_tip", "catchup", "snapshot_bytes",
+        "load_s", "export_s", "import_s", "catchup_s"
     )
+    allowed = set(required) | {"peak_ram_kib"}
+    lines = [line.strip() for line in output.splitlines() if MARKER in line]
+    if len(lines) != 1 or len(lines[0]) > 2048:
+        return None
+    tokens = lines[0].split()
+    if not tokens or tokens[0] != MARKER:
+        return None
 
-    for line in output.splitlines():
-        if MARKER not in line:
-            continue
+    values = {}
+    for token in tokens[1:]:
+        if token.count("=") != 1:
+            return None
+        key, raw = token.split("=", 1)
+        if key not in allowed or key in values or not raw:
+            return None
+        values[key] = raw
+    if not all(k in values for k in required):
+        return None
 
-        raw = line.split(MARKER, 1)[1]
+    def unsigned(key):
+        raw = values[key]
+        return int(raw) if re.fullmatch(r"[0-9]+", raw) else None
 
-        pairs = dict(
-            re.findall(
-                r"([a-z_]+)=([0-9.]+|Some\([0-9]+\)|None)",
-                raw
-            )
-        )
+    checkpoint = unsigned("checkpoint")
+    tip = unsigned("source_tip")
+    catchup = unsigned("catchup")
+    snapshot = unsigned("snapshot_bytes")
+    if any(x is None for x in (checkpoint, tip, catchup, snapshot)):
+        return None
+    if (checkpoint < 505000 or tip <= checkpoint
+            or catchup != tip - checkpoint or catchup <= 0
+            or not 0 < snapshot <= 512 * 1024 * 1024):
+        return None
 
-        if not all(k in pairs for k in required):
-            continue
+    for key in ("load_s", "export_s", "import_s", "catchup_s"):
+        raw = values[key]
+        if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", raw):
+            return None
+        measured = float(raw)
+        if not math.isfinite(measured) or measured < 0:
+            return None
 
-        if int(pairs["checkpoint"]) < 505000:
-            continue
-
-        if int(pairs["catchup"]) <= 0:
-            continue
-
-        keys = required + ("peak_ram_kib",)
-
-        return {
-            k: pairs[k]
-            for k in keys
-            if k in pairs
-        }
-
-    return None
-
+    ram = values.get("peak_ram_kib", "None")
+    if ram != "None" and not re.fullmatch(r"Some\([0-9]+\)", ram):
+        return None
+    return {key: values[key] for key in (*required, "peak_ram_kib") if key in values}
 
 def run_logged(command, repo, log_path,
                env=None, timeout=3600):

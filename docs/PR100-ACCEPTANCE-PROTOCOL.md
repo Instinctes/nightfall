@@ -107,3 +107,14 @@ No changes to consensus, monetary rules, genesis,
 mining, live datadirs or dedicated CI workflows.
 
 No automatic Mainnet release or upstream merge.
+
+
+<!-- pr100-evidence-consistency-v2 -->
+## Acceptance receipt consistency
+
+The offline evidence runner rejects duplicate or contaminated success
+markers, malformed or negative values, oversized snapshots and
+mathematically inconsistent checkpoint / tip / catch-up counts.
+Adversarial Python tests are part of the existing workspace CI.
+A passing local receipt is NOT a Mainnet production sign-off, independent
+checkpoint review, genuine legacy migration or desktop recovery proof.
