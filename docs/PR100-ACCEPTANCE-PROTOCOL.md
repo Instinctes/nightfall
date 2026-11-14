@@ -65,3 +65,45 @@ This closes a copy-time TOCTOU gap. It is **not** a substitute for a
 genuine independently checked Mainnet archive, offline operator data,
 Core GUI restoration, representative benchmarks or maintainer approval.
 No checkpoint, emission, network or wallet format changes are made.
+
+<!-- pr100-termux-offline-evidence-gate-v1 -->
+
+## Offline production evidence runner
+
+Self-test:
+
+`python3 -m unittest discover -s scripts -p test_pr100_production_gate.py -v`
+
+Evidence run:
+
+`python3 scripts/pr100_production_gate.py`
+
+The runner never accesses the live node or its wallet.
+
+It accepts disposable offline copies under:
+
+- `~/nightfall-pr100-fixtures/untouched-1.1.2-pruned/`
+- `~/nightfall-pr100-fixtures/complete-mainnet-archive/`
+
+The 1.1.2 test only proves unforced CLI refusal and byte
+preservation. It does not establish fixture provenance,
+successful migration or release acceptance.
+
+The Mainnet test calls the existing ignored Rust archive
+acceptance harness. It compares state after real checkpoint
+export, import, ordinary catch-up and restart.
+
+Missing inputs and insufficient resources are BLOCKED,
+never silently interpreted as passing.
+
+Fixture SHA256 fingerprints and raw logs stay local.
+
+Independent checkpoint certification, real-data import
+fault rehearsal, Core desktop GUI recovery, representative
+cross-platform benchmarks and final security approval
+remain separate, mandatory production requirements.
+
+No changes to consensus, monetary rules, genesis,
+mining, live datadirs or dedicated CI workflows.
+
+No automatic Mainnet release or upstream merge.
