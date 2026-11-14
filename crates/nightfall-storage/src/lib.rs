@@ -17,6 +17,34 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Hash precisely the bytes consumed while deserializing an untrusted
+/// checkpoint. The later durable scan archive must match these same bytes;
+/// comparing only the file length cannot detect a same-size replacement.
+struct CheckpointDigestReader<R: Read> {
+    reader: R,
+    hasher: blake3::Hasher,
+    bytes: u64,
+}
+
+impl<R: Read> CheckpointDigestReader<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            hasher: blake3::Hasher::new(),
+            bytes: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for CheckpointDigestReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let len = self.reader.read(buf)?;
+        self.hasher.update(&buf[..len]);
+        self.bytes += len as u64;
+        Ok(len)
+    }
+}
+
 pub mod checkpoint;
 const CHECKPOINT_SCAN_ARCHIVE: &str = "checkpoint-wallet-v2.json";
 pub mod codec;
@@ -743,9 +771,18 @@ impl ChainStore {
             );
         }
 
-        let reader = BufReader::new(File::open(from)?);
-        let snapshot: checkpoint::CheckpointSnapshot = serde_json::from_reader(reader)
-            .map_err(|e| anyhow::anyhow!("invalid checkpoint snapshot: {e}"))?;
+        // Bind the validated in-memory snapshot to the EXACT source bytes.
+        // The input is operator-supplied and can change before its second open.
+        let mut authenticated_reader =
+            CheckpointDigestReader::new(BufReader::new(File::open(from)?));
+        let snapshot: checkpoint::CheckpointSnapshot =
+            serde_json::from_reader(&mut authenticated_reader)
+                .map_err(|e| anyhow::anyhow!("invalid checkpoint snapshot: {e}"))?;
+        anyhow::ensure!(
+            authenticated_reader.bytes == bytes,
+            "checkpoint source changed length while being authenticated"
+        );
+        let authenticated_digest = authenticated_reader.hasher.finalize();
 
         let chain = checkpoint::chain_from_checkpoint_snapshot(snapshot, network)?;
 
@@ -779,10 +816,22 @@ impl ChainStore {
 
             anyhow::ensure!(
                 copied == bytes,
-                "checkpoint scan source changed during import"
+                "checkpoint scan source changed length during import"
             );
 
             target.sync_all()?;
+            drop(target);
+
+            // Refuse a same-size swap or in-place rewrite between parsing
+            // and copying. Leave the interrupted-import marker in place on
+            // mismatch; never publish a divergent wallet scan archive.
+            let mut archived = CheckpointDigestReader::new(BufReader::new(File::open(&temp)?));
+            std::io::copy(&mut archived, &mut std::io::sink())?;
+            anyhow::ensure!(
+                archived.bytes == authenticated_reader.bytes
+                    && archived.hasher.finalize() == authenticated_digest,
+                "checkpoint bytes changed after authentication; import interrupted"
+            );
         }
 
         fs::rename(&temp, &archive)?;
@@ -2577,5 +2626,35 @@ mod tests {
         loaded.verify_supply().unwrap();
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_byte_integrity_tests {
+    use super::CheckpointDigestReader;
+    use std::io::Cursor;
+
+    #[test]
+    fn checkpoint_copy_requires_exact_authenticated_bytes_not_only_length() {
+        let original = br#"{"checkpoint_height":505000}"#;
+        let replaced = br#"{"checkpoint_height":505001}"#;
+        assert_eq!(original.len(), replaced.len());
+
+        // Same reader used for the actual untrusted JSON parse.
+        let mut verified = CheckpointDigestReader::new(Cursor::new(original));
+        let _: serde_json::Value = serde_json::from_reader(&mut verified).unwrap();
+        let expected_digest = verified.hasher.finalize();
+        let expected_len = verified.bytes;
+        assert_eq!(expected_len, original.len() as u64);
+
+        let mut matching = CheckpointDigestReader::new(Cursor::new(original));
+        std::io::copy(&mut matching, &mut std::io::sink()).unwrap();
+        assert_eq!(matching.bytes, expected_len);
+        assert_eq!(matching.hasher.finalize(), expected_digest);
+
+        let mut changed = CheckpointDigestReader::new(Cursor::new(replaced));
+        std::io::copy(&mut changed, &mut std::io::sink()).unwrap();
+        assert_eq!(changed.bytes, expected_len);
+        assert_ne!(changed.hasher.finalize(), expected_digest);
     }
 }

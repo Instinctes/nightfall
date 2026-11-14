@@ -52,3 +52,16 @@ review and maintainer security approval are required.
 
 No live Mainnet state, mining or wallet activation.
 No automatic merge.
+
+## Byte-integrity handoff (storage-only regression)
+
+The importer hashes the exact bytes consumed by JSON deserialization and
+cryptographically compares them to the fsynced scan-archive staging file.
+A same-length source replacement between authentication and the durable
+copy is rejected, with the interrupted-import journal retained. Tests
+cover accepted identical bytes and rejected equal-length mutation.
+
+This closes a copy-time TOCTOU gap. It is **not** a substitute for a
+genuine independently checked Mainnet archive, offline operator data,
+Core GUI restoration, representative benchmarks or maintainer approval.
+No checkpoint, emission, network or wallet format changes are made.
