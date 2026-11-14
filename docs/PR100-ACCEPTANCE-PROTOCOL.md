@@ -118,3 +118,16 @@ mathematically inconsistent checkpoint / tip / catch-up counts.
 Adversarial Python tests are part of the existing workspace CI.
 A passing local receipt is NOT a Mainnet production sign-off, independent
 checkpoint review, genuine legacy migration or desktop recovery proof.
+
+<!-- pr100-fingerprint-failclosed-v1 -->
+## Offline fixture tree identity hardening
+
+The local acceptance fingerprint now refuses unreadable subtrees instead of
+silently skipping them. It rejects symbolic links, hardlinks, special files,
+cross-filesystem subtrees, identity-changing file replacements and observed
+concurrent mutations. Empty directories affect the tree digest. Four offline
+regressions cover refusal and tree identity. The evidence remains local.
+
+This is a local safety improvement, **not** certification of fixture origin,
+independent checkpoint authenticity, successful Mainnet migration, desktop
+wallet recovery, production readiness or permission to merge.

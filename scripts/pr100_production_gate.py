@@ -4,6 +4,7 @@
 import hashlib
 import json
 import os
+import stat
 import re
 import shutil
 import subprocess
@@ -19,91 +20,130 @@ MARKER = "PR100_REAL_MAINNET_PASS"
 
 
 def fingerprint(folder):
-    """Read-only SHA256 identity of an offline fixture."""
+    """Fail-closed identity of a disposable offline fixture tree.
 
+    Reject unreadable subtrees, links, special files, hardlinks, source
+    replacement and in-place changes observed while hashing. Include empty
+    directories in the identity. Never follow symlinks or traverse mounts.
+    """
+    # pr100-fingerprint-failclosed-v1
     folder = Path(folder)
 
-    if folder.is_symlink() or not folder.is_dir():
-        raise ValueError(
-            "Fixture missing, invalid or symlinked"
-        )
+    def reject(message):
+        raise ValueError(message)
+
+    def metadata(st):
+        # atime intentionally excluded: reading may legitimately change it.
+        return (st.st_dev, st.st_ino, st.st_mode, st.st_nlink,
+                st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+    try:
+        original = os.lstat(folder)
+    except OSError as e:
+        reject(f"Fixture inaccessible: {e}")
+
+    if not stat.S_ISDIR(original.st_mode):
+        reject("Fixture is not a regular directory or is a symlink")
+
+    def walk_error(e):
+        raise OSError(f"Fixture walk failed: {e}")
 
     digest = hashlib.sha256()
     count = 0
     total = 0
+    directories = []
+    max_dirs = 100_000
 
     for root, dirs, files in os.walk(
-        folder,
-        topdown=True,
-        followlinks=False
+        folder, topdown=True, followlinks=False, onerror=walk_error
     ):
+        base = Path(root)
+        dir_stat = os.lstat(base)
+
+        if not stat.S_ISDIR(dir_stat.st_mode) or dir_stat.st_dev != original.st_dev:
+            reject("Non-directory, symlink, or cross-device fixture subtree")
+
+        directories.append((base, metadata(dir_stat)))
+
+        if len(directories) > max_dirs:
+            reject("Too many fixture directories")
+
         dirs.sort()
         files.sort()
 
+        rel_dir = base.relative_to(folder).as_posix().encode("utf-8")
+
+        if len(rel_dir) > 0xffffffff:
+            reject("Fixture directory path too long")
+
+        digest.update(b"D" + len(rel_dir).to_bytes(4, "big") + rel_dir)
+
         for name in dirs:
-            p = Path(root) / name
-            if p.is_symlink():
-                raise ValueError(
-                    "Directory symlink rejected"
-                )
+            st = os.lstat(base / name)
+
+            if not stat.S_ISDIR(st.st_mode) or st.st_dev != original.st_dev:
+                reject("Directory link or mount rejected")
 
         for name in files:
-            p = Path(root) / name
+            path = base / name
+            before = os.lstat(path)
 
-            if p.is_symlink() or not p.is_file():
-                raise ValueError(
-                    "Link or special file rejected"
-                )
+            if not stat.S_ISREG(before.st_mode):
+                reject("Fixture link or special file rejected")
 
-            st = p.stat(follow_symlinks=False)
-
-            if st.st_nlink != 1:
-                raise ValueError(
-                    "Hardlinked file rejected"
-                )
+            if before.st_nlink != 1 or before.st_dev != original.st_dev:
+                reject("Fixture hardlink or external mount rejected")
 
             count += 1
-            total += st.st_size
+            total += before.st_size
 
             if count > MAX_FILES or total > MAX_BYTES:
-                raise ValueError(
-                    "Fixture exceeds safety bounds"
-                )
+                reject("Fixture exceeds safety bounds")
 
-            relative = p.relative_to(folder)
-            encoded = relative.as_posix().encode("utf-8")
+            rel = path.relative_to(folder).as_posix().encode("utf-8")
 
-            digest.update(
-                len(encoded).to_bytes(4, "big")
-            )
-            digest.update(encoded)
-            digest.update(
-                st.st_size.to_bytes(8, "big")
-            )
+            if len(rel) > 0xffffffff:
+                reject("Fixture path too long")
 
-            with p.open("rb") as f:
-                for chunk in iter(
-                    lambda: f.read(1024 * 1024),
-                    b""
-                ):
+            digest.update(b"F" + len(rel).to_bytes(4, "big") + rel)
+            digest.update(before.st_size.to_bytes(8, "big"))
+
+            # O_NOFOLLOW adds race protection on Unix. On Windows the
+            # surrounding lstat/fstat identity checks still fail closed.
+            flags = os.O_RDONLY
+
+            for flag in ("O_NOFOLLOW", "O_NONBLOCK", "O_CLOEXEC", "O_BINARY"):
+                flags |= getattr(os, flag, 0)
+
+            fd = os.open(path, flags)
+
+            with os.fdopen(fd, "rb") as source:
+                opened = os.fstat(source.fileno())
+
+                if not stat.S_ISREG(opened.st_mode) or metadata(opened) != metadata(before):
+                    reject("Fixture file replaced before read")
+
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
                     digest.update(chunk)
 
-            if p.stat(
-                follow_symlinks=False
-            ).st_size != st.st_size:
-                raise ValueError(
-                    "Fixture changed while hashing"
-                )
+                after_fd = os.fstat(source.fileno())
+
+            after_path = os.lstat(path)
+
+            if metadata(after_fd) != metadata(before) or metadata(after_path) != metadata(before):
+                reject("Fixture file changed or replaced during read")
 
     if count == 0:
-        raise ValueError("Empty fixture")
+        reject("Empty fixture")
 
-    return {
-        "sha256_tree": digest.hexdigest(),
-        "files": count,
-        "bytes": total
-    }
+    for path, before in directories:
+        if metadata(os.lstat(path)) != before:
+            reject("Fixture directory changed during scan")
 
+    if metadata(os.lstat(folder)) != metadata(original):
+        reject("Fixture root changed during scan")
+
+    return {"sha256_tree": digest.hexdigest(), "files": count, "bytes": total}
 
 def parse_mainnet_pass(output):
     """Fail closed on malformed or contradictory real-data test receipts.

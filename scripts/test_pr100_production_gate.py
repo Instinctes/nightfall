@@ -149,5 +149,84 @@ class EvidenceConsistencyV2(unittest.TestCase):
                 self.assertIsNone(mod.parse_mainnet_pass(bad))
 
 
+class FixtureAttestationFailClosed(unittest.TestCase):
+    # pr100-fingerprint-failclosed-v1
+
+    def test_permission_error_during_walk_is_not_ignored(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "block.dat").write_bytes(b"abcd")
+
+            def denied(*args, **kwargs):
+                kwargs["onerror"](PermissionError("unreadable subtree"))
+                return iter(())
+
+            with mock.patch.object(mod.os, "walk", side_effect=denied):
+                with self.assertRaises(OSError):
+                    mod.fingerprint(tmp)
+
+    def test_empty_directory_changes_tree_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "block.dat").write_bytes(b"abcd")
+
+            a = mod.fingerprint(root)
+
+            (root / "new-empty-dir").mkdir()
+
+            b = mod.fingerprint(root)
+
+            self.assertNotEqual(a["sha256_tree"], b["sha256_tree"])
+            self.assertEqual(a["bytes"], b["bytes"])
+
+    def test_same_length_path_replacement_during_open_rejected(self):
+        import os
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = root / "fixture"
+            fixture.mkdir()
+
+            target = fixture / "blocks.dat"
+            target.write_bytes(b"AAAA")
+
+            replacement = root / "replacement"
+            replacement.write_bytes(b"BBBB")
+
+            original_open = os.open
+
+            def swapping_open(path, flags, *args, **kwargs):
+                if Path(path) == target:
+                    os.replace(replacement, target)
+
+                return original_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(mod.os, "open", side_effect=swapping_open):
+                with self.assertRaises(ValueError):
+                    mod.fingerprint(fixture)
+
+    def test_symlink_and_fifo_rejected(self):
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "block.dat").write_bytes(b"abcd")
+
+            (root / "link").symlink_to(root / "block.dat")
+
+            with self.assertRaises(ValueError):
+                mod.fingerprint(root)
+
+            (root / "link").unlink()
+
+            if hasattr(os, "mkfifo"):
+                os.mkfifo(root / "pipe")
+
+                with self.assertRaises(ValueError):
+                    mod.fingerprint(root)
+
+
 if __name__ == "__main__":
     unittest.main()
