@@ -688,20 +688,13 @@ mod tests {
 
         let mut bytes = Vec::new();
 
-        write_portable_snapshot(
-            &mut bytes,
-            &snapshot
-        ).unwrap();
+        write_portable_snapshot(&mut bytes, &snapshot).unwrap();
 
         assert!(bytes.len() > 16);
 
-        let decoded =
-            read_portable_snapshot(bytes.as_slice()).unwrap();
+        let decoded = read_portable_snapshot(bytes.as_slice()).unwrap();
 
-        assert_eq!(
-            decoded.utxos.len(),
-            snapshot.utxos.len()
-        );
+        assert_eq!(decoded.utxos.len(), snapshot.utxos.len());
 
         for (a, b) in decoded.utxos.iter().zip(snapshot.utxos.iter()) {
             assert_eq!(a.commit, b.commit);
@@ -711,97 +704,55 @@ mod tests {
         }
 
         // Legacy JSON must remain readable.
-        let legacy = serde_json::to_vec(
-            &snapshot
-        ).unwrap();
+        let legacy = serde_json::to_vec(&snapshot).unwrap();
 
-        let old = read_portable_snapshot(
-            legacy.as_slice()
-        ).unwrap();
+        let old = read_portable_snapshot(legacy.as_slice()).unwrap();
 
-        assert_eq!(
-            old.utxos.len(),
-            snapshot.utxos.len()
-        );
+        assert_eq!(old.utxos.len(), snapshot.utxos.len());
 
         // Appended, unauthenticated bytes.
         let mut extra = bytes.clone();
         extra.extend_from_slice(b"UNAUTHENTICATED_SUFFIX");
 
-        assert!(
-            read_portable_snapshot(
-                extra.as_slice()
-            ).is_err()
-        );
+        assert!(read_portable_snapshot(extra.as_slice()).is_err());
 
         // Truncated binary snapshot.
         let mut truncated = bytes.clone();
         truncated.truncate(truncated.len() / 2);
 
-        assert!(
-            read_portable_snapshot(
-                truncated.as_slice()
-            ).is_err()
-        );
+        assert!(read_portable_snapshot(truncated.as_slice()).is_err());
 
         // Wrong format version.
         let mut version = bytes.clone();
 
-        version[8..12].copy_from_slice(
-            &4u32.to_le_bytes()
-        );
+        version[8..12].copy_from_slice(&4u32.to_le_bytes());
 
-        assert!(
-            read_portable_snapshot(
-                version.as_slice()
-            ).is_err()
-        );
+        assert!(read_portable_snapshot(version.as_slice()).is_err());
 
         // Corrupt magic.
         let mut magic = bytes.clone();
         magic[0] ^= 0x01;
 
-        assert!(
-            read_portable_snapshot(
-                magic.as_slice()
-            ).is_err()
-        );
+        assert!(read_portable_snapshot(magic.as_slice()).is_err());
 
         // Duplicate UTXO.
         let mut duplicates = snapshot.clone();
 
-        duplicates.utxos.push(
-            duplicates.utxos[0].clone()
-        );
+        duplicates.utxos.push(duplicates.utxos[0].clone());
 
-        assert!(
-            write_portable_snapshot(
-                &mut Vec::new(),
-                &duplicates
-            ).is_err()
-        );
+        assert!(write_portable_snapshot(&mut Vec::new(), &duplicates).is_err());
 
         // Missing authenticated creation bodies.
         let mut missing = snapshot.clone();
         missing.recent_bodies.clear();
 
-        assert!(
-            write_portable_snapshot(
-                &mut Vec::new(),
-                &missing
-            ).is_err()
-        );
+        assert!(write_portable_snapshot(&mut Vec::new(), &missing).is_err());
 
         // Modified complete output.
         let mut modified = snapshot.clone();
         modified.utxos[0].output.view_tag ^= 1;
 
-        assert!(
-            write_portable_snapshot(
-                &mut Vec::new(),
-                &modified
-            ).is_err()
-        );
+        assert!(write_portable_snapshot(&mut Vec::new(), &modified).is_err());
 
         // Header chain tampering.
         let mut falsified = decoded;
@@ -830,8 +781,12 @@ mod tests {
         let checkpoint_height = chain.tip_height().unwrap().0;
         let pin = chain.tip_hash().to_hex();
         let imported = chain_from_checkpoint_snapshot_with_pin(
-            restored, NetworkId::Devnet, checkpoint_height, &pin
-        ).unwrap();
+            restored,
+            NetworkId::Devnet,
+            checkpoint_height,
+            &pin,
+        )
+        .unwrap();
         assert_eq!(imported.tip_hash(), chain.tip_hash());
         let mut truncated = bytes.clone();
         truncated.pop();
@@ -1227,7 +1182,6 @@ mod tests {
     }
 }
 
-
 // PR100_COMPACT_V3_EXPERIMENT: trial wire format, NOT production approval.
 mod compact_wire_v3 {
     use super::*;
@@ -1258,9 +1212,7 @@ mod compact_wire_v3 {
         utxos: Vec<UtxoMeta>,
     }
 
-    fn bounded_vec<'de, D, T>(
-        deserializer: D
-    ) -> Result<Vec<T>, D::Error>
+    fn bounded_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
     where
         D: serde::Deserializer<'de>,
         T: Deserialize<'de>,
@@ -1270,37 +1222,24 @@ mod compact_wire_v3 {
         impl<'de, T: Deserialize<'de>> Visitor<'de> for Limited<T> {
             type Value = Vec<T>;
 
-            fn expecting(
-                &self,
-                f: &mut std::fmt::Formatter
-            ) -> std::fmt::Result {
-                write!(
-                    f,
-                    "vector of at most {MAX_ITEMS} records"
-                )
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "vector of at most {MAX_ITEMS} records")
             }
 
-            fn visit_seq<A: SeqAccess<'de>>(
-                self,
-                mut seq: A
-            ) -> Result<Self::Value, A::Error> {
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
                 if seq.size_hint().unwrap_or(0) > MAX_ITEMS {
-                    return Err(
-                        <A::Error as serde::de::Error>::custom(
-                            "snapshot vector exceeds count limit"
-                        )
-                    );
+                    return Err(<A::Error as serde::de::Error>::custom(
+                        "snapshot vector exceeds count limit",
+                    ));
                 }
 
                 let mut out = Vec::new();
 
                 while let Some(item) = seq.next_element()? {
                     if out.len() >= MAX_ITEMS {
-                        return Err(
-                            <A::Error as serde::de::Error>::custom(
-                                "snapshot vector exceeds count limit"
-                            )
-                        );
+                        return Err(<A::Error as serde::de::Error>::custom(
+                            "snapshot vector exceeds count limit",
+                        ));
                     }
 
                     out.push(item);
@@ -1310,9 +1249,7 @@ mod compact_wire_v3 {
             }
         }
 
-        deserializer.deserialize_seq(
-            Limited(PhantomData)
-        )
+        deserializer.deserialize_seq(Limited(PhantomData))
     }
 
     #[derive(Deserialize)]
@@ -1335,7 +1272,7 @@ mod compact_wire_v3 {
 
     pub(crate) fn write<W: Write>(
         writer: &mut W,
-        snapshot: &CheckpointSnapshot
+        snapshot: &CheckpointSnapshot,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
             snapshot.v == 2,
@@ -1343,9 +1280,7 @@ mod compact_wire_v3 {
         );
 
         let mut requested = BTreeSet::new();
-        let mut meta = Vec::with_capacity(
-            snapshot.utxos.len()
-        );
+        let mut meta = Vec::with_capacity(snapshot.utxos.len());
 
         for u in &snapshot.utxos {
             let commit = Hash256::from_hex(&u.commit)?;
@@ -1357,8 +1292,7 @@ mod compact_wire_v3 {
             );
 
             anyhow::ensure!(
-                u.output.commit.0 == commit.0
-                    && u.output.output_pk == output_pk.0,
+                u.output.commit.0 == commit.0 && u.output.output_pk == output_pk.0,
                 "checkpoint output metadata differs from full output"
             );
 
@@ -1373,10 +1307,7 @@ mod compact_wire_v3 {
 
         for body in &snapshot.recent_bodies {
             for out in &body.body.outputs {
-                let key = (
-                    body.height,
-                    out.commit.0
-                );
+                let key = (body.height, out.commit.0);
 
                 if requested.contains(&key) {
                     anyhow::ensure!(
@@ -1388,16 +1319,11 @@ mod compact_wire_v3 {
         }
 
         for u in &snapshot.utxos {
-            let key = (
-                u.height,
-                Hash256::from_hex(&u.commit)?.0
-            );
+            let key = (u.height, Hash256::from_hex(&u.commit)?.0);
 
-            let from_body = found.get(&key).ok_or_else(
-                || anyhow::anyhow!(
-                    "UTXO missing authenticated creation body"
-                )
-            )?;
+            let from_body = found
+                .get(&key)
+                .ok_or_else(|| anyhow::anyhow!("UTXO missing authenticated creation body"))?;
 
             anyhow::ensure!(
                 **from_body == u.output,
@@ -1425,9 +1351,7 @@ mod compact_wire_v3 {
         Ok(())
     }
 
-    pub(crate) fn read<R: Read>(
-        mut reader: R
-    ) -> anyhow::Result<CheckpointSnapshot> {
+    pub(crate) fn read<R: Read>(mut reader: R) -> anyhow::Result<CheckpointSnapshot> {
         let mut prefix = [0u8; 8];
 
         reader.read_exact(&mut prefix)?;
@@ -1435,19 +1359,15 @@ mod compact_wire_v3 {
         if &prefix != MAGIC {
             // Legacy JSON remains supported.
             // ChainStore enforces the bounded file size.
-            let combined =
-                std::io::Cursor::new(prefix).chain(reader);
+            let combined = std::io::Cursor::new(prefix).chain(reader);
 
-            return Ok(
-                serde_json::from_reader(combined)?
-            );
+            return Ok(serde_json::from_reader(combined)?);
         }
 
-        let wire: WireOwned =
-            bincode::DefaultOptions::new()
-                .with_fixint_encoding()
-                .with_limit(MAX_BYTES - MAGIC.len() as u64)
-                .deserialize_from(&mut reader)?;
+        let wire: WireOwned = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(MAX_BYTES - MAGIC.len() as u64)
+            .deserialize_from(&mut reader)?;
 
         // Reject trailing bytes also for wallet scanning.
         // Import already checks exact consumed source bytes.
@@ -1458,19 +1378,11 @@ mod compact_wire_v3 {
             "checkpoint contains trailing bytes"
         );
 
-        anyhow::ensure!(
-            wire.v == 3,
-            "invalid checkpoint wire version"
-        );
+        anyhow::ensure!(wire.v == 3, "invalid checkpoint wire version");
 
-        let expected =
-            usize::try_from(wire.checkpoint_height)?
-                .checked_add(1)
-                .ok_or_else(
-                    || anyhow::anyhow!(
-                        "checkpoint height overflow"
-                    )
-                )?;
+        let expected = usize::try_from(wire.checkpoint_height)?
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("checkpoint height overflow"))?;
 
         anyhow::ensure!(
             wire.headers.len() == expected,
@@ -1491,10 +1403,7 @@ mod compact_wire_v3 {
             );
 
             anyhow::ensure!(
-                wanted.insert((
-                    meta.height,
-                    meta.commit
-                )),
+                wanted.insert((meta.height, meta.commit)),
                 "duplicate compact UTXO metadata"
             );
         }
@@ -1508,34 +1417,25 @@ mod compact_wire_v3 {
             );
 
             for output in &body.body.outputs {
-                let key = (
-                    body.height,
-                    output.commit.0
-                );
+                let key = (body.height, output.commit.0);
 
                 if wanted.contains(&key) {
                     anyhow::ensure!(
-                        from_bodies
-                            .insert(key, output)
-                            .is_none(),
+                        from_bodies.insert(key, output).is_none(),
                         "duplicate output in retained creation bodies"
                     );
                 }
             }
         }
 
-        let mut full = Vec::with_capacity(
-            wire.utxos.len()
-        );
+        let mut full = Vec::with_capacity(wire.utxos.len());
 
         for meta in wire.utxos {
             let original = from_bodies
                 .get(&(meta.height, meta.commit))
-                .ok_or_else(
-                    || anyhow::anyhow!(
-                        "compact UTXO missing authenticated creation body"
-                    )
-                )?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("compact UTXO missing authenticated creation body")
+                })?;
 
             anyhow::ensure!(
                 original.output_pk == meta.output_pk,
@@ -1565,6 +1465,5 @@ mod compact_wire_v3 {
 }
 
 pub(crate) use compact_wire_v3::{
-    read as read_portable_snapshot,
-    write as write_portable_snapshot
+    read as read_portable_snapshot, write as write_portable_snapshot,
 };

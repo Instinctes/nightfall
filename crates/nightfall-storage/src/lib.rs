@@ -707,7 +707,10 @@ impl ChainStore {
         };
         let has_current = exists(&current)?;
         let has_legacy = exists(&legacy)?;
-        anyhow::ensure!(!(has_current && has_legacy), "ambiguous current and legacy scan archives");
+        anyhow::ensure!(
+            !(has_current && has_legacy),
+            "ambiguous current and legacy scan archives"
+        );
         let path = if has_current { current } else { legacy };
         let metadata = fs::symlink_metadata(&path)?;
         anyhow::ensure!(
