@@ -40,7 +40,7 @@ fn pr100_real_archive_export_import_catchup_equals_full_archive() {
 
     let _cleanup = Cleanup(scratch.clone());
 
-    let snapshot_file = scratch.join("authenticated-checkpoint.json");
+    let snapshot_file = scratch.join("authenticated-checkpoint-v3.bin");
 
     // Official export API, not a synthetic replacement.
     let start = Instant::now();

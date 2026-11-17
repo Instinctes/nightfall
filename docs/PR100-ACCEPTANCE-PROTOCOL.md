@@ -131,3 +131,22 @@ regressions cover refusal and tree identity. The evidence remains local.
 This is a local safety improvement, **not** certification of fixture origin,
 independent checkpoint authenticity, successful Mainnet migration, desktop
 wallet recovery, production readiness or permission to merge.
+
+
+<!-- PR100_COMPACT_V3_NOTE -->
+## Compact checkpoint v3 (real Mainnet prototype)
+
+Mainnet export/import/catch-up/restart was exercised on an isolated
+GitHub Actions runner with the exact checked-in v3 source bytes:
+https://github.com/nightfall-wizard/nightfall-wizard-fork/actions/runs/44100221674
+
+v3 stores authenticated creation bodies and UTXO metadata without
+repeating full Outputs. Full Outputs are reconstructed from the original
+checkpoint-bound creation bodies and rechecked against the pinned header
+chain, UTXO root, kernel sum and monetary supply. The 512 MiB import
+limit remains in force; old bounded JSON data remain readable.
+
+Evidence is **experimental local Mainnet equivalence**, not independent
+checkpoint certification, independent security review, proof of real
+1.1.2 operator migration, desktop GUI recovery, multi-platform benchmark
+or release approval. No merge or Mainnet activation is authorised.

@@ -46,7 +46,8 @@ impl<R: Read> Read for CheckpointDigestReader<R> {
 }
 
 pub mod checkpoint;
-const CHECKPOINT_SCAN_ARCHIVE: &str = "checkpoint-wallet-v2.json";
+const CHECKPOINT_SCAN_ARCHIVE: &str = "checkpoint-wallet-v3.bin";
+const LEGACY_CHECKPOINT_SCAN_ARCHIVE: &str = "checkpoint-wallet-v2.json";
 pub mod codec;
 pub mod dirlock;
 pub use codec::Format;
@@ -671,8 +672,10 @@ impl ChainStore {
         let tmp = out.with_extension("tmp");
         let write_result = (|| -> anyhow::Result<()> {
             let mut writer = BufWriter::new(File::create(&tmp)?);
-            serde_json::to_writer(&mut writer, &snapshot)?;
+            checkpoint::write_portable_snapshot(&mut writer, &snapshot)?;
             writer.flush()?;
+            writer.get_ref().sync_all()?;
+            drop(writer);
             fs::rename(&tmp, out)?;
             Ok(())
         })();
@@ -693,7 +696,19 @@ impl ChainStore {
         network: NetworkId,
     ) -> anyhow::Result<(Chain, Vec<checkpoint::CheckpointWalletOutput>)> {
         self.refuse_if_interrupted_recovery()?;
-        let path = self.dir.join(CHECKPOINT_SCAN_ARCHIVE);
+        let current = self.dir.join(CHECKPOINT_SCAN_ARCHIVE);
+        let legacy = self.dir.join(LEGACY_CHECKPOINT_SCAN_ARCHIVE);
+        let exists = |p: &Path| -> anyhow::Result<bool> {
+            match fs::symlink_metadata(p) {
+                Ok(_) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(e.into()),
+            }
+        };
+        let has_current = exists(&current)?;
+        let has_legacy = exists(&legacy)?;
+        anyhow::ensure!(!(has_current && has_legacy), "ambiguous current and legacy scan archives");
+        let path = if has_current { current } else { legacy };
         let metadata = fs::symlink_metadata(&path)?;
         anyhow::ensure!(
             metadata.file_type().is_file(),
@@ -705,7 +720,7 @@ impl ChainStore {
         );
 
         let reader = BufReader::new(File::open(&path)?);
-        let snapshot: checkpoint::CheckpointSnapshot = serde_json::from_reader(reader)?;
+        let snapshot: checkpoint::CheckpointSnapshot = checkpoint::read_portable_snapshot(reader)?;
 
         let mut outputs = Vec::with_capacity(snapshot.utxos.len());
 
@@ -765,6 +780,7 @@ impl ChainStore {
             || self.horizon_path().exists()
             || self.headers_path().exists()
             || self.dir.join(CHECKPOINT_SCAN_ARCHIVE).exists()
+            || self.dir.join(LEGACY_CHECKPOINT_SCAN_ARCHIVE).exists()
         {
             anyhow::bail!(
                 "checkpoint state import requires fresh chain state; refusing to replace existing chain files"
@@ -776,7 +792,7 @@ impl ChainStore {
         let mut authenticated_reader =
             CheckpointDigestReader::new(BufReader::new(File::open(from)?));
         let snapshot: checkpoint::CheckpointSnapshot =
-            serde_json::from_reader(&mut authenticated_reader)
+            checkpoint::read_portable_snapshot(&mut authenticated_reader)
                 .map_err(|e| anyhow::anyhow!("invalid checkpoint snapshot: {e}"))?;
         anyhow::ensure!(
             authenticated_reader.bytes == bytes,
@@ -803,7 +819,7 @@ impl ChainStore {
         // Retain authenticated history under the crash journal.
         // An interrupted import cannot silently finish without it.
         let archive = self.dir.join(CHECKPOINT_SCAN_ARCHIVE);
-        let temp = self.dir.join("checkpoint-wallet-v2.json.tmp");
+        let temp = self.dir.join("checkpoint-wallet-v3.bin.tmp");
 
         {
             let mut source = File::open(from)?;
