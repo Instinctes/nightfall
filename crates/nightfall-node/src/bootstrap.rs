@@ -50,6 +50,47 @@ pub struct Manifest {
     pub archive: String,
     pub archive_bytes: u64,
     pub blocks_bin_sha256: String,
+    #[serde(default)]
+    pub checkpoint: Option<CheckpointAsset>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct CheckpointAsset {
+    pub height: u64,
+    pub file: String,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+impl CheckpointAsset {
+    pub fn check(&self) -> anyhow::Result<()> {
+        let Some(rest) = self.file.strip_prefix("nightfall-checkpoint-") else {
+            anyhow::bail!("invalid checkpoint asset name");
+        };
+
+        let Some(rest) = rest.strip_suffix(".bin") else {
+            anyhow::bail!("invalid checkpoint extension");
+        };
+
+        anyhow::ensure!(
+            !rest.is_empty()
+                && rest.len() <= 40
+                && rest.chars().all(|c| c.is_ascii_digit() || c == '-'),
+            "invalid checkpoint asset name"
+        );
+
+        anyhow::ensure!(
+            self.bytes > 0 && self.bytes <= 512 * 1024 * 1024,
+            "invalid checkpoint asset size"
+        );
+
+        anyhow::ensure!(
+            self.sha256.len() == 64 && self.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+            "invalid checkpoint SHA-256"
+        );
+
+        Ok(())
+    }
 }
 
 fn agent() -> ureq::Agent {
@@ -109,6 +150,9 @@ impl Manifest {
         if !(MIN_ARCHIVE_BYTES..=MAX_ARCHIVE_BYTES).contains(&self.archive_bytes) {
             anyhow::bail!("the archive description states an implausible size");
         }
+        if let Some(checkpoint) = &self.checkpoint {
+            checkpoint.check()?;
+        }
         Ok(())
     }
 
@@ -156,6 +200,42 @@ pub fn download(
 /// its address to a web server because someone pressed a button.
 pub fn allowed() -> bool {
     !nightfall_p2p::privacy_lockdown_enabled()
+}
+
+/// Reuse the resumable, bounded SHA-256 downloader, but keep checkpoint bytes
+/// isolated from blocks.bin. Only the compiled checkpoint height is usable.
+pub fn download_checkpoint(
+    manifest: &Manifest,
+    dir: &Path,
+    cancel: &AtomicBool,
+    progress: impl FnMut(u64, u64),
+) -> anyhow::Result<Option<PathBuf>> {
+    refuse_under_lockdown()?;
+
+    if std::env::var_os("NIGHTFALL_NO_ASSUME_VALID").is_some() {
+        return Ok(None);
+    }
+
+    let Some(asset) = &manifest.checkpoint else {
+        return Ok(None);
+    };
+
+    asset.check()?;
+
+    if asset.height != nightfall_types::highest_checkpoint_height() {
+        return Ok(None);
+    }
+
+    let url = format!("{ARCHIVE_BASE}{}", asset.file);
+
+    let mut descriptor = manifest.clone();
+    descriptor.archive_bytes = asset.bytes;
+    descriptor.blocks_bin_sha256 = asset.sha256.clone();
+
+    // The alias is an authenticated checkpoint artifact, not a full archive.
+    let file = download_from(&url, &descriptor, &dir.join("checkpoint"), cancel, progress)?;
+
+    Ok(Some(file))
 }
 
 fn refuse_under_lockdown() -> anyhow::Result<()> {
@@ -319,6 +399,7 @@ mod tests {
             archive: "nightfall-chain-3-2026-11-12.bin".into(),
             archive_bytes: body.len() as u64,
             blocks_bin_sha256: hex::encode(Sha256::digest(body)),
+            checkpoint: None,
         }
     }
 
@@ -569,6 +650,29 @@ mod tests {
         let mut m = ok;
         m.archive_bytes = 0;
         assert!(m.check(GENESIS).is_err());
+    }
+
+    #[test]
+    fn optional_checkpoint_asset_rejects_path_traversal_and_oversize() {
+        let mut manifest = manifest_for(&vec![0u8; 1024]);
+
+        manifest.checkpoint = Some(CheckpointAsset {
+            height: 505_000,
+            file: "nightfall-checkpoint-505000-2026-11-18.bin".into(),
+            bytes: 400_548_128,
+            sha256: "00".repeat(32),
+        });
+
+        manifest.check(GENESIS).unwrap();
+
+        manifest.checkpoint.as_mut().unwrap().file = "../../wallet.seed".into();
+        assert!(manifest.check(GENESIS).is_err());
+
+        manifest.checkpoint.as_mut().unwrap().file =
+            "nightfall-checkpoint-505000-2026-11-18.bin".into();
+        manifest.checkpoint.as_mut().unwrap().bytes = 512 * 1024 * 1024 + 1;
+
+        assert!(manifest.check(GENESIS).is_err());
     }
 
     #[test]

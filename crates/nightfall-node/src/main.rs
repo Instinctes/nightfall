@@ -468,7 +468,13 @@ fn print_status(
         nightfall_types::Amount(chain.ledger.supply.circulating())
     );
     println!("utxos.......... {}", chain.ledger.utxos.len());
-    println!("kernels........ {}", chain.ledger.kernels.count);
+    if nightfall_storage::ChainStore::new(datadir).checkpoint_counts_unknown() {
+        println!("kernels........ unknown (pre-checkpoint history not counted)");
+        println!("transactions... unknown (pre-checkpoint history not counted)");
+    } else {
+        println!("kernels........ {}", chain.ledger.kernels.count);
+        println!("transactions... {}", chain.ledger.tx_count);
+    }
     println!("utxo_root...... {}", chain.ledger.utxo_root());
     println!(
         "supply_proof... {}",

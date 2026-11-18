@@ -562,6 +562,17 @@ impl WalletState {
         self.wallet().map(|w| w.scanned_to()).unwrap_or(0)
     }
 
+    /// A checkpoint must never silently replace historical wallet scans.
+    pub fn checkpoint_fast_start_safe(&self) -> bool {
+        self.wallet()
+            .map(|wallet| {
+                !wallet.has_scanned_history()
+                    && wallet.scan_anchor().is_empty()
+                    && wallet.history().is_empty()
+            })
+            .unwrap_or(false)
+    }
+
     pub fn history(&self) -> &[HistoryEntry] {
         self.wallet().map(|w| w.history()).unwrap_or(&[])
     }

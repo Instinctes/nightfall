@@ -3369,7 +3369,12 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 kv(
                     ui,
                     "Kernels",
-                    RichText::new(format_int(s.map(|s| s.kernels).unwrap_or(0))).monospace(),
+                    RichText::new(
+                        s.filter(|s| s.counts_verified)
+                            .map(|s| format_int(s.kernels))
+                            .unwrap_or_else(|| "unknown".into()),
+                    )
+                    .monospace(),
                 );
                 kv(
                     ui,

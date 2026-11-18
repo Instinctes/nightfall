@@ -165,6 +165,40 @@ impl ChainStore {
         codec::detect(&self.dir)
     }
 
+    /// Only the missing-seal upgrade case may offer Core's destructive
+    /// recovery action. Foreign networks and interrupted recovery journals
+    /// must never be auto-upgraded. This detection is read-only.
+    pub fn legacy_pruned_recovery_required(&self, network: NetworkId) -> bool {
+        let Some(meta) = self.read_meta() else {
+            return false;
+        };
+        let Ok(fresh) = Chain::new_fair(network) else {
+            return false;
+        };
+        meta.network == network
+            && meta.genesis_hash == fresh.genesis_hash.to_hex()
+            && meta.pruned
+            && meta.first_height > 0
+            && self.blocks_path().is_file()
+            && self.headers_path().is_file()
+            && self.horizon_path().is_file()
+            && (meta.validated_horizon_fingerprint.is_empty()
+                || meta.validated_headers_fingerprint.is_empty())
+            && self.refuse_if_interrupted_recovery().is_ok()
+    }
+
+    /// A checkpoint import knows the cryptographic kernel sum, NOT the
+    /// historical kernel/transaction counts. The scan archive is retained
+    /// across restarts as a durable provenance marker for unknown counts.
+    pub fn checkpoint_counts_unknown(&self) -> bool {
+        fs::symlink_metadata(self.dir.join(CHECKPOINT_SCAN_ARCHIVE)).is_ok()
+            || fs::symlink_metadata(self.dir.join(LEGACY_CHECKPOINT_SCAN_ARCHIVE)).is_ok()
+    }
+
+    pub fn checkpoint_scan_archive_path(&self) -> PathBuf {
+        self.dir.join(CHECKPOINT_SCAN_ARCHIVE)
+    }
+
     pub fn headers_path(&self) -> PathBuf {
         self.dir.join("headers.jsonl")
     }
