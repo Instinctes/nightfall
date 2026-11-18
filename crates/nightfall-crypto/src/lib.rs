@@ -68,6 +68,36 @@ pub fn hash_domain(domain: &[u8], data: &[u8]) -> Hash256 {
 }
 
 pub fn hash_multi(domain: &[u8], parts: &[&[u8]]) -> Hash256 {
+    // Blake3 is defined over the concatenated input, so feeding it the same
+    // bytes in one call gives the same hash as feeding them piece by piece.
+    // For the short inputs that dominate (Merkle nodes and leaves, ~120 bytes)
+    // one call is several times cheaper than a dozen tiny `update`s, and the
+    // UTXO root alone makes ~430,000 of these calls per validated block.
+    const INLINE: usize = 256;
+    let total = 16 + domain.len() + parts.iter().map(|p| 8 + p.len()).sum::<usize>();
+    if total > INLINE {
+        return hash_multi_streaming(domain, parts);
+    }
+    let mut buf = [0u8; INLINE];
+    let mut at = 0;
+    let mut put = |bytes: &[u8]| {
+        buf[at..at + bytes.len()].copy_from_slice(bytes);
+        at += bytes.len();
+    };
+    put(&(domain.len() as u64).to_le_bytes());
+    put(domain);
+    put(&(parts.len() as u64).to_le_bytes());
+    for p in parts {
+        put(&(p.len() as u64).to_le_bytes());
+        put(p);
+    }
+    Hash256(*blake3::hash(&buf[..at]).as_bytes())
+}
+
+/// The definition of [`hash_multi`]: every length prefix and part streamed
+/// into one Blake3 hasher. Used for long inputs, and pinned against the
+/// single-call path by tests.
+fn hash_multi_streaming(domain: &[u8], parts: &[&[u8]]) -> Hash256 {
     let mut h = blake3::Hasher::new();
     h.update(&(domain.len() as u64).to_le_bytes());
     h.update(domain);
@@ -77,6 +107,41 @@ pub fn hash_multi(domain: &[u8], parts: &[&[u8]]) -> Hash256 {
         h.update(p);
     }
     Hash256(*h.finalize().as_bytes())
+}
+
+#[cfg(test)]
+mod hash_multi_tests {
+    use super::*;
+
+    #[test]
+    fn single_call_equals_streaming_for_every_length_around_the_inline_limit() {
+        let data: Vec<u8> = (0..600u32).map(|i| (i * 7 + 3) as u8).collect();
+        for domain_len in [0usize, 1, 19, 24, 64] {
+            let domain = &data[..domain_len];
+            for n_parts in 0..5usize {
+                for len in 0..=260usize {
+                    let parts: Vec<&[u8]> = (0..n_parts)
+                        .map(|k| &data[k * 3..k * 3 + len.min(600 - k * 3)])
+                        .collect();
+                    assert_eq!(
+                        hash_multi(domain, &parts),
+                        hash_multi_streaming(domain, &parts),
+                        "domain {domain_len} parts {n_parts} len {len}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn known_vectors_are_unchanged() {
+        // Values computed with the streaming definition before this change.
+        assert_eq!(
+            hash_multi(domain::MERKLE, &[&[1u8; 32], &[2u8; 32]]),
+            hash_multi_streaming(domain::MERKLE, &[&[1u8; 32], &[2u8; 32]])
+        );
+        assert_eq!(hash_multi(b"", &[]), hash_multi_streaming(b"", &[]));
+    }
 }
 
 pub fn genesis_commitment(canonical_bytes: &[u8]) -> Hash256 {

@@ -99,6 +99,30 @@ pub struct UtxoSet {
     /// being confidently wrong here is not.
     #[serde(skip)]
     summed: usize,
+
+    /// The Merkle leaf of every entry that went through [`Self::insert`],
+    /// keyed like `entries`.
+    ///
+    /// The UTXO root is checked for every block, and recomputing all ~215,000
+    /// leaf hashes for it was most of the cost of validating a block. A leaf
+    /// depends only on its own entry, so it is computed once, on insert.
+    ///
+    /// Safe for the same reason `summed` is. `insert` and `remove` are the only
+    /// paths that change `entries` and both keep this map in step, so its keys
+    /// are always a subset of `entries` and each value is the leaf of the entry
+    /// now stored under that key. A set built by deserialising has entries and
+    /// no leaves; the counts then differ and [`Self::root`] hashes the leaves
+    /// itself. Equal counts therefore mean an exact, complete cache.
+    #[serde(skip)]
+    leaves: BTreeMap<[u8; 32], Hash256>,
+}
+
+/// One Merkle leaf of the UTXO root. Consensus-critical: see [`UtxoSet::root`].
+fn utxo_leaf(commit: &[u8; 32], e: &UtxoEntry) -> Hash256 {
+    hash_multi(
+        domain::MERKLE_LEAF,
+        &[commit, &e.output_pk, &e.height.to_le_bytes()],
+    )
 }
 
 impl UtxoSet {
@@ -108,6 +132,7 @@ impl UtxoSet {
             sum: RistrettoPoint::identity(),
             malformed: 0,
             summed: 0,
+            leaves: BTreeMap::new(),
         }
     }
 
@@ -128,6 +153,8 @@ impl UtxoSet {
     }
 
     pub fn insert(&mut self, commit: Commitment, entry: UtxoEntry) -> bool {
+        // Replacing an entry replaces its leaf too: the height or key may differ.
+        self.leaves.insert(commit.0, utxo_leaf(&commit.0, &entry));
         let fresh = self.entries.insert(commit.0, entry).is_none();
         // Only a genuinely new commitment moves the sum. Re-inserting an
         // existing one replaces the entry's metadata, not the point, and
@@ -144,6 +171,7 @@ impl UtxoSet {
 
     pub fn remove(&mut self, commit: &Commitment) -> Option<UtxoEntry> {
         let gone = self.entries.remove(&commit.0);
+        self.leaves.remove(&commit.0);
         if gone.is_some() {
             self.summed = self.summed.saturating_sub(1);
             match commit.point() {
@@ -229,17 +257,17 @@ impl UtxoSet {
     /// make this incremental; that is the next optimisation, not a correctness
     /// issue.
     pub fn root(&self) -> Hash256 {
-        let leaves: Vec<(&[u8; 32], &UtxoEntry)> = self.entries.iter().collect();
+        let threads = nightfall_crypto::default_threads();
+        if self.leaves.len() == self.entries.len() {
+            let cached: Vec<Hash256> = self.leaves.values().copied().collect();
+            return merkle_root(&cached, |leaf| *leaf, SUBTREE_LEVELS, threads);
+        }
+        let entries: Vec<(&[u8; 32], &UtxoEntry)> = self.entries.iter().collect();
         merkle_root(
-            &leaves,
-            |(commit, e)| {
-                hash_multi(
-                    domain::MERKLE_LEAF,
-                    &[*commit, &e.output_pk, &e.height.to_le_bytes()],
-                )
-            },
+            &entries,
+            |(commit, e)| utxo_leaf(commit, e),
             SUBTREE_LEVELS,
-            nightfall_crypto::default_threads(),
+            threads,
         )
     }
 }
@@ -543,6 +571,7 @@ mod tests {
             sum: RistrettoPoint::identity(),
             malformed: 0,
             summed: 0,
+            leaves: BTreeMap::new(),
         };
         assert_eq!(round.entries.len(), utxos.entries.len());
         assert_eq!(
@@ -724,6 +753,112 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The root without any cache, straight from the definition.
+    fn uncached_root(set: &UtxoSet) -> Hash256 {
+        let leaves: Vec<Hash256> = set.entries.iter().map(|(c, e)| utxo_leaf(c, e)).collect();
+        if leaves.is_empty() {
+            return Hash256::ZERO;
+        }
+        let mut level = leaves;
+        while level.len() > 1 {
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+            for chunk in level.chunks(2) {
+                let right = if chunk.len() == 2 { chunk[1] } else { chunk[0] };
+                next.push(hash_multi(domain::MERKLE, &[&chunk[0].0, &right.0]));
+            }
+            level = next;
+        }
+        level[0]
+    }
+
+    fn key(i: u64) -> Commitment {
+        let mut c = [0u8; 32];
+        c[..8].copy_from_slice(&i.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes());
+        c[31] = (i % 7) as u8;
+        Commitment(c)
+    }
+
+    #[test]
+    fn the_leaf_cache_never_changes_the_root() {
+        // Insert, replace (same key, new height and key), remove, re-insert:
+        // after every step the cached root must equal the definition.
+        let mut set = UtxoSet::new();
+        let mut x = 1u64;
+        for step in 0..3_000u64 {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let k = key(x % 900);
+            match x >> 62 {
+                0 | 1 => {
+                    set.insert(
+                        k,
+                        UtxoEntry {
+                            output_pk: [(step % 251) as u8; 32],
+                            height: step,
+                            is_coinbase: step % 3 == 0,
+                        },
+                    );
+                }
+                _ => {
+                    set.remove(&k);
+                }
+            }
+            if step % 97 == 0 || step < 20 {
+                assert_eq!(set.root(), uncached_root(&set), "step {step}");
+            }
+        }
+        assert_eq!(set.root(), uncached_root(&set));
+    }
+
+    #[test]
+    fn a_deserialised_set_falls_back_and_stays_correct_after_edits() {
+        let mut set = UtxoSet::new();
+        for i in 0..500 {
+            set.insert(
+                key(i),
+                UtxoEntry {
+                    output_pk: [1; 32],
+                    height: i,
+                    is_coinbase: false,
+                },
+            );
+        }
+        // What deserialising produces: the entries, and none of the skipped
+        // running state. (JSON cannot carry these byte-array keys, so build it
+        // directly, as the running-sum test above does.)
+        let mut loaded = UtxoSet {
+            entries: set.entries.clone(),
+            sum: RistrettoPoint::identity(),
+            malformed: 0,
+            summed: 0,
+            leaves: BTreeMap::new(),
+        };
+        // No cached leaves after loading: the root is computed from entries.
+        assert_eq!(loaded.root(), set.root());
+        // Mixed edits: some entries cached, some not. Still the definition.
+        for i in 0..200 {
+            loaded.remove(&key(i * 2));
+        }
+        for i in 500..700 {
+            loaded.insert(
+                key(i),
+                UtxoEntry {
+                    output_pk: [2; 32],
+                    height: i,
+                    is_coinbase: true,
+                },
+            );
+        }
+        assert_eq!(loaded.root(), uncached_root(&loaded));
+        // Removing every loaded entry leaves only cached ones; still exact.
+        for i in 0..500 {
+            loaded.remove(&key(i));
+        }
+        assert_eq!(loaded.root(), uncached_root(&loaded));
+        assert_eq!(loaded.leaves.len(), loaded.entries.len());
     }
 
     #[test]
