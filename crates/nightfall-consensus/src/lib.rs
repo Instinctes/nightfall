@@ -586,14 +586,22 @@ impl Chain {
         Some(self.blocks[..=last].to_vec())
     }
 
-    fn difficulty_history(&self) -> Vec<(u64, u64)> {
+    /// `(timestamp, difficulty)` of the most recent `take` blocks, oldest first.
+    ///
+    /// Only the tail is ever read: the retarget looks at the last
+    /// `DIFFICULTY_WINDOW + 1` blocks and median-time-past at the last
+    /// `MTP_WINDOW`. Copying the whole history for that cost a vector of
+    /// half a million entries per validated block.
+    fn recent_history(&self, take: usize) -> Vec<(u64, u64)> {
         if !self.headers.is_empty() {
-            self.headers
+            let from = self.headers.len().saturating_sub(take);
+            self.headers[from..]
                 .iter()
                 .map(|h| (h.timestamp_unix, h.difficulty))
                 .collect()
         } else {
-            self.blocks
+            let from = self.blocks.len().saturating_sub(take);
+            self.blocks[from..]
                 .iter()
                 .map(|b| (b.header.timestamp_unix, b.header.difficulty))
                 .collect()
@@ -603,21 +611,18 @@ impl Chain {
     /// Difficulty required of the next block.
     pub fn next_difficulty(&self) -> u64 {
         difficulty::next_difficulty(
-            &self.difficulty_history(),
+            &self.recent_history(nightfall_types::DIFFICULTY_WINDOW as usize + 1),
             self.network.initial_difficulty(),
             self.network.min_difficulty(),
         )
     }
 
     pub fn median_time_past(&self) -> u64 {
-        let ts: Vec<u64> = if !self.headers.is_empty() {
-            self.headers.iter().map(|h| h.timestamp_unix).collect()
-        } else {
-            self.blocks
-                .iter()
-                .map(|b| b.header.timestamp_unix)
-                .collect()
-        };
+        let ts: Vec<u64> = self
+            .recent_history(nightfall_types::MTP_WINDOW)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
         median_time_past(&ts)
     }
 
