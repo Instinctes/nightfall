@@ -46,8 +46,8 @@ BINDIR="/usr/local/bin"
 REPO="https://github.com/Instinctes/nightfall"
 # Bump both together after a reviewed Core release.
 # Refuse a moved or unexpected release tag.
-NIGHTFALL_RELEASE_TAG="v1.1.4"
-NIGHTFALL_RELEASE_SHA="c41859d0dc2dfd7a6a83034e7bc9b5d47d582b65"
+NIGHTFALL_RELEASE_TAG="v1.1.5"
+NIGHTFALL_RELEASE_SHA="c8a9783ebd36f8137654f01ca635d1fe96f0dcfd"
 EXPECTED_GENESIS="061a052d49607ff8f4b306c75d622ebd230cff4ec3a45a6dffc2f7738d4b20de"
 
 die() { printf '\033[31merror:\033[0m %s\n' "$1" >&2; exit 1; }
