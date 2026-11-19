@@ -96,6 +96,14 @@ pub const CHECKPOINTS: &[(u64, &str)] = &[
         530_000,
         "f885562490653963b509c0914fb6a49cef6cb96a20b729e953d5a33c96d453a9",
     ),
+    // Computed 19 Nov 2026 by a separate node that validated every block from
+    // 533,143 itself, and cross-checked against the seed that serves
+    // nightfallcoin.org/chain.json: hash, parent and UTXO root agree. ~5,000
+    // blocks below the tip at the time, far beyond `MAX_REORG_DEPTH`.
+    (
+        540_000,
+        "a877ec3af6f7c800ac8197e805fd7e67c196ffc5f922c8ac9478d72a114644ef",
+    ),
 ];
 
 /// The pinned hash for `height`, if this build has an opinion about it.
