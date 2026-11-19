@@ -50,3 +50,8 @@ objc2-app-kit = { version = "0.2.2", features = [
 objc2-foundation = "0.2.2"
 
 
+
+[features]
+# GPU mining (Metal / CUDA). Built into every release; off until switched on.
+default = ["gpu"]
+gpu = ["nightfall-node/gpu"]

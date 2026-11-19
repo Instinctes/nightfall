@@ -249,6 +249,8 @@ pub struct App {
     /// Ask the router to forward the P2P port (UPnP). Off by default.
     pub upnp: bool,
     pub mining_threads: usize,
+    /// Local GPU build: mine with the Apple GPU instead of CPU threads.
+    pub gpu_mining: bool,
     pub want_quit: bool,
     pub window_hidden: bool,
 
@@ -440,6 +442,8 @@ impl App {
             prune: load_flag(&datadir, "prune", false),
             upnp: load_flag(&datadir, "upnp", false),
             mining_threads,
+            gpu_mining: nightfall_node::runtime::GPU_AVAILABLE
+                && load_flag(&datadir, "gpu_mining", false),
             want_quit: false,
             window_hidden: false,
             activity_filter: String::new(),
@@ -560,6 +564,7 @@ impl App {
                 if self.upnp && !IS_DEV_BUILD {
                     h.enable_upnp();
                 }
+                h.set_gpu_mining(self.gpu_mining);
                 let handle = Arc::new(h);
                 self.node = Some(Arc::clone(&handle));
                 self.spawn_sync_worker(handle);
@@ -648,6 +653,15 @@ impl App {
         save_mining_threads(&self.datadir, n);
         if let Some(node) = &self.node {
             node.set_mining_threads(n);
+        }
+    }
+
+    pub fn set_gpu_mining(&mut self, on: bool) {
+        let on = on && nightfall_node::runtime::GPU_AVAILABLE;
+        self.gpu_mining = on;
+        save_flag(&self.datadir, "gpu_mining", on);
+        if let Some(node) = &self.node {
+            node.set_gpu_mining(on);
         }
     }
 

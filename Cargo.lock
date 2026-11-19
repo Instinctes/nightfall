@@ -3039,6 +3039,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nightfall-gpu"
+version = "1.1.4"
+dependencies = [
+ "blake2",
+ "libloading 0.8.9",
+ "metal",
+ "nightfall-crypto",
+ "nightfall-types",
+]
+
+[[package]]
 name = "nightfall-ledger"
 version = "1.1.4"
 dependencies = [
@@ -3079,6 +3090,7 @@ dependencies = [
  "igd-next",
  "nightfall-consensus",
  "nightfall-crypto",
+ "nightfall-gpu",
  "nightfall-ledger",
  "nightfall-p2p",
  "nightfall-storage",

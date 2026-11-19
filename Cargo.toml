@@ -13,6 +13,7 @@ members = [
     "crates/nightfall-mobile",
     "crates/nightfall-web",
     "crates/nightfall-nodekit",
+    "crates/nightfall-gpu",
 ]
 
 [workspace.package]

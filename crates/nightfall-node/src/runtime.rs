@@ -1340,6 +1340,19 @@ impl NodeHandle {
         }
     }
 
+    /// GPU mining on/off. Ignored when [`GPU_AVAILABLE`] is false.
+    pub fn set_gpu_mining(&self, on: bool) {
+        GPU_MINING.store(on && GPU_AVAILABLE, Ordering::SeqCst);
+        tracing::info!(
+            "GPU mining {}",
+            if on && GPU_AVAILABLE { "on" } else { "off" }
+        );
+    }
+
+    pub fn gpu_mining(&self) -> bool {
+        GPU_MINING.load(Ordering::SeqCst)
+    }
+
     pub fn mining_threads(&self) -> usize {
         self.state
             .lock()
@@ -4501,6 +4514,87 @@ pub fn blocks_behind(state: &SharedState) -> Option<u64> {
 
 const MAX_MINING_THREADS: usize = 64;
 
+/// Local GPU build only: mine with the Apple GPU instead of CPU threads.
+///
+/// One switch per process (Core runs one node). Read at every template, so
+/// turning it on or off lands without a restart. Without the `gpu` feature
+/// the flag exists but is never acted on.
+pub static GPU_MINING: AtomicBool = AtomicBool::new(false);
+
+/// GPU batches dispatched since start (diagnostics and tests).
+pub static GPU_BATCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Whether this binary was built with the GPU backend at all.
+pub const GPU_AVAILABLE: bool = cfg!(feature = "gpu");
+
+/// Nonces per GPU dispatch. 128 × 32 MiB = 4 GiB; measured on an M3 Pro this
+/// is where the rate stops climbing (~1,770 H/s). `NF_GPU_BATCH` overrides.
+#[cfg(feature = "gpu")]
+fn gpu_batch() -> usize {
+    std::env::var("NF_GPU_BATCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| (1..=512).contains(n))
+        .unwrap_or(128)
+}
+
+/// Mine one template on the GPU.
+///
+/// `Ok(None)` when told to stop, `Err` when the GPU cannot be used — the
+/// caller then falls back to the CPU. A GPU hit is never trusted: it is
+/// recomputed with the consensus hasher, and a mismatch is an error that
+/// switches the GPU off, so a driver or kernel fault can at worst waste time,
+/// never put an invalid block on the network.
+#[cfg(feature = "gpu")]
+fn mine_gpu(
+    slot: &mut Option<nightfall_gpu::GpuHasher>,
+    preimage: &[u8],
+    difficulty: u64,
+    start_nonce: u64,
+    params: nightfall_types::PowParams,
+    should_stop: &dyn Fn() -> bool,
+    hash_counter: &AtomicU64,
+) -> Result<Option<(u64, nightfall_types::Hash256)>, String> {
+    if slot.as_ref().map(|g| g.params()) != Some(params) {
+        let gpu = nightfall_gpu::GpuHasher::new(params, gpu_batch())?;
+        tracing::info!(
+            "GPU mining on {} — {} nonces per batch, {} MiB",
+            gpu.device_name(),
+            gpu.batch(),
+            gpu.memory_bytes() / (1024 * 1024)
+        );
+        *slot = Some(gpu);
+    }
+    let gpu = slot.as_mut().expect("just initialised");
+    let batch = gpu.batch() as u64;
+    let mut nonce = start_nonce;
+    let mut nonces = Vec::with_capacity(batch as usize);
+    loop {
+        if should_stop() || !GPU_MINING.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        nonces.clear();
+        nonces.extend((0..batch).map(|i| nonce.wrapping_add(i)));
+        nonce = nonce.wrapping_add(batch);
+        let hashes = gpu.hash_batch(preimage, &nonces);
+        if let Some(e) = gpu.take_error() {
+            *slot = None;
+            return Err(e);
+        }
+        hash_counter.fetch_add(batch, Ordering::Relaxed);
+        GPU_BATCHES.fetch_add(1, Ordering::Relaxed);
+        for (n, h) in nonces.iter().zip(hashes) {
+            if nightfall_crypto::meets_difficulty(h, difficulty) {
+                let check = nightfall_crypto::nighthash(preimage, *n, params);
+                if check != h {
+                    return Err(format!("GPU hash for nonce {n} disagrees with the CPU"));
+                }
+                return Ok(Some((*n, h)));
+            }
+        }
+    }
+}
+
 fn initial_mining_threads() -> usize {
     std::env::var("NF_MINING_THREADS")
         .ok()
@@ -4528,6 +4622,9 @@ fn mining_loop(state: SharedState, shutdown: Arc<Shutdown>) {
             nightfall_crypto::mining_memory_bytes(params, threads) / (1024 * 1024)
         );
     }
+
+    #[cfg(feature = "gpu")]
+    let mut gpu_slot: Option<nightfall_gpu::GpuHasher> = None;
 
     loop {
         if shutdown.is_requested() {
@@ -4671,15 +4768,50 @@ fn mining_loop(state: SharedState, shutdown: Arc<Shutdown>) {
             .unwrap_or(1)
             .clamp(1, MAX_MINING_THREADS);
         let start_nonce: u64 = rand::random();
-        let Some((nonce, _hash)) = mine_parallel(
-            &preimage,
-            difficulty,
-            start_nonce,
-            pow_params,
-            threads,
-            &should_stop,
-            Some(hash_counter.as_ref()),
-        ) else {
+
+        // GPU first when switched on (local build only). Measured on an M3 Pro,
+        // CPU threads alongside the GPU *lower* the total — both fight over the
+        // same memory bandwidth — so the GPU replaces them rather than joining.
+        #[cfg(feature = "gpu")]
+        let gpu_result = if GPU_MINING.load(Ordering::Relaxed) {
+            match mine_gpu(
+                &mut gpu_slot,
+                &preimage,
+                difficulty,
+                start_nonce,
+                pow_params,
+                &should_stop,
+                hash_counter.as_ref(),
+            ) {
+                Ok(found) => Some(found),
+                Err(e) => {
+                    tracing::warn!("GPU mining switched off, using CPU threads: {e}");
+                    GPU_MINING.store(false, Ordering::Relaxed);
+                    gpu_slot = None;
+                    None
+                }
+            }
+        } else {
+            // Off: give the 4 GiB workspace back.
+            gpu_slot = None;
+            None
+        };
+        #[cfg(not(feature = "gpu"))]
+        let gpu_result: Option<Option<(u64, nightfall_types::Hash256)>> = None;
+
+        let found = match gpu_result {
+            Some(found) => found,
+            None => mine_parallel(
+                &preimage,
+                difficulty,
+                start_nonce,
+                pow_params,
+                threads,
+                &should_stop,
+                Some(hash_counter.as_ref()),
+            ),
+        };
+        let Some((nonce, _hash)) = found else {
             // Tip moved or mining was switched off — rebuild on the new tip.
             continue;
         };
