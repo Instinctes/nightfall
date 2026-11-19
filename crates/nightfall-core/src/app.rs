@@ -246,7 +246,11 @@ pub struct App {
     startup_address: Option<String>,
     pub close_to_tray: bool,
     pub prune: bool,
+    /// Ask the router to forward the P2P port (UPnP). Off by default.
+    pub upnp: bool,
     pub mining_threads: usize,
+    /// Local GPU build: mine with the Apple GPU instead of CPU threads.
+    pub gpu_mining: bool,
     pub want_quit: bool,
     pub window_hidden: bool,
 
@@ -436,7 +440,10 @@ impl App {
             startup_address: None,
             close_to_tray: load_close_to_tray(&datadir),
             prune: load_flag(&datadir, "prune", false),
+            upnp: load_flag(&datadir, "upnp", false),
             mining_threads,
+            gpu_mining: nightfall_node::runtime::GPU_AVAILABLE
+                && load_flag(&datadir, "gpu_mining", false),
             want_quit: false,
             window_hidden: false,
             activity_filter: String::new(),
@@ -554,6 +561,10 @@ impl App {
                 self.fast_start_allowed = self.network == NetworkId::Mainnet
                     && !IS_DEV_BUILD
                     && h.direct_downloads_allowed();
+                if self.upnp && !IS_DEV_BUILD {
+                    h.enable_upnp();
+                }
+                h.set_gpu_mining(self.gpu_mining);
                 let handle = Arc::new(h);
                 self.node = Some(Arc::clone(&handle));
                 self.spawn_sync_worker(handle);
@@ -623,12 +634,34 @@ impl App {
         }
     }
 
+    pub fn set_upnp(&mut self, on: bool, ctx: &egui::Context) {
+        self.upnp = on;
+        save_flag(&self.datadir, "upnp", on);
+        self.toasts.info(
+            ctx,
+            if on {
+                "UPnP on — the router is asked at the next start"
+            } else {
+                "UPnP off from the next start. A mapping that is already open closes when the wallet quits."
+            },
+        );
+    }
+
     pub fn set_mining_threads(&mut self, n: usize) {
         let n = n.clamp(1, 64);
         self.mining_threads = n;
         save_mining_threads(&self.datadir, n);
         if let Some(node) = &self.node {
             node.set_mining_threads(n);
+        }
+    }
+
+    pub fn set_gpu_mining(&mut self, on: bool) {
+        let on = on && nightfall_node::runtime::GPU_AVAILABLE;
+        self.gpu_mining = on;
+        save_flag(&self.datadir, "gpu_mining", on);
+        if let Some(node) = &self.node {
+            node.set_gpu_mining(on);
         }
     }
 

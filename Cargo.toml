@@ -13,10 +13,11 @@ members = [
     "crates/nightfall-mobile",
     "crates/nightfall-web",
     "crates/nightfall-nodekit",
+    "crates/nightfall-gpu",
 ]
 
 [workspace.package]
-version = "1.1.4"
+version = "1.1.5"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nightfallcoin/nightfall"
@@ -33,6 +34,7 @@ nightfall-p2p = { path = "crates/nightfall-p2p" }
 nightfall-node = { path = "crates/nightfall-node" }
 nightfall-wallet = { path = "crates/nightfall-wallet" }
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+igd-next = { version = "0.18", default-features = false, features = ["io_sync"] }
 uniffi = "0.28"
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"

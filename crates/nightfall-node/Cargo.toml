@@ -30,6 +30,14 @@ tracing-subscriber = { workspace = true }
 rand.workspace = true
 ureq.workspace = true
 sha2 = { workspace = true }
+igd-next = { workspace = true }
+nightfall-gpu = { path = "../nightfall-gpu", optional = true }
+
+[features]
+# GPU mining: Metal on macOS, CUDA (driver loaded at run time) on Windows
+# and Linux. Built into every release; switched off until the user turns it on.
+default = ["gpu"]
+gpu = ["dep:nightfall-gpu"]
 
 [dev-dependencies]
 nightfall-storage = { workspace = true }

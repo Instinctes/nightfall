@@ -78,6 +78,11 @@ enum Commands {
         /// Seeds that serve IBD or --mobile-listen must not set this.
         #[arg(long, default_value_t = false)]
         prune: bool,
+        /// Ask the router to forward the P2P port (UPnP), renewed every half
+        /// hour and removed on exit. Off by default; refused when a proxy is
+        /// set, because that node keeps its address private.
+        #[arg(long, default_value_t = false)]
+        upnp: bool,
     },
     /// Write `blocks.jsonl` + `snapshot.json`. The importer still verifies PoW.
     ExportSnapshot {
@@ -279,6 +284,7 @@ fn main() -> anyhow::Result<()> {
             mobile_listen,
             introducer,
             prune,
+            upnp,
         } => {
             let listen =
                 listen.unwrap_or_else(|| format!("0.0.0.0:{}", network.default_p2p_port()));
@@ -337,6 +343,10 @@ fn main() -> anyhow::Result<()> {
             stop_signals::install()?;
             let handle = NodeHandle::start(cfg)?;
             println!("genesis........ {}", handle.genesis_hex());
+            if upnp {
+                handle.enable_upnp();
+                println!("upnp........... asking the router to forward the P2P port");
+            }
             println!("node online — Ctrl+C to stop");
 
             let mut last_heartbeat = Instant::now();

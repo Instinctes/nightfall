@@ -2752,6 +2752,37 @@ pub fn mining(app: &mut App, ui: &mut egui::Ui) {
             .size(11.0)
             .color(TEXT_DIM),
         );
+
+        if nightfall_node::runtime::GPU_AVAILABLE {
+            ui.add_space(14.0);
+            ui.label(RichText::new("GPU").size(12.0).color(TEXT_DIM));
+            ui.add_space(4.0);
+            let mut on = app.gpu_mining;
+            if ui
+                .checkbox(
+                    &mut on,
+                    if cfg!(target_os = "macos") {
+                        "Mine with the Apple GPU (Metal) instead of CPU threads"
+                    } else {
+                        "Mine with the NVIDIA GPU (CUDA) instead of CPU threads"
+                    },
+                )
+                .changed()
+            {
+                app.set_gpu_mining(on);
+            }
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "Experimental. Uses about 4 GiB of GPU memory while on and replaces the \
+                     CPU threads above. The GPU must pass a self-test against the CPU hash \
+                     first, every GPU hit is recomputed on the CPU before a block is sent, \
+                     and on any mismatch or driver error the GPU switches itself off.",
+                )
+                .size(11.0)
+                .color(TEXT_DIM),
+            );
+        }
     });
 
     ui.add_space(14.0);
@@ -3811,6 +3842,44 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                         RichText::new(format_int(s.prune_height)).monospace(),
                     );
                 }
+            }
+        });
+
+        ui.add_space(GAP_LG);
+        titled_card(ui, "Reachability", |ui| {
+            ui.set_width(ui.available_width());
+            let mut upnp = app.upnp;
+            if check(
+                ui,
+                &mut upnp,
+                "Open the P2P port on my router automatically (UPnP)",
+            ) {
+                app.set_upnp(upnp, ctx);
+            }
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "Off by default. When on, the wallet asks your router to forward the P2P \
+                     port to this computer, so other nodes can connect to you and the network \
+                     depends less on a few seeds. Your router then accepts connections for \
+                     NIGHTFALLCOIN, and your IP address can be passed on to other nodes as a \
+                     place to connect. Not used when a proxy (Tor) is set. Takes effect at the \
+                     next start.",
+                )
+                .size(11.0)
+                .color(TEXT_DIM),
+            );
+            if let Some(status) = app.status.as_ref().and_then(|s| s.upnp.clone()) {
+                ui.add_space(6.0);
+                kv(ui, "Router", RichText::new(status).size(12.0));
+            }
+            if let Some(s) = &app.status {
+                ui.add_space(4.0);
+                kv(
+                    ui,
+                    "Reachable nodes known",
+                    RichText::new(format_int(s.reachable_nodes as u64)).monospace(),
+                );
             }
         });
 
