@@ -3814,6 +3814,44 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             }
         });
 
+        ui.add_space(GAP_LG);
+        titled_card(ui, "Reachability", |ui| {
+            ui.set_width(ui.available_width());
+            let mut upnp = app.upnp;
+            if check(
+                ui,
+                &mut upnp,
+                "Open the P2P port on my router automatically (UPnP)",
+            ) {
+                app.set_upnp(upnp, ctx);
+            }
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "Off by default. When on, the wallet asks your router to forward the P2P \
+                     port to this computer, so other nodes can connect to you and the network \
+                     depends less on a few seeds. Your router then accepts connections for \
+                     NIGHTFALLCOIN, and your IP address can be passed on to other nodes as a \
+                     place to connect. Not used when a proxy (Tor) is set. Takes effect at the \
+                     next start.",
+                )
+                .size(11.0)
+                .color(TEXT_DIM),
+            );
+            if let Some(status) = app.status.as_ref().and_then(|s| s.upnp.clone()) {
+                ui.add_space(6.0);
+                kv(ui, "Router", RichText::new(status).size(12.0));
+            }
+            if let Some(s) = &app.status {
+                ui.add_space(4.0);
+                kv(
+                    ui,
+                    "Reachable nodes known",
+                    RichText::new(format_int(s.reachable_nodes as u64)).monospace(),
+                );
+            }
+        });
+
         ui.add_space(14.0);
 
         titled_card(ui, "Window", |ui| {

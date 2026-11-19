@@ -354,11 +354,26 @@ pub struct NodeInner {
     /// a very different situation from one where everybody upgraded, and until
     /// now the two were indistinguishable from the inside.
     pub peer_agents: HashMap<String, String>,
+    /// When each entry of `peer_agents` was last seen.
+    ///
+    /// Without it the census only ever grew: an entry was written at the
+    /// handshake and never removed, so `peer_versions` was everyone met since
+    /// the node started, long-gone 0.8 nodes included. Entries now expire
+    /// [`PEER_AGENT_TTL_SECS`] after the peer was last connected, and a peer
+    /// with a live session never expires.
+    peer_agent_seen: HashMap<String, u64>,
     /// Last advertised tip height per live session key (`in:…` / `out:…`).
     session_height: HashMap<String, u64>,
-    /// Listen addresses we ourselves completed an outbound handshake to.
-    /// Those are the only IPs we publish: we know they answer.
-    reachable_listen: HashSet<String>,
+    /// Listen addresses that answered a handshake we started, with when.
+    /// Those are the only IPs we publish: we know they answer. An address
+    /// not confirmed again within [`REACHABLE_TTL_SECS`] is no longer passed
+    /// on, so the directory does not keep pointing new nodes at machines
+    /// that went away.
+    reachable_listen: HashMap<String, u64>,
+    /// When we last tried to dial back a peer that connected to us.
+    probed_listen: HashMap<String, u64>,
+    /// What the optional UPnP port mapping achieved, for the status screen.
+    upnp_status: Option<String>,
     /// Replay from disk is still running. P2P waits; RPC/light already answer.
     pub(crate) loading: bool,
     pub(crate) preview_blocks: u64,
@@ -574,9 +589,55 @@ impl NodeInner {
     pub fn publishable_peers(&self) -> Vec<String> {
         merge_directory_peers(
             self.network.seed_nodes().iter().map(|s| s.to_string()),
-            self.reachable_listen.iter().cloned(),
+            self.fresh_reachable(now_unix()),
             MAX_PEERS_PER_MSG,
         )
+    }
+
+    /// Listen addresses confirmed reachable within [`REACHABLE_TTL_SECS`].
+    fn fresh_reachable(&self, now: u64) -> Vec<String> {
+        fresh_entries(&self.reachable_listen, now, REACHABLE_TTL_SECS)
+    }
+
+    pub(crate) fn set_upnp_status(&mut self, status: Option<String>) {
+        self.upnp_status = status;
+    }
+
+    /// How many listening nodes this node currently passes on, seeds excluded.
+    pub fn reachable_node_count(&self, now: u64) -> usize {
+        self.fresh_reachable(now).len()
+    }
+
+    /// Record that `addr` answered a handshake we started.
+    fn note_reachable(&mut self, addr: &str, now: u64) {
+        if !is_directory_addr(addr) {
+            return;
+        }
+        if !self.reachable_listen.contains_key(addr) && self.reachable_listen.len() >= MAX_REACHABLE
+        {
+            self.reachable_listen
+                .retain(|_, at| now.saturating_sub(*at) < REACHABLE_TTL_SECS);
+            if self.reachable_listen.len() >= MAX_REACHABLE {
+                return;
+            }
+        }
+        self.reachable_listen.insert(addr.to_string(), now);
+    }
+
+    /// Versions of the peers connected now or within [`PEER_AGENT_TTL_SECS`].
+    /// Expired entries are dropped as a side effect.
+    pub fn recent_peer_versions(&mut self, now: u64) -> BTreeMap<String, usize> {
+        let live: HashSet<String> = self.inbound_peer_addrs.values().cloned().collect();
+        retain_recent_agents(&mut self.peer_agents, &mut self.peer_agent_seen, &live, now)
+    }
+
+    /// Whether to dial `addr` back to find out if it accepts connections.
+    /// Rate-limited per address, and never for one we already know answers.
+    fn claim_probe(&mut self, addr: &str, now: u64) -> bool {
+        if !is_directory_addr(addr) || self.suppressed_peers.contains(addr) {
+            return false;
+        }
+        claim_probe_slot(&self.reachable_listen, &mut self.probed_listen, addr, now)
     }
 
     pub fn dialable_peers(&self) -> Vec<String> {
@@ -865,6 +926,11 @@ pub struct StatusSnap {
     pub pruned: bool,
     /// First height whose body is still on disk. 0 = archive.
     pub prune_height: u64,
+    /// Listening nodes confirmed reachable in the last 24 hours, seeds
+    /// excluded: the ones this node passes on to others.
+    pub reachable_nodes: usize,
+    /// Outcome of the optional UPnP port mapping; `None` when it is off.
+    pub upnp: Option<String>,
 }
 
 /// Why mining is held, for the UI. Distinct from the mining-hold number
@@ -1060,7 +1126,10 @@ impl NodeHandle {
             behind_since: now_unix(),
             peer_agents: HashMap::new(),
             session_height: HashMap::new(),
-            reachable_listen: HashSet::new(),
+            reachable_listen: HashMap::new(),
+            probed_listen: HashMap::new(),
+            upnp_status: None,
+            peer_agent_seen: HashMap::new(),
             loading: need_slow_replay,
             preview_blocks,
             preview_total: 0,
@@ -1343,6 +1412,29 @@ impl NodeHandle {
         Ok(backup)
     }
 
+    /// Ask the router to forward the P2P port (UPnP), and keep it forwarded
+    /// until the node stops. Off unless called. Refused when the node dials
+    /// through a proxy or runs under privacy lockdown: a node that hides its
+    /// address must not publish it through the router either.
+    pub fn enable_upnp(&self) {
+        let (proxy, port) = match self.state.lock() {
+            Ok(g) => (g.proxy.is_some(), g.listen_port),
+            Err(_) => return,
+        };
+        if proxy || nightfall_p2p::privacy_lockdown_enabled() {
+            if let Ok(mut g) = self.state.lock() {
+                g.set_upnp_status(Some("off: this node keeps its address private".into()));
+            }
+            return;
+        }
+        crate::upnp::spawn(
+            Arc::clone(&self.state),
+            port,
+            Arc::clone(&self.shutdown),
+            Arc::clone(&self.workers),
+        );
+    }
+
     /// Whether this node may fetch the chain archive over plain HTTPS: not
     /// under privacy lockdown, and not when it dials its peers through a
     /// proxy. See [`crate::bootstrap`].
@@ -1563,7 +1655,7 @@ impl NodeHandle {
     }
 
     pub fn status_snapshot(&self) -> anyhow::Result<StatusSnap> {
-        let g = self.state.lock().unwrap();
+        let mut g = self.state.lock().unwrap();
         let loading = g.loading;
         let blocks = if loading {
             g.preview_blocks
@@ -1590,10 +1682,9 @@ impl NodeHandle {
                 .or_else(|| g.chain.blocks.last().map(|b| b.header.timestamp_unix))
                 .unwrap_or(0)
         };
-        let mut peer_versions = BTreeMap::new();
-        for agent in g.peer_agents.values() {
-            *peer_versions.entry(agent.clone()).or_insert(0) += 1;
-        }
+        let peer_versions = g.recent_peer_versions(now_unix());
+        let reachable_nodes = g.reachable_node_count(now_unix());
+        let upnp = g.upnp_status.clone();
         let stalled = g.stalled_on_fork.load(Ordering::SeqCst);
         let reorging = g.reorg_in_flight.load(Ordering::SeqCst);
         let fork_rewind = g.fork_rewind.load(Ordering::Relaxed);
@@ -1649,6 +1740,8 @@ impl NodeHandle {
             mining_threads: g.mining_threads.load(Ordering::Relaxed),
             pruned: g.chain.is_pruned(),
             prune_height: g.chain.first_height,
+            reachable_nodes,
+            upnp,
             sync_hold: if loading {
                 SyncHold::Synced
             } else {
@@ -1977,9 +2070,7 @@ fn open_outbound_session(
     {
         let mut g = state.lock().unwrap();
         g.mark_confirmed(addr.to_string());
-        if is_directory_addr(addr) {
-            g.reachable_listen.insert(addr.to_string());
-        }
+        g.note_reachable(addr, now_unix());
     }
 
     let write_clone = stream.try_clone()?;
@@ -2173,6 +2264,183 @@ fn apply_ibd_page(inner: &mut NodeInner, page: IbdBatch, now: u64) -> IbdPage {
 }
 
 const REORG_FETCH_COOLDOWN_SECS: u64 = 15;
+
+/// Keys of `map` whose timestamp is younger than `ttl`, sorted.
+fn fresh_entries(map: &HashMap<String, u64>, now: u64, ttl: u64) -> Vec<String> {
+    let mut fresh: Vec<String> = map
+        .iter()
+        .filter(|(_, at)| now.saturating_sub(**at) < ttl)
+        .map(|(key, _)| key.clone())
+        .collect();
+    fresh.sort();
+    fresh
+}
+
+/// Drop census entries that are neither live nor seen within the TTL, then
+/// count what is left by agent string.
+fn retain_recent_agents(
+    agents: &mut HashMap<String, String>,
+    seen: &mut HashMap<String, u64>,
+    live: &HashSet<String>,
+    now: u64,
+) -> BTreeMap<String, usize> {
+    agents.retain(|addr, _| {
+        live.contains(addr)
+            || seen
+                .get(addr)
+                .is_some_and(|at| now.saturating_sub(*at) < PEER_AGENT_TTL_SECS)
+    });
+    seen.retain(|addr, _| agents.contains_key(addr));
+    let mut versions = BTreeMap::new();
+    for agent in agents.values() {
+        *versions.entry(agent.clone()).or_insert(0) += 1;
+    }
+    versions
+}
+
+/// Whether `addr` may be dialled back now, recording the attempt if so.
+fn claim_probe_slot(
+    reachable: &HashMap<String, u64>,
+    probed: &mut HashMap<String, u64>,
+    addr: &str,
+    now: u64,
+) -> bool {
+    if reachable
+        .get(addr)
+        .is_some_and(|at| now.saturating_sub(*at) < REACHABLE_TTL_SECS / 2)
+    {
+        return false;
+    }
+    if probed
+        .get(addr)
+        .is_some_and(|at| now.saturating_sub(*at) < PROBE_RETRY_SECS)
+    {
+        return false;
+    }
+    if probed.len() >= MAX_PROBED {
+        probed.retain(|_, at| now.saturating_sub(*at) < PROBE_RETRY_SECS);
+        if probed.len() >= MAX_PROBED {
+            return false;
+        }
+    }
+    probed.insert(addr.to_string(), now);
+    true
+}
+
+#[cfg(test)]
+mod directory_ttl_tests {
+    use super::*;
+
+    #[test]
+    fn the_census_keeps_live_and_recent_peers_only() {
+        let now = 1_000_000;
+        let mut agents: HashMap<String, String> = HashMap::new();
+        let mut seen: HashMap<String, u64> = HashMap::new();
+        for (addr, agent, at) in [
+            ("1.1.1.1:17891", "nightfalld/1.1.4", now - 60),
+            (
+                "2.2.2.2:17891",
+                "nightfalld/0.8.0",
+                now - PEER_AGENT_TTL_SECS - 1,
+            ),
+            (
+                "3.3.3.3:17891",
+                "nightfalld/1.1.2",
+                now - 10 * PEER_AGENT_TTL_SECS,
+            ),
+        ] {
+            agents.insert(addr.into(), agent.into());
+            seen.insert(addr.into(), at);
+        }
+        // A peer still connected never expires, however old its stamp.
+        let live: HashSet<String> = ["3.3.3.3:17891".to_string()].into();
+        let versions = retain_recent_agents(&mut agents, &mut seen, &live, now);
+        assert_eq!(versions.get("nightfalld/1.1.4"), Some(&1));
+        assert_eq!(versions.get("nightfalld/1.1.2"), Some(&1));
+        assert_eq!(versions.get("nightfalld/0.8.0"), None);
+        assert_eq!(agents.len(), 2);
+        assert_eq!(seen.len(), 2);
+    }
+
+    #[test]
+    fn only_recently_confirmed_addresses_are_published() {
+        let now = 5_000_000;
+        let map: HashMap<String, u64> = [
+            ("a:1".to_string(), now - 10),
+            ("b:1".to_string(), now - REACHABLE_TTL_SECS),
+            ("c:1".to_string(), now - REACHABLE_TTL_SECS + 1),
+        ]
+        .into();
+        assert_eq!(
+            fresh_entries(&map, now, REACHABLE_TTL_SECS),
+            vec!["a:1", "c:1"]
+        );
+    }
+
+    #[test]
+    fn dial_back_is_rate_limited_and_skips_known_reachable_nodes() {
+        let now = 9_000_000;
+        let mut reachable: HashMap<String, u64> = HashMap::new();
+        let mut probed: HashMap<String, u64> = HashMap::new();
+        assert!(claim_probe_slot(&reachable, &mut probed, "x:1", now));
+        // Not again until the retry interval has passed.
+        assert!(!claim_probe_slot(&reachable, &mut probed, "x:1", now + 60));
+        assert!(claim_probe_slot(
+            &reachable,
+            &mut probed,
+            "x:1",
+            now + PROBE_RETRY_SECS
+        ));
+        // A node confirmed recently is not probed at all.
+        reachable.insert("y:1".into(), now);
+        assert!(!claim_probe_slot(&reachable, &mut probed, "y:1", now + 60));
+        // ...until half its directory lifetime has passed.
+        assert!(claim_probe_slot(
+            &reachable,
+            &mut probed,
+            "y:1",
+            now + REACHABLE_TTL_SECS / 2
+        ));
+    }
+
+    #[test]
+    fn the_probe_table_is_bounded() {
+        let now = 1_000;
+        let reachable: HashMap<String, u64> = HashMap::new();
+        let mut probed: HashMap<String, u64> = HashMap::new();
+        for i in 0..MAX_PROBED {
+            assert!(claim_probe_slot(
+                &reachable,
+                &mut probed,
+                &format!("n{i}:1"),
+                now
+            ));
+        }
+        assert!(!claim_probe_slot(
+            &reachable,
+            &mut probed,
+            "late:1",
+            now + 1
+        ));
+        assert_eq!(probed.len(), MAX_PROBED);
+        // Once old entries age out, room is made again.
+        assert!(claim_probe_slot(
+            &reachable,
+            &mut probed,
+            "late:1",
+            now + PROBE_RETRY_SECS
+        ));
+    }
+}
+
+/// How long a peer counts in the version census after it was last connected.
+const PEER_AGENT_TTL_SECS: u64 = 30 * 60;
+/// How long a dialled-back address stays in the published directory.
+const REACHABLE_TTL_SECS: u64 = 24 * 60 * 60;
+/// How long before a peer that did not answer a dial-back is tried again.
+const PROBE_RETRY_SECS: u64 = 6 * 60 * 60;
+const MAX_REACHABLE: usize = 1_024;
+const MAX_PROBED: usize = 4_096;
 const REORG_FETCH_MAX_PEERS: usize = 256;
 
 /// Claim the side-channel reorg-fetch slot for one peer.
@@ -2756,8 +3024,18 @@ fn handle_peer(
                     g.mark_confirmed(addr.clone());
                     tracing::info!("learned peer address {addr} running {agent}");
                 }
+                let now = now_unix();
+                if g.peer_agents.len() >= MAX_PEERS * 2 {
+                    g.recent_peer_versions(now);
+                }
                 if g.peer_agents.len() < MAX_PEERS * 2 {
                     g.peer_agents.insert(addr.clone(), agent.clone());
+                    g.peer_agent_seen.insert(addr.clone(), now);
+                }
+                if g.claim_probe(addr, now) {
+                    let (st, sd, target) =
+                        (Arc::clone(&state), Arc::clone(&shutdown), addr.clone());
+                    workers.spawn(move || probe_listen_addr(&st, &target, &sd));
                 }
             }
 
@@ -2878,9 +3156,71 @@ fn handle_peer(
     if let Ok(mut g) = state.lock() {
         g.sessions.remove(&session_key);
         g.session_height.remove(&session_key);
-        g.inbound_peer_addrs.remove(&session_key);
+        if let Some(addr) = g.inbound_peer_addrs.remove(&session_key) {
+            // Connected until now: count it for another TTL from here.
+            if g.peer_agents.contains_key(&addr) {
+                g.peer_agent_seen.insert(addr, now_unix());
+            }
+        }
     }
     result
+}
+
+/// Dial back a peer that connected to us, to learn whether it accepts
+/// connections itself.
+///
+/// Most nodes sit behind a router and cannot be reached; publishing their
+/// address only sends new installs to dead ends. A node that answers a
+/// handshake we started is reachable, and goes into the directory every
+/// node hands out. One handshake, then the socket is closed: this is a
+/// check, not a session.
+fn probe_listen_addr(state: &SharedState, addr: &str, shutdown: &Arc<Shutdown>) {
+    if shutdown.is_requested() {
+        return;
+    }
+    let proxy = state.lock().ok().and_then(|g| g.proxy.clone());
+    let Ok((mut stream, _)) = connect_peer_via(addr, 5_000, proxy.as_ref()) else {
+        return;
+    };
+    let Ok(_tracked) = shutdown.track_socket(&stream) else {
+        return;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(8)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(8)));
+    let Ok((network, genesis, height, tip, port, pruned, first)) = state.lock().map(|g| {
+        (
+            g.network,
+            g.chain.genesis_hash,
+            g.chain.tip_height().map(|h| h.0).unwrap_or(0),
+            g.chain.tip_hash(),
+            g.listen_port,
+            g.chain.is_pruned(),
+            g.chain.first_height,
+        )
+    }) else {
+        return;
+    };
+    if is_self_connection(&stream, port) {
+        return;
+    }
+    if handshake(
+        &mut stream,
+        network,
+        genesis,
+        height,
+        tip,
+        port,
+        pruned,
+        first,
+    )
+    .is_ok()
+    {
+        if let Ok(mut g) = state.lock() {
+            g.note_reachable(addr, now_unix());
+            g.mark_confirmed(addr.to_string());
+        }
+        tracing::debug!("dial-back to {addr} answered: reachable");
+    }
 }
 
 fn prepare_live_socket(stream: &TcpStream) -> std::io::Result<()> {

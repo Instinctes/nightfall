@@ -351,7 +351,12 @@ pub(crate) fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
 
     match req.method.as_str() {
         "status" => {
-            let g = state.lock().unwrap();
+            let mut g = state.lock().unwrap();
+            // Peers connected now or in the last 30 minutes; see
+            // `NodeInner::recent_peer_versions`.
+            let now = nightfall_storage::now_unix();
+            let peer_versions = g.recent_peer_versions(now);
+            let reachable_nodes = g.reachable_node_count(now);
             let loading = g.loading;
             let chain = &g.chain;
             let supply_ok = !loading && chain.verify_supply().is_ok();
@@ -374,11 +379,6 @@ pub(crate) fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
             // During an incident this is the first thing worth knowing, and it
             // used to be unanswerable from anywhere: the handshake carried an
             // agent string that the node received and discarded.
-            let mut peer_versions: std::collections::BTreeMap<&str, usize> =
-                std::collections::BTreeMap::new();
-            for agent in g.peer_agents.values() {
-                *peer_versions.entry(agent.as_str()).or_insert(0) += 1;
-            }
             ok(
                 json!({
                     "network": chain.network.as_str(),
@@ -402,6 +402,7 @@ pub(crate) fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
                     "live_peers": g.sessions.len(),
                     "wire_version": nightfall_types::WIRE_VERSION,
                     "peer_versions": peer_versions,
+                    "reachable_nodes": reachable_nodes,
                     "max_supply": MAX_SUPPLY_NIGHT,
                     "ticker": TICKER,
                     "tor_proxy": g.proxy.is_some()

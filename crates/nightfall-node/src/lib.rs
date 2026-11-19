@@ -6,6 +6,7 @@ pub mod recovery;
 pub mod rpc;
 pub mod runtime;
 pub mod session;
+mod upnp;
 
 pub use runtime::{
     classify_sync_hold, NodeConfig, NodeHandle, NodeInner, SharedState, StatusSnap, SyncHold,
