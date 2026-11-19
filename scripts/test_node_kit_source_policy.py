@@ -24,8 +24,8 @@ def validate_policy(source):
     revision = 'SOURCE_REV="$(git -C "$BUILD/nightfall" rev-parse --verify HEAD)"'
     lock = 'LOCK_SHA="$(sha256sum "$BUILD/nightfall/Cargo.lock" | awk \'{print $1}\')"'
     revisions = [
-        ('NIGHTFALL_RELEASE_TAG="v1.1.4"', "pinned release tag"),
-        ('NIGHTFALL_RELEASE_SHA="c41859d0dc2dfd7a6a83034e7bc9b5d47d582b65"', "pinned release commit"),
+        ('NIGHTFALL_RELEASE_TAG="v1.1.5"', "pinned release tag"),
+        ('NIGHTFALL_RELEASE_SHA="c8a9783ebd36f8137654f01ca635d1fe96f0dcfd"', "pinned release commit"),
         ('[ "$SOURCE_REV" = "$NIGHTFALL_RELEASE_SHA" ] || die "release tag does not match pinned commit"', "fail-closed tag verification"),
         (clone, "source clone"),
         (revision, "Git revision capture"),
