@@ -10,6 +10,7 @@ mod address_book;
 mod app;
 mod backup_recovery;
 mod feedback;
+mod fx;
 mod onboarding;
 mod recovery_studio;
 mod reward;

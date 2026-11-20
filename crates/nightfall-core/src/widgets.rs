@@ -241,6 +241,18 @@ pub fn radial_wash(painter: &egui::Painter, centre: egui::Pos2, radius: f32, col
     if radius <= 0.0 {
         return;
     }
+    painter.add(radial_shape(centre, radius, color, None));
+}
+
+/// The mesh behind [`radial_wash`]. With `inside`, the rim is pulled in to
+/// that rectangle, so a light can be kept on the card it belongs to without a
+/// clip rect — which a reserved paint slot cannot have.
+pub fn radial_shape(
+    centre: egui::Pos2,
+    radius: f32,
+    color: Color32,
+    inside: Option<Rect>,
+) -> egui::Shape {
     const SEG: usize = 64;
     let edge = Color32::from_rgba_premultiplied(0, 0, 0, 0);
 
@@ -248,16 +260,17 @@ pub fn radial_wash(painter: &egui::Painter, centre: egui::Pos2, radius: f32, col
     mesh.colored_vertex(centre, color);
     for i in 0..SEG {
         let a = (i as f32 / SEG as f32) * std::f32::consts::TAU;
-        mesh.colored_vertex(
-            egui::pos2(centre.x + radius * a.cos(), centre.y + radius * a.sin()),
-            edge,
-        );
+        let mut p = egui::pos2(centre.x + radius * a.cos(), centre.y + radius * a.sin());
+        if let Some(r) = inside {
+            p = p.clamp(r.min, r.max);
+        }
+        mesh.colored_vertex(p, edge);
     }
     let n = SEG as u32;
     for i in 0..n {
         mesh.add_triangle(0, 1 + i, 1 + (i + 1) % n);
     }
-    painter.add(egui::Shape::mesh(mesh));
+    egui::Shape::mesh(mesh)
 }
 
 /// Fixed room lighting, sampled as a mesh so it remains smooth at every DPI.
@@ -492,69 +505,6 @@ pub fn plate_gutters(ctx: &egui::Context) {
         .show(ctx, |_| {});
 }
 
-/// A card whose background is the brand gradient. Used for the balance hero.
-pub fn gradient_card<R>(
-    ui: &mut egui::Ui,
-    height: f32,
-    flash: f32,
-    add: impl FnOnce(&mut egui::Ui) -> R,
-) -> R {
-    let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
-    ui.painter().add(egui::Shape::Rect(
-        glass_card_shadow().as_shape(rect, Rounding::same(ROUND)),
-    ));
-    gradient_rect(
-        ui.painter(),
-        rect,
-        ROUND,
-        Vec2::new(1.0, 0.55),
-        brand_gradient,
-    );
-    gradient_rect(ui.painter(), rect, ROUND, Vec2::new(0.0, 1.0), |t| {
-        with_alpha(TEXT, ((1.0 - t).powf(2.2) * 28.0) as u8)
-    });
-    if flash > 0.02 {
-        radial_wash(
-            ui.painter(),
-            rect.center(),
-            rect.width().min(rect.height()) * 0.72,
-            with_alpha(PINK, (flash * 90.0) as u8),
-        );
-        radial_wash(
-            ui.painter(),
-            egui::pos2(rect.left() + rect.width() * 0.22, rect.center().y),
-            rect.height() * 0.85,
-            with_alpha(CYAN, (flash * 70.0) as u8),
-        );
-    }
-    // Contour detail stays on the right, behind content and clipped to the hero.
-    let painter = ui.painter().with_clip_rect(rect.shrink(12.0));
-    for line in 0..10 {
-        let points = (0..60)
-            .map(|i| {
-                let x = i as f32 / 59.0;
-                egui::pos2(
-                    rect.right() - rect.width() * 0.36 + x * rect.width() * 0.44,
-                    rect.bottom() - 12.0 - line as f32 * 8.0 - (x * 5.0).sin() * 20.0,
-                )
-            })
-            .collect();
-        painter.add(egui::Shape::line(
-            points,
-            Stroke::new(1.0_f32, with_alpha(INK, 22)),
-        ));
-    }
-
-    let inner = rect.shrink(22.0);
-    let mut child = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(inner)
-            .layout(egui::Layout::top_down(egui::Align::LEFT)),
-    );
-    add(&mut child)
-}
-
 /// Test-only: the outer rect of every outermost [`card`] drawn this frame.
 ///
 /// A card's edges are the one thing a screenshot shows plainly and a layout
@@ -622,12 +572,16 @@ pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let floor = if depth == 0 { CARD_FLOOR.get() } else { 0.0 };
     #[cfg(test)]
     card_probe::enter();
+    // The sheet is painted into a slot reserved before the content, once the
+    // content has decided how tall the card is: shadow, glass, a lit top
+    // edge, and — while the pointer is over it — a soft light under the
+    // pointer. All of it sits behind the text.
+    let slot = ui.painter().add(egui::Shape::Noop);
     let drawn = egui::Frame::none()
-        .fill(glass_surface())
+        .fill(Color32::TRANSPARENT)
         .stroke(Stroke::NONE)
         .rounding(Rounding::same(ROUND))
         .inner_margin(egui::Margin::same(22.0))
-        .shadow(glass_card_shadow())
         .show(ui, |ui| {
             fill_width(ui, (outer - 44.0).max(0.0));
             let y0 = ui.cursor().top();
@@ -647,6 +601,8 @@ pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
             (out, natural)
         });
     let (out, natural) = drawn.inner;
+    ui.painter()
+        .set(slot, card_sheet(ui.ctx(), drawn.response.rect, depth == 0));
     if depth == 0 {
         ROW_HEIGHTS.with(|h| h.borrow_mut().push(natural));
     }
@@ -654,6 +610,38 @@ pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     #[cfg(test)]
     card_probe::leave(drawn.response.rect);
     out
+}
+
+/// Everything a card's sheet is made of, behind its content.
+fn card_sheet(ctx: &egui::Context, rect: Rect, outermost: bool) -> egui::Shape {
+    let mut shapes = Vec::with_capacity(4);
+    if outermost {
+        shapes.push(egui::Shape::Rect(
+            glass_card_shadow().as_shape(rect, Rounding::same(ROUND)),
+        ));
+    }
+    shapes.push(egui::Shape::rect_filled(
+        rect,
+        Rounding::same(ROUND),
+        glass_surface(),
+    ));
+    // Light caught along the top, fading out a third of the way down: the
+    // sheet has a front edge without a drawn line.
+    shapes.push(gradient_shape(rect, ROUND, Vec2::new(0.0, 1.0), |t| {
+        let k = (1.0 - t / 0.34).max(0.0);
+        Color32::from_white_alpha((k * k * 13.0) as u8)
+    }));
+    if outermost && crate::fx::motion() {
+        if let Some(p) = ctx.pointer_hover_pos().filter(|p| rect.contains(*p)) {
+            shapes.push(radial_shape(
+                p,
+                rect.width().min(420.0) * 0.75,
+                with_alpha(GRAD_A, 16),
+                Some(rect.shrink(1.0)),
+            ));
+        }
+    }
+    egui::Shape::Vec(shapes)
 }
 
 /// One row of a data list: label left, value hard right, hairline under.
@@ -1167,15 +1155,36 @@ pub fn primary_button_width(
         .inner;
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, text));
 
+    // Pressed, the button sinks a little and springs back; hovered, it lifts
+    // and its glow brightens. The allocated rectangle never changes, so the
+    // layout around it does not move — only the paint does.
+    let hot = enabled && resp.hovered();
+    let scale = crate::fx::spring(
+        ui.ctx(),
+        resp.id.with("press"),
+        if enabled && resp.is_pointer_button_down_on() {
+            0.95
+        } else {
+            1.0
+        },
+    );
+    let lift = crate::fx::spring(ui.ctx(), resp.id.with("lift"), if hot { 1.0 } else { 0.0 });
+    let drawn = Rect::from_center_size(
+        rect.center() - Vec2::new(0.0, lift * 1.5),
+        rect.size() * scale,
+    );
     if enabled {
-        let hot = resp.hovered();
-        gradient_rect(ui.painter(), rect, ROUND_SM, Vec2::new(1.0, 0.0), |t| {
-            let c = brand_gradient(t * 0.7);
-            if hot {
-                lerp_color(c, Color32::WHITE, 0.07)
-            } else {
-                c
+        ui.painter().add(egui::Shape::Rect(
+            egui::epaint::Shadow {
+                offset: egui::vec2(0.0, 6.0 + lift * 3.0),
+                blur: 18.0 + lift * 8.0,
+                spread: -4.0,
+                color: with_alpha(GRAD_A, (70.0 + lift * 60.0) as u8),
             }
+            .as_shape(drawn, Rounding::same(ROUND_SM)),
+        ));
+        gradient_rect(ui.painter(), drawn, ROUND_SM, Vec2::new(1.0, 0.0), |t| {
+            lerp_color(brand_gradient(t * 0.7), Color32::WHITE, 0.07 * lift)
         });
         // Glass buttons: fill only. A 1px top stroke read as a white hairline.
     } else {
@@ -1185,12 +1194,12 @@ pub fn primary_button_width(
 
     if resp.has_focus() {
         ui.painter().rect_stroke(
-            rect.expand(3.0),
+            drawn.expand(3.0),
             Rounding::same(ROUND_SM),
             Stroke::new(2.0_f32, ACCENT_HI),
         );
     }
-    let pos = rect.center() - galley.size() / 2.0;
+    let pos = drawn.center() - galley.size() / 2.0;
     ui.painter().galley(pos, galley, fg);
 
     if enabled && resp.hovered() {
@@ -1362,6 +1371,31 @@ pub fn segmented(ui: &mut egui::Ui, id: &str, labels: &[&str], selected: usize) 
         glass_surface(),
         Stroke::NONE,
     );
+    // The chosen segment is one lit tile that slides to its answer.
+    let knob_x = crate::fx::spring(
+        ui.ctx(),
+        egui::Id::new(("segmented-knob", id)),
+        seg_w * selected.min(labels.len().saturating_sub(1)) as f32,
+    );
+    let knob = Rect::from_min_size(
+        egui::pos2(rect.left() + PAD + knob_x, rect.top() + PAD),
+        Vec2::new(seg_w, rect.height() - PAD * 2.0),
+    );
+    ui.painter().add(egui::Shape::Rect(
+        egui::epaint::Shadow {
+            offset: egui::vec2(0.0, 2.0),
+            blur: 8.0,
+            spread: 0.0,
+            color: with_alpha(INK, 90),
+        }
+        .as_shape(knob, Rounding::same((ROUND_SM - PAD).max(0.0))),
+    ));
+    ui.painter().rect(
+        knob,
+        Rounding::same((ROUND_SM - PAD).max(0.0)),
+        glass_inner(),
+        Stroke::new(1.0_f32, with_alpha(GRAD_A, 40)),
+    );
     let mut clicked = None;
     for (index, label) in labels.iter().enumerate() {
         let seg = Rect::from_min_size(
@@ -1379,15 +1413,7 @@ pub fn segmented(ui: &mut egui::Ui, id: &str, labels: &[&str], selected: usize) 
             )
         });
         if on {
-            // The chosen half carries the accent. At SURFACE_HI on SURFACE_LOW
-            // the difference was one step of grey, and which way round a swap
-            // runs is not something to leave to a careful look.
-            ui.painter().rect(
-                seg,
-                Rounding::same((ROUND_SM - PAD).max(0.0)),
-                glass_inner(),
-                Stroke::NONE,
-            );
+            // Drawn above as the sliding tile.
         } else if resp.hovered() {
             ui.painter().rect_filled(
                 seg,
@@ -1544,62 +1570,78 @@ pub fn inset_note<R>(ui: &mut egui::Ui, tone: Color32, add: impl FnOnce(&mut egu
 /// and accented when on, clearly outlined when off, and the label is part of
 /// the hit area rather than a separate piece of text beside it.
 pub fn check(ui: &mut egui::Ui, on: &mut bool, label: &str) -> bool {
-    const BOX: f32 = 17.0;
-    const GAP: f32 = 10.0;
+    // A switch, as on every Apple settings page: the label reads on the left,
+    // the answer sits at the right edge where the eye goes for it.
+    const SW: Vec2 = Vec2::new(44.0, 26.0);
+    const GAP: f32 = 14.0;
     let width = ui.available_width();
     let galley = ui.fonts(|f| {
         f.layout(
             label.to_string(),
-            egui::FontId::proportional(13.0),
+            egui::FontId::proportional(13.5),
             TEXT,
-            (width - BOX - GAP).max(40.0),
+            (width - SW.x - GAP).max(40.0),
         )
     });
-    let height = galley.size().y.max(BOX);
+    let height = galley.size().y.max(SW.y);
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
     let enabled = ui.is_enabled();
     let hot = resp.hovered() && enabled;
-    let square = Rect::from_min_size(
-        egui::pos2(rect.left(), rect.top() + (height - BOX) / 2.0),
-        Vec2::splat(BOX),
+    let track = Rect::from_min_size(
+        egui::pos2(rect.right() - SW.x, rect.top() + (height - SW.y) / 2.0),
+        SW,
     );
-    let (fill, stroke) = match (*on, hot) {
-        (true, _) => (GRAD_A, GRAD_A),
-        (false, true) => (SURFACE_HOVER, ACCENT_HI),
-        (false, false) => (SURFACE_LOW, with_alpha(TEXT, 35)),
+    let k = crate::fx::spring(
+        ui.ctx(),
+        resp.id.with("switch"),
+        if *on { 1.0 } else { 0.0 },
+    );
+    let off_fill = if hot { SURFACE_HOVER } else { SURFACE_LOW };
+    let fill = if enabled {
+        lerp_color(off_fill, SUCCESS, k.clamp(0.0, 1.0))
+    } else {
+        SURFACE_LOW
     };
     ui.painter().rect(
-        square,
-        Rounding::same(5.0),
-        if enabled { fill } else { SURFACE_LOW },
-        Stroke::new(
-            1.0_f32,
-            if enabled {
-                stroke
-            } else {
-                with_alpha(TEXT, 25)
-            },
-        ),
+        track,
+        Rounding::same(SW.y / 2.0),
+        fill,
+        Stroke::new(1.0_f32, with_alpha(TEXT, if *on { 0 } else { 30 })),
     );
-    if *on {
-        // A tick drawn as two strokes, not a glyph: the bundled font has no
-        // check mark, and a missing glyph is a box — which is exactly the
-        // thing an unticked checkbox already looks like.
-        let c = square.center();
-        ui.painter().add(egui::Shape::line(
-            vec![
-                egui::pos2(c.x - 4.0, c.y),
-                egui::pos2(c.x - 1.0, c.y + 3.2),
-                egui::pos2(c.x + 4.2, c.y - 3.4),
-            ],
-            Stroke::new(2.0_f32, INK),
-        ));
+    let squeeze = if resp.is_pointer_button_down_on() {
+        5.0
+    } else {
+        0.0
+    };
+    let r = SW.y / 2.0 - 2.5;
+    let x = track.left() + 2.5 + r + k * (SW.x - 5.0 - 2.0 * r);
+    let knob = Rect::from_center_size(
+        egui::pos2(x, track.center().y),
+        Vec2::new(r * 2.0 + squeeze, r * 2.0),
+    );
+    ui.painter().add(egui::Shape::Rect(
+        egui::epaint::Shadow {
+            offset: egui::vec2(0.0, 2.0),
+            blur: 6.0,
+            spread: 0.0,
+            color: Color32::from_black_alpha(70),
+        }
+        .as_shape(knob, Rounding::same(r)),
+    ));
+    ui.painter().rect_filled(
+        knob,
+        Rounding::same(r),
+        if enabled { Color32::WHITE } else { TEXT_FAINT },
+    );
+    if resp.has_focus() {
+        ui.painter().rect_stroke(
+            track.expand(3.0),
+            Rounding::same(SW.y / 2.0 + 3.0),
+            Stroke::new(2.0_f32, ACCENT_HI),
+        );
     }
     ui.painter().galley(
-        egui::pos2(
-            square.right() + GAP,
-            rect.top() + (height - galley.size().y) / 2.0,
-        ),
+        egui::pos2(rect.left(), rect.top() + (height - galley.size().y) / 2.0),
         galley,
         if enabled { TEXT } else { TEXT_FAINT },
     );
@@ -1713,21 +1755,53 @@ pub fn qr_code(ui: &mut egui::Ui, data: &str, size: f32) {
 
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, Rounding::same(6.0), Color32::WHITE);
+    // A soft violet glow under a white card.
+    painter.add(egui::Shape::Rect(
+        egui::epaint::Shadow {
+            offset: egui::vec2(0.0, 14.0),
+            blur: 34.0,
+            spread: -6.0,
+            color: with_alpha(ACCENT, 150),
+        }
+        .as_shape(rect, Rounding::same(18.0)),
+    ));
+    painter.rect_filled(rect, Rounding::same(18.0), Color32::WHITE);
 
+    // Modules stay square and dark-on-white: a code that looks nicer but
+    // scans worse is a worse code. Only the three finder eyes are drawn as
+    // rounded rings in the wallet's ink, which every scanner still reads.
+    let ink = INK;
     let colors = code.to_colors();
+    let in_finder = |x: usize, y: usize| {
+        let f = |a: usize, b: usize| x >= a && x < a + 7 && y >= b && y < b + 7;
+        f(0, 0) || f(width - 7, 0) || f(0, width - 7)
+    };
     for y in 0..width {
         for x in 0..width {
-            if colors[y * width + x] == qrcode::Color::Dark {
+            if colors[y * width + x] == qrcode::Color::Dark && !in_finder(x, y) {
                 let min =
                     rect.min + Vec2::new((x + quiet) as f32 * scale, (y + quiet) as f32 * scale);
                 painter.rect_filled(
                     Rect::from_min_size(min, Vec2::splat(scale.ceil())),
                     Rounding::ZERO,
-                    Color32::BLACK,
+                    ink,
                 );
             }
         }
+    }
+    for (fx, fy) in [(0, 0), (width - 7, 0), (0, width - 7)] {
+        let at = |n: usize| (n + quiet) as f32 * scale;
+        let outer = Rect::from_min_size(
+            rect.min + Vec2::new(at(fx), at(fy)),
+            Vec2::splat(7.0 * scale),
+        );
+        painter.rect_filled(outer, Rounding::same(scale * 2.0), ink);
+        painter.rect_filled(
+            outer.shrink(scale),
+            Rounding::same(scale * 1.4),
+            Color32::WHITE,
+        );
+        painter.rect_filled(outer.shrink(scale * 2.0), Rounding::same(scale), ACCENT);
     }
 }
 
@@ -1791,13 +1865,19 @@ impl Toasts {
             } else {
                 1.0
             };
-            let appear = ((age / 0.28).clamp(0.0, 1.0) as f32).powf(0.65);
-            let alpha = fade * appear;
-            let y_off = (1.0 - appear) * 18.0;
+            let appear = if crate::fx::motion() {
+                // A spring-like arrival: overshoot a few points, settle.
+                let p = (age / 0.45).clamp(0.0, 1.0) as f32;
+                1.0 - (1.0 - p).powi(3) * (1.0 + 2.2 * p)
+            } else {
+                1.0
+            };
+            let alpha = fade * appear.clamp(0.0, 1.0);
+            let x_off = (1.0 - appear) * 60.0;
 
             let id = egui::Id::new(("toast", toast.created.to_bits()));
             let shown = egui::Area::new(id)
-                .fixed_pos(egui::pos2(screen.max.x - 24.0, y + y_off))
+                .fixed_pos(egui::pos2(screen.max.x - 24.0 + x_off, y))
                 .pivot(egui::Align2::RIGHT_BOTTOM)
                 .interactable(false)
                 .show(ctx, |ui| {
@@ -1806,24 +1886,22 @@ impl Toasts {
                     egui::Frame::none()
                         // Toasts overlap page text: use opaque frost so the
                         // message never merges with the content underneath.
-                        .fill(tint(SURFACE, toast.color, 0.14))
-                        .stroke(Stroke::NONE)
-                        .rounding(Rounding::same(ROUND_SM))
-                        .inner_margin(egui::Margin::symmetric(14.0, 11.0))
+                        .fill(tint(SURFACE, toast.color, 0.10))
+                        .stroke(Stroke::new(1.0_f32, with_alpha(toast.color, 50)))
+                        .rounding(Rounding::same(ROUND_SM + 4.0))
+                        .inner_margin(egui::Margin::symmetric(16.0, 13.0))
                         .shadow(egui::epaint::Shadow {
-                            offset: egui::vec2(0.0, 4.0),
-                            blur: 16.0,
+                            offset: egui::vec2(0.0, 10.0),
+                            blur: 28.0,
                             spread: 0.0,
-                            color: Color32::from_black_alpha(120),
+                            color: Color32::from_black_alpha(130),
                         })
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                ui.painter().circle_filled(
-                                    ui.cursor().min + Vec2::new(3.0, 8.0),
-                                    3.5,
-                                    toast.color,
-                                );
-                                ui.add_space(12.0);
+                                let c = ui.cursor().min + Vec2::new(9.0, 9.0);
+                                radial_wash(ui.painter(), c, 14.0, with_alpha(toast.color, 90));
+                                ui.painter().circle_filled(c, 4.5, toast.color);
+                                ui.add_space(24.0);
                                 ui.add(
                                     egui::Label::new(RichText::new(&toast.text).color(TEXT)).wrap(),
                                 );

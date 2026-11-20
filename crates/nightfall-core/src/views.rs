@@ -122,6 +122,16 @@ fn night(darks: u64) -> String {
     format!("{}.{:08}", format_int(whole), frac)
 }
 
+/// An amount as the amount field accepts it: no thousands separators.
+///
+/// MAX used to write `night()` into the field and strip a narrow no-break
+/// space that `format_int` no longer produces — it writes commas now — so
+/// from 1,000 NIGHT up MAX filled in "2,747.99900000" and the field's own
+/// parser refused it.
+fn amount_field_text(darks: u64) -> String {
+    night(darks).replace([',', '\u{202F}'], "")
+}
+
 // `manual_is_multiple_of` does not exist on every toolchain we build with;
 // `unknown_lints` keeps the older one from failing on the allow itself.
 #[allow(unknown_lints)]
@@ -136,6 +146,39 @@ fn night_compact(darks: u64) -> String {
 }
 
 // ------------------------------------------------------------- dashboard ---
+
+/// The shape of the balance over its last movements, for the hero's hill.
+///
+/// Walked backwards from what is spendable now, undoing one entry at a time.
+/// It is a picture, not a ledger: unlocking rewards and failed sends make it
+/// approximate, so it carries no numbers and nothing reads a value off it.
+fn balance_history(app: &App, now_available: u64) -> Vec<f64> {
+    let Ok(wallet) = app.wallet.lock() else {
+        return Vec::new();
+    };
+    let mut entries: Vec<_> = wallet
+        .history()
+        .iter()
+        .filter(|e| !e.failed && !e.quarantined)
+        .map(|e| (e.timestamp, e.direction, e.amount, e.fee))
+        .collect();
+    drop(wallet);
+    entries.sort_by_key(|e| std::cmp::Reverse(e.0));
+    let mut value = now_available as f64;
+    let mut out = vec![value];
+    for (_, direction, amount, fee) in entries.into_iter().take(40) {
+        match direction {
+            Direction::Received | Direction::Mined => value -= amount as f64,
+            Direction::Sent => value += (amount + fee) as f64,
+        }
+        out.push(value.max(0.0));
+    }
+    out.reverse();
+    if out.len() < 3 {
+        return Vec::new();
+    }
+    out
+}
 
 pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
     let tip = app.tip_height();
@@ -274,32 +317,61 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
     // chips competing with the figure they qualify. The chips used to be the
     // same visual weight as the balance, so "12 NIGHT" and "3 outputs" read
     // as two facts of equal rank.
-    gradient_card(ui, 156.0, app.coin_flash_amount(ui.ctx()), |ui| {
-        ui.label(RichText::new("SPENDABLE").size(11.0).color(INK).strong());
-        ui.add_space(2.0);
+    // The hero is deep enough for white, so the two actions sit on it as a
+    // white pill and a clear one — the pastel gradient this replaced could
+    // not carry a white button, which is why they used to live underneath.
+    let history = balance_history(app, balances.available);
+    let count = app.wallet.lock().map(|w| w.output_count()).unwrap_or(0);
+    let mut go_to = None;
+    crate::fx::hero_card(ui, 256.0, app.coin_flash_amount(ui.ctx()), &history, |ui| {
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(night(balances.available))
-                    .size(42.0)
-                    .color(INK)
-                    .strong(),
+                RichText::new("SPENDABLE")
+                    .size(11.0)
+                    .color(Color32::WHITE)
+                    .strong()
+                    .extra_letter_spacing(1.2),
             );
-            ui.add_space(8.0);
+            ui.add_space(6.0);
+            let net = app.network.as_str().to_uppercase();
+            let galley = ui.painter().layout_no_wrap(
+                net.clone(),
+                egui::FontId::proportional(10.0),
+                Color32::WHITE,
+            );
+            let (r, _) =
+                ui.allocate_exact_size(galley.size() + Vec2::new(14.0, 6.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(r, Rounding::same(999.0), Color32::from_white_alpha(34));
+            ui.painter()
+                .galley(r.center() - galley.size() / 2.0, galley, Color32::WHITE);
+        });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            crate::fx::odometer(
+                ui,
+                egui::Id::new("hero-balance"),
+                balances.available,
+                8,
+                46.0,
+                Color32::WHITE,
+            )
+            .on_hover_text(format!("{} NIGHT", night(balances.available)));
+            ui.add_space(10.0);
             ui.label(
                 RichText::new("NIGHT")
-                    .size(15.0)
-                    .color(INK.gamma_multiply(0.72))
+                    .size(16.0)
+                    .color(Color32::WHITE)
                     .strong(),
             );
         });
-        ui.add_space(10.0);
-        let count = app.wallet.lock().map(|w| w.output_count()).unwrap_or(0);
+        ui.add_space(8.0);
         let mut parts = Vec::new();
         if balances.immature > 0 {
-            parts.push(format!("{} unlocking", night(balances.immature)));
+            parts.push(format!("{} unlocking", night_compact(balances.immature)));
         }
         if balances.pending_out > 0 {
-            parts.push(format!("{} pending", night(balances.pending_out)));
+            parts.push(format!("{} pending", night_compact(balances.pending_out)));
         }
         parts.push(format!(
             "{count} output{}",
@@ -307,27 +379,26 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
         ));
         ui.label(
             RichText::new(parts.join("  ·  "))
-                .size(12.0)
-                .color(INK.gamma_multiply(0.78)),
+                .size(12.5)
+                .color(Color32::WHITE),
         );
+        ui.add_space(18.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            if crate::fx::hero_button(ui, "send", "Send", true).clicked() {
+                go_to = Some(View::Send);
+            }
+            if crate::fx::hero_button(ui, "receive", "Receive", false).clicked() {
+                go_to = Some(View::Receive);
+            }
+        });
     });
+    if let Some(view) = go_to {
+        app.view = view;
+    }
 
-    // Actions live below the gradient, not on it: a white pill on the light end
-    // of the gradient is nearly invisible.
     ui.add_space(GAP_MD);
     ui.horizontal_wrapped(|ui| {
-        // One width for both. "Send" at 75 points beside "Receive" at 92 was
-        // two sizes for one pair of equally important choices — and the
-        // padding hack that produced it (`"  Receive  "`) is exactly the kind
-        // of thing that stops working the moment the label changes.
-        if let Some(index) = button_row(ui, &["Send", "Receive"], true) {
-            app.view = if index == 0 {
-                View::Send
-            } else {
-                View::Receive
-            };
-        }
-
         // The wallet syncs itself every few seconds; this is a status readout,
         // not a button. Nothing here should ever need clicking to stay current.
         //
@@ -1524,7 +1595,7 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                         .clicked()
                     {
                         let max = balances.available.saturating_sub(app.send_fee);
-                        app.send_amount = night(max).replace('\u{202F}', "");
+                        app.send_amount = amount_field_text(max);
                     }
                     ui.label(
                         RichText::new(format!("Available {}", night(balances.available)))
@@ -1757,17 +1828,20 @@ pub fn send(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                         );
                     });
 
-                ui.add_space(16.0);
-                ui.horizontal(|ui| {
-                    if primary_button(
-                        ui,
-                        "Send now",
-                        !app.send_busy && app.wallet_sync_error.is_none(),
-                    )
-                    .clicked()
-                    {
-                        do_send = true;
-                    }
+                ui.add_space(18.0);
+                // The last step is a gesture rather than a click: a payment
+                // cannot be undone, and a slide cannot happen by accident.
+                // It does exactly what the "Send now" button did.
+                if crate::fx::slide_to_confirm(
+                    ui,
+                    "send-payment",
+                    "Slide to send",
+                    !app.send_busy && app.wallet_sync_error.is_none(),
+                ) {
+                    do_send = true;
+                }
+                ui.add_space(10.0);
+                ui.vertical_centered(|ui| {
                     if ghost_button(ui, "Cancel").clicked() {
                         cancel = true;
                     }
@@ -2666,32 +2740,42 @@ pub fn mining(app: &mut App, ui: &mut egui::Ui) {
         if let Some(error) = &app.reward_sound_error {
             ui.label(RichText::new(error).size(11.5).color(TEXT_DIM));
         }
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            dot(ui, if mining { SUCCESS } else { TEXT_DIM }, mining);
-            ui.add_space(8.0);
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new(if mining { "Mining" } else { "Stopped" })
-                        .size(22.0)
-                        .strong(),
-                );
-                ui.label(
-                    RichText::new(if mining {
-                        format_hashrate(app.hashrate.current)
+        ui.add_space(4.0);
+        // One big switch, lit while it runs. No fee either way: the whole
+        // block reward goes to this wallet.
+        ui.vertical_centered(|ui| {
+            if crate::fx::power_button(ui, mining, 150.0)
+                .on_hover_text(if mining {
+                    "Stop mining"
+                } else {
+                    "Start mining"
+                })
+                .clicked()
+            {
+                app.set_mining(!mining);
+            }
+            ui.label(
+                RichText::new(if mining { "Mining" } else { "Start mining" })
+                    .size(20.0)
+                    .strong(),
+            );
+            ui.label(
+                RichText::new(if mining {
+                    let engine = if app.gpu_mining {
+                        "GPU".to_string()
                     } else {
-                        "CPU idle".to_string()
-                    })
-                    .size(13.0)
-                    .color(if mining { ACCENT_HI } else { TEXT_DIM }),
-                );
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let label = if mining { "Stop" } else { "Start mining" };
-                if primary_button(ui, label, true).clicked() {
-                    app.set_mining(!mining);
-                }
-            });
+                        format!("{} CPU threads", app.mining_threads)
+                    };
+                    format!(
+                        "{} · {engine} · no fee",
+                        format_hashrate(app.hashrate.current)
+                    )
+                } else {
+                    "Press the button · no fee, the whole reward is yours".to_string()
+                })
+                .size(13.0)
+                .color(if mining { ACCENT_HI } else { TEXT_DIM }),
+            );
         });
 
         if mining {
@@ -2720,9 +2804,9 @@ pub fn mining(app: &mut App, ui: &mut egui::Ui) {
             false,
         );
 
-        if app.hashrate.history.len() > 2 {
+        if app.hashrate.history.len() > 2 && app.hashrate.history.iter().any(|v| *v > 0.0) {
             ui.add_space(16.0);
-            sparkline(ui, &app.hashrate.history, 72.0);
+            crate::fx::area_chart(ui, &app.hashrate.history, 96.0);
         }
 
         ui.add_space(16.0);
@@ -2733,9 +2817,15 @@ pub fn mining(app: &mut App, ui: &mut egui::Ui) {
         ui.label(RichText::new("CPU threads").size(12.0).color(TEXT_DIM));
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            let mut n = app.mining_threads as i32;
-            let resp = ui.add(egui::Slider::new(&mut n, 1..=max_threads).integer());
-            if resp.changed() {
+            let room = (ui.available_width() - 150.0).clamp(160.0, 420.0);
+            if let Some(n) = crate::fx::slider_int(
+                ui,
+                "mining-threads",
+                app.mining_threads as i32,
+                1,
+                max_threads,
+                room,
+            ) {
                 app.set_mining_threads(n as usize);
             }
             ui.label(
@@ -2758,17 +2848,15 @@ pub fn mining(app: &mut App, ui: &mut egui::Ui) {
             ui.label(RichText::new("GPU").size(12.0).color(TEXT_DIM));
             ui.add_space(4.0);
             let mut on = app.gpu_mining;
-            if ui
-                .checkbox(
-                    &mut on,
-                    if cfg!(target_os = "macos") {
-                        "Mine with the Apple GPU (Metal) instead of CPU threads"
-                    } else {
-                        "Mine with the NVIDIA GPU (CUDA) instead of CPU threads"
-                    },
-                )
-                .changed()
-            {
+            if check(
+                ui,
+                &mut on,
+                if cfg!(target_os = "macos") {
+                    "Mine with the Apple GPU (Metal) instead of CPU threads"
+                } else {
+                    "Mine with the NVIDIA GPU (CUDA) instead of CPU threads"
+                },
+            ) {
                 app.set_gpu_mining(on);
             }
             ui.add_space(4.0);
@@ -3012,38 +3100,6 @@ fn human_duration(secs: f64) -> String {
     }
 }
 
-fn sparkline(ui: &mut egui::Ui, data: &[f64], height: f32) {
-    let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
-    let max = data.iter().cloned().fold(f64::MIN, f64::max).max(1.0);
-    let n = data.len();
-    if n < 2 {
-        return;
-    }
-
-    let painter = ui.painter();
-    painter.rect_filled(rect, Rounding::same(6.0), SURFACE_HI);
-
-    let points: Vec<egui::Pos2> = data
-        .iter()
-        .enumerate()
-        .map(|(i, v)| {
-            let x = rect.min.x + 6.0 + (rect.width() - 12.0) * (i as f32 / (n - 1) as f32);
-            let y = rect.max.y - 6.0 - (rect.height() - 12.0) * (*v / max) as f32;
-            egui::pos2(x, y)
-        })
-        .collect();
-
-    painter.add(egui::Shape::line(
-        points.clone(),
-        Stroke::new(1.8_f32, ACCENT_HI),
-    ));
-
-    if let Some(last) = points.last() {
-        painter.circle_filled(*last, 3.0, ACCENT_HI);
-    }
-}
-
 // --------------------------------------------------------------- network ---
 
 pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -3075,7 +3131,11 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 .strong(),
             );
         });
-        ui.add_space(14.0);
+        ui.add_space(4.0);
+        // How many, never where: the lights are placed by their number, not by
+        // any address, so the picture leaks nothing a screenshot could share.
+        crate::fx::globe(ui, 250.0, peers, s.map(|s| s.reachable_nodes).unwrap_or(0));
+        ui.add_space(10.0);
         metric_grid(
             ui,
             &[
@@ -3905,6 +3965,21 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 .size(11.0)
                 .color(TEXT_DIM),
             );
+            ui.add_space(14.0);
+            let mut still = app.reduce_motion;
+            if check(ui, &mut still, "Reduce motion") {
+                app.set_reduce_motion(still);
+            }
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "Turns off page transitions, springs, rolling numbers and celebrations. \
+                     Everything still works the same. ⌘K opens a quick search for pages and \
+                     common actions; ⌘1 to ⌘7 jump straight to a page.",
+                )
+                .size(11.0)
+                .color(TEXT_DIM),
+            );
         });
     }
 
@@ -3985,4 +4060,19 @@ pub fn onboarding(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     // draws. A second copy of them here was the same fact stated twice, one
     // line apart, in two different sizes.
     app.show_onboarding(ui, ctx);
+}
+
+#[cfg(test)]
+mod amount_field_tests {
+    use super::amount_field_text;
+    use crate::app::parse_amount;
+
+    #[test]
+    fn max_fills_in_an_amount_the_field_accepts() {
+        for darks in [1, 100_000_000, 274_799_900_000, 8_999_999_912_345_678] {
+            let text = amount_field_text(darks);
+            assert!(!text.contains(','), "{text}");
+            assert_eq!(parse_amount(&text), Ok(darks), "{text}");
+        }
+    }
 }

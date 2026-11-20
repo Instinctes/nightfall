@@ -93,6 +93,15 @@ pub const GRAD_A: Color32 = Color32::from_rgb(0xBD, 0xA2, 0xFF);
 pub const PINK: Color32 = Color32::from_rgb(0xE7, 0x9C, 0xEF);
 pub const CYAN: Color32 = Color32::from_rgb(0x78, 0xDB, 0xEC);
 
+/// The hero: Nightfall violet into orchid into deep teal. Dark enough that
+/// white text reads on every point of it — pinned by
+/// `white_reads_on_the_hero` — which the pastel brand gradient is not.
+pub const HERO_A: Color32 = Color32::from_rgb(0x6A, 0x43, 0xD6);
+pub const HERO_B: Color32 = Color32::from_rgb(0x8A, 0x3D, 0xAE);
+pub const HERO_C: Color32 = Color32::from_rgb(0x2B, 0x7A, 0x96);
+/// Text on the white pill that sits on the hero.
+pub const HERO_INK: Color32 = Color32::from_rgb(0x3A, 0x22, 0x8C);
+
 pub const SUCCESS: Color32 = Color32::from_rgb(0x4A, 0xE0, 0xA8);
 pub const WARN: Color32 = Color32::from_rgb(0xFF, 0xC8, 0x5C);
 pub const DANGER: Color32 = Color32::from_rgb(0xFF, 0x7B, 0x8A);
@@ -189,6 +198,9 @@ pub fn apply(ctx: &egui::Context) {
     v.selection.bg_fill = ACCENT_DIM;
     v.selection.stroke = Stroke::new(1.0_f32, ACCENT_HI);
     v.hyperlink_color = ACCENT_HI;
+    // Sliders fill up to the handle, as on macOS, instead of a bare groove.
+    v.slider_trailing_fill = true;
+    v.handle_shape = egui::style::HandleShape::Circle;
 
     // Text fields inherit these. Buttons override with a pill of their own, so
     // the radius here is the field radius — see `ROUND_FIELD`.
@@ -372,9 +384,34 @@ pub fn brand_gradient(t: f32) -> Color32 {
     }
 }
 
+/// Sample the hero gradient at `t ∈ [0,1]`.
+pub fn hero_gradient(t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    if t < 0.5 {
+        lerp_color(HERO_A, HERO_B, t / 0.5)
+    } else {
+        lerp_color(HERO_B, HERO_C, (t - 0.5) / 0.5)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The balance is written in white on the hero, at every point of it.
+    #[test]
+    fn white_reads_on_the_hero() {
+        for step in 0..=100 {
+            let background = hero_gradient(step as f32 / 100.0);
+            let ratio = (luminance(Color32::WHITE) + 0.05) / (luminance(background) + 0.05);
+            assert!(
+                ratio >= 4.5,
+                "white on the hero at {step}% is {ratio:.2}:1 ({background:?})"
+            );
+        }
+        let pill = (luminance(Color32::WHITE) + 0.05) / (luminance(HERO_INK) + 0.05);
+        assert!(pill >= 4.5, "hero pill text is {pill:.2}:1");
+    }
     #[test]
     fn original_nightfall_palette_is_preserved() {
         // UI refinements must not silently turn Nightfall into a graphite theme.
