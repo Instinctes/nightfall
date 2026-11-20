@@ -433,7 +433,85 @@ fn hero_sky(
     }
 }
 
-/// The balance card: a deep violet-to-teal sheet with white text and a slowly
+/// One of Nightfall's symbols, drawn from strokes and meshes so it needs no
+/// font: 0 a crescent moon, 1 a NIGHT coin, 2 a block, 3 a sparkle.
+fn night_symbol(
+    painter: &egui::Painter,
+    kind: u32,
+    c: Pos2,
+    size: f32,
+    angle: f32,
+    colour: Color32,
+) {
+    let rot = |v: Vec2| {
+        let (s, co) = angle.sin_cos();
+        c + Vec2::new(v.x * co - v.y * s, v.x * s + v.y * co)
+    };
+    let crescent = |r: f32, centre: Pos2| {
+        // The band between the outer edge and an inner curve that meets it
+        // at both horns.
+        let mut mesh = egui::Mesh::default();
+        const N: usize = 18;
+        for k in 0..=N {
+            let th = -std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * k as f32 / N as f32;
+            let (sn, cs) = th.sin_cos();
+            let (s, co) = angle.sin_cos();
+            let turn = |v: Vec2| centre + Vec2::new(v.x * co - v.y * s, v.x * s + v.y * co);
+            mesh.colored_vertex(turn(Vec2::new(r * cs, r * sn)), colour);
+            mesh.colored_vertex(turn(Vec2::new(r * 0.42 * cs, r * sn)), colour);
+        }
+        for k in 0..N as u32 {
+            let a = k * 2;
+            mesh.add_triangle(a, a + 1, a + 2);
+            mesh.add_triangle(a + 1, a + 3, a + 2);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+    };
+    match kind {
+        0 => crescent(size, c),
+        1 => {
+            painter.circle_stroke(c, size, Stroke::new(1.4_f32, colour));
+            painter.circle_stroke(c, size * 0.78, Stroke::new(0.8_f32, colour));
+            crescent(size * 0.5, c);
+        }
+        2 => {
+            let pts: Vec<Pos2> = (0..6)
+                .map(|k| rot(Vec2::angled(k as f32 * TAU / 6.0) * size))
+                .collect();
+            painter.add(egui::Shape::closed_line(
+                pts.clone(),
+                Stroke::new(1.4_f32, colour),
+            ));
+            let inner: Vec<Pos2> = (0..6)
+                .map(|k| rot(Vec2::angled(k as f32 * TAU / 6.0) * size * 0.45))
+                .collect();
+            painter.add(egui::Shape::convex_polygon(
+                inner,
+                with_alpha(colour, colour.a() / 2),
+                Stroke::NONE,
+            ));
+            // Links to the next block.
+            painter.line_segment(
+                [pts[0], rot(Vec2::new(size * 1.7, 0.0))],
+                Stroke::new(1.0_f32, colour),
+            );
+        }
+        _ => {
+            let mut mesh = egui::Mesh::default();
+            mesh.colored_vertex(c, colour);
+            for k in 0..8 {
+                let r = if k % 2 == 0 { size * 1.3 } else { size * 0.32 };
+                mesh.colored_vertex(rot(Vec2::angled(k as f32 * TAU / 8.0) * r), colour);
+            }
+            for k in 0..8_u32 {
+                mesh.add_triangle(0, 1 + k, 1 + (k + 1) % 8);
+            }
+            painter.add(egui::Shape::mesh(mesh));
+        }
+    }
+}
+
+/// The balance card: a light pastel sky with dark ink on it and a slowly
 /// moving aurora sky, a glare that follows the pointer and a few twinkling
 /// stars — all inside its rounded corners.
 ///
@@ -485,35 +563,48 @@ pub fn hero_card<R>(
         uv: Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
     }));
 
-    // Stars on the right, well inside the corners so none sits on the rim.
+    // Nightfall's own symbols drift up the right of the sky — moons, NIGHT
+    // coins, blocks and sparkles — well inside the corners, turning slowly
+    // and fading in and out as they rise.
     let field = Rect::from_min_max(
-        egui::pos2(rect.left() + rect.width() * 0.50, rect.top() + ROUND * 0.7),
-        egui::pos2(rect.right() - ROUND * 0.9, rect.bottom() - ROUND * 0.7),
+        egui::pos2(rect.left() + rect.width() * 0.48, rect.top() + ROUND * 0.6),
+        egui::pos2(rect.right() - ROUND * 0.9, rect.bottom() - ROUND * 0.6),
     );
-    for i in 0..22_u32 {
+    for i in 0..18_u32 {
         let h = i.wrapping_mul(2_654_435_761).rotate_left(11) ^ 0x5bd1_e995;
-        let x = (h & 0xFFFF) as f32 / 65535.0;
-        let y = ((h >> 16) & 0xFFFF) as f32 / 65535.0;
-        // A star only comes out once the dark has reached it.
-        let out = darkness(0.50 + 0.50 * x, night);
-        let twinkle = (0.5 + 0.5 * (t * (0.8 + x) + i as f32 * 1.7).sin()) * out;
+        let x = (i as f32 * 0.618_034 + 0.13).fract();
+        let speed = 0.025 + 0.025 * ((h >> 3) & 7) as f32 / 7.0;
+        // Rise from the bottom of the field to the top, then begin again.
+        let rise = (t * speed + ((h >> 16) & 0xFFFF) as f32 / 65535.0).fract();
+        let y = 1.0 - rise;
+        let sway = 6.0 * (t * 0.6 + i as f32).sin();
         let p = egui::pos2(
-            field.left() + field.width() * x,
+            field.left() + field.width() * x + sway,
             field.top() + field.height() * y,
         );
-        let r = 0.8 + 1.2 * ((h >> 7) & 3) as f32 / 3.0;
-        // On the light sky a white star would vanish: these are sparks of
-        // light with a violet heart.
+        // A symbol only comes out once the dark has reached it.
+        let out = darkness(0.48 + 0.52 * x, night);
+        let fade = smooth(0.0, 0.18, rise) * (1.0 - smooth(0.80, 1.0, rise));
+        let twinkle = 0.65 + 0.35 * (t * (1.1 + x) + i as f32 * 1.7).sin();
+        let alpha = out * fade * twinkle;
+        if alpha < 0.02 {
+            continue;
+        }
+        let size = 5.0 + 4.0 * ((h >> 7) & 3) as f32 / 3.0;
+        let angle = (t * 0.25 + i as f32) * if h & 1 == 0 { 1.0 } else { -1.0 };
         radial_wash(
             &painter,
             p,
-            r * 4.5,
-            Color32::from_white_alpha((twinkle * 150.0) as u8),
+            size * 2.6,
+            Color32::from_white_alpha((alpha * 170.0) as u8),
         );
-        painter.circle_filled(
+        night_symbol(
+            &painter,
+            i % 4,
             p,
-            r,
-            with_alpha(ACCENT, ((60.0 + twinkle * 150.0) * out) as u8),
+            size,
+            angle,
+            with_alpha(ACCENT, (alpha * 235.0) as u8),
         );
     }
     if motion() {
