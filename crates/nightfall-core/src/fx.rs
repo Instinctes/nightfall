@@ -563,6 +563,57 @@ pub fn hero_card<R>(
         uv: Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
     }));
 
+    // Hashes raining softly behind everything: columns of hex digits that
+    // fall at their own pace, a brighter head and a fading tail, changing as
+    // they go. Faint by design, and faded out towards the balance on the
+    // left so the writing never has to compete with it.
+    {
+        let area = rect.shrink2(Vec2::new(ROUND * 0.55, 6.0));
+        let rain = painter.with_clip_rect(area);
+        let font = egui::FontId::monospace(10.5);
+        let col_w = 17.0;
+        let row_h = 13.0;
+        let cols = (area.width() / col_w) as u32;
+        let rows = (area.height() / row_h) as i32 + 2;
+        let hex = b"0123456789abcdef";
+        for col in 0..cols {
+            let x = area.left() + 8.0 + col as f32 * col_w;
+            let u = (x - rect.left()) / rect.width();
+            let presence = smooth(0.30, 0.75, u) * darkness(u, night);
+            if presence < 0.02 {
+                continue;
+            }
+            let h = col.wrapping_mul(2_654_435_761).rotate_left(3) ^ 0x7f4a_7c15;
+            let speed = 1.6 + 2.2 * ((h >> 4) & 15) as f32 / 15.0;
+            let span = rows as f32 + 6.0;
+            let head = ((t * speed + (h & 0xFF) as f32) % span) - 3.0;
+            let tail = 5 + (h >> 12) as i32 % 6;
+            for k in 0..tail {
+                let row = head.floor() as i32 - k;
+                if row < 0 || row >= rows {
+                    continue;
+                }
+                let y = area.top() + row as f32 * row_h;
+                let fade = 1.0 - k as f32 / tail as f32;
+                let glyph = {
+                    let tick = (t * 9.0) as u32 / (1 + k as u32);
+                    let v = tick.wrapping_mul(2_246_822_519)
+                        ^ col.wrapping_mul(3_266_489_917)
+                        ^ (row as u32).wrapping_mul(668_265_263);
+                    hex[(v >> 9) as usize % 16] as char
+                };
+                let alpha = presence * fade * if k == 0 { 70.0 } else { 38.0 };
+                rain.text(
+                    egui::pos2(x, y),
+                    egui::Align2::CENTER_TOP,
+                    glyph,
+                    font.clone(),
+                    with_alpha(if k == 0 { HERO_A } else { ACCENT }, alpha as u8),
+                );
+            }
+        }
+    }
+
     // Nightfall's own symbols drift up the right of the sky — moons, NIGHT
     // coins, blocks and sparkles — well inside the corners, turning slowly
     // and fading in and out as they rise.
