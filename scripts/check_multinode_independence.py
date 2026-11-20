@@ -25,6 +25,7 @@ EXPECTED = {
     "partition_cuts_real_session_and_heal_resynchronizes",
     "partitioned_competing_chains_converge_on_heavier_work",
     "three_node_survival_after_origin_failure",
+    "throttled_link_disconnect_recovers_verified_state",
 }
 
 MAX_CAPTURE = 2 * 1024 * 1024
