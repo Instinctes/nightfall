@@ -147,39 +147,6 @@ fn night_compact(darks: u64) -> String {
 
 // ------------------------------------------------------------- dashboard ---
 
-/// The shape of the balance over its last movements, for the hero's hill.
-///
-/// Walked backwards from what is spendable now, undoing one entry at a time.
-/// It is a picture, not a ledger: unlocking rewards and failed sends make it
-/// approximate, so it carries no numbers and nothing reads a value off it.
-fn balance_history(app: &App, now_available: u64) -> Vec<f64> {
-    let Ok(wallet) = app.wallet.lock() else {
-        return Vec::new();
-    };
-    let mut entries: Vec<_> = wallet
-        .history()
-        .iter()
-        .filter(|e| !e.failed && !e.quarantined)
-        .map(|e| (e.timestamp, e.direction, e.amount, e.fee))
-        .collect();
-    drop(wallet);
-    entries.sort_by_key(|e| std::cmp::Reverse(e.0));
-    let mut value = now_available as f64;
-    let mut out = vec![value];
-    for (_, direction, amount, fee) in entries.into_iter().take(40) {
-        match direction {
-            Direction::Received | Direction::Mined => value -= amount as f64,
-            Direction::Sent => value += (amount + fee) as f64,
-        }
-        out.push(value.max(0.0));
-    }
-    out.reverse();
-    if out.len() < 3 {
-        return Vec::new();
-    }
-    out
-}
-
 pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
     let tip = app.tip_height();
     let maturity = app.maturity();
@@ -320,10 +287,9 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
     // The hero is deep enough for white, so the two actions sit on it as a
     // white pill and a clear one — the pastel gradient this replaced could
     // not carry a white button, which is why they used to live underneath.
-    let history = balance_history(app, balances.available);
     let count = app.wallet.lock().map(|w| w.output_count()).unwrap_or(0);
     let mut go_to = None;
-    crate::fx::hero_card(ui, 256.0, app.coin_flash_amount(ui.ctx()), &history, |ui| {
+    crate::fx::hero_card(ui, 256.0, app.coin_flash_amount(ui.ctx()), |ui| {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("SPENDABLE")
@@ -341,8 +307,9 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
             );
             let (r, _) =
                 ui.allocate_exact_size(galley.size() + Vec2::new(14.0, 6.0), egui::Sense::hover());
+            // Dark glass under white letters reads on every part of the sky.
             ui.painter()
-                .rect_filled(r, Rounding::same(999.0), Color32::from_white_alpha(34));
+                .rect_filled(r, Rounding::same(999.0), Color32::from_black_alpha(80));
             ui.painter()
                 .galley(r.center() - galley.size() / 2.0, galley, Color32::WHITE);
         });

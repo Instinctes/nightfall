@@ -97,21 +97,34 @@ pub fn clock(ctx: &egui::Context) -> f32 {
 
 /// A tween on an exact integer, kept in `f64` because a balance in darks does
 /// not fit an `f32` without losing its last digits.
-fn tween_u64(ctx: &egui::Context, id: egui::Id, target: u64) -> f64 {
+fn tween_u64(ctx: &egui::Context, id: egui::Id, target: u64, intro: bool) -> f64 {
     #[derive(Clone, Copy)]
     struct T {
         from: f64,
         to: u64,
         start: f64,
+        secs: f64,
     }
     let now = ctx.input(|i| i.time);
-    let mut t = ctx.data(|d| d.get_temp::<T>(id)).unwrap_or(T {
-        from: target as f64,
-        to: target,
-        start: now - 10.0,
+    // The first time this number is seen it counts up from zero — once per
+    // run, not on every visit to the page: the state outlives the page.
+    let mut t = ctx.data(|d| d.get_temp::<T>(id)).unwrap_or(if intro {
+        T {
+            from: 0.0,
+            to: target,
+            start: now,
+            secs: 1.9,
+        }
+    } else {
+        T {
+            from: target as f64,
+            to: target,
+            start: now - 10.0,
+            secs: 1.25,
+        }
     });
     let shown = |t: &T| {
-        let p = ((now - t.start) / 1.25).clamp(0.0, 1.0);
+        let p = ((now - t.start) / t.secs).clamp(0.0, 1.0);
         let e = 1.0 - (1.0 - p).powi(4);
         t.from + (t.to as f64 - t.from) * e
     };
@@ -120,6 +133,7 @@ fn tween_u64(ctx: &egui::Context, id: egui::Id, target: u64) -> f64 {
             from: shown(&t),
             to: target,
             start: now,
+            secs: 1.25,
         };
     }
     let value = if motion() { shown(&t) } else { target as f64 };
@@ -144,9 +158,12 @@ pub fn odometer(
     size: f32,
     color: Color32,
 ) -> egui::Response {
-    let value = tween_u64(ui.ctx(), id, units);
+    let value = tween_u64(ui.ctx(), id, units, true);
     let scale = 10_u64.pow(decimals) as f64;
-    let whole = (value / scale).floor() as u64;
+    // Laid out for the larger of where it is going and where it is, so the
+    // number keeps one width while it counts and the label beside it stays
+    // put. Places the count has not reached yet are simply not drawn.
+    let whole = ((value.max(units as f64)) / scale).floor() as u64;
     let whole_text = crate::widgets::format_int(whole);
 
     let big = egui::FontId::proportional(size);
@@ -188,6 +205,9 @@ pub fn odometer(
 
     let draw_digit = |x: f32, place: u32, font: &egui::FontId, w: f32, h: f32, alpha: u8| {
         let pow = 10_f64.powi(place as i32);
+        if place > decimals && value < pow {
+            return;
+        }
         let x_val = value / pow;
         let digit = (x_val.floor() as u64 % 10) as u8;
         // A place only turns while every place below it is passing 9 → 0.
@@ -215,20 +235,23 @@ pub fn odometer(
     };
 
     let mut x = rect.left();
-    for (place, _) in &layout {
+    for (x_index, (place, _)) in layout.iter().enumerate() {
         match place {
             Some(p) => {
                 draw_digit(x, *p, &big, cell_big, size, 255);
                 x += cell_big;
             }
             None => {
-                painter.text(
-                    egui::pos2(x, base),
-                    egui::Align2::LEFT_BOTTOM,
-                    ",",
-                    big.clone(),
-                    color,
-                );
+                // A separator belongs to the digit before it.
+                if value >= 10_f64.powi((next_place(&layout, x_index) + 1) as i32) {
+                    painter.text(
+                        egui::pos2(x, base),
+                        egui::Align2::LEFT_BOTTOM,
+                        ",",
+                        big.clone(),
+                        color,
+                    );
+                }
                 x += comma;
             }
         }
@@ -248,11 +271,118 @@ pub fn odometer(
     resp
 }
 
+/// The place of the first digit after position `from` in an odometer layout.
+fn next_place(layout: &[(Option<u32>, bool)], from: usize) -> u32 {
+    layout[from..].iter().find_map(|(p, _)| *p).unwrap_or(0)
+}
+
 // -------------------------------------------------------------- the hero ---
 
-/// The balance card: a deep violet-to-teal sheet with white text, a slow sheen
-/// travelling across it, a glare that follows the pointer, and the shape of
-/// recent balance history drawn faintly along its foot.
+/// The hero's moving sky, rendered into a small texture every frame.
+///
+/// Everything that lights the sheet — the drifting glows, the aurora band,
+/// the glare under the pointer, the flash when coins arrive — is baked into
+/// this one image, and the image is drawn as a *rounded* rectangle. A light
+/// painted on top of the sheet would be clipped by a rectangle and show square
+/// corners wherever it reaches the edge; a light inside the texture cannot.
+///
+/// The left half, where the balance is written, is kept to the plain gradient
+/// so white text stays at the contrast `white_reads_on_the_hero` pins.
+fn hero_sky(
+    ctx: &egui::Context,
+    t: f32,
+    aspect: f32,
+    flash: f32,
+    pointer: Option<(f32, f32)>,
+) -> egui::TextureHandle {
+    const W: usize = 160;
+    const H: usize = 48;
+    let smooth = |a: f32, b: f32, x: f32| {
+        let k = ((x - a) / (b - a)).clamp(0.0, 1.0);
+        k * k * (3.0 - 2.0 * k)
+    };
+    let glows = [
+        (
+            0.78 + 0.10 * (t * 0.21).sin(),
+            0.30 + 0.25 * (t * 0.33).sin(),
+            PINK,
+            0.42,
+        ),
+        (
+            0.58 + 0.16 * (t * 0.17).cos(),
+            0.85 + 0.12 * (t * 0.29).sin(),
+            CYAN,
+            0.38,
+        ),
+        (
+            0.95 + 0.06 * (t * 0.13).sin(),
+            0.55 + 0.20 * (t * 0.23).cos(),
+            GRAD_A,
+            0.34,
+        ),
+    ];
+    let mut pixels = Vec::with_capacity(W * H);
+    for row in 0..H {
+        let v = row as f32 / (H - 1) as f32;
+        for col in 0..W {
+            let u = col as f32 / (W - 1) as f32;
+            let mut c = hero_gradient((u * 0.78 + v * 0.22).clamp(0.0, 1.0));
+            // Lights live on the right; the writing on the left keeps its sky.
+            let room = 0.18 + 0.82 * smooth(0.30, 0.72, u);
+            for (cx, cy, colour, strength) in glows {
+                let dx = (u - cx) * aspect;
+                let dy = v - cy;
+                let w = (-(dx * dx + dy * dy) / (2.0 * 0.55_f32.powi(2))).exp();
+                c = lerp_color(c, colour, w * strength * room);
+            }
+            // The aurora: two soft ribbons rippling along the sheet at
+            // different speeds, so the light never repeats the same shape.
+            let fade_in = smooth(0.36, 0.70, u);
+            for (base, amp, k1, k2, speed, width, strength) in [
+                (0.60, 0.16, 5.0, 11.0, 0.55, 0.11, 0.60),
+                (0.36, 0.10, 3.3, 8.0, -0.38, 0.08, 0.38),
+            ] {
+                let y0 = base
+                    + amp * (u * k1 + t * speed).sin()
+                    + amp * 0.4 * (u * k2 - t * speed * 1.4).sin();
+                let band = (-((v - y0) / width).powi(2)).exp() * fade_in;
+                let ribbon =
+                    lerp_color(CYAN, PINK, (u * 1.4 + (t * 0.1 + base).sin() * 0.3).fract());
+                c = lerp_color(c, ribbon, band * strength);
+            }
+            if flash > 0.02 {
+                c = lerp_color(c, PINK, flash * 0.28);
+            }
+            if let Some((pu, pv)) = pointer {
+                let dx = (u - pu) * aspect;
+                let dy = v - pv;
+                let w = (-(dx * dx + dy * dy) / (2.0 * 0.45_f32.powi(2))).exp();
+                c = lerp_color(c, Color32::WHITE, w * 0.10);
+            }
+            pixels.push(Color32::from_rgb(c.r(), c.g(), c.b()));
+        }
+    }
+    let image = egui::ColorImage {
+        size: [W, H],
+        pixels,
+    };
+    let id = egui::Id::new("hero-sky-texture");
+    match ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        Some(mut handle) => {
+            handle.set(image, egui::TextureOptions::LINEAR);
+            handle
+        }
+        None => {
+            let handle = ctx.load_texture("hero-sky", image, egui::TextureOptions::LINEAR);
+            ctx.data_mut(|d| d.insert_temp(id, handle.clone()));
+            handle
+        }
+    }
+}
+
+/// The balance card: a deep violet-to-teal sheet with white text and a slowly
+/// moving aurora sky, a glare that follows the pointer and a few twinkling
+/// stars — all inside its rounded corners.
 ///
 /// The pastel brand gradient carries dark ink and stays the colour of the
 /// main buttons; the hero is the one surface deep enough for white, which is
@@ -261,7 +391,6 @@ pub fn hero_card<R>(
     ui: &mut egui::Ui,
     height: f32,
     flash: f32,
-    history: &[f64],
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
     let width = ui.available_width();
@@ -278,68 +407,59 @@ pub fn hero_card<R>(
         }
         .as_shape(rect, Rounding::same(ROUND)),
     ));
-    crate::widgets::gradient_rect(&painter, rect, ROUND, Vec2::new(1.0, 0.62), hero_gradient);
+    let pointer = resp.hover_pos().map(|p| {
+        (
+            (p.x - rect.left()) / rect.width().max(1.0),
+            (p.y - rect.top()) / rect.height().max(1.0),
+        )
+    });
+    let sky = hero_sky(
+        ui.ctx(),
+        t,
+        rect.width() / rect.height().max(1.0),
+        flash,
+        pointer,
+    );
+    painter.add(egui::Shape::Rect(egui::epaint::RectShape {
+        rect,
+        rounding: Rounding::same(ROUND),
+        fill: Color32::WHITE,
+        stroke: Stroke::new(1.0_f32, Color32::from_white_alpha(28)),
+        blur_width: 0.0,
+        fill_texture_id: sky.id(),
+        uv: Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+    }));
 
-    let clipped = painter.with_clip_rect(rect.shrink(2.0));
-    // The sheen: a broad soft light circling slowly over the sheet.
-    let orbit = egui::pos2(
-        rect.center().x + rect.width() * 0.34 * (t * 0.23).cos(),
-        rect.center().y + rect.height() * 0.42 * (t * 0.31).sin(),
+    // Stars on the right, well inside the corners so none sits on the rim.
+    let field = Rect::from_min_max(
+        egui::pos2(rect.left() + rect.width() * 0.50, rect.top() + ROUND * 0.7),
+        egui::pos2(rect.right() - ROUND * 0.9, rect.bottom() - ROUND * 0.7),
     );
-    radial_wash(
-        &clipped,
-        orbit,
-        rect.height() * 1.25,
-        Color32::from_white_alpha(16),
-    );
-    // A second, warmer light so the sheet never looks like one flat colour.
-    radial_wash(
-        &clipped,
-        egui::pos2(
-            rect.right() - rect.width() * 0.18,
-            rect.top() + rect.height() * 0.1,
-        ),
-        rect.height() * 1.1,
-        with_alpha(PINK, 34),
-    );
-    if flash > 0.02 {
-        radial_wash(
-            &clipped,
-            rect.center(),
-            rect.width().min(rect.height()) * 0.9,
-            with_alpha(PINK, (flash * 110.0) as u8),
+    for i in 0..22_u32 {
+        let h = i.wrapping_mul(2_654_435_761).rotate_left(11) ^ 0x5bd1_e995;
+        let x = (h & 0xFFFF) as f32 / 65535.0;
+        let y = ((h >> 16) & 0xFFFF) as f32 / 65535.0;
+        let twinkle = 0.5 + 0.5 * (t * (0.8 + x) + i as f32 * 1.7).sin();
+        let p = egui::pos2(
+            field.left() + field.width() * x,
+            field.top() + field.height() * y,
         );
-    }
-    if let Some(pointer) = resp.hover_pos() {
+        let r = 0.8 + 1.2 * ((h >> 7) & 3) as f32 / 3.0;
         radial_wash(
-            &clipped,
-            pointer,
-            rect.height() * 1.1,
-            Color32::from_white_alpha(22),
+            &painter,
+            p,
+            r * 4.0,
+            Color32::from_white_alpha((twinkle * 40.0) as u8),
+        );
+        painter.circle_filled(
+            p,
+            r,
+            Color32::from_white_alpha((90.0 + twinkle * 150.0) as u8),
         );
     }
     if motion() {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(33));
-    }
-
-    // Balance history, drawn as a quiet hill along the right-hand foot.
-    if history.len() >= 2 {
-        let chart = Rect::from_min_max(
-            egui::pos2(
-                rect.left() + rect.width() * 0.46,
-                rect.bottom() - height * 0.46,
-            ),
-            egui::pos2(rect.right(), rect.bottom()),
-        );
-        area_chart_painter(
-            &clipped,
-            chart,
-            history,
-            Color32::from_white_alpha(110),
-            Color32::from_white_alpha(16),
-            false,
-        );
     }
 
     let inner = rect.shrink2(Vec2::new(26.0, 22.0));
@@ -371,7 +491,7 @@ pub fn hero_button(ui: &mut egui::Ui, id: &str, text: &str, filled: bool) -> egu
     let (fill, fg) = if filled {
         (Color32::WHITE, HERO_INK)
     } else {
-        (Color32::from_white_alpha(30), Color32::WHITE)
+        (Color32::from_black_alpha(70), Color32::WHITE)
     };
     ui.painter().rect(
         r,
