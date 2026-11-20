@@ -278,6 +278,35 @@ fn next_place(layout: &[(Option<u32>, bool)], from: usize) -> u32 {
 
 // -------------------------------------------------------------- the hero ---
 
+fn smooth(a: f32, b: f32, x: f32) -> f32 {
+    let k = ((x - a) / (b - a)).clamp(0.0, 1.0);
+    k * k * (3.0 - 2.0 * k)
+}
+
+/// How dark the hero is at `u` (0 left … 1 right) while night falls:
+/// `progress` 0 is every light on, 1 is night everywhere. The front is wide
+/// and eased so the change reads as a dimming, not a wipe.
+fn darkness(u: f32, progress: f32) -> f32 {
+    let front = -0.45 + progress * 1.9;
+    1.0 - smooth(front - 0.45, front, u)
+}
+
+/// How far night has fallen on the hero since it was first shown: once per
+/// run, eased in and out over 1.6 seconds.
+fn nightfall_progress(ctx: &egui::Context) -> f32 {
+    if !motion() {
+        return 1.0;
+    }
+    let id = egui::Id::new("hero-nightfall-start");
+    let now = ctx.input(|i| i.time);
+    let start = ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(id, || now));
+    let p = ((now - start) / 1.6).clamp(0.0, 1.0) as f32;
+    if p < 1.0 {
+        ctx.request_repaint();
+    }
+    smooth(0.0, 1.0, p)
+}
+
 /// The hero's moving sky, rendered into a small texture every frame.
 ///
 /// Everything that lights the sheet — the drifting glows, the aurora band,
@@ -294,31 +323,34 @@ fn hero_sky(
     aspect: f32,
     flash: f32,
     pointer: Option<(f32, f32)>,
+    nightfall: f32,
 ) -> egui::TextureHandle {
     const W: usize = 160;
     const H: usize = 48;
-    let smooth = |a: f32, b: f32, x: f32| {
-        let k = ((x - a) / (b - a)).clamp(0.0, 1.0);
-        k * k * (3.0 - 2.0 * k)
+    // A light that comes up quickly and then goes out, softly, every few
+    // seconds — each glow on its own beat.
+    let beat = |period: f32, phase: f32| {
+        let k = (t / period + phase).fract();
+        smooth(0.0, 0.16, k) * (1.0 - smooth(0.16, 0.86, k))
     };
     let glows = [
         (
             0.78 + 0.10 * (t * 0.21).sin(),
             0.30 + 0.25 * (t * 0.33).sin(),
             PINK,
-            0.42,
+            0.30 + 0.30 * beat(6.0, 0.0),
         ),
         (
             0.58 + 0.16 * (t * 0.17).cos(),
             0.85 + 0.12 * (t * 0.29).sin(),
             CYAN,
-            0.38,
+            0.26 + 0.30 * beat(7.5, 0.37),
         ),
         (
             0.95 + 0.06 * (t * 0.13).sin(),
             0.55 + 0.20 * (t * 0.23).cos(),
             GRAD_A,
-            0.34,
+            0.24 + 0.28 * beat(5.2, 0.71),
         ),
     ];
     let mut pixels = Vec::with_capacity(W * H);
@@ -327,6 +359,10 @@ fn hero_sky(
         for col in 0..W {
             let u = col as f32 / (W - 1) as f32;
             let mut c = hero_gradient((u * 0.78 + v * 0.22).clamp(0.0, 1.0));
+            // Night settles from the bottom left: a long, soft fall from the
+            // lit top right into deep violet where the balance is written.
+            let deep = (1.0 - smooth(0.0, 1.0, u * 0.7 + (1.0 - v) * 0.3)) * 0.30;
+            c = lerp_color(c, INK, deep);
             // Lights live on the right; the writing on the left keeps its sky.
             let room = 0.18 + 0.82 * smooth(0.30, 0.72, u);
             for (cx, cy, colour, strength) in glows {
@@ -352,6 +388,13 @@ fn hero_sky(
             }
             if flash > 0.02 {
                 c = lerp_color(c, PINK, flash * 0.28);
+            }
+            // When the lights go out: the sheet opens lit, and darkness sweeps
+            // across it from the left in a soft, wide front.
+            let dark = darkness(u, nightfall);
+            if dark < 1.0 {
+                let lit = lerp_color(lerp_color(GRAD_A, PINK, v * 0.7), Color32::WHITE, 0.30);
+                c = lerp_color(lit, c, dark);
             }
             if let Some((pu, pv)) = pointer {
                 let dx = (u - pu) * aspect;
@@ -413,12 +456,14 @@ pub fn hero_card<R>(
             (p.y - rect.top()) / rect.height().max(1.0),
         )
     });
+    let night = nightfall_progress(ui.ctx());
     let sky = hero_sky(
         ui.ctx(),
         t,
         rect.width() / rect.height().max(1.0),
         flash,
         pointer,
+        night,
     );
     painter.add(egui::Shape::Rect(egui::epaint::RectShape {
         rect,
@@ -439,7 +484,9 @@ pub fn hero_card<R>(
         let h = i.wrapping_mul(2_654_435_761).rotate_left(11) ^ 0x5bd1_e995;
         let x = (h & 0xFFFF) as f32 / 65535.0;
         let y = ((h >> 16) & 0xFFFF) as f32 / 65535.0;
-        let twinkle = 0.5 + 0.5 * (t * (0.8 + x) + i as f32 * 1.7).sin();
+        // A star only comes out once the dark has reached it.
+        let out = darkness(0.50 + 0.50 * x, night);
+        let twinkle = (0.5 + 0.5 * (t * (0.8 + x) + i as f32 * 1.7).sin()) * out;
         let p = egui::pos2(
             field.left() + field.width() * x,
             field.top() + field.height() * y,
@@ -454,7 +501,7 @@ pub fn hero_card<R>(
         painter.circle_filled(
             p,
             r,
-            Color32::from_white_alpha((90.0 + twinkle * 150.0) as u8),
+            Color32::from_white_alpha(((90.0 + twinkle * 150.0) * out) as u8),
         );
     }
     if motion() {
@@ -1245,5 +1292,27 @@ pub fn island(
         }
     } else {
         painter.galley(rect.center() - galley.size() / 2.0, galley, Color32::WHITE);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::darkness;
+
+    /// The hero opens with every light on, ends in full night, and the dark
+    /// only ever deepens as it falls — a dimming, never a flicker.
+    #[test]
+    fn night_falls_across_the_whole_hero_and_only_deepens() {
+        for step in 0..=20 {
+            let u = step as f32 / 20.0;
+            assert!(darkness(u, 0.0) < 0.001, "lit at the start ({u})");
+            assert!(darkness(u, 1.0) > 0.999, "dark at the end ({u})");
+            let mut last = 0.0;
+            for p in 0..=100 {
+                let d = darkness(u, p as f32 / 100.0);
+                assert!(d + 1e-6 >= last, "darkness went back at u={u}, p={p}");
+                last = d;
+            }
+        }
     }
 }
