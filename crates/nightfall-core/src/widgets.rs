@@ -27,21 +27,39 @@ pub const FIELD_MARGIN: egui::Margin = egui::Margin {
 };
 
 /// Native vector icons: no font-dependent glyphs or bitmap scaling.
+///
+/// `active` is 0 at rest and 1 when the item is hovered or chosen; each icon
+/// has a small motion of its own that grows with it — the arrows nudge the
+/// way they point, a light runs along the activity line, the chip's pins
+/// pulse, the network's nodes take turns, the sliders slide. `t` is the
+/// motion clock (frozen when motion is reduced) and `busy` marks a page that
+/// is working in the background, which keeps its icon moving at rest.
 pub fn nav_icon(
     painter: &egui::Painter,
     view: crate::app::View,
     origin: egui::Pos2,
     color: Color32,
+    active: f32,
+    t: f32,
+    busy: bool,
 ) {
     use crate::app::View;
+    let a = active.clamp(0.0, 1.2);
     let stroke = Stroke::new(1.6_f32, color);
-    let line = |pts: &[(f32, f32)]| {
+    let line_at = |shift: Vec2, pts: &[(f32, f32)]| {
         painter.add(egui::Shape::line(
             pts.iter()
-                .map(|(x, y)| origin + Vec2::new(*x, *y))
+                .map(|(x, y)| origin + shift + Vec2::new(*x, *y))
                 .collect(),
             stroke,
         ))
+    };
+    let line = |pts: &[(f32, f32)]| line_at(Vec2::ZERO, pts);
+    let glow = |p: egui::Pos2, k: f32| {
+        if k > 0.02 {
+            radial_wash(painter, p, 7.0, with_alpha(GRAD_A, (k * 150.0) as u8));
+            painter.circle_filled(p, 1.6, with_alpha(Color32::WHITE, (k * 255.0) as u8));
+        }
     };
     match view {
         View::Dashboard => {
@@ -49,6 +67,16 @@ pub fn nav_icon(
                 Rect::from_min_size(origin + Vec2::new(2.0, 4.0), Vec2::new(18.0, 14.0)),
                 Rounding::same(3.0),
                 stroke,
+            );
+            // The little panel fills with light.
+            let panel = Rect::from_min_max(
+                origin + Vec2::new(15.0, 10.0),
+                origin + Vec2::new(20.0, 14.0),
+            );
+            painter.rect_filled(
+                panel,
+                Rounding::same(1.0),
+                with_alpha(GRAD_A, (a * 200.0) as u8),
             );
             line(&[
                 (15.0, 10.0),
@@ -59,39 +87,77 @@ pub fn nav_icon(
             ]);
         }
         View::Send => {
-            line(&[(4.0, 18.0), (18.0, 4.0), (9.0, 4.0)]);
-            line(&[(18.0, 4.0), (18.0, 13.0)]);
+            let bob = a * (1.6 + 0.6 * (t * 4.0).sin());
+            let shift = Vec2::new(bob, -bob);
+            line_at(shift, &[(4.0, 18.0), (18.0, 4.0), (9.0, 4.0)]);
+            line_at(shift, &[(18.0, 4.0), (18.0, 13.0)]);
         }
         View::Receive => {
-            line(&[(18.0, 4.0), (4.0, 18.0), (13.0, 18.0)]);
-            line(&[(4.0, 18.0), (4.0, 9.0)]);
+            let bob = a * (1.6 + 0.6 * (t * 4.0).sin());
+            let shift = Vec2::new(-bob, bob);
+            line_at(shift, &[(18.0, 4.0), (4.0, 18.0), (13.0, 18.0)]);
+            line_at(shift, &[(4.0, 18.0), (4.0, 9.0)]);
         }
         View::Activity => {
-            line(&[(2.0, 16.0), (7.0, 10.0), (11.0, 13.0), (19.0, 5.0)]);
+            let pts = [(2.0_f32, 16.0_f32), (7.0, 10.0), (11.0, 13.0), (19.0, 5.0)];
+            line(&pts);
+            // A light runs along the line, start to end.
+            let k = (t * 0.7).fract();
+            let seg = (k * 3.0).min(2.999);
+            let i = seg as usize;
+            let f = seg - i as f32;
+            let (x, y) = (
+                pts[i].0 + (pts[i + 1].0 - pts[i].0) * f,
+                pts[i].1 + (pts[i + 1].1 - pts[i].1) * f,
+            );
+            glow(origin + Vec2::new(x, y), a.min(1.0));
         }
         View::Mining => {
-            painter.rect_stroke(
-                Rect::from_min_size(origin + Vec2::splat(5.0), Vec2::splat(12.0)),
-                Rounding::same(2.0),
-                stroke,
-            );
-            for p in [7.0, 11.0, 15.0] {
-                line(&[(p, 2.0), (p, 5.0)]);
-                line(&[(p, 17.0), (p, 20.0)]);
-                line(&[(2.0, p), (5.0, p)]);
-                line(&[(17.0, p), (20.0, p)]);
+            let core = Rect::from_min_size(origin + Vec2::splat(5.0), Vec2::splat(12.0));
+            let heat = (a.min(1.0)).max(if busy { 0.7 } else { 0.0 });
+            if heat > 0.02 {
+                painter.rect_filled(
+                    core.shrink(2.5),
+                    Rounding::same(1.0),
+                    with_alpha(
+                        GRAD_A,
+                        (heat * (150.0 + 80.0 * (t * 5.0).sin().abs())) as u8,
+                    ),
+                );
+            }
+            painter.rect_stroke(core, Rounding::same(2.0), stroke);
+            for (n, p) in [7.0_f32, 11.0, 15.0].into_iter().enumerate() {
+                // Pins stretch in turn, like a clock running through them.
+                let pulse = heat * 1.4 * (0.5 + 0.5 * (t * 6.0 - n as f32 * 1.3).sin());
+                line(&[(p, 2.0 - pulse), (p, 5.0)]);
+                line(&[(p, 17.0), (p, 20.0 + pulse)]);
+                line(&[(2.0 - pulse, p), (5.0, p)]);
+                line(&[(17.0, p), (20.0 + pulse, p)]);
             }
         }
         View::Network => {
-            for (x, y) in [(11.0, 3.0), (3.0, 18.0), (19.0, 18.0)] {
-                painter.circle_stroke(origin + Vec2::new(x, y), 2.5, stroke);
-            }
+            let nodes = [(11.0_f32, 3.0_f32), (3.0, 18.0), (19.0, 18.0)];
             line(&[(10.0, 6.0), (4.0, 15.0)]);
             line(&[(12.0, 6.0), (18.0, 15.0)]);
             line(&[(6.0, 18.0), (16.0, 18.0)]);
+            for (n, (x, y)) in nodes.into_iter().enumerate() {
+                let p = origin + Vec2::new(x, y);
+                // The nodes take turns lighting up.
+                let turn = (0.5 + 0.5 * (t * 3.0 - n as f32 * 2.1).sin()).powi(3);
+                let k = a.min(1.0) * turn;
+                if k > 0.02 {
+                    painter.circle_filled(p, 2.5, with_alpha(GRAD_A, (k * 230.0) as u8));
+                }
+                painter.circle_stroke(p, 2.5, stroke);
+            }
         }
         View::Settings => {
-            for (y, x) in [(5.0, 8.0), (11.0, 15.0), (17.0, 6.0)] {
+            for (n, (y, x)) in [(5.0_f32, 8.0_f32), (11.0, 15.0), (17.0, 6.0)]
+                .into_iter()
+                .enumerate()
+            {
+                // Each slider drifts a little, out of step with the others.
+                let x = x + a.min(1.0) * 3.0 * (t * 2.2 + n as f32 * 2.0).sin();
                 line(&[(2.0, y), (x - 2.0, y)]);
                 line(&[(x + 2.0, y), (20.0, y)]);
                 painter.circle_stroke(origin + Vec2::new(x, y), 2.0, stroke);

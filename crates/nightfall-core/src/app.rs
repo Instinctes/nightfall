@@ -1476,13 +1476,39 @@ impl App {
                     egui::Rect::from_min_max(egui::pos2(inner.left(), footer_top), inner.max);
                 ui.allocate_ui_at_rect(nav_rect, |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
+                    let t = crate::fx::clock(ui.ctx());
                     ui.horizontal(|ui| {
                         ui.add_space(2.0);
-                        logo(ui, 32.0);
+                        // A slow breath of light behind the mark.
+                        let halo = ui.painter().add(egui::Shape::Noop);
+                        let mark = logo(ui, 32.0).rect;
+                        let breath = 0.55 + 0.45 * (t * 1.1).sin();
+                        ui.painter().set(
+                            halo,
+                            crate::widgets::radial_shape(
+                                mark.center(),
+                                26.0 + breath * 6.0,
+                                with_alpha(GRAD_A, (40.0 + breath * 50.0) as u8),
+                                None,
+                            ),
+                        );
                         ui.add_space(9.0);
                         ui.vertical(|ui| {
                             ui.add_space(2.0);
-                            ui.label(RichText::new("NIGHTFALL").size(17.0).color(TEXT).strong());
+                            let word = ui
+                                .label(RichText::new("NIGHTFALL").size(17.0).color(TEXT).strong())
+                                .rect;
+                            // Every seven seconds a glint passes over the name.
+                            let k = (t / 7.0).fract() * 7.0;
+                            if k < 1.2 {
+                                let x = word.left() - 20.0 + (word.width() + 40.0) * (k / 1.2);
+                                radial_wash(
+                                    &ui.painter().with_clip_rect(word.expand(2.0)),
+                                    egui::pos2(x, word.center().y),
+                                    16.0,
+                                    Color32::from_white_alpha(70),
+                                );
+                            }
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
                                 ui.label(RichText::new("CORE WALLET").size(9.5).color(ACCENT_HI));
@@ -1536,11 +1562,30 @@ impl App {
                         }
 
                         let fg = if selected { TEXT } else { TEXT_DIM };
+                        let lift = crate::fx::spring(
+                            ui.ctx(),
+                            egui::Id::new(("nav-item", view as u8)),
+                            if resp.hovered() {
+                                1.0
+                            } else if selected {
+                                0.35
+                            } else {
+                                0.0
+                            },
+                        );
+                        // Icons keep moving while lit; ask for the frames.
+                        if lift > 0.05 && crate::fx::motion() {
+                            ui.ctx().request_repaint_after(Duration::from_millis(33));
+                        }
+                        let busy = view == View::Mining && self.is_mining();
                         nav_icon(
                             ui.painter(),
                             view,
                             egui::pos2(rect.min.x + 15.0, rect.center().y - 11.0),
                             fg,
+                            lift,
+                            t,
+                            busy,
                         );
                         let galley = ui.painter().layout_no_wrap(
                             label.to_string(),
@@ -1548,10 +1593,35 @@ impl App {
                             fg,
                         );
                         ui.painter().galley(
-                            egui::pos2(rect.min.x + 46.0, rect.center().y - galley.size().y / 2.0),
+                            egui::pos2(
+                                rect.min.x + 46.0 + lift * 3.0,
+                                rect.center().y - galley.size().y / 2.0,
+                            ),
                             galley,
                             fg,
                         );
+                        // Mining is running: three little bars dance beside it.
+                        if busy {
+                            for n in 0..3 {
+                                let h = 4.0
+                                    + 8.0
+                                        * (0.5
+                                            + 0.5 * (t * (5.0 + n as f32) + n as f32 * 1.7).sin());
+                                let x = rect.right() - 22.0 + n as f32 * 5.0;
+                                let bar = egui::Rect::from_min_max(
+                                    egui::pos2(x, rect.center().y + 6.0 - h),
+                                    egui::pos2(x + 3.0, rect.center().y + 6.0),
+                                );
+                                ui.painter().rect_filled(
+                                    bar,
+                                    Rounding::same(1.5),
+                                    brand_gradient(n as f32 / 2.0),
+                                );
+                            }
+                            if crate::fx::motion() {
+                                ui.ctx().request_repaint_after(Duration::from_millis(40));
+                            }
+                        }
 
                         if resp.has_focus() {
                             ui.painter().rect_stroke(
@@ -1567,9 +1637,55 @@ impl App {
                             self.reveal_view_key = false;
                         }
                     }
+                    // A few stars in the quiet stretch of the rail below the pages.
+                    {
+                        let top = ui.cursor().top() + 18.0;
+                        let bottom = footer_top - 12.0;
+                        if bottom - top > 30.0 {
+                            let w = ui.max_rect().width();
+                            let left = ui.max_rect().left();
+                            for i in 0..14_u32 {
+                                let h = i.wrapping_mul(2_654_435_761).rotate_left(5) ^ 0x68e3_1da4;
+                                let x = left + 8.0 + (w - 16.0) * ((h & 0xFFFF) as f32 / 65535.0);
+                                let y =
+                                    top + (bottom - top) * (((h >> 16) & 0xFFFF) as f32 / 65535.0);
+                                let tw = 0.5
+                                    + 0.5 * (t * (0.7 + (h & 7) as f32 * 0.12) + i as f32).sin();
+                                ui.painter().circle_filled(
+                                    egui::pos2(x, y),
+                                    0.6 + ((h >> 9) & 3) as f32 * 0.3,
+                                    Color32::from_white_alpha((20.0 + tw * 70.0) as u8),
+                                );
+                            }
+                            if crate::fx::motion() {
+                                ui.ctx().request_repaint_after(Duration::from_millis(80));
+                            }
+                        }
+                    }
                     if let Some(at) = pill_at {
-                        let y = crate::fx::spring(ui.ctx(), egui::Id::new("nav-pill-y"), at.top());
-                        let pill = egui::Rect::from_min_size(egui::pos2(at.left(), y), at.size());
+                        let ctx = ui.ctx().clone();
+                        let y = crate::fx::spring(&ctx, egui::Id::new("nav-pill-y"), at.top());
+                        // Liquid: while it travels the tile stretches out
+                        // behind itself, then pulls back to its own size.
+                        let prev_id = egui::Id::new("nav-pill-prev");
+                        let prev = ctx.data(|d| d.get_temp::<f32>(prev_id)).unwrap_or(y);
+                        ctx.data_mut(|d| d.insert_temp(prev_id, y));
+                        let moved = y - prev;
+                        let stretch = (moved.abs() * 1.6).min(18.0);
+                        let (top, bottom) = if moved > 0.0 {
+                            (y - stretch, y + at.height())
+                        } else {
+                            (y, y + at.height() + stretch)
+                        };
+                        let pill = egui::Rect::from_min_max(
+                            egui::pos2(at.left(), top),
+                            egui::pos2(at.right(), bottom),
+                        );
+                        let settled = 1.0 - (moved.abs() / 6.0).min(1.0);
+                        let bar = egui::Rect::from_center_size(
+                            egui::pos2(pill.left() + 4.0, pill.center().y),
+                            egui::vec2(3.0, (pill.height() * 0.52).max(10.0)),
+                        );
                         ui.painter().set(
                             pill_slot,
                             egui::Shape::Vec(vec![
@@ -1586,6 +1702,12 @@ impl App {
                                     pill,
                                     Rounding::same(ROUND_SM),
                                     glass_inner(),
+                                ),
+                                crate::widgets::gradient_shape(
+                                    bar,
+                                    1.5,
+                                    egui::vec2(0.0, 1.0),
+                                    |k| with_alpha(brand_gradient(k), (settled * 255.0) as u8),
                                 ),
                             ]),
                         );
