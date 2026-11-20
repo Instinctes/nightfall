@@ -81,25 +81,28 @@ impl Rewards {
         false
     }
 
+    /// Draw the presentation in progress. Returns the amount and count of a
+    /// presentation that starts on this frame, so the window can celebrate it
+    /// once — and only once — in its own way too.
     pub fn show(
         &mut self,
         ctx: &egui::Context,
         sound_enabled: bool,
         payment_dialog: bool,
         top: f32,
-    ) {
+    ) -> Option<(u64, u64)> {
         // Neither an overlay nor its sound may interrupt payment review.
         // Pending outputs remain deduplicated and are presented afterwards.
         if payment_dialog {
-            return;
+            return None;
         }
         let now = ctx.input(|input| input.time);
-        if self.advance(now) && sound_enabled {
+        let started = self.advance(now);
+        if started && sound_enabled {
             crate::feedback::play_reward_chime();
         }
-        let Some((reward, start)) = self.active else {
-            return;
-        };
+        let (reward, start) = self.active?;
+        let news = started.then_some((reward.amount, reward.count));
         let elapsed = (now - start).max(0.0) as f32;
         let enter = (elapsed / 0.24).clamp(0.0, 1.0);
         let enter = 1.0 - (1.0 - enter).powi(3);
@@ -121,9 +124,11 @@ impl Rewards {
                         1.0_f32,
                         crate::theme::ACCENT_HI.linear_multiply(0.55),
                     ))
-                    .rounding(Rounding::same(14.0))
-                    .inner_margin(egui::Margin::symmetric(12.0, 7.0))
+                    .rounding(Rounding::same(18.0))
+                    .inner_margin(egui::Margin::symmetric(14.0, 9.0))
                     .show(ui, |ui| {
+                        // Wide enough for "12 MINING REWARDS" on one line.
+                        ui.set_min_width(190.0);
                         ui.horizontal(|ui| {
                             crate::widgets::logo(ui, 24.0);
                             ui.add_space(10.0);
@@ -147,10 +152,11 @@ impl Rewards {
                         });
                     });
             });
+        news
     }
 }
 
-fn compact_amount(darks: u64) -> String {
+pub fn compact_amount(darks: u64) -> String {
     let full = Amount(darks).decimal_string();
     format!(
         "+{} {}",

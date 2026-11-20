@@ -323,6 +323,22 @@ pub struct App {
     rewards: crate::reward::Rewards,
     pub reward_sound: bool,
     pub reward_sound_error: Option<String>,
+    /// Settings → Window: stop every animation. Saved like the reward sound.
+    pub reduce_motion: bool,
+    /// Stars and paper for a found block or a payment that left.
+    confetti: crate::fx::Confetti,
+    /// The island's news and when it arrived (context time).
+    island_news: Option<(String, f64)>,
+    /// The page on screen and when it arrived, for the page transition.
+    page_since: (View, f64),
+    /// ⌘K: the query typed so far, while the palette is open.
+    palette: Option<String>,
+    palette_pick: usize,
+    /// When the last celebration burst, so a run of blocks is one party.
+    last_burst: f64,
+    /// When this wallet last found a block (context time), for the shockwave
+    /// on the Mining page.
+    pub block_found_at: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -492,6 +508,14 @@ impl App {
             rewards: Default::default(),
             reward_sound: load_flag(&datadir, "reward_sound", true),
             reward_sound_error: None,
+            reduce_motion: load_flag(&datadir, "reduce_motion", false),
+            confetti: Default::default(),
+            island_news: None,
+            page_since: (View::Dashboard, -10.0),
+            palette: None,
+            palette_pick: 0,
+            last_burst: f64::MIN,
+            block_found_at: None,
         };
         if custody == Custody::Legacy && app.wallet_load_error.is_none() {
             app.start_node();
@@ -686,6 +710,38 @@ impl App {
                 );
             }
         }
+    }
+
+    /// Settings → Window → Reduce motion. A preference, not a security
+    /// setting: if it cannot be saved it still applies for this session.
+    pub fn set_reduce_motion(&mut self, on: bool) {
+        use std::io::Write;
+        self.reduce_motion = on;
+        let saved = (|| -> std::io::Result<()> {
+            std::fs::create_dir_all(&self.datadir)?;
+            let mut file = std::fs::File::create(self.datadir.join("reduce_motion"))?;
+            file.write_all(if on { b"1" } else { b"0" })?;
+            file.sync_all()
+        })();
+        if let Err(error) = saved {
+            tracing::warn!(%error, "cannot save the motion preference");
+        }
+    }
+
+    /// Confetti, at most once every 25 seconds: a devnet or a lucky streak
+    /// finds blocks faster than anyone wants paper falling on the page.
+    fn celebrate(&mut self, ctx: &egui::Context, at: egui::Pos2, colours: &[Color32]) {
+        let now = ctx.input(|i| i.time);
+        if now - self.last_burst >= 25.0 {
+            self.last_burst = now;
+            self.confetti.burst(at, colours);
+        }
+    }
+
+    /// Put a line of news in the island for a few seconds.
+    pub fn announce(&mut self, ctx: &egui::Context, text: impl Into<String>) {
+        self.island_news = Some((text.into(), ctx.input(|i| i.time)));
+        ctx.request_repaint();
     }
 
     pub fn resync_chain(&mut self, ctx: &egui::Context) {
@@ -1208,6 +1264,15 @@ impl App {
         let amount = arrived as f64 / DARKS_PER_NIGHT as f64;
         self.toasts
             .success(ctx, format!("Received {amount:.8} NIGHT"));
+        self.announce(
+            ctx,
+            format!(
+                "Payment received  {}",
+                crate::reward::compact_amount(arrived)
+            ),
+        );
+        let top = ctx.screen_rect().center_top() + Vec2::new(0.0, 150.0);
+        self.celebrate(ctx, top, &[SUCCESS, CYAN, GRAD_A]);
     }
 
     fn drain_sync_signal(&mut self, _ctx: &egui::Context) {
@@ -1324,6 +1389,9 @@ impl App {
                 self.send_amount.clear();
                 self.send_memo.clear();
                 self.view = View::Activity;
+                self.announce(ctx, "Payment submitted · waiting for a block");
+                let at = ctx.screen_rect().center();
+                self.celebrate(ctx, at, &[GRAD_A, PINK, CYAN, SUCCESS]);
             }
             Err(e) => self.toasts.error(ctx, e.to_string()),
         }
@@ -1408,13 +1476,39 @@ impl App {
                     egui::Rect::from_min_max(egui::pos2(inner.left(), footer_top), inner.max);
                 ui.allocate_ui_at_rect(nav_rect, |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
+                    let t = crate::fx::clock(ui.ctx());
                     ui.horizontal(|ui| {
                         ui.add_space(2.0);
-                        logo(ui, 32.0);
+                        // A slow breath of light behind the mark.
+                        let halo = ui.painter().add(egui::Shape::Noop);
+                        let mark = logo(ui, 32.0).rect;
+                        let breath = 0.55 + 0.45 * (t * 1.1).sin();
+                        ui.painter().set(
+                            halo,
+                            crate::widgets::radial_shape(
+                                mark.center(),
+                                26.0 + breath * 6.0,
+                                with_alpha(GRAD_A, (40.0 + breath * 50.0) as u8),
+                                None,
+                            ),
+                        );
                         ui.add_space(9.0);
                         ui.vertical(|ui| {
                             ui.add_space(2.0);
-                            ui.label(RichText::new("NIGHTFALL").size(17.0).color(TEXT).strong());
+                            let word = ui
+                                .label(RichText::new("NIGHTFALL").size(17.0).color(TEXT).strong())
+                                .rect;
+                            // Every seven seconds a glint passes over the name.
+                            let k = (t / 7.0).fract() * 7.0;
+                            if k < 1.2 {
+                                let x = word.left() - 20.0 + (word.width() + 40.0) * (k / 1.2);
+                                radial_wash(
+                                    &ui.painter().with_clip_rect(word.expand(2.0)),
+                                    egui::pos2(x, word.center().y),
+                                    16.0,
+                                    Color32::from_white_alpha(70),
+                                );
+                            }
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
                                 ui.label(RichText::new("CORE WALLET").size(9.5).color(ACCENT_HI));
@@ -1424,6 +1518,11 @@ impl App {
                     });
 
                     ui.add_space(12.0);
+
+                    // The selection is one lit tile that glides to the page
+                    // chosen, painted behind the items into a reserved slot.
+                    let pill_slot = ui.painter().add(egui::Shape::Noop);
+                    let mut pill_at: Option<egui::Rect> = None;
 
                     for (view, label) in View::ALL {
                         let group = match view {
@@ -1451,12 +1550,7 @@ impl App {
                         });
 
                         if selected {
-                            ui.painter().rect(
-                                rect,
-                                Rounding::same(ROUND_SM),
-                                glass_inner(),
-                                Stroke::NONE,
-                            );
+                            pill_at = Some(rect);
                         } else if resp.hovered() {
                             ui.painter().rect(
                                 rect,
@@ -1468,11 +1562,30 @@ impl App {
                         }
 
                         let fg = if selected { TEXT } else { TEXT_DIM };
+                        let lift = crate::fx::spring(
+                            ui.ctx(),
+                            egui::Id::new(("nav-item", view as u8)),
+                            if resp.hovered() {
+                                1.0
+                            } else if selected {
+                                0.35
+                            } else {
+                                0.0
+                            },
+                        );
+                        // Icons keep moving while lit; ask for the frames.
+                        if lift > 0.05 && crate::fx::motion() {
+                            ui.ctx().request_repaint_after(Duration::from_millis(33));
+                        }
+                        let busy = view == View::Mining && self.is_mining();
                         nav_icon(
                             ui.painter(),
                             view,
                             egui::pos2(rect.min.x + 15.0, rect.center().y - 11.0),
                             fg,
+                            lift,
+                            t,
+                            busy,
                         );
                         let galley = ui.painter().layout_no_wrap(
                             label.to_string(),
@@ -1480,10 +1593,35 @@ impl App {
                             fg,
                         );
                         ui.painter().galley(
-                            egui::pos2(rect.min.x + 46.0, rect.center().y - galley.size().y / 2.0),
+                            egui::pos2(
+                                rect.min.x + 46.0 + lift * 3.0,
+                                rect.center().y - galley.size().y / 2.0,
+                            ),
                             galley,
                             fg,
                         );
+                        // Mining is running: three little bars dance beside it.
+                        if busy {
+                            for n in 0..3 {
+                                let h = 4.0
+                                    + 8.0
+                                        * (0.5
+                                            + 0.5 * (t * (5.0 + n as f32) + n as f32 * 1.7).sin());
+                                let x = rect.right() - 22.0 + n as f32 * 5.0;
+                                let bar = egui::Rect::from_min_max(
+                                    egui::pos2(x, rect.center().y + 6.0 - h),
+                                    egui::pos2(x + 3.0, rect.center().y + 6.0),
+                                );
+                                ui.painter().rect_filled(
+                                    bar,
+                                    Rounding::same(1.5),
+                                    brand_gradient(n as f32 / 2.0),
+                                );
+                            }
+                            if crate::fx::motion() {
+                                ui.ctx().request_repaint_after(Duration::from_millis(40));
+                            }
+                        }
 
                         if resp.has_focus() {
                             ui.painter().rect_stroke(
@@ -1498,6 +1636,81 @@ impl App {
                             self.reveal_mnemonic = false;
                             self.reveal_view_key = false;
                         }
+                    }
+                    // A few stars in the quiet stretch of the rail below the pages.
+                    {
+                        let top = ui.cursor().top() + 18.0;
+                        let bottom = footer_top - 12.0;
+                        if bottom - top > 30.0 {
+                            let w = ui.max_rect().width();
+                            let left = ui.max_rect().left();
+                            for i in 0..14_u32 {
+                                let h = i.wrapping_mul(2_654_435_761).rotate_left(5) ^ 0x68e3_1da4;
+                                let x = left + 8.0 + (w - 16.0) * ((h & 0xFFFF) as f32 / 65535.0);
+                                let y =
+                                    top + (bottom - top) * (((h >> 16) & 0xFFFF) as f32 / 65535.0);
+                                let tw = 0.5
+                                    + 0.5 * (t * (0.7 + (h & 7) as f32 * 0.12) + i as f32).sin();
+                                ui.painter().circle_filled(
+                                    egui::pos2(x, y),
+                                    0.6 + ((h >> 9) & 3) as f32 * 0.3,
+                                    Color32::from_white_alpha((20.0 + tw * 70.0) as u8),
+                                );
+                            }
+                            if crate::fx::motion() {
+                                ui.ctx().request_repaint_after(Duration::from_millis(80));
+                            }
+                        }
+                    }
+                    if let Some(at) = pill_at {
+                        let ctx = ui.ctx().clone();
+                        let y = crate::fx::spring(&ctx, egui::Id::new("nav-pill-y"), at.top());
+                        // Liquid: while it travels the tile stretches out
+                        // behind itself, then pulls back to its own size.
+                        let prev_id = egui::Id::new("nav-pill-prev");
+                        let prev = ctx.data(|d| d.get_temp::<f32>(prev_id)).unwrap_or(y);
+                        ctx.data_mut(|d| d.insert_temp(prev_id, y));
+                        let moved = y - prev;
+                        let stretch = (moved.abs() * 1.6).min(18.0);
+                        let (top, bottom) = if moved > 0.0 {
+                            (y - stretch, y + at.height())
+                        } else {
+                            (y, y + at.height() + stretch)
+                        };
+                        let pill = egui::Rect::from_min_max(
+                            egui::pos2(at.left(), top),
+                            egui::pos2(at.right(), bottom),
+                        );
+                        let settled = 1.0 - (moved.abs() / 6.0).min(1.0);
+                        let bar = egui::Rect::from_center_size(
+                            egui::pos2(pill.left() + 4.0, pill.center().y),
+                            egui::vec2(3.0, (pill.height() * 0.52).max(10.0)),
+                        );
+                        ui.painter().set(
+                            pill_slot,
+                            egui::Shape::Vec(vec![
+                                egui::Shape::Rect(
+                                    egui::epaint::Shadow {
+                                        offset: egui::vec2(0.0, 4.0),
+                                        blur: 12.0,
+                                        spread: -2.0,
+                                        color: with_alpha(INK, 110),
+                                    }
+                                    .as_shape(pill, Rounding::same(ROUND_SM)),
+                                ),
+                                egui::Shape::rect_filled(
+                                    pill,
+                                    Rounding::same(ROUND_SM),
+                                    glass_inner(),
+                                ),
+                                crate::widgets::gradient_shape(
+                                    bar,
+                                    1.5,
+                                    egui::vec2(0.0, 1.0),
+                                    |k| with_alpha(brand_gradient(k), (settled * 255.0) as u8),
+                                ),
+                            ]),
+                        );
                     }
                 });
 
@@ -1648,8 +1861,8 @@ impl App {
                                         egui::Layout::top_down(egui::Align::LEFT),
                                         |ui| {
                                             ui.set_width(detail_width);
-                                            ui.add_space(-2.0);
-                                            ui.label(RichText::new(title).size(24.0).strong());
+                                            ui.add_space(-4.0);
+                                            ui.label(RichText::new(title).size(28.0).strong());
                                             ui.add(
                                                 egui::Label::new(
                                                     RichText::new(views::page_description(
@@ -1750,6 +1963,9 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply(ctx);
+        // The screenshot walk photographs each page a few frames after asking
+        // for it; nothing may still be on its way in when the shutter fires.
+        crate::fx::set_reduce_motion(self.reduce_motion || self.shots.is_some());
         paint_room(ctx);
         // Before any early return below: a screen that cannot be moved or
         // closed is a trap, and the lock screen and onboarding are screens.
@@ -1883,6 +2099,7 @@ impl eframe::App for App {
             return;
         }
 
+        self.shortcuts(ctx);
         self.float_sidebar(ctx);
         self.topbar(ctx);
         // The toolbar's lock must conceal page data in this same frame.
@@ -1890,6 +2107,10 @@ impl eframe::App for App {
             ctx.request_repaint();
             return;
         }
+        if self.page_since.0 != self.view {
+            self.page_since = (self.view, ctx.input(|i| i.time));
+        }
+        let arrive = crate::fx::ease_since(ctx, self.page_since.1, 0.42);
 
         egui::CentralPanel::default()
             .frame(
@@ -1912,6 +2133,11 @@ impl eframe::App for App {
                     area = area.vertical_scroll_offset(offset);
                 }
                 let drawn = area.show(ui, |ui| {
+                    // A new page rises a few points into place as it fades in.
+                    if arrive < 1.0 {
+                        ui.set_opacity(arrive);
+                        ui.add_space((1.0 - arrive) * 26.0);
+                    }
                     page_column(ui, self.view.content_max_width(), |ui| {
                         let banner_w = ui.available_width();
 
@@ -1985,14 +2211,245 @@ impl eframe::App for App {
         {
             self.rewards.preview(ctx.input(|input| input.time));
         }
-        self.rewards.show(
+        if let Some((amount, count)) = self.rewards.show(
             ctx,
             self.reward_sound,
             self.send_confirm || self.retry_payment.is_some(),
             94.0 + Self::title_clearance(),
-        );
+        ) {
+            self.block_found_at = Some(ctx.input(|i| i.time));
+            let what = if count == 1 {
+                "Block found".to_string()
+            } else {
+                format!("{count} blocks found")
+            };
+            self.announce(
+                ctx,
+                format!("{what}  {}", crate::reward::compact_amount(amount)),
+            );
+            let corner = ctx.screen_rect().right_top() + Vec2::new(-160.0, 150.0);
+            self.celebrate(ctx, corner, &[GRAD_A, PINK, WARN, CYAN]);
+        }
+        self.island(ctx);
+        self.palette_window(ctx);
         self.toasts.show(ctx);
+        self.confetti.show(ctx);
         crate::ui_shots::step(self, ctx);
+    }
+}
+
+impl App {
+    /// ⌘1…⌘7 open the pages in sidebar order; ⌘K opens the palette.
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        let keys = [
+            egui::Key::Num1,
+            egui::Key::Num2,
+            egui::Key::Num3,
+            egui::Key::Num4,
+            egui::Key::Num5,
+            egui::Key::Num6,
+            egui::Key::Num7,
+        ];
+        for (index, key) in keys.into_iter().enumerate() {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, key)) {
+                self.go(View::ALL[index].0);
+            }
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
+            self.palette = if self.palette.is_some() {
+                None
+            } else {
+                Some(String::new())
+            };
+            self.palette_pick = 0;
+        }
+    }
+
+    /// Navigate, closing anything a page left revealed — the same as a click
+    /// in the sidebar.
+    fn go(&mut self, view: View) {
+        self.view = view;
+        self.reveal_seed = false;
+        self.reveal_mnemonic = false;
+        self.reveal_view_key = false;
+    }
+
+    /// The black pill at the top of the window.
+    fn island(&mut self, ctx: &egui::Context) {
+        if Self::title_clearance() <= 0.0 {
+            return;
+        }
+        let (text, colour) = match &self.status {
+            None => ("Node starting".to_string(), TEXT_DIM),
+            Some(s) if s.loading => ("Loading the chain".to_string(), WARN),
+            Some(s) if s.live_peers == 0 => {
+                (format!("No peers · block {}", format_int(s.blocks)), WARN)
+            }
+            Some(s) if s.blocks_behind > 0 || s.sync_hold != nightfall_node::SyncHold::Synced => (
+                format!("Syncing · block {}", format_int(s.blocks)),
+                ACCENT_HI,
+            ),
+            Some(s) => (
+                format!(
+                    "Synced · block {} · {} peers",
+                    format_int(s.blocks),
+                    s.live_peers
+                ),
+                SUCCESS,
+            ),
+        };
+        let plate = crate::widgets::window_plate(ctx);
+        let centre = egui::pos2(plate.center().x, plate.top() + 19.0);
+        let news = self.island_news.as_ref().map(|(t, at)| (t.as_str(), *at));
+        crate::fx::island(ctx, centre, &text, colour, news);
+    }
+
+    /// ⌘K: go anywhere, do the common things, by typing.
+    fn palette_window(&mut self, ctx: &egui::Context) {
+        let Some(mut query) = self.palette.take() else {
+            return;
+        };
+        let mining = self.is_mining();
+        let mut actions: Vec<(String, u8)> = View::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, (_, label))| (format!("Go to {label}"), i as u8))
+            .collect();
+        actions.push((
+            if mining {
+                "Stop mining".into()
+            } else {
+                "Start mining".into()
+            },
+            100,
+        ));
+        actions.push(("Lock wallet".into(), 101));
+        actions.push((
+            if self.reduce_motion {
+                "Turn animations back on".into()
+            } else {
+                "Reduce motion".into()
+            },
+            102,
+        ));
+        let needle = query.to_lowercase();
+        let shown: Vec<(String, u8)> = actions
+            .into_iter()
+            .filter(|(label, _)| needle.is_empty() || label.to_lowercase().contains(&needle))
+            .collect();
+        self.palette_pick = self.palette_pick.min(shown.len().saturating_sub(1));
+
+        let (up, down, enter, escape) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        if up {
+            self.palette_pick = self.palette_pick.saturating_sub(1);
+        }
+        if down && self.palette_pick + 1 < shown.len() {
+            self.palette_pick += 1;
+        }
+        let mut chosen = enter
+            .then(|| shown.get(self.palette_pick).map(|a| a.1))
+            .flatten();
+        let mut close = escape;
+
+        let plate = crate::widgets::window_plate(ctx);
+        egui::Area::new(egui::Id::new("palette"))
+            .fixed_pos(egui::pos2(plate.center().x - 270.0, plate.top() + 110.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(tint(SURFACE, GRAD_A, 0.05))
+                    .stroke(Stroke::new(1.0_f32, with_alpha(BORDER_HI, 90)))
+                    .rounding(Rounding::same(ROUND_SM + 4.0))
+                    .inner_margin(egui::Margin::same(10.0))
+                    .shadow(egui::epaint::Shadow {
+                        offset: egui::vec2(0.0, 24.0),
+                        blur: 60.0,
+                        spread: 0.0,
+                        color: Color32::from_black_alpha(170),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(520.0);
+                        let edit = ui.add(
+                            egui::TextEdit::singleline(&mut query)
+                                .id_salt("palette-query")
+                                .hint_text(RichText::new("Go to, or do…").color(TEXT_FAINT))
+                                .font(egui::FontId::proportional(17.0))
+                                .frame(false)
+                                .desired_width(500.0)
+                                .margin(egui::Margin::symmetric(10.0, 10.0)),
+                        );
+                        edit.request_focus();
+                        ui.add_space(6.0);
+                        for (index, (label, code)) in shown.iter().enumerate() {
+                            let (rect, resp) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 36.0),
+                                egui::Sense::click(),
+                            );
+                            if resp.hovered() {
+                                self.palette_pick = index;
+                            }
+                            if index == self.palette_pick {
+                                crate::widgets::gradient_rect(
+                                    ui.painter(),
+                                    rect,
+                                    10.0,
+                                    Vec2::new(1.0, 0.0),
+                                    |t| hero_gradient(t * 0.5),
+                                );
+                            }
+                            ui.painter().text(
+                                rect.left_center() + Vec2::new(14.0, 0.0),
+                                egui::Align2::LEFT_CENTER,
+                                label,
+                                egui::FontId::proportional(14.0),
+                                if index == self.palette_pick {
+                                    Color32::WHITE
+                                } else {
+                                    TEXT_DIM
+                                },
+                            );
+                            if *code < 7 {
+                                ui.painter().text(
+                                    rect.right_center() - Vec2::new(14.0, 0.0),
+                                    egui::Align2::RIGHT_CENTER,
+                                    if cfg!(target_os = "macos") {
+                                        format!("⌘{}", code + 1)
+                                    } else {
+                                        format!("Ctrl+{}", code + 1)
+                                    },
+                                    egui::FontId::proportional(12.0),
+                                    TEXT_FAINT,
+                                );
+                            }
+                            if resp.clicked() {
+                                chosen = Some(*code);
+                            }
+                        }
+                        if shown.is_empty() {
+                            ui.label(RichText::new("Nothing matches.").color(TEXT_FAINT));
+                        }
+                    });
+            });
+        if let Some(code) = chosen {
+            close = true;
+            match code {
+                0..=6 => self.go(View::ALL[code as usize].0),
+                100 => self.set_mining(!mining),
+                101 => self.request_vault(crate::vault_ui::Action::Lock, ctx),
+                102 => self.set_reduce_motion(!self.reduce_motion),
+                _ => {}
+            }
+        }
+        if !close {
+            self.palette = Some(query);
+        }
     }
 }
 
