@@ -2711,7 +2711,7 @@ pub fn mining(app: &mut App, ui: &mut egui::Ui) {
         // One big switch, lit while it runs. No fee either way: the whole
         // block reward goes to this wallet.
         ui.vertical_centered(|ui| {
-            if crate::fx::power_button(ui, mining, 150.0)
+            if crate::fx::power_button(ui, mining, 150.0, app.hashrate.current, app.block_found_at)
                 .on_hover_text(if mining {
                     "Stop mining"
                 } else {
@@ -2744,6 +2744,8 @@ pub fn mining(app: &mut App, ui: &mut egui::Ui) {
                 .color(if mining { ACCENT_HI } else { TEXT_DIM }),
             );
         });
+        ui.add_space(14.0);
+        crate::fx::chain_strip(ui, blocks, mining);
 
         if mining {
             if let Some(status) = &app.status {

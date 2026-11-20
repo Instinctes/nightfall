@@ -336,6 +336,9 @@ pub struct App {
     palette_pick: usize,
     /// When the last celebration burst, so a run of blocks is one party.
     last_burst: f64,
+    /// When this wallet last found a block (context time), for the shockwave
+    /// on the Mining page.
+    pub block_found_at: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -512,6 +515,7 @@ impl App {
             palette: None,
             palette_pick: 0,
             last_burst: f64::MIN,
+            block_found_at: None,
         };
         if custody == Custody::Legacy && app.wallet_load_error.is_none() {
             app.start_node();
@@ -2091,6 +2095,7 @@ impl eframe::App for App {
             self.send_confirm || self.retry_payment.is_some(),
             94.0 + Self::title_clearance(),
         ) {
+            self.block_found_at = Some(ctx.input(|i| i.time));
             let what = if count == 1 {
                 "Block found".to_string()
             } else {

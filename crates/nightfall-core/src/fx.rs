@@ -667,10 +667,26 @@ pub fn area_chart_painter(
 
 // ----------------------------------------------------------- power button ---
 
-/// The mining switch: a large round button with a turning ring of light while
-/// it is on.
-pub fn power_button(ui: &mut egui::Ui, on: bool, diameter: f32) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(diameter + 36.0), Sense::click());
+/// The mining switch, on a stage of its own.
+///
+/// While it runs, points of light spiral in from the edges and are drawn into
+/// the core — nonces being tried — faster as the hashrate climbs. When a block
+/// is found a shockwave rolls out from the button. Off, the stage is still.
+pub fn power_button(
+    ui: &mut egui::Ui,
+    on: bool,
+    diameter: f32,
+    hashrate: f64,
+    found_at: Option<f64>,
+) -> egui::Response {
+    let stage = Vec2::new(ui.available_width(), diameter * 1.9);
+    let (stage_rect, _) = ui.allocate_exact_size(stage, Sense::hover());
+    let rect = Rect::from_center_size(stage_rect.center(), Vec2::splat(diameter + 36.0));
+    let resp = ui.interact(
+        Rect::from_center_size(rect.center(), Vec2::splat(diameter)),
+        egui::Id::new("mining-power-button"),
+        Sense::click(),
+    );
     resp.widget_info(|| {
         egui::WidgetInfo::selected(
             egui::WidgetType::Checkbox,
@@ -701,7 +717,42 @@ pub fn power_button(ui: &mut egui::Ui, on: bool, diameter: f32) -> egui::Respons
     let painter = ui.painter();
     let t = clock(&ctx);
 
+    let stage_painter = painter.with_clip_rect(stage_rect);
     if glow > 0.01 {
+        // The vortex: each point starts at the edge of the stage and is
+        // drawn inward along a spiral, brightening as it nears the core.
+        // Its speed follows the hashrate on a log scale, so a laptop and a
+        // GPU both look busy without either looking frantic.
+        let speed = 0.10 + 0.08 * (1.0 + hashrate.max(0.0)).log10() as f32;
+        let outer = (stage_rect.width() * 0.5).min(diameter * 1.6);
+        const N: usize = 140;
+        for i in 0..N {
+            // Additive recurrences on two irrational steps: even around the
+            // circle and even in speed, with no two points in lockstep.
+            let jitter = (i as f32 * 0.754_877_7).fract();
+            let pace = 0.7 + 0.6 * (i as f32 * 0.569_840_3).fract();
+            let phase = (t * speed * pace + i as f32 * 0.618_034).fract();
+            let k = phase * phase;
+            let radius = outer + (r * 1.02 - outer) * k;
+            let angle = jitter * TAU + phase * TAU * 1.35;
+            let p = c + Vec2::new(angle.cos() * radius, angle.sin() * radius * 0.62);
+            let fade = smooth(0.0, 0.18, phase) * (1.0 - smooth(0.88, 1.0, phase));
+            let colour = brand_gradient((i as f32 / N as f32 + t * 0.03).fract());
+            let a = glow * fade * (0.35 + 0.65 * phase);
+            if phase > 0.55 {
+                radial_wash(
+                    &stage_painter,
+                    p,
+                    6.0,
+                    with_alpha(colour, (a * 120.0) as u8),
+                );
+            }
+            stage_painter.circle_filled(
+                p,
+                0.8 + 1.6 * phase,
+                with_alpha(colour, (a * 230.0) as u8),
+            );
+        }
         // A ring of soft lights in the brand colours, turning.
         for i in 0..18 {
             let a = i as f32 / 18.0 * TAU + t * 0.9;
@@ -769,6 +820,34 @@ pub fn power_button(ui: &mut egui::Ui, on: bool, diameter: f32) -> egui::Respons
         stroke,
     );
 
+    // A found block: two rings roll out from the core and fade.
+    if let Some(at) = found_at.filter(|_| motion()) {
+        let age = (ctx.input(|i| i.time) - at) as f32;
+        if (0.0..1.6).contains(&age) {
+            for (delay, colour) in [(0.0_f32, GRAD_A), (0.22, PINK)] {
+                let k = ((age - delay) / 1.2).clamp(0.0, 1.0);
+                if k > 0.0 && k < 1.0 {
+                    let e = 1.0 - (1.0 - k).powi(3);
+                    stage_painter.circle_stroke(
+                        c,
+                        r + e * diameter * 0.95,
+                        Stroke::new(
+                            3.0 * (1.0 - k) + 0.5,
+                            with_alpha(colour, ((1.0 - k) * 220.0) as u8),
+                        ),
+                    );
+                }
+            }
+            radial_wash(
+                &stage_painter,
+                c,
+                r * (1.2 + age),
+                with_alpha(Color32::WHITE, ((1.0 - age / 1.6) * 60.0) as u8),
+            );
+            ctx.request_repaint();
+        }
+    }
+
     if resp.has_focus() {
         painter.circle_stroke(c, r + 5.0, Stroke::new(2.0_f32, ACCENT_HI));
     }
@@ -776,6 +855,137 @@ pub fn power_button(ui: &mut egui::Ui, on: bool, diameter: f32) -> egui::Respons
         ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     resp
+}
+
+/// The last few blocks of the chain, in a row, sliding left as each new one
+/// arrives. While mining, the empty slot at the right edge is the block being
+/// worked on: it shimmers, and hash characters roll across it.
+pub fn chain_strip(ui: &mut egui::Ui, tip: u64, mining: bool) {
+    const SLOTS: i64 = 7;
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 78.0), Sense::hover());
+    let painter = ui.painter().with_clip_rect(rect);
+    let ctx = ui.ctx().clone();
+    let t = clock(&ctx);
+    let gap = 12.0;
+    let bw = ((width - gap * (SLOTS as f32)) / (SLOTS as f32 + 0.6)).clamp(48.0, 120.0);
+    let bh = 50.0;
+    let step = bw + gap;
+    // Slide: the row is drawn at the spring's height, which jumps to the new
+    // tip and is then pulled smoothly into place — so a new block comes out
+    // of the working slot on the right and the older ones move left.
+    let shown = spring(&ctx, egui::Id::new("chain-strip-tip"), tip as f32);
+    let shift = ((tip as f32 - shown) * step).clamp(-step, step * 2.0);
+    let y = rect.center().y - 6.0;
+    let next = Rect::from_min_size(
+        egui::pos2(rect.right() - 2.0 - bw, y - bh / 2.0),
+        Vec2::new(bw, bh),
+    );
+    let newest_right = next.left() - gap;
+
+    // The block being worked on, behind the row so an arriving block covers it.
+    let dash = with_alpha(GRAD_A, if mining { 150 } else { 60 });
+    painter.rect_stroke(next, Rounding::same(12.0), Stroke::new(1.0_f32, dash));
+    if mining && motion() {
+        let sweep = (t * 0.9).fract();
+        let sx = next.left() + next.width() * sweep;
+        let inner = painter.with_clip_rect(next.shrink(1.0));
+        radial_wash(
+            &inner,
+            egui::pos2(sx, next.center().y),
+            bh * 0.9,
+            with_alpha(CYAN, 90),
+        );
+        let hex = b"0123456789abcdef";
+        let n = ((bw - 12.0) / 7.5).max(3.0) as usize;
+        let text: String = (0..n)
+            .map(|j| {
+                let v = ((t * 18.0) as u32).wrapping_mul(2_654_435_761)
+                    ^ (j as u32).wrapping_mul(40_503);
+                hex[(v >> 7) as usize % 16] as char
+            })
+            .collect();
+        inner.text(
+            next.center(),
+            egui::Align2::CENTER_CENTER,
+            text,
+            egui::FontId::monospace(11.0),
+            with_alpha(CYAN, 200),
+        );
+        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+    } else {
+        painter.text(
+            next.center(),
+            egui::Align2::CENTER_CENTER,
+            "next",
+            egui::FontId::proportional(11.0),
+            TEXT_FAINT,
+        );
+    }
+
+    for j in (0..=SLOTS).rev() {
+        let height = tip as i64 - j;
+        if height < 0 {
+            continue;
+        }
+        let right = newest_right - j as f32 * step + shift;
+        let b = Rect::from_min_size(egui::pos2(right - bw, y - bh / 2.0), Vec2::new(bw, bh));
+        if b.right() < rect.left() {
+            continue;
+        }
+        let newest = j == 0;
+        // Older blocks fade towards the left edge.
+        let age = ((rect.right() - b.center().x) / rect.width()).clamp(0.0, 1.0);
+        let alpha = (1.0 - age * 0.75).clamp(0.15, 1.0);
+        let fill = if newest {
+            lerp_color(HERO_A, GRAD_A, 0.25)
+        } else {
+            lerp_color(SURFACE_HI, HERO_A, 0.35)
+        };
+        // The link to the block after this one.
+        painter.line_segment(
+            [
+                egui::pos2(b.right(), b.center().y),
+                egui::pos2(b.right() + gap, b.center().y),
+            ],
+            Stroke::new(2.0_f32, with_alpha(GRAD_A, (alpha * 120.0) as u8)),
+        );
+        if newest {
+            // Small enough to fade out inside the strip, never cut square.
+            radial_wash(&painter, b.center(), bh * 0.68, with_alpha(GRAD_A, 80));
+        }
+        painter.rect_filled(
+            b,
+            Rounding::same(12.0),
+            with_alpha(fill, (alpha * 255.0) as u8),
+        );
+        painter.rect_stroke(
+            b,
+            Rounding::same(12.0),
+            Stroke::new(
+                1.0_f32,
+                with_alpha(GRAD_A, (alpha * if newest { 160.0 } else { 60.0 }) as u8),
+            ),
+        );
+        painter.text(
+            b.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("#{}", crate::widgets::format_int(height as u64)),
+            egui::FontId::proportional(if bw > 90.0 { 13.0 } else { 11.0 }),
+            with_alpha(TEXT, (alpha * 255.0) as u8),
+        );
+    }
+    painter.text(
+        egui::pos2(rect.left(), rect.bottom()),
+        egui::Align2::LEFT_BOTTOM,
+        if mining {
+            "Working on the next block"
+        } else {
+            "The latest blocks"
+        },
+        egui::FontId::proportional(11.0),
+        TEXT_FAINT,
+    );
 }
 
 // ------------------------------------------------------------------ slider ---
