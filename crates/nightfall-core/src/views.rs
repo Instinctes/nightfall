@@ -3101,7 +3101,7 @@ pub fn network(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.add_space(4.0);
         // How many, never where: the lights are placed by their number, not by
         // any address, so the picture leaks nothing a screenshot could share.
-        crate::fx::globe(ui, 250.0, peers, s.map(|s| s.reachable_nodes).unwrap_or(0));
+        crate::fx::globe(ui, 380.0, peers, s.map(|s| s.reachable_nodes).unwrap_or(0));
         ui.add_space(10.0);
         metric_grid(
             ui,

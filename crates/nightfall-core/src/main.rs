@@ -11,6 +11,7 @@ mod app;
 mod backup_recovery;
 mod feedback;
 mod fx;
+mod globe_land;
 mod onboarding;
 mod recovery_studio;
 mod reward;

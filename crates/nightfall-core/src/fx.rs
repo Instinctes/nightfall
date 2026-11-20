@@ -871,133 +871,344 @@ pub fn slider_int(
 
 // ------------------------------------------------------------------- globe ---
 
-/// A slowly turning globe with this node at its heart and one light for each
-/// peer it is talking to. The positions are made up — a node does not know
-/// where its peers are, and this does not pretend to — so the picture is
-/// "how many", never "where".
+/// The land of the Earth as points on the unit sphere, decoded once.
+///
+/// A Fibonacci lattice spreads the points evenly — no crowding at the poles,
+/// which a latitude/longitude grid would have — and each is kept when the
+/// one-degree land map in `globe_land` says it falls on land.
+fn land_points() -> &'static [[f32; 3]] {
+    use std::sync::OnceLock;
+    static POINTS: OnceLock<Vec<[f32; 3]>> = OnceLock::new();
+    POINTS.get_or_init(|| {
+        use crate::globe_land::{HEIGHT, LAND_RLE, WIDTH};
+        let mut land = vec![false; WIDTH * HEIGHT];
+        let mut i = 0;
+        for row in 0..HEIGHT {
+            let runs = LAND_RLE[i] as usize;
+            i += 1;
+            let (mut col, mut on) = (0, false);
+            for k in 0..runs {
+                let n = LAND_RLE[i + k] as usize;
+                if on {
+                    for c in col..(col + n).min(WIDTH) {
+                        land[row * WIDTH + c] = true;
+                    }
+                }
+                col += n;
+                on = !on;
+            }
+            i += runs;
+        }
+        const N: usize = 11_000;
+        let golden = std::f32::consts::PI * (3.0 - 5.0_f32.sqrt());
+        (0..N)
+            .filter_map(|k| {
+                let y = 1.0 - 2.0 * (k as f32 + 0.5) / N as f32;
+                let ring = (1.0 - y * y).sqrt();
+                let a = golden * k as f32;
+                let (x, z) = (ring * a.cos(), ring * a.sin());
+                let lat = y.asin().to_degrees();
+                let lon = (-z).atan2(x).to_degrees();
+                let row = ((90.0 - lat).floor() as usize).min(HEIGHT - 1);
+                let col = ((lon + 180.0).floor() as usize).min(WIDTH - 1);
+                land[row * WIDTH + col].then_some([x, y, z])
+            })
+            .collect()
+    })
+}
+
+/// A point on the unit sphere at a latitude and longitude, in degrees.
+fn on_sphere(lat: f32, lon: f32) -> [f32; 3] {
+    let (la, lo) = (lat.to_radians(), lon.to_radians());
+    [la.cos() * lo.cos(), la.sin(), -la.cos() * lo.sin()]
+}
+
+fn slerp(a: [f32; 3], b: [f32; 3], s: f32) -> [f32; 3] {
+    let dot = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]).clamp(-1.0, 1.0);
+    let w = dot.acos();
+    if w < 1e-4 {
+        return a;
+    }
+    let (ka, kb) = (((1.0 - s) * w).sin() / w.sin(), (s * w).sin() / w.sin());
+    [
+        ka * a[0] + kb * b[0],
+        ka * a[1] + kb * b[1],
+        ka * a[2] + kb * b[2],
+    ]
+}
+
+/// The Earth turning slowly in its own light, with this node and one light
+/// for every peer it is talking to, joined by arcs that carry pulses.
+///
+/// The continents are real; where the lights sit on them is not. A node does
+/// not know where its peers are and this does not pretend to — every light is
+/// placed by its number alone, so the picture says how many, never where, and
+/// a screenshot of it shares nothing. Drag it to spin the world.
 pub fn globe(ui: &mut egui::Ui, height: f32, peers: usize, reachable: usize) {
     let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), Sense::drag());
+    let ctx = ui.ctx().clone();
     let painter = ui.painter().with_clip_rect(rect);
-    let t = clock(ui.ctx());
+    let t = clock(&ctx);
     if motion() {
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(33));
-    }
-    let c = rect.center() + Vec2::new(0.0, 6.0);
-    let r = (height * 0.40).min(width * 0.30);
-    // Kept inside the globe's own rectangle by its rim rather than by the
-    // clip, so the glow fades out instead of ending in a square.
-    painter.add(crate::widgets::radial_shape(
-        c,
-        r * 1.7,
-        with_alpha(ACCENT, 70),
-        Some(rect),
-    ));
-
-    let grid = with_alpha(ACCENT_HI, 28);
-    for i in -2..=2 {
-        let lat = i as f32 * 0.5;
-        let rr = r * lat.cos();
-        let y = c.y - r * lat.sin();
-        ellipse(
-            &painter,
-            egui::pos2(c.x, y),
-            rr,
-            rr * 0.2,
-            Stroke::new(1.0_f32, grid),
-        );
-    }
-    for i in 0..6 {
-        let a = t * 0.25 + i as f32 * TAU / 12.0;
-        ellipse(
-            &painter,
-            c,
-            (r * a.cos()).abs(),
-            r,
-            Stroke::new(1.0_f32, grid),
-        );
+        ctx.request_repaint_after(std::time::Duration::from_millis(33));
     }
 
-    // Deterministic pseudo-random sphere points.
-    let point = |i: usize| {
-        let h = (i as u32).wrapping_mul(2_654_435_761).rotate_left(13) ^ 0x9E37_79B9;
-        let u = (h & 0xFFFF) as f32 / 65535.0;
-        let v = ((h >> 16) & 0xFFFF) as f32 / 65535.0;
-        ((u - 0.5) * 2.4, v * TAU)
+    // Spin: a slow turn of its own, plus whatever a drag gave it, which
+    // carries on and dies away like a real globe on its stand.
+    let spin_id = egui::Id::new("globe-spin");
+    let (mut offset, mut velocity) = ctx
+        .data(|d| d.get_temp::<(f32, f32)>(spin_id))
+        .unwrap_or((0.0, 0.0));
+    let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 1.0 / 20.0);
+    if resp.dragged() {
+        let dx = resp.drag_delta().x;
+        offset += dx * 0.008;
+        velocity = dx * 0.008 / dt.max(1.0 / 120.0);
+    } else {
+        offset += velocity * dt;
+        velocity *= (1.0 - 2.4 * dt).max(0.0);
+    }
+    if velocity.abs() > 0.001 {
+        ctx.request_repaint();
+    }
+    ctx.data_mut(|d| d.insert_temp(spin_id, (offset, velocity)));
+    if resp.hovered() {
+        ctx.set_cursor_icon(if resp.dragged() {
+            egui::CursorIcon::Grabbing
+        } else {
+            egui::CursorIcon::Grab
+        });
+    }
+
+    let yaw = t * 0.10 + offset;
+    let tilt: f32 = 0.38;
+    let (sy, cy) = yaw.sin_cos();
+    let (st, ct) = tilt.sin_cos();
+    // World → view: turn about the polar axis, then lean towards the viewer.
+    let view = |p: [f32; 3]| -> [f32; 3] {
+        let x = p[0] * cy - p[2] * sy;
+        let z = p[0] * sy + p[2] * cy;
+        let y = p[1] * ct - z * st;
+        let z = p[1] * st + z * ct;
+        [x, y, z]
     };
-    let mut drawn: Vec<(Pos2, f32, bool)> = (0..peers.min(160))
-        .map(|i| {
-            let (lat, lon) = point(i);
-            let lon = lon + t * 0.25;
-            let x = lat.cos() * lon.sin();
-            let y = lat.sin();
-            let z = lat.cos() * lon.cos();
-            (egui::pos2(c.x + x * r, c.y - y * r), z, i < reachable)
-        })
-        .collect();
-    drawn.sort_by(|a, b| a.1.total_cmp(&b.1));
-    for (p, z, _) in &drawn {
-        if *z < -0.2 {
+    let c = rect.center() + Vec2::new(0.0, 4.0);
+    let r = (height * 0.42).min(width * 0.32);
+    let screen = |v: [f32; 3]| egui::pos2(c.x + v[0] * r, c.y - v[1] * r);
+
+    // Stars behind the world.
+    for i in 0..60_u32 {
+        let h = i.wrapping_mul(2_246_822_519).rotate_left(9) ^ 0x2545_f491;
+        let p = egui::pos2(
+            rect.left() + rect.width() * ((h & 0xFFFF) as f32 / 65535.0),
+            rect.top() + rect.height() * (((h >> 16) & 0xFFFF) as f32 / 65535.0),
+        );
+        if (p - c).length() < r * 1.15 {
             continue;
         }
-        let mid = egui::pos2((c.x + p.x) / 2.0, (c.y + p.y) / 2.0 - 30.0);
-        let pts: Vec<Pos2> = (0..=16)
-            .map(|k| {
-                let s = k as f32 / 16.0;
-                let a = c.lerp(mid, s);
-                let b = mid.lerp(*p, s);
-                a.lerp(b, s)
-            })
-            .collect();
-        painter.add(egui::Shape::line(
-            pts,
-            Stroke::new(
-                1.0_f32,
-                with_alpha(GRAD_A, (18.0 + z.max(0.0) * 50.0) as u8),
-            ),
-        ));
+        let tw = 0.35 + 0.65 * (0.5 + 0.5 * (t * (0.6 + (h & 7) as f32 * 0.15) + i as f32).sin());
+        painter.circle_filled(
+            p,
+            0.6 + ((h >> 5) & 3) as f32 * 0.35,
+            Color32::from_white_alpha((tw * 120.0) as u8),
+        );
     }
-    // Travelling pulses along a few of the links.
-    if motion() && !drawn.is_empty() {
-        for k in 0..4 {
-            let idx = ((t * 0.7) as usize + k * 7) % drawn.len();
-            let (p, z, _) = drawn[idx];
-            if z < 0.0 {
-                continue;
+
+    // Atmosphere: a wide violet halo and a thin bright limb.
+    radial_wash(&painter, c, r * 1.55, with_alpha(ACCENT, 80));
+    radial_wash(&painter, c, r * 1.18, with_alpha(GRAD_A, 60));
+
+    // The ocean: deep at the limb, lit towards the upper left.
+    let light = {
+        let l = [-0.45_f32, 0.55, 0.70];
+        let n = (l[0] * l[0] + l[1] * l[1] + l[2] * l[2]).sqrt();
+        [l[0] / n, l[1] / n, l[2] / n]
+    };
+    {
+        let mut mesh = egui::Mesh::default();
+        let centre_colour = lerp_color(HERO_A, INK, 0.35);
+        mesh.colored_vertex(c, centre_colour);
+        const SEG: usize = 96;
+        for i in 0..=SEG {
+            let a = i as f32 / SEG as f32 * TAU;
+            let (dx, dy) = (a.cos(), a.sin());
+            let lit = (-dx * light[0] + dy * light[1]).max(0.0);
+            let rim = lerp_color(lerp_color(INK, HERO_A, 0.25), HERO_A, lit * 0.8);
+            mesh.colored_vertex(egui::pos2(c.x + dx * r, c.y + dy * r), rim);
+        }
+        for i in 0..SEG as u32 {
+            mesh.add_triangle(0, 1 + i, 2 + i);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+    }
+    radial_wash(
+        &painter,
+        c + Vec2::new(-r * 0.30, -r * 0.34),
+        r * 0.62,
+        with_alpha(GRAD_A, 46),
+    );
+
+    // Graticule on the near side: every 30° of latitude and longitude.
+    let grid = |p: [f32; 3]| view(p);
+    for lat in [-60.0_f32, -30.0, 0.0, 30.0, 60.0] {
+        let pts: Vec<[f32; 3]> = (0..=72)
+            .map(|k| grid(on_sphere(lat, k as f32 * 5.0)))
+            .collect();
+        draw_near(&painter, &pts, screen, with_alpha(ACCENT_HI, 26));
+    }
+    for k in 0..12 {
+        let lon = k as f32 * 30.0;
+        let pts: Vec<[f32; 3]> = (0..=36)
+            .map(|j| grid(on_sphere(-90.0 + j as f32 * 5.0, lon)))
+            .collect();
+        draw_near(&painter, &pts, screen, with_alpha(ACCENT_HI, 22));
+    }
+
+    // Land: each point a small light, brighter where the sun is and fading
+    // towards the limb so the world reads as round.
+    let dot_r = (r * 0.0125).clamp(0.9, 2.6);
+    for p in land_points() {
+        let v = view(*p);
+        if v[2] <= 0.02 {
+            continue;
+        }
+        let sun = (v[0] * light[0] + v[1] * light[1] + v[2] * light[2]).max(0.0);
+        let limb = v[2].powf(0.6);
+        let colour = lerp_color(lerp_color(ACCENT, GRAD_A, sun), CYAN, sun * sun * 0.35);
+        painter.circle_filled(
+            screen(v),
+            dot_r * (0.7 + 0.3 * limb),
+            with_alpha(colour, (60.0 + 195.0 * limb * (0.45 + 0.55 * sun)) as u8),
+        );
+    }
+    painter.circle_stroke(c, r, Stroke::new(1.2_f32, with_alpha(GRAD_A, 120)));
+
+    // A small satellite on a tilted orbit.
+    {
+        let a = t * 0.55;
+        let orbit = |a: f32| view([1.32 * a.cos(), 0.35 * a.sin(), 1.32 * a.sin()]);
+        let path: Vec<[f32; 3]> = (0..=96).map(|k| orbit(k as f32 / 96.0 * TAU)).collect();
+        for w in path.windows(2) {
+            let front = w[0][2] > 0.0 || {
+                let p = screen(w[0]);
+                (p - c).length() > r
+            };
+            if front {
+                painter.line_segment(
+                    [screen(w[0]), screen(w[1])],
+                    Stroke::new(1.0_f32, with_alpha(ACCENT_HI, 30)),
+                );
             }
-            let s = (t * 0.7).fract();
-            let mid = egui::pos2((c.x + p.x) / 2.0, (c.y + p.y) / 2.0 - 30.0);
-            let at = c.lerp(mid, s).lerp(mid.lerp(p, s), s);
-            radial_wash(&painter, at, 9.0, with_alpha(CYAN, 200));
-            painter.circle_filled(at, 2.2, CYAN);
+        }
+        let s = orbit(a);
+        let sp = screen(s);
+        if s[2] > 0.0 || (sp - c).length() > r {
+            radial_wash(&painter, sp, 10.0, with_alpha(CYAN, 150));
+            painter.circle_filled(sp, 2.2, Color32::WHITE);
         }
     }
-    for (p, z, reach) in &drawn {
-        let a = 0.3 + z.max(0.0) * 0.7;
-        let colour = if *reach { PINK } else { ACCENT_HI };
-        let size = if *reach { 4.0 } else { 2.6 } * (0.75 + z.max(0.0) * 0.35);
-        painter.circle_filled(*p, size, with_alpha(colour, (a * 255.0) as u8));
+
+    // This node and its peers, placed on land by number alone.
+    let land = land_points();
+    if land.is_empty() {
+        return;
     }
-    radial_wash(&painter, c, 22.0, with_alpha(GRAD_A, 230));
-    painter.circle_filled(c, 5.0, Color32::WHITE);
+    let pick = |i: u32| {
+        let h = i.wrapping_mul(2_654_435_761).rotate_left(13) ^ 0x9E37_79B9;
+        land[(h as usize) % land.len()]
+    };
+    let home = pick(7);
+    let shown = peers.min(48);
+    for i in 0..shown {
+        let peer = pick(101 + i as u32);
+        let reach = i < reachable;
+        let colour = if reach { PINK } else { CYAN };
+        // The arc rises off the surface in proportion to its length.
+        let dot = (home[0] * peer[0] + home[1] * peer[1] + home[2] * peer[2]).clamp(-1.0, 1.0);
+        let lift = 0.08 + 0.22 * (dot.acos() / std::f32::consts::PI);
+        let arc: Vec<[f32; 3]> = (0..=40)
+            .map(|k| {
+                let s = k as f32 / 40.0;
+                let p = slerp(home, peer, s);
+                let h = 1.0 + lift * (std::f32::consts::PI * s).sin();
+                view([p[0] * h, p[1] * h, p[2] * h])
+            })
+            .collect();
+        let visible = |v: [f32; 3]| v[2] > 0.0 || (screen(v) - c).length() > r;
+        for w in arc.windows(2) {
+            if visible(w[0]) && visible(w[1]) {
+                painter.line_segment(
+                    [screen(w[0]), screen(w[1])],
+                    Stroke::new(1.1_f32, with_alpha(colour, 70)),
+                );
+            }
+        }
+        // A pulse runs out along each arc, each on its own clock.
+        if motion() {
+            let phase = ((t * 0.45 + i as f32 * 0.37) % 1.0 + 1.0) % 1.0;
+            for (k, fade) in [(0.0_f32, 1.0_f32), (0.04, 0.55), (0.08, 0.25)] {
+                let s = (phase - k).clamp(0.0, 1.0);
+                let idx = (s * 40.0) as usize;
+                let v = arc[idx.min(40)];
+                if visible(v) {
+                    let p = screen(v);
+                    radial_wash(
+                        &painter,
+                        p,
+                        8.0 * fade,
+                        with_alpha(colour, (200.0 * fade) as u8),
+                    );
+                    painter.circle_filled(p, 1.8 * fade, Color32::WHITE);
+                }
+            }
+        }
+        let pv = view(peer);
+        if pv[2] > 0.0 {
+            let p = screen(pv);
+            let ring = ((t * 0.8 + i as f32 * 0.21) % 1.0 + 1.0) % 1.0;
+            painter.circle_stroke(
+                p,
+                3.0 + ring * 9.0,
+                Stroke::new(1.0_f32, with_alpha(colour, ((1.0 - ring) * 160.0) as u8)),
+            );
+            painter.circle_filled(p, 2.8, colour);
+        }
+    }
+    let hv = view(home);
+    if hv[2] > 0.0 {
+        let p = screen(hv);
+        radial_wash(&painter, p, 22.0, with_alpha(Color32::WHITE, 110));
+        painter.circle_filled(p, 4.2, Color32::WHITE);
+        painter.text(
+            p + Vec2::new(10.0, -10.0),
+            egui::Align2::LEFT_BOTTOM,
+            "This node",
+            egui::FontId::proportional(12.0),
+            TEXT,
+        );
+    }
     painter.text(
-        c + Vec2::new(0.0, 26.0),
-        egui::Align2::CENTER_CENTER,
-        "This node",
-        egui::FontId::proportional(12.0),
-        TEXT,
+        egui::pos2(rect.center().x, rect.bottom() - 6.0),
+        egui::Align2::CENTER_BOTTOM,
+        "One light per peer. Positions are illustrative — Core never looks up where a peer is.",
+        egui::FontId::proportional(11.0),
+        TEXT_FAINT,
     );
 }
 
-fn ellipse(painter: &egui::Painter, c: Pos2, rx: f32, ry: f32, stroke: Stroke) {
-    let pts: Vec<Pos2> = (0..=64)
-        .map(|i| {
-            let a = i as f32 / 64.0 * TAU;
-            egui::pos2(c.x + rx * a.cos(), c.y + ry * a.sin())
-        })
-        .collect();
-    painter.add(egui::Shape::line(pts, stroke));
+/// Draw the parts of a line on the sphere that face the viewer.
+fn draw_near(
+    painter: &egui::Painter,
+    pts: &[[f32; 3]],
+    screen: impl Fn([f32; 3]) -> Pos2,
+    colour: Color32,
+) {
+    for w in pts.windows(2) {
+        if w[0][2] > 0.0 && w[1][2] > 0.0 {
+            painter.line_segment([screen(w[0]), screen(w[1])], Stroke::new(1.0_f32, colour));
+        }
+    }
 }
 
 // ----------------------------------------------------------- slide to send ---
