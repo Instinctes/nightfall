@@ -373,17 +373,22 @@ fn hero_sky(
             }
             // The aurora: two soft ribbons rippling along the sheet at
             // different speeds, so the light never repeats the same shape.
-            let fade_in = smooth(0.36, 0.70, u);
+            // The ribbons begin well to the right of the balance and fade in
+            // over a long stretch, so the middle of the sheet stays calm.
+            let fade_in = smooth(0.50, 0.92, u);
             for (base, amp, k1, k2, speed, width, strength) in [
-                (0.60, 0.16, 5.0, 11.0, 0.55, 0.11, 0.60),
-                (0.36, 0.10, 3.3, 8.0, -0.38, 0.08, 0.38),
+                (0.60, 0.16, 5.0, 11.0, 0.55, 0.11, 0.55),
+                (0.36, 0.10, 3.3, 8.0, -0.38, 0.08, 0.32),
             ] {
                 let y0 = base
                     + amp * (u * k1 + t * speed).sin()
                     + amp * 0.4 * (u * k2 - t * speed * 1.4).sin();
                 let band = (-((v - y0) / width).powi(2)).exp() * fade_in;
-                let ribbon =
-                    lerp_color(CYAN, PINK, (u * 1.4 + (t * 0.1 + base).sin() * 0.3).fract());
+                // Cyan into pink and back along a sine, never by wrapping a
+                // fraction: a wrap jumps from pink straight to cyan and
+                // leaves a hard vertical seam in the light.
+                let hue = 0.5 + 0.5 * (u * 3.2 + t * 0.15 + base * 4.0).sin();
+                let ribbon = lerp_color(CYAN, PINK, hue);
                 c = lerp_color(c, ribbon, band * strength);
             }
             if flash > 0.02 {
