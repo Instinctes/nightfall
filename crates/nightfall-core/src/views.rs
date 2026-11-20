@@ -294,7 +294,7 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
             ui.label(
                 RichText::new("SPENDABLE")
                     .size(11.0)
-                    .color(Color32::WHITE)
+                    .color(INK)
                     .strong()
                     .extra_letter_spacing(1.2),
             );
@@ -307,9 +307,9 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
             );
             let (r, _) =
                 ui.allocate_exact_size(galley.size() + Vec2::new(14.0, 6.0), egui::Sense::hover());
-            // Dark glass under white letters reads on every part of the sky.
+            // White letters on an ink pill read on every part of the sky.
             ui.painter()
-                .rect_filled(r, Rounding::same(999.0), Color32::from_black_alpha(80));
+                .rect_filled(r, Rounding::same(999.0), with_alpha(INK, 210));
             ui.painter()
                 .galley(r.center() - galley.size() / 2.0, galley, Color32::WHITE);
         });
@@ -321,16 +321,11 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
                 balances.available,
                 8,
                 46.0,
-                Color32::WHITE,
+                INK,
             )
             .on_hover_text(format!("{} NIGHT", night(balances.available)));
             ui.add_space(10.0);
-            ui.label(
-                RichText::new("NIGHT")
-                    .size(16.0)
-                    .color(Color32::WHITE)
-                    .strong(),
-            );
+            ui.label(RichText::new("NIGHT").size(16.0).color(INK).strong());
         });
         ui.add_space(8.0);
         let mut parts = Vec::new();
@@ -344,11 +339,7 @@ pub fn dashboard(app: &mut App, ui: &mut egui::Ui) {
             "{count} output{}",
             if count == 1 { "" } else { "s" }
         ));
-        ui.label(
-            RichText::new(parts.join("  ·  "))
-                .size(12.5)
-                .color(Color32::WHITE),
-        );
+        ui.label(RichText::new(parts.join("  ·  ")).size(12.5).color(INK));
         ui.add_space(18.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;

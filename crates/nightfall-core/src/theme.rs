@@ -99,8 +99,6 @@ pub const CYAN: Color32 = Color32::from_rgb(0x78, 0xDB, 0xEC);
 pub const HERO_A: Color32 = Color32::from_rgb(0x6A, 0x43, 0xD6);
 pub const HERO_B: Color32 = Color32::from_rgb(0x8A, 0x3D, 0xAE);
 pub const HERO_C: Color32 = Color32::from_rgb(0x2B, 0x7A, 0x96);
-/// Text on the white pill that sits on the hero.
-pub const HERO_INK: Color32 = Color32::from_rgb(0x3A, 0x22, 0x8C);
 
 pub const SUCCESS: Color32 = Color32::from_rgb(0x4A, 0xE0, 0xA8);
 pub const WARN: Color32 = Color32::from_rgb(0xFF, 0xC8, 0x5C);
@@ -409,8 +407,6 @@ mod tests {
                 "white on the hero at {step}% is {ratio:.2}:1 ({background:?})"
             );
         }
-        let pill = (luminance(Color32::WHITE) + 0.05) / (luminance(HERO_INK) + 0.05);
-        assert!(pill >= 4.5, "hero pill text is {pill:.2}:1");
     }
     #[test]
     fn original_nightfall_palette_is_preserved() {

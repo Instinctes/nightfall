@@ -315,8 +315,8 @@ fn nightfall_progress(ctx: &egui::Context) -> f32 {
 /// painted on top of the sheet would be clipped by a rectangle and show square
 /// corners wherever it reaches the edge; a light inside the texture cannot.
 ///
-/// The left half, where the balance is written, is kept to the plain gradient
-/// so white text stays at the contrast `white_reads_on_the_hero` pins.
+/// The lights stay mostly on the right, so the left half, where the balance is
+/// written in dark ink, keeps the calm pastel sky.
 fn hero_sky(
     ctx: &egui::Context,
     t: f32,
@@ -358,18 +358,23 @@ fn hero_sky(
         let v = row as f32 / (H - 1) as f32;
         for col in 0..W {
             let u = col as f32 / (W - 1) as f32;
-            let mut c = hero_gradient((u * 0.78 + v * 0.22).clamp(0.0, 1.0));
-            // Night settles from the bottom left: a long, soft fall from the
-            // lit top right into deep violet where the balance is written.
-            let deep = (1.0 - smooth(0.0, 1.0, u * 0.7 + (1.0 - v) * 0.3)) * 0.30;
-            c = lerp_color(c, INK, deep);
+            // The pastel brand sky — lavender into pink into cyan — which
+            // carries dark ink at every point
+            // (`pastel_gradient_uses_readable_dark_ink`).
+            let mut c = brand_gradient((u * 0.80 + v * 0.20).clamp(0.0, 1.0));
+            // A soft veil of light across the top, as on the first design.
+            c = lerp_color(c, Color32::WHITE, 0.30 * (1.0 - v).powf(1.6));
             // Lights live on the right; the writing on the left keeps its sky.
             let room = 0.18 + 0.82 * smooth(0.30, 0.72, u);
             for (cx, cy, colour, strength) in glows {
                 let dx = (u - cx) * aspect;
                 let dy = v - cy;
                 let w = (-(dx * dx + dy * dy) / (2.0 * 0.55_f32.powi(2))).exp();
-                c = lerp_color(c, colour, w * strength * room);
+                c = lerp_color(
+                    c,
+                    lerp_color(colour, Color32::WHITE, 0.25),
+                    w * strength * room,
+                );
             }
             // The aurora: two soft ribbons rippling along the sheet at
             // different speeds, so the light never repeats the same shape.
@@ -388,7 +393,7 @@ fn hero_sky(
                 // fraction: a wrap jumps from pink straight to cyan and
                 // leaves a hard vertical seam in the light.
                 let hue = 0.5 + 0.5 * (u * 3.2 + t * 0.15 + base * 4.0).sin();
-                let ribbon = lerp_color(CYAN, PINK, hue);
+                let ribbon = lerp_color(lerp_color(CYAN, PINK, hue), Color32::WHITE, 0.45);
                 c = lerp_color(c, ribbon, band * strength);
             }
             if flash > 0.02 {
@@ -398,7 +403,7 @@ fn hero_sky(
             // across it from the left in a soft, wide front.
             let dark = darkness(u, nightfall);
             if dark < 1.0 {
-                let lit = lerp_color(lerp_color(GRAD_A, PINK, v * 0.7), Color32::WHITE, 0.30);
+                let lit = lerp_color(lerp_color(GRAD_A, PINK, v * 0.7), Color32::WHITE, 0.72);
                 c = lerp_color(lit, c, dark);
             }
             if let Some((pu, pv)) = pointer {
@@ -432,9 +437,9 @@ fn hero_sky(
 /// moving aurora sky, a glare that follows the pointer and a few twinkling
 /// stars — all inside its rounded corners.
 ///
-/// The pastel brand gradient carries dark ink and stays the colour of the
-/// main buttons; the hero is the one surface deep enough for white, which is
-/// pinned by `white_reads_on_the_hero` in `theme`.
+/// The sky is the pastel brand gradient, so everything on it is written in
+/// dark ink — which `pastel_gradient_uses_readable_dark_ink` pins at every
+/// point of that gradient.
 pub fn hero_card<R>(
     ui: &mut egui::Ui,
     height: f32,
@@ -451,7 +456,7 @@ pub fn hero_card<R>(
             offset: egui::vec2(0.0, 14.0),
             blur: 34.0,
             spread: -6.0,
-            color: with_alpha(ACCENT, 120),
+            color: with_alpha(ACCENT, 90),
         }
         .as_shape(rect, Rounding::same(ROUND)),
     ));
@@ -497,16 +502,18 @@ pub fn hero_card<R>(
             field.top() + field.height() * y,
         );
         let r = 0.8 + 1.2 * ((h >> 7) & 3) as f32 / 3.0;
+        // On the light sky a white star would vanish: these are sparks of
+        // light with a violet heart.
         radial_wash(
             &painter,
             p,
-            r * 4.0,
-            Color32::from_white_alpha((twinkle * 40.0) as u8),
+            r * 4.5,
+            Color32::from_white_alpha((twinkle * 150.0) as u8),
         );
         painter.circle_filled(
             p,
             r,
-            Color32::from_white_alpha(((90.0 + twinkle * 150.0) * out) as u8),
+            with_alpha(ACCENT, ((60.0 + twinkle * 150.0) * out) as u8),
         );
     }
     if motion() {
@@ -540,10 +547,12 @@ pub fn hero_button(ui: &mut egui::Ui, id: &str, text: &str, filled: bool) -> egu
         if pressed { 0.94 } else { 1.0 },
     );
     let r = Rect::from_center_size(rect.center() + Vec2::new(0.0, lift), rect.size() * s);
+    // On the pastel sky: the main action is a dark ink pill, the other a pane
+    // of white glass with ink letters.
     let (fill, fg) = if filled {
-        (Color32::WHITE, HERO_INK)
+        (INK, Color32::WHITE)
     } else {
-        (Color32::from_black_alpha(70), Color32::WHITE)
+        (Color32::from_white_alpha(150), INK)
     };
     ui.painter().rect(
         r,
@@ -552,7 +561,7 @@ pub fn hero_button(ui: &mut egui::Ui, id: &str, text: &str, filled: bool) -> egu
         if filled {
             Stroke::NONE
         } else {
-            Stroke::new(1.0_f32, Color32::from_white_alpha(70))
+            Stroke::new(1.0_f32, with_alpha(INK, 60))
         },
     );
     ui.painter().text(
@@ -566,7 +575,7 @@ pub fn hero_button(ui: &mut egui::Ui, id: &str, text: &str, filled: bool) -> egu
         ui.painter().rect_stroke(
             r.expand(3.0),
             Rounding::same(ROUND_SM),
-            Stroke::new(2.0_f32, Color32::WHITE),
+            Stroke::new(2.0_f32, INK),
         );
     }
     if resp.hovered() {
@@ -874,8 +883,25 @@ pub fn chain_strip(ui: &mut egui::Ui, tip: u64, mining: bool) {
     // Slide: the row is drawn at the spring's height, which jumps to the new
     // tip and is then pulled smoothly into place — so a new block comes out
     // of the working slot on the right and the older ones move left.
-    let shown = spring(&ctx, egui::Id::new("chain-strip-tip"), tip as f32);
-    let shift = ((tip as f32 - shown) * step).clamp(-step, step * 2.0);
+    // Only the *offset* is animated, never the height itself: a block height
+    // like 548,588 has no room left in an f32 for the fraction a spring
+    // needs, so a spring on the height never settled and the newest block
+    // sat a few points over the working slot. The offset is small and exact.
+    let last_id = egui::Id::new("chain-strip-last-tip");
+    let offset_id = egui::Id::new("chain-strip-offset");
+    let last = ctx.data(|d| d.get_temp::<u64>(last_id)).unwrap_or(tip);
+    if tip != last {
+        let jump = (tip as i64 - last as i64).clamp(-2, 2) as f32;
+        let (x, v) = ctx
+            .data(|d| d.get_temp::<(f32, f32)>(offset_id))
+            .unwrap_or((0.0, 0.0));
+        ctx.data_mut(|d| {
+            d.insert_temp(offset_id, ((x + jump).clamp(-2.0, 2.0), v));
+            d.insert_temp(last_id, tip);
+        });
+    }
+    let offset = spring(&ctx, offset_id, 0.0);
+    let shift = (offset * step).clamp(-step * 2.0, step * 2.0);
     let y = rect.center().y - 6.0;
     let next = Rect::from_min_size(
         egui::pos2(rect.right() - 2.0 - bw, y - bh / 2.0),
