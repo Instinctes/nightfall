@@ -15,7 +15,7 @@ use std::time::Duration;
 #[command(
     name = "nightfall-nodekit",
     version,
-    about = "Diagnose, verify and set up a NIGHTFALLCOIN node — read-only unless you name an output file"
+    about = "Diagnose, verify and set up a NIGHTFALLCOIN node; destructive legacy upgrades require explicit --force"
 )]
 struct Cli {
     /// Network to check against. Its genesis is computed by this build's
@@ -97,6 +97,17 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Explicitly upgrade old pruned 1.1.x chain data by backing it up
+    /// and resetting only chain state for a fully verified resync.
+    /// Never auto-seals history whose deleted bodies cannot be validated.
+    UpgradePruned {
+        /// Existing datadir; no implicit default for a destructive operation.
+        #[arg(long)]
+        datadir: PathBuf,
+        /// Acknowledge that the preserved chain backup will need resync.
+        #[arg(long)]
+        force: bool,
+    },
     /// Print the genesis hash this build expects.
     Genesis,
 }
@@ -121,6 +132,77 @@ fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
     let network = kit::parse_network(&cli.network)?;
     match cli.cmd {
+        Cmd::UpgradePruned { datadir, force } => {
+            if !force {
+                anyhow::bail!(
+                    "Legacy pruned 1.1.x state cannot be safely sealed without its deleted historical bodies. Stop the node, back up the wallet, and re-run upgrade-pruned with --force to preserve the old chain in a recovery backup and start a fresh verified resync. No files were changed."
+                );
+            }
+            let network_explicit = std::env::args()
+                .skip(1)
+                .any(|arg| arg == "--network" || arg.starts_with("--network="));
+            let options = nightfall_node::recovery::RecoverOpts {
+                datadir: datadir.clone(),
+                network,
+                force,
+            };
+            // The recovery preflight runs BEFORE taking a lock: no accidental
+            // datadir creation and no symlink traversal on malformed inputs.
+            nightfall_node::recovery::precheck(&options, network_explicit, true)?;
+
+            let validate_legacy = || -> Result<()> {
+                let meta: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(datadir.join("chain-meta.json"))?)?;
+                let is_pruned = meta.get("pruned").and_then(|v| v.as_bool()) == Some(true)
+                    && meta
+                        .get("first_height")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                        > 0;
+                let seal_horizon = meta
+                    .get("validated_horizon_fingerprint")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let seal_headers = meta
+                    .get("validated_headers_fingerprint")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !is_pruned || (!seal_horizon.is_empty() && !seal_headers.is_empty()) {
+                    anyhow::bail!(
+                        "upgrade-pruned only accepts legacy pruned data without complete seals; this datadir is not such a case"
+                    );
+                }
+                Ok(())
+            };
+
+            validate_legacy()?;
+            // Do not touch running nodes or desktop wallets.
+            let _lock = nightfall_storage::dirlock::acquire(&datadir)?;
+            // Recheck under the one-writer lock to avoid an intervening change.
+            validate_legacy()?;
+
+            let report = nightfall_node::recovery::recover_stalled_fork(&options)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "network": network.as_str(),
+                        "backup": report.backup_dir,
+                        "old_tip": report.previous_tip,
+                        "resync_required": true,
+                        "wallet_preserved": true
+                    })
+                );
+            } else {
+                println!(
+                    "Legacy pruned chain archived in {}",
+                    report.backup_dir.display()
+                );
+                println!("Wallet preserved. Restart the node with mining off until the whole chain is independently verified and synchronized.");
+                println!("No unverified old storage seals were trusted or minted.");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Cmd::Genesis => {
             let g = kit::pinned_genesis(network)?;
             if cli.json {

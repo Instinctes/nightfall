@@ -234,6 +234,10 @@ pub struct App {
     pub backup_acked: bool,
     pub recovery_studio: crate::recovery_studio::RecoveryStudio,
     pub resync_confirm: bool,
+    pub legacy_pruned_required: bool,
+    legacy_pruned_confirm: bool,
+    legacy_pruned_busy: bool,
+    legacy_pruned_result: Arc<Mutex<Option<Result<String, String>>>>,
     /// Progress of a fast start, written by its worker thread.
     pub fast_start: Arc<Mutex<FastStart>>,
     fast_start_cancel: Arc<AtomicBool>,
@@ -450,6 +454,10 @@ impl App {
             backup_acked: load_backup_acked(&datadir),
             recovery_studio: Default::default(),
             resync_confirm: false,
+            legacy_pruned_required: false,
+            legacy_pruned_confirm: false,
+            legacy_pruned_busy: false,
+            legacy_pruned_result: Arc::new(Mutex::new(None)),
             fast_start: Arc::new(Mutex::new(FastStart::Idle)),
             fast_start_cancel: Arc::new(AtomicBool::new(false)),
             fast_start_allowed: false,
@@ -524,6 +532,17 @@ impl App {
     }
 
     fn start_node(&mut self) {
+        // This check runs before NodeHandle starts asynchronous replay. A
+        // failed legacy load must not leave Core's Resync button stranded.
+        if nightfall_storage::ChainStore::new(&self.datadir)
+            .legacy_pruned_recovery_required(self.network)
+        {
+            self.legacy_pruned_required = true;
+            self.status_error = Some("Legacy pruned 1.1.x chain needs a backed-up resync".into());
+            return;
+        }
+        self.legacy_pruned_required = false;
+        self.status_error = None;
         let miner = self.wallet.lock().ok().and_then(|w| w.address());
 
         let mut cfg = NodeConfig {
@@ -745,6 +764,11 @@ impl App {
     }
 
     pub fn resync_chain(&mut self, ctx: &egui::Context) {
+        if self.legacy_pruned_required {
+            self.toasts
+                .error(ctx, "Use the legacy pruned recovery confirmation instead");
+            return;
+        }
         let Some(node) = self.node.clone() else {
             self.toasts.error(ctx, "Node is not running");
             return;
@@ -792,6 +816,91 @@ impl App {
     }
 
     /// Fetch the published chain archive and continue from it.
+    pub fn recover_legacy_pruned(&mut self, ctx: &egui::Context) {
+        if !self.legacy_pruned_required
+            || !self.legacy_pruned_confirm
+            || self.legacy_pruned_busy
+            || self.node.is_some()
+        {
+            return;
+        }
+
+        let Some(lock) = self.data_lock.clone() else {
+            self.toasts
+                .error(ctx, "Core has no data-directory lock; recovery refused");
+            return;
+        };
+
+        self.legacy_pruned_busy = true;
+        self.legacy_pruned_confirm = false;
+
+        let network = self.network;
+        let dir = self.datadir.clone();
+        let slot = self.legacy_pruned_result.clone();
+        let repaint = ctx.clone();
+
+        std::thread::spawn(move || {
+            let _lock = lock; // The one-writer lock stays held throughout.
+
+            let result = (|| -> anyhow::Result<String> {
+                let opts = nightfall_node::recovery::RecoverOpts {
+                    datadir: dir.clone(),
+                    network,
+                    force: true,
+                };
+
+                nightfall_node::recovery::precheck(&opts, true, true)?;
+
+                anyhow::ensure!(
+                    nightfall_storage::ChainStore::new(&dir)
+                        .legacy_pruned_recovery_required(network),
+                    "the datadir is no longer an eligible legacy pruned chain"
+                );
+
+                let report = nightfall_node::recovery::recover_stalled_fork(&opts)?;
+                Ok(report.backup_dir.display().to_string())
+            })()
+            .map_err(|e| format!("{e:#}"));
+
+            if let Ok(mut answer) = slot.lock() {
+                *answer = Some(result);
+            }
+
+            repaint.request_repaint();
+        });
+    }
+
+    fn finish_legacy_pruned_recovery(&mut self, ctx: &egui::Context) {
+        let result = self
+            .legacy_pruned_result
+            .try_lock()
+            .ok()
+            .and_then(|mut result| result.take());
+
+        if let Some(result) = result {
+            self.legacy_pruned_busy = false;
+
+            match result {
+                Ok(backup) => {
+                    self.legacy_pruned_required = false;
+                    self.toasts.info(
+                        ctx,
+                        format!(
+                        "Legacy chain backed up in {backup}. Wallet preserved. Resync from genesis."
+                    ),
+                    );
+                    self.start_node();
+                }
+
+                Err(error) => {
+                    self.status_error = Some(format!(
+                        "Legacy pruned recovery refused: {error}. Keep the backup and journal."
+                    ));
+                }
+            }
+        }
+    }
+
     ///
     /// Runs on its own thread and reports through `self.fast_start`. The
     /// node keeps syncing from peers meanwhile and decides for itself whether
@@ -818,7 +927,15 @@ impl App {
         let cancel = self.fast_start_cancel.clone();
         let access = self.wallet_scan_access.clone();
         let dir = self.datadir.join("chain-archive");
+
+        let wallet_is_fresh = self
+            .wallet
+            .lock()
+            .map(|w| w.checkpoint_fast_start_safe())
+            .unwrap_or(false);
+
         let ctx = ctx.clone();
+
         std::thread::spawn(move || {
             let set = |value: FastStart| {
                 if let Ok(mut slot) = state.lock() {
@@ -829,6 +946,38 @@ impl App {
             let result = (|| -> anyhow::Result<u64> {
                 use nightfall_node::bootstrap;
                 let manifest = bootstrap::Manifest::fetch(&node.genesis_hex())?;
+                if wallet_is_fresh && node.can_adopt_checkpoint_snapshot() {
+                    match bootstrap::download_checkpoint(&manifest, &dir, &cancel, |done, total| {
+                        set(FastStart::Downloading { done, total })
+                    }) {
+                        Ok(Some(snapshot)) => {
+                            let _access = access
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("wallet scan lock poisoned"))?;
+
+                            set(FastStart::Checking {
+                                done: 0,
+                                total: manifest.checkpoint.as_ref().map(|c| c.height).unwrap_or(0),
+                            });
+
+                            // Invalid state must fail closed.
+                            let adopted = node.adopt_checkpoint_snapshot(&snapshot);
+                            bootstrap::discard(&dir);
+                            return adopted;
+                        }
+
+                        Ok(None) => {}
+
+                        Err(error) if cancel.load(Ordering::SeqCst) => {
+                            return Err(error);
+                        }
+
+                        Err(error) => {
+                            tracing::warn!("snapshot unavailable; archive fallback: {error}");
+                        }
+                    }
+                }
+
                 bootstrap::download(&manifest, &dir, &cancel, |done, total| {
                     set(FastStart::Downloading { done, total })
                 })?;
@@ -2008,6 +2157,7 @@ impl eframe::App for App {
             return;
         }
         self.poll_status();
+        self.finish_legacy_pruned_recovery(ctx);
         self.drain_sync_signal(ctx);
         let released = RELEASED_SENDS.load(Ordering::SeqCst);
         if released != self.observed_released {
@@ -2178,6 +2328,44 @@ impl eframe::App for App {
                                     ui.label(
                                         RichText::new(format!("Node error: {err}")).color(DANGER),
                                     );
+
+                                    if self.legacy_pruned_required {
+                                        ui.add_space(10.0);
+
+                                        ui.label(
+                                            "A 1.1.x pruned chain lacks authenticated seals.                                              Its deleted bodies cannot be rechecked. Core can                                              move only chain state into a journaled recovery                                              backup and start a fresh verified resync. Wallet                                              keys and history are preserved. No unverified                                              seals will be created."
+                                        );
+
+                                        if self.legacy_pruned_busy {
+                                            ui.spinner();
+                                            ui.label("Creating verified genesis and backup…");
+                                        } else if self.legacy_pruned_confirm {
+                                            ui.label(
+                                                RichText::new(
+                                                    "The original chain will be backed up;                                                      it will not be deleted. Continue?"
+                                                ).color(WARN)
+                                            );
+
+                                            ui.horizontal(|ui| {
+                                                if primary_button(
+                                                    ui,
+                                                    "Back up chain and resync",
+                                                    true
+                                                ).clicked() {
+                                                    self.recover_legacy_pruned(ctx);
+                                                }
+
+                                                if ghost_button(ui, "Cancel").clicked() {
+                                                    self.legacy_pruned_confirm = false;
+                                                }
+                                            });
+                                        } else if ghost_button(
+                                            ui,
+                                            "Recover legacy pruned chain (keep wallet)"
+                                        ).clicked() {
+                                            self.legacy_pruned_confirm = true;
+                                        }
+                                    }
                                 });
                             ui.add_space(12.0);
                         }
