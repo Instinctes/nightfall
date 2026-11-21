@@ -1,0 +1,70 @@
+name: Public network evidence (read-only)
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/check_public_network_status.py'
+      - 'scripts/test_public_network_status.py'
+      - 'docs/PUBLIC-NETWORK-EVIDENCE.md'
+      - '.github/workflows/public-network-evidence.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/check_public_network_status.py'
+      - 'scripts/test_public_network_status.py'
+      - 'docs/PUBLIC-NETWORK-EVIDENCE.md'
+      - '.github/workflows/public-network-evidence.yml'
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python syntax
+        run: python3 -m py_compile scripts/check_public_network_status.py scripts/test_public_network_status.py
+      - name: Built-in emission and status regression
+        run: python3 scripts/check_public_network_status.py --self-test
+      - name: Mocked adverse-network regression (no requests)
+        run: python3 -m unittest discover -s scripts -p 'test_public_network_status.py' -v
+
+  public-observation:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Capture independent public API observation
+        id: observe
+        shell: bash
+        run: |
+          set +e
+          python3 scripts/check_public_network_status.py --report "$RUNNER_TEMP/nightfall-public-evidence.json"
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: Upload bounded evidence snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-network-evidence
+          path: ${{ runner.temp }}/nightfall-public-evidence.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Classify result
+        shell: bash
+        env:
+          OBSERVATION_EXIT: ${{ steps.observe.outputs.status }}
+        run: |
+          case "$OBSERVATION_EXIT" in
+            0) echo 'CONSISTENT: public API observations matched.' ;;
+            1) echo 'MISMATCH: investigate the public endpoints; no consensus flaw proven.'; exit 1 ;;
+            2) echo 'INCONCLUSIVE: public endpoints unavailable or tip moved; no network claim.' ;;
+            *) echo 'Unexpected checker exit status'; exit 1 ;;
+          esac
