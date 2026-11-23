@@ -91,10 +91,21 @@ fn ip_is_globally_reachable(ip: std::net::IpAddr) -> bool {
                 && (v4.octets()[0] != 100 || v4.octets()[1] & 0xc0 != 0x40) // 100.64/10
         }
         std::net::IpAddr::V6(v6) => {
+            // Mapped IPv4 must follow the IPv4 filter.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return ip_is_globally_reachable(std::net::IpAddr::V4(v4));
+            }
+            let b = v6.octets();
+            let documentation = b[0] == 0x20 && b[1] == 0x01 && b[2] == 0x0d && b[3] == 0xb8;
             !v6.is_unspecified()
                 && !v6.is_loopback()
                 && !v6.is_multicast()
                 && !is_unique_local_v6(v6)
+                // fe80::/10: link-local. fec0::/10: site-local.
+                && !(b[0] == 0xfe && (b[1] & 0xc0) == 0x80)
+                && !(b[0] == 0xfe && (b[1] & 0xc0) == 0xc0)
+                // 2001:db8::/32: documentation-only.
+                && !documentation
         }
     }
 }
@@ -739,6 +750,27 @@ mod directory_tests {
         assert!(!is_directory_addr("abcd.onion:17891"));
         assert!(!is_directory_addr("no-port"));
         assert!(!is_directory_addr(""));
+    }
+
+    #[test]
+    fn reserved_ipv6_is_not_advertised() {
+        for addr in [
+            "[::1]:17891",
+            "[::]:17891",
+            "[fe80::1]:17891",
+            "[febf::1]:17891",
+            "[fec0::1]:17891",
+            "[2001:db8::1]:17891",
+            "[fd12:3456::1]:17891",
+            "[::ffff:127.0.0.1]:17891",
+            "[::ffff:192.168.1.7]:17891",
+            "[::ffff:100.64.1.2]:17891",
+        ] {
+            assert!(!is_directory_addr(addr), "published reserved {addr}");
+        }
+        for addr in ["[2001:4860:4860::8888]:17891", "[::ffff:8.8.8.8]:17891"] {
+            assert!(is_directory_addr(addr), "blocked public {addr}");
+        }
     }
 
     #[test]
