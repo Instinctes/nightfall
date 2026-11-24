@@ -1,0 +1,36 @@
+name: Release guidance
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/check_release_guidance.py'
+      - 'scripts/test_release_guidance.py'
+      - 'docs/RELEASE-GUIDANCE.md'
+      - '.github/workflows/release-guidance.yml'
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  guidance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Offline regression tests
+        run: |
+          python3 -m unittest discover \
+            -s scripts \
+            -p test_release_guidance.py -v
+
+      - name: Public release observation
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+        run: python3 scripts/check_release_guidance.py
