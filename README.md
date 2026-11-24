@@ -465,6 +465,7 @@ vulnerability reporting is enabled on this repository.
 | [docs/ATTRIBUTES.md](docs/ATTRIBUTES.md) | Locked product attributes, with the gaps marked |
 | [MANIFESTO.md](MANIFESTO.md) | Why this exists |
 | [FAIR_LAUNCH.md](FAIR_LAUNCH.md) | Fair launch rules |
+| [Nightpool PoW research](https://github.com/nightfall-wizard/nightpool-pow-share-gate/tree/e460ca3f643b8b23e97cc2ca51cc4530c58f9fa2) | External Devnet share-validation research; not a production mining pool |
 
 ## Community
 
