@@ -17,7 +17,7 @@ use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
@@ -482,11 +482,16 @@ struct FaultProxy {
     enabled: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     active: Arc<Mutex<Vec<TcpStream>>>,
+    delayed_chunks: Arc<AtomicU64>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl FaultProxy {
     fn spawn(target: SocketAddr, forbidden_ports: &[u16]) -> Self {
+        Self::spawn_with_latency(target, forbidden_ports, Duration::ZERO)
+    }
+
+    fn spawn_with_latency(target: SocketAddr, forbidden_ports: &[u16], latency: Duration) -> Self {
         let listener = loop {
             let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fault proxy listener");
             let port = listener.local_addr().expect("proxy local addr").port();
@@ -504,10 +509,12 @@ impl FaultProxy {
         let enabled = Arc::new(AtomicBool::new(true));
         let stop = Arc::new(AtomicBool::new(false));
         let active = Arc::new(Mutex::new(Vec::new()));
+        let delayed_chunks = Arc::new(AtomicU64::new(0));
 
         let worker_enabled = Arc::clone(&enabled);
         let worker_stop = Arc::clone(&stop);
         let worker_active = Arc::clone(&active);
+        let worker_delayed = Arc::clone(&delayed_chunks);
 
         let worker = thread::spawn(move || {
             while !worker_stop.load(Ordering::SeqCst) {
@@ -546,7 +553,10 @@ impl FaultProxy {
                             }
                         }
 
-                        thread::spawn(move || relay_bidirectional(downstream, upstream));
+                        let chunks = Arc::clone(&worker_delayed);
+                        thread::spawn(move || {
+                            relay_bidirectional(downstream, upstream, latency, chunks)
+                        });
                     }
 
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -567,8 +577,13 @@ impl FaultProxy {
             enabled,
             stop,
             active,
+            delayed_chunks,
             worker: Some(worker),
         }
+    }
+
+    fn delayed_chunks(&self) -> u64 {
+        self.delayed_chunks.load(Ordering::Relaxed)
     }
 
     fn addr(&self) -> SocketAddr {
@@ -606,26 +621,60 @@ fn shutdown_all(active: &Arc<Mutex<Vec<TcpStream>>>) {
     }
 }
 
-fn relay_bidirectional(downstream: TcpStream, upstream: TcpStream) {
-    let mut down_read = match downstream.try_clone() {
-        Ok(s) => s,
+fn copy_with_latency(
+    mut input: TcpStream,
+    mut output: TcpStream,
+    latency: Duration,
+    delayed_chunks: Arc<AtomicU64>,
+) {
+    // TCP is a byte stream. Preserve every payload byte.
+    // A delay per chunk models a slow link, not packet loss.
+    let mut buffer = [0_u8; 4096];
+
+    loop {
+        match input.read(&mut buffer) {
+            Ok(0) => break,
+
+            Ok(n) => {
+                if !latency.is_zero() {
+                    thread::sleep(latency);
+
+                    delayed_chunks.fetch_add(1, Ordering::Relaxed);
+                }
+
+                if output.write_all(&buffer[..n]).is_err() {
+                    break;
+                }
+            }
+
+            Err(_) => break,
+        }
+    }
+
+    let _ = output.shutdown(Shutdown::Write);
+}
+
+fn relay_bidirectional(
+    downstream: TcpStream,
+    upstream: TcpStream,
+    latency: Duration,
+    delayed_chunks: Arc<AtomicU64>,
+) {
+    let down_read = match downstream.try_clone() {
+        Ok(stream) => stream,
         Err(_) => return,
     };
-    let mut up_write = match upstream.try_clone() {
-        Ok(s) => s,
+
+    let up_write = match upstream.try_clone() {
+        Ok(stream) => stream,
         Err(_) => return,
     };
 
-    let forward = thread::spawn(move || {
-        let _ = io::copy(&mut down_read, &mut up_write);
-        let _ = up_write.shutdown(Shutdown::Write);
-    });
+    let first = Arc::clone(&delayed_chunks);
 
-    let mut up_read = upstream;
-    let mut down_write = downstream;
+    let forward = thread::spawn(move || copy_with_latency(down_read, up_write, latency, first));
 
-    let _ = io::copy(&mut up_read, &mut down_write);
-    let _ = down_write.shutdown(Shutdown::Write);
+    copy_with_latency(upstream, downstream, latency, delayed_chunks);
 
     let _ = forward.join();
 }
@@ -1189,4 +1238,119 @@ fn three_node_survival_after_origin_failure() {
     drop(b_to_a);
 
     fs::remove_dir_all(&root).expect("remove successful lab datadirs");
+}
+
+// Incremental regression: existing tests cover partition/heal.
+// This scenario adds latency on a live bidirectional session
+// and checks authenticated recovery plus monetary integrity.
+
+#[test]
+#[ignore = "real Devnet fault test; use independence-quality-gate"]
+fn throttled_link_disconnect_recovers_verified_state() {
+    let root = unique_root();
+
+    fs::create_dir_all(&root).expect("create throttled harness root");
+
+    let a_spec = NodeSpec::new(&root, "slow-source", Ipv4Addr::new(127, 0, 0, 2));
+
+    let b_spec = NodeSpec::new(&root, "slow-follower", Ipv4Addr::new(127, 0, 0, 3));
+
+    a_spec.init();
+    b_spec.init();
+
+    a_spec.mine_blocks(12);
+
+    let link = FaultProxy::spawn_with_latency(
+        a_spec.p2p,
+        &[
+            a_spec.p2p.port(),
+            a_spec.rpc.port(),
+            b_spec.p2p.port(),
+            b_spec.rpc.port(),
+        ],
+        Duration::from_millis(30),
+    );
+
+    let a = Node::spawn(a_spec.clone(), false, &[]);
+
+    let b = Node::spawn(b_spec.clone(), false, &[link.addr()]);
+
+    wait_until(
+        "initial throttled synchronization",
+        Duration::from_secs(120),
+        || {
+            let left = a.status()?;
+            let right = b.status()?;
+
+            Ok(left.blocks >= 12 && left.same_chain(&right) && left.peers >= 1 && right.peers >= 1)
+        },
+    )
+    .unwrap_or_else(|e| panic!("{e}\nA:\n{}\nB:\n{}", a.dump_log(), b.dump_log()));
+
+    assert!(
+        link.delayed_chunks() > 0,
+        "the fault proxy carried no delayed TCP chunks"
+    );
+
+    assert_recovered_state_agreement(&[&a, &b]);
+
+    // Sever the already-established connection.
+    // The proxy must also refuse reconnect attempts.
+    link.partition();
+
+    wait_until("slowed link actually disconnected", CONNECT_TIMEOUT, || {
+        Ok(a.status()?.peers == 0 && b.status()?.peers == 0)
+    })
+    .unwrap_or_else(|e| panic!("{e}\nA:\n{}\nB:\n{}", a.dump_log(), b.dump_log()));
+
+    let isolated = b.status().expect("follower state under partition");
+
+    drop(a);
+
+    a_spec.mine_blocks(1);
+
+    let a = Node::spawn(a_spec.clone(), false, &[]);
+
+    let newer = a.status().expect("source advanced under partition");
+
+    assert_eq!(newer.blocks, isolated.blocks + 1);
+
+    thread::sleep(Duration::from_secs(4));
+
+    assert!(
+        b.status().expect("isolated follower").same_chain(&isolated),
+        "uncontrolled peer path bypassed the proxy"
+    );
+
+    // Restore the real TCP path.
+    // The production P2P reconnect mechanism must heal it.
+    link.heal();
+
+    wait_until(
+        "throttled reconnect and state convergence",
+        Duration::from_secs(120),
+        || {
+            let source = a.status()?;
+            let follower = b.status()?;
+
+            Ok(source.same_chain(&follower) && source.tip == newer.tip)
+        },
+    )
+    .unwrap_or_else(|e| panic!("{e}\nA:\n{}\nB:\n{}", a.dump_log(), b.dump_log()));
+
+    // Reuse existing verification of:
+    // tip, UTXO root, minted, burned,
+    // circulating supply and verify_supply RPC.
+    assert_recovered_state_agreement(&[&a, &b]);
+
+    assert!(
+        link.delayed_chunks() >= 2,
+        "no delayed traffic across recovery"
+    );
+
+    drop(b);
+    drop(a);
+    drop(link);
+
+    fs::remove_dir_all(&root).expect("cleanup disposable Devnet datadirs");
 }
