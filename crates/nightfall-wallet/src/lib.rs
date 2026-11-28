@@ -17,6 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, Zeroizing};
 
+mod coin_selection;
 mod receipt;
 pub use receipt::{verify_receipt, PaymentReceipt, ReceiptKind, ReceiptProof, RECEIPT_VERSION};
 /// The payment request: what a payee asks for, as one checkable line.
@@ -1619,30 +1620,27 @@ impl Wallet {
         maturity: u64,
     ) -> anyhow::Result<Vec<Spendable>> {
         let pending = self.pending_input_commits();
-        let mut available: Vec<&OwnedOutput> = self
+        let eligible = self
             .db
             .outputs
             .iter()
-            .filter(|o| !o.spent)
-            .filter(|o| !pending.contains(&o.commit.0))
-            .filter(|o| !self.is_reserved(&o.commit))
-            .filter(|o| {
+            .enumerate()
+            .filter(|(_, o)| !o.spent)
+            .filter(|(_, o)| !pending.contains(&o.commit.0))
+            .filter(|(_, o)| !self.is_reserved(&o.commit))
+            .filter(|(_, o)| {
                 maturity == 0 || !o.is_coinbase || tip_height >= o.height.saturating_add(maturity)
             })
-            .collect();
-        // Largest first, so a payment consumes as few outputs as it can.
-        available.sort_by_key(|o| std::cmp::Reverse(o.value));
-
-        let available_total = available
-            .iter()
-            .fold(0u64, |sum, o| sum.saturating_add(o.value));
+            .map(|(index, o)| (index, o.value));
+        let (available_total, selected) = coin_selection::bounded_largest(eligible, MAX_INPUTS);
 
         let mut chosen = Vec::new();
         let mut total = 0u64;
-        for o in available.into_iter().take(MAX_INPUTS) {
+        for index in selected {
             if total >= target {
                 break;
             }
+            let o = &self.db.outputs[index];
             total = total.saturating_add(o.value);
             chosen.push(o.to_spendable(&self.keys)?);
         }
@@ -3163,6 +3161,60 @@ mod tests {
         let picked = w.pick_commit_hexes_at(1, 0, 0).unwrap();
         assert_eq!(picked, vec![commit.to_hex()]);
         fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn bounded_selection_preserves_wallet_filters_and_ties() {
+        let keys = WalletKeys::from_seed([7u8; 32]);
+        let mut wallet = Wallet::in_memory(NetworkId::Devnet, keys, 0);
+        let mut commits = Vec::new();
+
+        for (i, value) in [7u64, 9, 9, 100, 200, 300, 6].into_iter().enumerate() {
+            let blind = Scalar::from(i as u64 + 1);
+            let commit = Commitment::new(value, &blind);
+            commits.push(commit.to_hex());
+
+            wallet.test_insert_output(OwnedOutput {
+                commit,
+                value,
+                blind_hex: hex::encode(blind.to_bytes()),
+                key_offset_hex: hex::encode(Scalar::ZERO.to_bytes()),
+                memo: String::new(),
+                height: 9,
+                spent: i == 3,
+                is_coinbase: i == 4,
+            });
+        }
+
+        wallet.reserve_commits(&[commits[5].clone()]).unwrap();
+
+        assert_eq!(
+            wallet.pick_commit_hexes_at(10, 10, 5).unwrap(),
+            vec![commits[1].clone(), commits[2].clone()]
+        );
+
+        assert!(wallet.pick_commit_hexes_at(0, 10, 5).unwrap().is_empty());
+
+        assert!(wallet
+            .pick_commit_hexes_at(32, 10, 5)
+            .unwrap_err()
+            .to_string()
+            .contains("insufficient funds"));
+
+        assert_eq!(
+            wallet.pick_commit_hexes_at(31, 10, 5).unwrap(),
+            vec![
+                commits[1].clone(),
+                commits[2].clone(),
+                commits[0].clone(),
+                commits[6].clone()
+            ]
+        );
+
+        assert_eq!(
+            wallet.pick_commit_hexes_at(10, 14, 5).unwrap(),
+            vec![commits[4].clone()]
+        );
     }
 
     #[test]
