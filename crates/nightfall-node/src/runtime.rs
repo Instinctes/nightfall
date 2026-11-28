@@ -892,6 +892,7 @@ pub struct StatusSnap {
     pub tip_height: u64,
     pub coinbase_maturity: u64,
     pub kernels: u64,
+    pub counts_verified: bool,
     pub started_at: u64,
     /// How far behind the best peer, so the UI can say why mining is paused
     /// instead of appearing to do nothing.
@@ -1398,6 +1399,13 @@ impl NodeHandle {
             if meta.exists() {
                 fs::rename(&meta, backup.join("chain-meta.json"))?;
             }
+
+            let scan = g.store.checkpoint_scan_archive_path();
+
+            if scan.exists() {
+                fs::rename(&scan, backup.join("checkpoint-wallet-v3.bin"))?;
+            }
+
             g.chain = Chain::new_fair(g.network)?;
             g.store.save(&g.chain)?;
             g.branch.clear();
@@ -1458,6 +1466,195 @@ impl NodeHandle {
                 .lock()
                 .map(|g| g.proxy.is_none())
                 .unwrap_or(false)
+    }
+
+    /// Checkpoints may only replace a fresh mainnet genesis.
+    pub fn can_adopt_checkpoint_snapshot(&self) -> bool {
+        self.state
+            .lock()
+            .map(|g| {
+                !g.loading
+                    && g.network == NetworkId::Mainnet
+                    && !g.chain.is_pruned()
+                    && g.chain.block_count() <= 1
+                    && !self.shutdown.is_requested()
+                    && !self.mining_enabled.load(Ordering::SeqCst)
+                    && !g.store.checkpoint_counts_unknown()
+            })
+            .unwrap_or(false)
+    }
+
+    /// Validate in isolation before changing any live chain file.
+    pub fn adopt_checkpoint_snapshot(&self, source: &std::path::Path) -> anyhow::Result<u64> {
+        use nightfall_storage::{sync_dir, CHECKPOINT_IMPORT_JOURNAL};
+        use sha2::{Digest, Sha256};
+        use std::io::{Read, Write};
+
+        anyhow::ensure!(
+            self.can_adopt_checkpoint_snapshot(),
+            "checkpoint fast start is only available on a fresh mainnet chain"
+        );
+
+        let stage = self.datadir.join(format!(
+            ".checkpoint-stage-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+
+        fs::create_dir(&stage)?;
+
+        let result = (|| -> anyhow::Result<u64> {
+            let staged = ChainStore::new(&stage);
+            let candidate = staged.import_checkpoint_snapshot(source, NetworkId::Mainnet)?;
+
+            let original = staged.checkpoint_scan_archive_path();
+            let target = self.datadir.join("checkpoint-wallet-v3.bin");
+            let pending = self.datadir.join("checkpoint-wallet-v3.bin.pending");
+
+            anyhow::ensure!(
+                !target.exists() && !pending.exists(),
+                "an existing checkpoint scan archive must not be overwritten"
+            );
+
+            let mut reader = fs::File::open(&original)?;
+            let mut writer = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&pending)?;
+
+            let mut expected = Sha256::new();
+            let mut buffer = [0u8; 128 * 1024];
+
+            loop {
+                let n = reader.read(&mut buffer)?;
+                if n == 0 {
+                    break;
+                }
+                expected.update(&buffer[..n]);
+                writer.write_all(&buffer[..n])?;
+            }
+
+            writer.sync_all()?;
+            drop(writer);
+
+            let mut actual = Sha256::new();
+            let mut copied = fs::File::open(&pending)?;
+
+            loop {
+                let n = copied.read(&mut buffer)?;
+                if n == 0 {
+                    break;
+                }
+                actual.update(&buffer[..n]);
+            }
+
+            anyhow::ensure!(
+                expected.finalize() == actual.finalize(),
+                "copied checkpoint wallet archive changed on disk"
+            );
+
+            let mut g = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("node lock poisoned"))?;
+
+            anyhow::ensure!(
+                !g.loading
+                    && !g.chain.is_pruned()
+                    && g.chain.block_count() <= 1
+                    && g.network == NetworkId::Mainnet
+                    && !self.shutdown.is_requested()
+                    && !self.mining_enabled.load(Ordering::SeqCst),
+                "node advanced or is shutting down during checkpoint preparation"
+            );
+
+            g.store.refuse_if_interrupted_recovery()?;
+
+            anyhow::ensure!(
+                !g.store.checkpoint_counts_unknown(),
+                "an existing checkpoint marker must not be replaced"
+            );
+
+            let marker = self.datadir.join(CHECKPOINT_IMPORT_JOURNAL);
+
+            let commit = (|| -> anyhow::Result<()> {
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&marker)?;
+
+                file.write_all(
+                    b"checkpoint fast-start adoption in progress
+",
+                )?;
+
+                file.sync_all()?;
+                sync_dir(&self.datadir)?;
+
+                g.store.save(&candidate)?;
+                fs::rename(&pending, &target)?;
+
+                for path in [
+                    g.store.blocks_path(),
+                    g.store.headers_path(),
+                    g.store.horizon_path(),
+                    g.store.meta_path(),
+                    target.clone(),
+                ] {
+                    fs::File::open(&path)?.sync_all()?;
+                }
+
+                sync_dir(&self.datadir)?;
+
+                anyhow::ensure!(
+                    g.store.is_own_file_trusted(),
+                    "installed checkpoint lacks a valid local storage seal"
+                );
+
+                fs::remove_file(&marker)?;
+                sync_dir(&self.datadir)?;
+
+                Ok(())
+            })();
+
+            if let Err(error) = commit {
+                // Never continue mining or persisting a partial import.
+                g.loading = true;
+                self.mining_enabled.store(false, Ordering::SeqCst);
+                self.shutdown.request();
+                return Err(error);
+            }
+
+            g.chain = candidate;
+            g.branch.clear();
+            g.ibd_buffer.clear();
+            g.ibd_from = next_needed_height(&g);
+            g.mempool = Mempool::default();
+            g.bump_tip();
+
+            let blocks = g.chain.block_count();
+            let next = next_needed_height(&g);
+            let peers = g.sessions.all();
+
+            drop(g);
+
+            for peer in peers {
+                let _ = peer.send(&nightfall_p2p::PeerMsg::GetBlocks {
+                    from_height: next,
+                    limit: nightfall_p2p::MAX_BLOCKS_PER_REQUEST,
+                });
+            }
+
+            Ok(blocks)
+        })();
+
+        let _ = fs::remove_dir_all(&stage);
+
+        if !self.datadir.join(CHECKPOINT_IMPORT_JOURNAL).exists() {
+            let _ = fs::remove_file(self.datadir.join("checkpoint-wallet-v3.bin.pending"));
+        }
+
+        result
     }
 
     /// Validate the chain file in `import_dir` and, if it is ahead of what
@@ -1530,6 +1727,14 @@ impl NodeHandle {
             g.mempool = Mempool::default();
             g.bump_tip();
             g.persist()?;
+
+            if !g.chain.is_pruned() {
+                let scan = g.store.checkpoint_scan_archive_path();
+                if scan.exists() {
+                    fs::remove_file(scan)?;
+                }
+            }
+
             (
                 g.sessions.all(),
                 g.chain.block_count(),
@@ -1723,6 +1928,7 @@ impl NodeHandle {
             tip_height,
             coinbase_maturity: g.chain.ledger.coinbase_maturity,
             kernels: g.chain.ledger.kernels.count,
+            counts_verified: !g.store.checkpoint_counts_unknown(),
             started_at: g.started_at,
             blocks_behind: catchup.unwrap_or(0),
             live_peers: g.sessions.len(),

@@ -393,7 +393,16 @@ pub(crate) fn dispatch(req: &RpcReq, state: &SharedState) -> RpcRes {
                     "burned_fees": chain.ledger.supply.total_burned_darks,
                     "circulating": chain.ledger.supply.circulating(),
                     "utxos": chain.ledger.utxos.len(),
-                    "kernels": chain.ledger.kernels.count,
+                    "kernels": if g.store.checkpoint_counts_unknown() {
+                        None
+                    } else {
+                        Some(chain.ledger.kernels.count)
+                    },
+                    "tx_count": if g.store.checkpoint_counts_unknown() {
+                        None
+                    } else {
+                        Some(chain.ledger.tx_count)
+                    },
                     "utxo_root": chain.ledger.utxo_root().to_hex(),
                     "supply_invariant_ok": supply_ok,
                     "mempool": g.mempool.len(),

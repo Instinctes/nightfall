@@ -994,6 +994,78 @@ impl Wallet {
         Ok(found)
     }
 
+    /// Establish a fresh restored wallet from independently verified
+    /// checkpoint UTXOs. Never use untrusted external API data here.
+    /// Existing histories must use full archive reconciliation.
+    pub fn ingest_authenticated_checkpoint_outputs(
+        &mut self,
+        outputs: &[LightOutput],
+        checkpoint_height: u64,
+        checkpoint_hash: &str,
+    ) -> anyhow::Result<u32> {
+        anyhow::ensure!(
+            !self.has_scanned_history()
+                && self.db.scanned_tip.is_empty()
+                && self.db.scanned_to == self.db.birth_height,
+            "checkpoint recovery requires a fresh, unscanned wallet"
+        );
+
+        anyhow::ensure!(
+            checkpoint_height >= self.db.birth_height,
+            "checkpoint precedes wallet birth height"
+        );
+
+        let anchor = decode32(checkpoint_hash).context("invalid authenticated checkpoint hash")?;
+
+        let mut seen = BTreeSet::new();
+
+        for output in outputs {
+            anyhow::ensure!(
+                output.height >= self.db.birth_height && output.height <= checkpoint_height,
+                "checkpoint output outside wallet history"
+            );
+            anyhow::ensure!(
+                seen.insert(output.commit.as_str()),
+                "duplicate checkpoint output"
+            );
+        }
+
+        self.db.scanned_tip = hex::encode(anchor);
+
+        let result = self.ingest_scan_page(outputs, &[], checkpoint_height);
+
+        if result.is_err() {
+            self.db.scanned_tip.clear();
+        }
+
+        result
+    }
+
+    /// The first post-checkpoint body has no retained overlap block.
+    /// Authenticate its parent against the saved checkpoint anchor.
+    pub fn scan_blocks_after_checkpoint(&mut self, blocks: &[Block]) -> anyhow::Result<u32> {
+        let first = blocks
+            .first()
+            .context("empty checkpoint continuation page")?;
+
+        anyhow::ensure!(
+            self.scan_from().checked_add(1) == Some(first.header.height.0)
+                && !self.db.scanned_tip.is_empty()
+                && first.header.prev_hash.to_hex() == self.db.scanned_tip,
+            "post-checkpoint body does not extend the wallet's saved chain"
+        );
+
+        for pair in blocks.windows(2) {
+            anyhow::ensure!(
+                pair[0].header.height.0.checked_add(1) == Some(pair[1].header.height.0)
+                    && pair[1].header.prev_hash == pair[0].hash(),
+                "post-checkpoint scan page is not continuous"
+            );
+        }
+
+        self.scan_blocks_inner(blocks, false)
+    }
+
     /// Scan blocks for outputs belonging to this wallet and mark spent ones.
     ///
     /// Returns how many new outputs were discovered.
@@ -3495,5 +3567,115 @@ mod tests {
         // Releasing an unknown or already-released send changes nothing.
         assert_eq!(w.release_sends(&["dead".to_string()], &unspend).unwrap(), 0);
         fs::remove_dir_all(&d).ok();
+    }
+}
+
+#[cfg(test)]
+mod authenticated_checkpoint_scan_tests {
+    use super::*;
+
+    fn fixture() -> (Wallet, LightOutput) {
+        let keys = WalletKeys::generate();
+
+        let (out, _) = nightfall_crypto::create_output(
+            &keys.address(),
+            27_000_000,
+            "checkpoint-scan",
+            NetworkId::Devnet.proof_context(),
+        )
+        .expect("create a real cryptographic output");
+
+        let light = LightOutput {
+            height: 4,
+            timestamp: 1000,
+            commit: hex::encode(out.commit.0),
+            ephemeral_pk: hex::encode(out.ephemeral_pk),
+            output_pk: hex::encode(out.output_pk),
+            view_tag: out.view_tag,
+            payload: hex::encode(out.payload),
+            coinbase: false,
+        };
+
+        (Wallet::in_memory(NetworkId::Devnet, keys, 0), light)
+    }
+
+    #[test]
+    fn checkpoint_scan_records_anchor_and_rejects_repeat() {
+        let (mut wallet, light) = fixture();
+        let hash = "ab".repeat(32);
+
+        assert_eq!(
+            wallet
+                .ingest_authenticated_checkpoint_outputs(&[light], 10, &hash)
+                .unwrap(),
+            1
+        );
+
+        assert_eq!(wallet.scanned_to(), 10);
+        assert_eq!(wallet.scan_anchor(), hash);
+        assert_eq!(wallet.outputs().len(), 1);
+
+        assert!(wallet
+            .ingest_authenticated_checkpoint_outputs(&[], 10, &hash)
+            .is_err());
+    }
+
+    #[test]
+    fn checkpoint_scan_rejects_duplicate_history_before_mutating() {
+        let (mut wallet, light) = fixture();
+
+        assert!(wallet
+            .ingest_authenticated_checkpoint_outputs(&[light.clone(), light], 10, &"cd".repeat(32))
+            .is_err());
+
+        assert_eq!(wallet.scanned_to(), 0);
+        assert!(wallet.scan_anchor().is_empty());
+        assert!(wallet.outputs().is_empty());
+    }
+
+    #[test]
+    fn checkpoint_bridge_requires_the_real_parent_hash() {
+        let keys = WalletKeys::generate();
+        let address = keys.address();
+
+        let mut chain = nightfall_consensus::Chain::new_fair(NetworkId::Devnet).unwrap();
+
+        let now = nightfall_storage::now_unix();
+
+        chain.mine_block(&address, vec![], now).unwrap();
+        chain.mine_block(&address, vec![], now + 15).unwrap();
+
+        let genesis = &chain.blocks[0];
+        let original = &genesis.body.outputs[0];
+
+        let first = LightOutput {
+            height: 0,
+            timestamp: genesis.header.timestamp_unix,
+            commit: hex::encode(original.commit.0),
+            ephemeral_pk: hex::encode(original.ephemeral_pk),
+            output_pk: hex::encode(original.output_pk),
+            view_tag: original.view_tag,
+            payload: hex::encode(&original.payload),
+            coinbase: original.features.is_coinbase(),
+        };
+
+        let mut wallet = Wallet::in_memory(NetworkId::Devnet, keys, 0);
+
+        wallet
+            .ingest_authenticated_checkpoint_outputs(&[first], 0, &genesis.hash().to_hex())
+            .unwrap();
+
+        let mut wrong = chain.blocks[1].clone();
+        wrong.header.prev_hash.0[0] ^= 1;
+
+        assert!(wallet.scan_blocks_after_checkpoint(&[wrong]).is_err());
+
+        assert_eq!(wallet.scanned_to(), 0);
+
+        wallet
+            .scan_blocks_after_checkpoint(&chain.blocks[1..2])
+            .unwrap();
+
+        assert_eq!(wallet.scanned_to(), 1);
     }
 }

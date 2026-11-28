@@ -3112,6 +3112,7 @@ dependencies = [
  "clap",
  "hex",
  "nightfall-consensus",
+ "nightfall-node",
  "nightfall-storage",
  "nightfall-types",
  "serde",
@@ -3138,6 +3139,7 @@ version = "1.1.6"
 dependencies = [
  "anyhow",
  "bincode",
+ "blake3",
  "dirs 5.0.1",
  "libc",
  "nightfall-consensus",
