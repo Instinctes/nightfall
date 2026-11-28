@@ -128,7 +128,6 @@ fn parse_amount(s: &str) -> Result<u64, MobileError> {
 // Do not advance a mobile wallet past a malformed page. The server can be
 // mistaken or hostile; schema validation is not proof that its chain is real.
 const MOBILE_SCAN_LIMIT: u64 = 256;
-const SEALED_PAYLOAD_HEX: usize = 2 * (8 + 32 + 64 + 16);
 
 struct MobileScanPage {
     scanned_to: u64,
@@ -150,6 +149,22 @@ fn scan_hex(value: Option<&serde_json::Value>, bytes: usize) -> Result<String, M
     if text.len() != bytes * 2 || hex::decode(text).is_err() {
         return Err(malformed_scan("invalid hex field"));
     }
+    Ok(text.to_owned())
+}
+
+// Wallet ciphertext length is not a consensus rule.
+fn scan_payload(value: Option<&serde_json::Value>) -> Result<String, MobileError> {
+    let text = value
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| malformed_scan("missing payload"))?;
+
+    if !text.len().is_multiple_of(2)
+        || text.len() / 2 > nightfall_types::MAX_MESSAGE_BYTES
+        || !text.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(malformed_scan("invalid payload encoding or size"));
+    }
+
     Ok(text.to_owned())
 }
 
@@ -252,7 +267,7 @@ fn parse_mobile_scan_page(
             ephemeral_pk: scan_hex(row.get("ephemeral_pk"), 32)?,
             output_pk: scan_hex(row.get("output_pk"), 32)?,
             view_tag,
-            payload: scan_hex(row.get("payload"), SEALED_PAYLOAD_HEX / 2)?,
+            payload: scan_payload(row.get("payload"))?,
             coinbase,
         });
     }
@@ -535,6 +550,85 @@ mod mobile_scan_feed_tests {
     }
 
     #[test]
+    fn mixed_payloads_keep_owned_payment() {
+        use nightfall_crypto::{create_output, WalletKeys};
+
+        let network = NetworkId::Devnet;
+        let keys = WalletKeys::from_seed([42; 32]);
+        let address = keys.address();
+        let context = network.proof_context();
+
+        let (good, _) = create_output(&address, 123_456, "synthetic regression", context).unwrap();
+
+        let (unopenable, _) = create_output(&address, 654_321, "", context).unwrap();
+
+        let row = |output: &nightfall_crypto::Output, height: u64| {
+            json!({
+                "height": height,
+                "timestamp": 1234,
+                "commit": hex::encode(output.commit.0),
+                "ephemeral_pk":
+                    hex::encode(output.ephemeral_pk),
+                "output_pk":
+                    hex::encode(output.output_pk),
+                "view_tag": output.view_tag,
+                "payload": hex::encode(&output.payload),
+                "coinbase": false
+            })
+        };
+
+        // Synthetic RPC records, not validated blocks.
+        for size in [0usize, 1, 119, 121, 500] {
+            let mut unusual = row(&unopenable, 7);
+            unusual["payload"] = json!("ab".repeat(size));
+
+            let mut page = good_page();
+            page["outputs"] = json!([unusual, row(&good, 8)]);
+            page["spent"] = json!([]);
+
+            let parsed = parse_mobile_scan_page(&page, 7).unwrap();
+
+            assert_eq!(parsed.outputs.len(), 2);
+
+            let mut wallet = Wallet::in_memory(network, keys.clone(), 7);
+
+            let found = wallet
+                .ingest_scan_page(&parsed.outputs, &parsed.spent, parsed.scanned_to)
+                .unwrap();
+
+            assert_eq!(found, 1);
+            assert_eq!(wallet.outputs().len(), 1);
+            assert_eq!(wallet.outputs()[0].value, 123_456);
+            assert_eq!(wallet.outputs()[0].commit.0, good.commit.0);
+            assert_eq!(wallet.scanned_to(), 8);
+        }
+    }
+
+    #[test]
+    fn payload_encoding_and_size_boundaries() {
+        for valid in ["", "00", "aB", "abcdef"] {
+            assert!(scan_payload(Some(&json!(valid))).is_ok());
+        }
+
+        for invalid in ["0", "xyz0", "gg", "00 0"] {
+            assert!(scan_payload(Some(&json!(invalid))).is_err());
+        }
+
+        assert!(scan_payload(None).is_err());
+        assert!(scan_payload(Some(&json!(null))).is_err());
+        assert!(scan_payload(Some(&json!(123))).is_err());
+
+        let limit = nightfall_types::MAX_MESSAGE_BYTES;
+
+        let at_limit = json!("00".repeat(limit));
+        assert!(scan_payload(Some(&at_limit)).is_ok());
+        drop(at_limit);
+
+        let above_limit = json!("00".repeat(limit + 1));
+        assert!(scan_payload(Some(&above_limit)).is_err());
+    }
+
+    #[test]
     fn valid_page_keeps_every_record() {
         let parsed = parse_mobile_scan_page(&good_page(), 7).unwrap();
         assert_eq!(parsed.scanned_to, 8);
@@ -600,7 +694,7 @@ mod mobile_scan_feed_tests {
         p["outputs"][0]["height"] = json!(9);
         assert!(parse_mobile_scan_page(&p, 7).is_err());
         p = good_page();
-        p["outputs"][0]["payload"] = json!("00");
+        p["outputs"][0]["payload"] = json!("0");
         assert!(parse_mobile_scan_page(&p, 7).is_err());
     }
 

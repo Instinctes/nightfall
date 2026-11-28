@@ -12,16 +12,20 @@ patch **does not authenticate the remote chain**.
 
 Before calling `Wallet::ingest_scan_page`, require the page to state the exact
 requested start and a contiguous bounded block interval; check the complete
-output/spend arrays, field types, 32-byte hex values, the v8 fixed-size sealed
-payload, view-tag range, heights, and optional tip and archive-horizon claims.
+output/spend arrays, field types, 32-byte hex values, bounded hexadecimal
+payloads, view-tag range, heights, and optional tip and archive-horizon claims.
 Reject the whole page on any malformed record, instead of dropping that
 record and advancing. Empty pages must contain no records and no progress.
 
 The page parser is separate from key material and has offline regression
-tests with malformed and adversarial JSON. No network, real wallet, keys or
-payments are touched by tests. Normal pages follow the unchanged ingestion
+tests with malformed and adversarial JSON. Tests use synthetic keys and in-memory payments only. No network or production wallet is involved. Normal pages follow the unchanged ingestion
 logic. A valid-looking response is **not** independent verification, and a
 malicious node can still withhold a valid response or lie consistently.
+
+Payload length is not a consensus rule.
+Accept hexadecimal ciphertexts within the existing P2P
+message budget. The shared wallet scanner ignores
+unopenable outputs while continuing to discover payments.
 
 ## Verification
 
