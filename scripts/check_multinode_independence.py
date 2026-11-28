@@ -417,7 +417,7 @@ def main():
         )
 
     print(
-        "PASS: all three scenarios passed "
+        f"PASS: all {len(EXPECTED)} scenarios passed "
         "in every repetition"
     )
 

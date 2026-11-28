@@ -407,10 +407,11 @@ cargo test --workspace
 **Do not weaken `exploit_regression.rs`.** Every test in it is the inverse of a
 proof-of-concept that once worked against a real build.
 
-Worth saying plainly: **no test starts two nodes.** Every networking fault this
-project has had — a freeze, a fork, the 2,000-block wall, a handshake checked in
-only one direction — was found by real nodes disagreeing, while the suite
-passed. A multi-node harness is the most valuable thing anyone could contribute.
+The dedicated [Independence Quality Gate](docs/INDEPENDENCE-QUALITY-GATE.md) runs real Devnet node processes.
+It exercises network partitions, competing chains, three-node survival,
+and throttled-link recovery, including monetary-state checks.
+These tests are not an independent security audit or proof of
+real-world operator diversity.
 
 ---
 

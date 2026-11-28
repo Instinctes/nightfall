@@ -20,9 +20,12 @@ No consensus, emission, wallet-key, or P2P wire change is introduced.
 3. Remove the original node, allow surviving nodes to advance,
    restore the original node, and verify convergence.
 
+4. Add latency to a bidirectional link, disconnect it, restore it,
+   and verify recovered chain and monetary state.
+
 ## Acceptance
 
-All three named tests must pass in three consecutive runs.
+All four named tests must pass in three consecutive runs.
 
 Missing tests, nonzero exits, incomplete output, and timeouts fail
 the quality gate.
@@ -43,11 +46,11 @@ The receipt contains no wallet keys, credentials, or chain data.
 
 ## Reproduction
 
-The three real-process tests are ignored by regular workspace tests.
+The four real-process tests are ignored by regular workspace tests.
 The dedicated independence gate runs them explicitly with `--ignored`
-and checks that all three pass in each repetition. Changes under
-`crates/nightfall-node/src/**` and `crates/nightfall-p2p/src/**`
-also trigger the dedicated pull-request workflow.
+and checks that all four pass in each repetition. Changes to the node, its protocol and storage dependencies, Cargo
+manifests, lockfile, toolchain configuration and gate runner trigger
+the dedicated pull-request workflow.
 
 Run from the source repository:
 
@@ -81,7 +84,7 @@ Publish failures as well as successes.
 
 ## Monetary-state acceptance after healing
 
-All three real-process Devnet scenarios additionally
+All four real-process Devnet scenarios additionally
 verify monetary-state consistency after network recovery.
 
 Acceptance conditions:
